@@ -1,0 +1,20 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# the Blender fork is its own git repo
+/blender/
+/build/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# harness output
+/out/
+.DS_Store
+
+# downloaded stock Blender for fast UI iteration
+/tools/
