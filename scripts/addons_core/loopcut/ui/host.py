@@ -199,6 +199,23 @@ def _do_action(session: dict, action) -> None:
             conversations.add_project(new, bpy.data.filepath)
             return new
         _switch(session, fresh)
+    elif kind == "close_panel":
+        _close_area_later(bpy.context.window, bpy.context.area)
+
+
+def _close_area_later(window, area) -> None:
+    """Join the panel's area into its neighbour, from a timer: the click arrives inside a modal
+    operator that runs in this very area, which must finish before the area is freed."""
+    def close():
+        if area is None or window is None:
+            return None
+        try:
+            with bpy.context.temp_override(window=window, area=area):
+                bpy.ops.screen.area_close()
+        except RuntimeError as ex:  # The last area, or full screen: Blender says no.
+            print(f"Loopcut: could not close the panel: {ex}")
+        return None
+    bpy.app.timers.register(close, first_interval=0.05)
 
 
 def _switch(session: dict, make_session) -> None:
@@ -243,8 +260,17 @@ def _show_in(area) -> None:
     area.tag_redraw()
 
 
+_docking: set = set()  # Windows with a dock() in flight; the new area is not a host until finish().
+
+
 def find_panel(window):
     return next((a for a in window.screen.areas if is_host(a)), None)
+
+
+def has_panel(window) -> bool:
+    """True when the window shows Loopcut or is about to: dock() finishes on a later tick, and
+    two callers racing it (startup and the onboarding import did) must not both dock."""
+    return window.as_pointer() in _docking or find_panel(window) is not None
 
 
 def dock(window, then=None) -> None:
@@ -257,15 +283,24 @@ def dock(window, then=None) -> None:
     view = max(views, key=lambda a: a.width * a.height)
     region = next(r for r in view.regions if r.type == "WINDOW")
     before = {a.as_pointer() for a in window.screen.areas}
-    with bpy.context.temp_override(window=window, area=view, region=region):
-        bpy.ops.screen.area_split(direction="VERTICAL", factor=DOCK_FACTOR)
+    key = window.as_pointer()
+    _docking.add(key)
+    try:
+        with bpy.context.temp_override(window=window, area=view, region=region):
+            bpy.ops.screen.area_split(direction="VERTICAL", factor=DOCK_FACTOR)
+    except Exception:
+        _docking.discard(key)
+        raise
 
     def finish():
-        fresh = [a for a in window.screen.areas if a.as_pointer() not in before]
-        panel = max(fresh + [view], key=lambda a: a.x)
-        _show_in(panel)
-        if then:
-            then(panel)
+        try:
+            fresh = [a for a in window.screen.areas if a.as_pointer() not in before]
+            panel = max(fresh + [view], key=lambda a: a.x)
+            _show_in(panel)
+            if then:
+                then(panel)
+        finally:
+            _docking.discard(key)
     bpy.app.timers.register(finish, first_interval=0.1)
 
 

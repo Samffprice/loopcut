@@ -50,7 +50,7 @@ def _dock_at_startup() -> None:
     if not host.NATIVE or bpy.app.background or prefs is None or not prefs.dock_on_startup:
         return
     windows = bpy.context.window_manager.windows
-    if windows and not any(host.find_panel(w) for w in windows):
+    if windows and not any(host.has_panel(w) for w in windows):
         try:
             host.dock(windows[0])
         except RuntimeError as ex:

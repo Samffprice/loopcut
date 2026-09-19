@@ -553,10 +553,16 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     mark = f.px(18)
     f.prims.append({"t": "mark", "id": "header.mark", "x": pad, "y": (height - mark) // 2, "w": mark, "h": mark})
     f.text("header.title", pad + mark + f.px(8), y, "Loopcut", size, T.TEXT)
-    label = "New chat"
     small = f.px(T.FONT_SIZE_SMALL)
+    # Close, at the far right: the editor's own header is hidden, so this is how the panel goes away.
+    close = "\u00d7"
+    close_width = round(f.measure("ui", size, close))
+    close_x = f.width - pad - close_width
+    f.text("header.close", close_x, y, close, size, T.TEXT_MUTED)
+    f.hit("header.close", close_x - f.px(8), 0, close_width + f.px(16), height, ("close_panel", None))
+    label = "New chat"
     label_width = round(f.measure("ui", small, label))
-    label_x = f.width - pad - label_width
+    label_x = close_x - f.px(18) - label_width
     f.text("header.new", label_x, (height - f.line_height(small)) // 2, label, small, T.TEXT_MUTED)
     f.hit("header.new", label_x - f.px(6), 0, label_width + f.px(12), height, ("new_chat", None))
     other = "Back" if view == "history" else "History"

@@ -321,7 +321,7 @@ def _import_now() -> None:
 def _reopen() -> None:
     from .ui import host
     window = bpy.context.window_manager.windows[0]
-    if not host.find_panel(window):  # Their startup file has no Loopcut panel.
+    if not host.has_panel(window):  # Their startup file has no Loopcut panel.
         try:
             host.dock(window)
         except RuntimeError as ex:
