@@ -1,5 +1,5 @@
 # The checks that need no Blender, on every push: the agent loop, layout, persistence and the
-# settings import, plus that the fork patch and its base tag are present for the release build.
+# settings import. Only the tip of the history is fetched, and none of Blender's LFS files.
 name: Tests
 
 on:
@@ -16,8 +16,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"  # The Python inside Blender 5.2.
-      - run: python3 -m unittest discover -s tests
-      - run: test -s patches/blender.patch && grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' patches/BASE
+      - run: python3 -m unittest discover -s loopcut/tests

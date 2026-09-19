@@ -2428,24 +2428,6 @@ endif()
 include(build_files/cmake/testing.cmake)
 
 # -----------------------------------------------------------------------------
-# Loopcut: Branding
-#
-# Icons and the splash are made in the Loopcut repository (branding/make_assets.py), next to this
-# checkout, the same way the add-on is bundled from there.
-
-set(LOOPCUT_BRANDING_DIR "${CMAKE_SOURCE_DIR}/../branding" CACHE PATH
-  "Folder with loopcut.icns, loopcut.ico and splash.png"
-)
-foreach(_loopcut_brand_file loopcut.icns loopcut.ico splash.png)
-  if(NOT EXISTS "${LOOPCUT_BRANDING_DIR}/${_loopcut_brand_file}")
-    message(FATAL_ERROR
-      "LOOPCUT_BRANDING_DIR (${LOOPCUT_BRANDING_DIR}) has no ${_loopcut_brand_file}"
-    )
-  endif()
-endforeach()
-unset(_loopcut_brand_file)
-
-# -----------------------------------------------------------------------------
 # Add Sub-Directories
 
 if(WITH_BLENDER)

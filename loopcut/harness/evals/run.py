@@ -23,8 +23,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent.parent
-EVALS = REPO / "out" / "evals"
+REPO = Path(__file__).resolve().parents[3]   # The repository; see harness/checkout.py for the layout.
+WORKSPACE = REPO.parent
+EVALS = WORKSPACE / "out" / "evals"
 
 
 def task_index() -> dict[str, list[str]]:
@@ -39,7 +40,7 @@ def task_index() -> dict[str, list[str]]:
 
 
 def blender() -> str:
-    path = os.environ.get("LOOPCUT_BLENDER") or str(REPO / "tools/Blender.app/Contents/MacOS/Blender")
+    path = os.environ.get("LOOPCUT_BLENDER") or str(WORKSPACE / "tools/Blender.app/Contents/MacOS/Blender")
     if not Path(path).is_file():
         sys.exit(f"No Blender at {path}; set LOOPCUT_BLENDER.")
     return path
@@ -92,7 +93,7 @@ def summarize(run: dict, previous: dict | None) -> str:
 
 
 def configured_model() -> str:
-    sys.path.insert(0, str(REPO / "extension" / "loopcut"))
+    sys.path.insert(0, str(REPO / "scripts" / "addons_core" / "loopcut"))
     import config  # The module has no bpy imports, so it loads outside Blender.
     return config.load().model
 

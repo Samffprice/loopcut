@@ -15,7 +15,6 @@ from pathlib import Path
 
 import bpy
 
-REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checkout  # noqa: E402
 checkout.use()

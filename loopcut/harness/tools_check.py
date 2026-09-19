@@ -88,7 +88,7 @@ def check():
         assert before == after, f"user's view must be restored: {before} -> {after}"
         assert not tools.execute("capture_viewport", json.dumps({"focus": ["Nope"]})).ok
         assert "Nearest to the viewpoint first: " in shot.text, shot.text
-        out = Path(__file__).resolve().parent.parent / "out"
+        out = checkout.OUT
         tools.execute("run_python", json.dumps({"summary": "Red cube in frame", "code": (
             "cube = bpy.data.objects['Cube']\ncube.location.x = 0\n"
             "cube.data.materials[0].node_tree.nodes['Principled BSDF'].inputs['Base Color'].default_value = (1, 0, 0, 1)")}))
@@ -99,7 +99,7 @@ def check():
             shutil.copy(extra.image_path, out / f"{name}.png")
         after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
-        shutil.copy(shot.image_path, Path(__file__).resolve().parent.parent / "out" / "capture_check.png")
+        shutil.copy(shot.image_path, checkout.OUT / "capture_check.png")
         assert bpy.context.scene.render.resolution_x == 1920, "render settings must be restored"
         print(f"TOOLS OK: capture at {shot.image_path} ({shot.image_path.stat().st_size} bytes)")
         code = 0

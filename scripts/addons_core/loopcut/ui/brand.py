@@ -1,8 +1,8 @@
 """The Loopcut mark: the one place its geometry lives. The panel draws it from here, and
-branding/make_assets.py makes the app icons and splash from the same polygons.
+release/loopcut/make_assets.py makes the app icons and splash from the same polygons.
 
 The mark was traced by hand from the only surviving copy, a 95 px render in the old Blender
-Copilot login mockup (branding/source/). If the original artwork turns up, replace SHAPES.
+Copilot login mockup (release/loopcut/source/). If the original artwork turns up, replace SHAPES.
 Needs numpy, which Blender's Python has; nothing else.
 """
 

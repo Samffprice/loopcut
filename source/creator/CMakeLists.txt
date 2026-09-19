@@ -164,12 +164,6 @@ if(WIN32 AND NOT UNIX)
     -DBLEN_VER_RC_4=0
   )
 
-  # Loopcut: winblender.rc names loopcut.ico, and the resource compiler looks next to the .rc file.
-  configure_file(
-    ${LOOPCUT_BRANDING_DIR}/loopcut.ico
-    ${CMAKE_SOURCE_DIR}/release/windows/icons/loopcut.ico
-    COPYONLY
-  )
   list(APPEND SRC
     ${CMAKE_SOURCE_DIR}/release/windows/icons/winblender.rc
   )
@@ -486,23 +480,6 @@ if(WITH_PYTHON)
     PATTERN "addons_core/bl_pkg/Makefile" EXCLUDE
     PATTERN "addons_core/bl_pkg/tests" EXCLUDE
     PATTERN "addons_core/bl_pkg/example_extension" EXCLUDE
-  )
-
-  # Loopcut: bundle the add-on that fills the Loopcut editor. It is developed outside this
-  # repository (hot-reloaded from its checkout), so it is copied in at install time.
-  set(LOOPCUT_EXTENSION_DIR "${CMAKE_SOURCE_DIR}/../extension/loopcut" CACHE PATH
-    "The `loopcut` Python package to bundle as a core add-on"
-  )
-  if(NOT EXISTS "${LOOPCUT_EXTENSION_DIR}/__init__.py")
-    message(FATAL_ERROR
-      "LOOPCUT_EXTENSION_DIR (${LOOPCUT_EXTENSION_DIR}) is not the loopcut Python package"
-    )
-  endif()
-  install(
-    DIRECTORY ${LOOPCUT_EXTENSION_DIR}/
-    DESTINATION ${TARGETDIR_VER}/scripts/addons_core/loopcut
-    PATTERN "__pycache__" EXCLUDE
-    PATTERN ".env*" EXCLUDE
   )
 
   if(WITH_PYTHON_MODULE)
@@ -1787,9 +1764,9 @@ elseif(APPLE)
     "Loopcut.app/Contents"
   )
 
-  # Loopcut: the app icon is made in the Loopcut repository (branding/make_assets.py).
+  # Loopcut: the app icon (release/loopcut/make_assets.py makes it).
   install(
-    FILES ${LOOPCUT_BRANDING_DIR}/loopcut.icns
+    FILES ${CMAKE_SOURCE_DIR}/release/loopcut/loopcut.icns
     DESTINATION "Loopcut.app/Contents/Resources"
   )
 

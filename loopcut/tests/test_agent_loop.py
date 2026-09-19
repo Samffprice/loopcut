@@ -12,9 +12,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "extension"))
-sys.path.insert(0, str(REPO / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # agent.py only needs bpy for the session store; give it a stand-in.
 fake_bpy = types.ModuleType("bpy")

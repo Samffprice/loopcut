@@ -9,7 +9,6 @@ from pathlib import Path
 
 import bpy
 
-REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checkout  # noqa: E402
 checkout.use()
@@ -102,7 +101,7 @@ def poll():
               f"user items linked: {sum(1 for i in session['items'] if i.get('checkpoint'))}")
         images = sum(1 for m in session["messages"] if isinstance(m.get("content"), list))
         print(f"elapsed {elapsed:.0f}s, api messages {len(session['messages'])}, viewport images sent {images}")
-        out = REPO / "out"
+        out = checkout.OUT
         out.mkdir(exist_ok=True)
         write_transcript(session, out)
         with bpy.context.temp_override(window=STATE["window"]):

@@ -7,12 +7,21 @@ check its work, and every step is one undo away.
 
 | Path | What |
 |---|---|
-| `extension/loopcut/` | The product. Python: agent loop, tools, and a UI drawn with `gpu`/`blf`. |
-| `harness/` | Scripts that drive Blender for screenshots and checks. Fixtures are canned conversations. |
-| `tests/` | Runs without Blender: agent loop against a scripted fake model server, layout. |
-| `harness/evals/` | The eval suite: real agent turns on scripted tasks, checked by reading the scene. |
-| `blender/` | The Blender fork (own git repo, branch `loopcut`, based on v5.2.2): the product people run. Holds only what Python cannot do; see "The Loopcut build". Gitignored here. |
-| `tools/` | Stock Blender 5.2.2 for fast iteration. Gitignored. |
+| `scripts/addons_core/loopcut/` | The product's brain and face, a core add-on. Python: agent loop, tools, and a UI drawn with `gpu`/`blf`. |
+| `release/loopcut/` | The brand: icons, splash, the script that makes them. See "License and name". |
+| `loopcut/harness/` | Scripts that drive Blender for screenshots and checks. Fixtures are canned conversations. |
+| `loopcut/tests/` | Runs without Blender: agent loop against a scripted fake model server, layout. |
+| `loopcut/harness/evals/` | The eval suite: real agent turns on scripted tasks, checked by reading the scene. |
+| `loopcut/scripts/` | The dev loop, the first-run check, the Mac release. |
+| everything else | Blender 5.2.2, changed in about forty files; see "The Loopcut build". |
+
+This repository is a fork of Blender (`upstream` is projects.blender.org; our branch is `main`,
+based on the `v5.2.2` tag). Next to the checkout, outside Git, sit `build/` (build folders, as
+Blender's own `../build_*`), `tools/` (a stock Blender 5.2.2 for fast iteration), `out/` (harness
+output) and `.env`. Blender's Git LFS files are not stored here: `make update` fetches them from
+projects.blender.org, which it does for any fork hosted elsewhere. Push with `git push --no-verify`
+so Git LFS does not try to upload Blender's files; Loopcut's own binaries in `release/loopcut/`
+are ordinary Git files.
 
 ## Setup
 
@@ -20,7 +29,7 @@ Users: Preferences > Add-ons > Loopcut. Pick a provider (any OpenAI-compatible e
 including a local one), paste a key, pick a model. The key is kept in `credentials.json` in
 Blender's config folder with user-only permissions, never in `userpref.blend` or a .blend.
 
-Developers: copy `.env.example` to `.env` and fill it in. Quote values containing `|`. Never commit
+Developers: copy `loopcut/.env.example` to `.env` next to the checkout and fill it in. Quote values containing `|`. Never commit
 `.env`. Lookup order per setting: environment, preferences, `.env`.
 
 Model-written code asks before it runs ("Always allow" on the card stops asking for that
@@ -29,33 +38,33 @@ than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped, so an endless loop cannot freeze B
 
 ## The Loopcut build
 
-`blender/` is Blender with six additions, kept small so rebasing onto a new release stays cheap:
+Blender with six additions, kept small so rebasing onto a new release stays cheap:
 
 - `SpaceLoopcut`, an editor type that is a shell: it clears its region, fires the add-on's draw
   callback, owns the "Loopcut" keymap and redraws when selection, mode or the open file change.
-  All UI and logic stay in `extension/loopcut/` and hot-reload.
+  All UI and logic stay in `scripts/addons_core/loopcut/` and hot-reload.
 - `wm.loopcut_snapshot_write` / `wm.loopcut_snapshot_restore`: checkpoints as recovery files, so a
   restore happens in place (see Checkpoints).
-- The add-on is bundled (`scripts/addons_core/loopcut`, copied from `LOOPCUT_EXTENSION_DIR` at
-  install time) and enabled for new and existing preferences.
+- The add-on is a core add-on (`scripts/addons_core/loopcut`), enabled for new and existing
+  preferences.
 - Its own settings folder (`Loopcut/<version>` where Blender has `Blender/<version>`), so it
   never writes to stock Blender's preferences, and a first-run flow in the splash screen modelled
   on Cursor's: "Import Blender 5.2 Settings" copies preferences, add-ons, keymap, themes and the
   startup file from the newest stock Blender folder it can read (`blender_import.py`), or "Start
   Fresh" shows Blender's quick setup; then connect a model, privacy, done. The steps are drawn by
-  `extension/loopcut/onboarding.py`; the fork's splash menus only call it. Add-ons that did not
+  `scripts/addons_core/loopcut/onboarding.py`; the fork's splash menus only call it. Add-ons that did not
   load after an import are named on the last step.
 - The product's name and face: `Loopcut.app` (executable `Loopcut`, bundle id
   `io.github.samffprice.loopcut`), "Loopcut (Blender 5.2.2)" in the window title, its own app
   icon, splash and top-bar icon. "Blender" and its logo are the Blender Foundation's trademarks,
-  so a fork may not ship under them. The files come from `branding/` (`LOOPCUT_BRANDING_DIR`),
-  made by `branding/make_assets.py` from the mark's polygons in `extension/loopcut/ui/brand.py`.
+  so a fork may not ship under them. The files are in `release/loopcut/`, made by its
+  `make_assets.py` from the mark's polygons in `scripts/addons_core/loopcut/ui/brand.py`.
   On Windows the icon, product name and install folder are Loopcut's; the executable is still
   `blender.exe`.
 - At startup the panel is docked right of the 3D viewport if the layout has none. Cmd+L
   (Ctrl+Alt+L elsewhere) focuses it, opening it first if needed.
 
-Build: `ninja -C build/lite install` (the build folder must stay on the external disk). After
+Build: `ninja -C ../build/lite install` (the build folder must stay on the external disk). After
 changing Python only, the same command re-copies the add-on in seconds. The same extension still
 runs in stock Blender, borrowing a Text Editor area; the harness uses whichever Blender
 `LOOPCUT_BLENDER` names and always loads the checkout, not the bundled copy.
@@ -66,15 +75,14 @@ The dev build has `WITH_ASSERT_ABORT` on; a release build must turn it and `WITH
 
 The Mac build is made at home, the Windows one on GitHub's runners (it cannot be built on a Mac):
 
-    scripts/make_patch.sh && git add patches && git commit -m "Fork patch for v0.1.0" && git push
-    scripts/release_mac.sh v0.1.0 --upload                       # .dmg, added to a draft release
+    git tag v0.1.0 && git push --no-verify origin main v0.1.0
+    loopcut/scripts/release_mac.sh v0.1.0 --upload               # .dmg, added to a draft release
     gh workflow run release.yml -f release_tag=v0.1.0            # Windows .zip/.msi, same release
 
-`.github/workflows/release.yml` only ever starts by hand. The fork is not in this repository, so
-CI rebuilds it from upstream Blender at the tag in `patches/BASE` plus `patches/blender.patch`;
-`scripts/make_patch.sh` writes both and checks the patch applies to the clean tag, so run it
-whenever the fork changed. A hosted build takes hours; in a private repository Windows minutes
-are billed at 2x and macOS at 10x.
+`.github/workflows/release.yml` only ever starts by hand and builds straight from this repository.
+A hosted build takes hours; in a private repository Windows minutes are billed at 2x and macOS at
+10x. The tag is the release's source, which is what the GPL asks for: whoever gets the app can get
+exactly that.
 
 Both use Blender's release configuration. On a Mac that is everything: Cycles' Metal kernels are
 compiled on the user's machine. The Windows build leaves out the CUDA, OptiX, HIP and oneAPI
@@ -82,6 +90,19 @@ kernels for now, so Cycles renders on the CPU there. The builds are unsigned: ma
 is damaged until `xattr -cr /Applications/Loopcut.app` is run, and Windows shows a SmartScreen
 warning; signing needs an Apple Developer ID and a Windows code-signing certificate.
 `.github/workflows/tests.yml` runs the Blender-free tests on every push.
+
+## License and name
+
+The code is Blender's and ours together, under the GNU General Public License v3 or later, like
+Blender (`COPYING`, `doc/license/`). That includes the add-on: it is written against Blender's
+Python API and ships inside the app. Anything that only talks to the app over the network, such as
+a hosted model service, is separate work and does not belong in this repository.
+
+The license covers the code, not the name. "Loopcut" and the Loopcut mark (`release/loopcut/`)
+identify this product, and the GPL grants no right to use them; a fork of this repository needs
+its own name and icons, exactly as this one does not use Blender's. Blender is a trademark
+of the Blender Foundation; Loopcut is based on Blender and is not affiliated with or endorsed by
+the Blender Foundation.
 
 ## What the agent can do
 
@@ -108,23 +129,23 @@ Keep and Undo all (which restores that turn's checkpoint).
 
 | Command | Time | Use |
 |---|---|---|
-| `scripts/dev.sh` | save → redraw <1s | Blender stays open with the panel; saving any file under `extension/` hot-reloads it and keeps the conversation. |
-| `scripts/shot.sh <fixture>` | ~10s | Renders `harness/fixtures/<fixture>.json` to `out/`: window PNG, panel-only PNG, and the frame's display list as JSON. No network. |
-| `python3 -m unittest discover -s tests` | <1s | Agent loop and layout. |
-| `Blender --factory-startup --python harness/tools_check.py` | ~8s | The real tools against a real scene. |
-| `Blender --factory-startup --enable-event-simulate --python harness/input_check.py` | ~8s | Click, type, select, undo, complete an @mention, Esc through simulated events. |
-| `Blender -b --factory-startup --python harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `scripts/shot.sh attachments` shows the chips. |
-| `Blender -b --factory-startup --python harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |
-| `scripts/onboarding_check.sh` | ~40s | First run of the build in a throwaway home folder: clicks through a fresh start, imports stock settings and checks they took effect and stock Blender's folder is byte-identical, screenshots every step to `out/onboarding/`. |
-| `Blender -b --factory-startup --python harness/snapshot_check.py` | ~2s | The build's in-place restore (skipped in stock Blender). |
-| `Blender -b --factory-startup --python harness/evals/selfcheck.py` | ~5s | Every eval check fails on the untouched scene and passes on its reference solution. No model. |
-| `python3 harness/evals/run.py [tasks] [--tag t] [--label "what changed"]` | ~6 min, costs tokens | 22 real agent turns, checked by reading the scene; `out/evals/<time>/summary.md` has pass rate, time, steps, failed calls and what was won or lost against the previous run. |
+| `loopcut/scripts/dev.sh` | save → redraw <1s | Blender stays open with the panel; saving any file under `scripts/addons_core/loopcut/` hot-reloads it and keeps the conversation. |
+| `loopcut/scripts/shot.sh <fixture>` | ~10s | Renders `loopcut/harness/fixtures/<fixture>.json` to `../out/`: window PNG, panel-only PNG, and the frame's display list as JSON. No network. |
+| `python3 -m unittest discover -s loopcut/tests` | <1s | Agent loop and layout. |
+| `Blender --factory-startup --python loopcut/harness/tools_check.py` | ~8s | The real tools against a real scene. |
+| `Blender --factory-startup --enable-event-simulate --python loopcut/harness/input_check.py` | ~8s | Click, type, select, undo, complete an @mention, Esc through simulated events. |
+| `Blender -b --factory-startup --python loopcut/harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `loopcut/scripts/shot.sh attachments` shows the chips. |
+| `Blender -b --factory-startup --python loopcut/harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |
+| `loopcut/scripts/onboarding_check.sh` | ~40s | First run of the build in a throwaway home folder: clicks through a fresh start, imports stock settings and checks they took effect and stock Blender's folder is byte-identical, screenshots every step to `../out/onboarding/`. |
+| `Blender -b --factory-startup --python loopcut/harness/snapshot_check.py` | ~2s | The build's in-place restore (skipped in stock Blender). |
+| `Blender -b --factory-startup --python loopcut/harness/evals/selfcheck.py` | ~5s | Every eval check fails on the untouched scene and passes on its reference solution. No model. |
+| `python3 loopcut/harness/evals/run.py [tasks] [--tag t] [--label "what changed"]` | ~6 min, costs tokens | 22 real agent turns, checked by reading the scene; `../out/evals/<time>/summary.md` has pass rate, time, steps, failed calls and what was won or lost against the previous run. |
 
-When a run goes badly, read the task's transcript in `out/evals/<time>/<task>.md` before blaming
+When a run goes badly, read the task's transcript in `../out/evals/<time>/<task>.md` before blaming
 the model: it shows exactly what the tools told it. The two regressions found this way so far were
 both tools lying (an enum listed as `['DEFAULT']`; two look-alike objects overlapping in a capture).
 
-Debugging a frame: read `out/<fixture>.json` before squinting at pixels. Every primitive has an
+Debugging a frame: read `../out/<fixture>.json` before squinting at pixels. Every primitive has an
 id, rect and color, so "invisible" shows up as a color equal to its background or a rect outside
 the region.
 
@@ -151,7 +172,7 @@ input box.
   than 30 days are removed at startup.
 - Not covered: files the agent writes elsewhere on disk, preferences, add-ons, linked libraries.
 
-Check: `LOOPCUT_DATA_DIR=<tmp>/data Blender --factory-startup --enable-event-simulate --python harness/checkpoint_check.py -- <tmp>/project`
+Check: `LOOPCUT_DATA_DIR=<tmp>/data Blender --factory-startup --enable-event-simulate --python loopcut/harness/checkpoint_check.py -- <tmp>/project`
 clicks the real buttons and asserts the original file's hash never changes.
 
 ## Conversations
@@ -172,7 +193,7 @@ fresh one without losing the old.
 - Checkpoints keep working across restarts. A snapshot store untouched for 30 days is dropped
   to reclaim space; its conversation stays and shows those checkpoints as expired.
 
-Check: `harness/persistence_check.py` (two launches sharing a data folder; see its docstring).
+Check: `loopcut/harness/persistence_check.py` (two launches sharing a data folder; see its docstring).
 Harness scripts default `LOOPCUT_DATA_DIR` to a temp folder so they never touch real data.
 
 ## UI architecture

@@ -1,10 +1,10 @@
 """The Loopcut mark, and every file made from it.
 
-The mark's polygons live in extension/loopcut/ui/brand.py (the panel draws them too), so every
+The mark's polygons live in scripts/addons_core/loopcut/ui/brand.py (the panel draws them too), so every
 size is drawn fresh instead of scaled. source/ holds the render it was traced from.
 
 Needs numpy, which Blender's Python has:
-    tools/Blender.app/Contents/Resources/5.2/python/bin/python3.13 branding/make_assets.py \
+    tools/Blender.app/Contents/Resources/5.2/python/bin/python3.13 release/loopcut/make_assets.py \
         tools/Blender.app/Contents/Resources/5.2/datafiles/fonts/Inter.woff2
 Writes mark.svg, topbar-icon.svg, mark-<size>.png, app-icon-1024.png, loopcut.ico and, on macOS only (they use
 iconutil and Quick Look), loopcut.icns and splash.png next to this file. The splash's wordmark is
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "extension" / "loopcut" / "ui"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core" / "loopcut" / "ui"))
 import brand  # noqa: E402  (the mark's polygons and rasteriser, shared with the panel)
 from brand import PALETTE, SHAPES, hex_rgb, square  # noqa: E402
 

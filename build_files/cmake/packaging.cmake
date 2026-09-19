@@ -89,13 +89,13 @@ if(WIN32)
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
   set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
 
-  set(CPACK_NSIS_MUI_ICON ${LOOPCUT_BRANDING_DIR}/loopcut.ico)
+  set(CPACK_NSIS_MUI_ICON ${CMAKE_SOURCE_DIR}/release/loopcut/loopcut.ico)
   set(CPACK_NSIS_COMPRESSOR "/SOLID lzma")
 
   # Even though we no longer display this, we still need to set it otherwise it'll throw an error
   # during the msi build.
   set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/release/license/spdx/GPL-3.0-or-later.txt)
-  set(CPACK_WIX_PRODUCT_ICON ${LOOPCUT_BRANDING_DIR}/loopcut.ico)
+  set(CPACK_WIX_PRODUCT_ICON ${CMAKE_SOURCE_DIR}/release/loopcut/loopcut.ico)
 
   set(BLENDER_NAMESPACE_GUID "507F933F-5898-404A-9A05-18282FD491A6")
 
