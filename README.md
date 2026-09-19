@@ -85,8 +85,12 @@ A hosted build takes hours; in a private repository Windows minutes are billed a
 exactly that.
 
 Both use Blender's release configuration. On a Mac that is everything: Cycles' Metal kernels are
-compiled on the user's machine. The Windows build leaves out the CUDA, OptiX, HIP and oneAPI
-kernels for now, so Cycles renders on the CPU there. The builds are unsigned: macOS says the app
+compiled on the user's machine. On Windows the NVIDIA (CUDA, OptiX) and AMD (HIP) kernels are
+taken from the official Blender release of the same version, checked against
+`loopcut/official-builds.sha256`: Loopcut does not change Cycles, so they are the kernels this
+source would produce, without the vendor SDKs and hours of compiling. Update that file when
+moving to a new Blender version, and compile the kernels instead if Cycles is ever changed.
+Intel's oneAPI is off. The builds are unsigned: macOS says the app
 is damaged until `xattr -cr /Applications/Loopcut.app` is run, and Windows shows a SmartScreen
 warning; signing needs an Apple Developer ID and a Windows code-signing certificate.
 `.github/workflows/tests.yml` runs the Blender-free tests on every push.

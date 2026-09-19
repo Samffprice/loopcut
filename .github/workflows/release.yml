@@ -82,12 +82,50 @@ jobs:
           python3 build_files/utils/make_update.py --no-blender ${{ steps.libs.outputs.cache-hit == 'true' && '--no-libraries' || '' }}
           git lfs checkout
 
+      # Cycles on NVIDIA and AMD cards needs kernels compiled with the vendors' SDKs, which take hours
+      # and tools a hosted runner lacks. Loopcut does not change Cycles, so the kernels of the
+      # official Blender release of the same version are the ones this source would produce: take
+      # them from the official download, checked against the checksum pinned in
+      # loopcut/official-builds.sha256. Put under scripts/, they are installed and packaged like any
+      # other script file. If anything here fails the build goes on and Cycles renders on the CPU.
+      - name: GPU kernels from the official Blender release (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          header=blender/source/blender/blenkernel/BKE_blender_version.h
+          number=$(awk '$2 == "BLENDER_VERSION" {print $3}' "$header")
+          patch=$(awk '$2 == "BLENDER_VERSION_PATCH" {print $3}' "$header")
+          version="$((number / 100)).$((number % 100)).$patch"
+          name="blender-$version-windows-x64.zip"
+          grep -F "  $name" blender/loopcut/official-builds.sha256 > pinned.sha256 ||
+            { echo "No pinned checksum for $name: update loopcut/official-builds.sha256" >&2; exit 1; }
+          curl -fL --retry 3 -o "$name" "https://download.blender.org/release/Blender${version%.*}/$name"
+          sha256sum -c pinned.sha256
+          mkdir kernels
+          unzip -q -j "$name" "*/scripts/addons_core/cycles/lib/*.zst" -d kernels
+          test "$(ls kernels | wc -l)" -ge 20
+          mkdir -p blender/scripts/addons_core/cycles/lib
+          mv kernels/* blender/scripts/addons_core/cycles/lib/
+          rm -f "$name"
+          ls blender/scripts/addons_core/cycles/lib | sed -E 's/(gfx|sm_|compute_)[0-9a-z]+/\1*/' | sort | uniq -c
+
+      # The OptiX device code needs NVIDIA's headers (the version official builds use), which are
+      # public. Pinned by commit. Without them CMake turns OptiX off and says so; CUDA still works.
+      - name: OptiX headers (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          git clone --quiet --depth 1 --branch v8.0.0 https://github.com/NVIDIA/optix-dev.git optix
+          test "$(git -C optix rev-parse HEAD)" = "f60c1e44f18426f426a2ed948f28515b3cf67b8a" ||
+            { echo "optix-dev v8.0.0 is not the pinned commit; not using it" >&2; rm -rf optix; exit 1; }
+
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
         run: brew install ninja
 
-      # Release configuration, minus what a hosted runner cannot build: the CUDA, OptiX, HIP and
-      # oneAPI kernels need their vendor SDKs. Cycles still renders on the CPU, and on Metal on a Mac.
+      # Release configuration, minus what a hosted runner cannot build: compiling the CUDA, OptiX, HIP
+      # and oneAPI kernels needs the vendors' SDKs. The NVIDIA and AMD device code is still built (it
+      # loads the drivers at run time) and uses the kernels from the step above; Intel's oneAPI is off.
       # The -D options come after -C on purpose: the release configuration force-sets the ones it names.
       - name: Configure and build (macOS)
         if: runner.os == 'macOS'
@@ -108,9 +146,9 @@ jobs:
           cmake -S blender -B build -G Ninja ^
             -C blender/build_files/cmake/config/blender_release.cmake ^
             -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF ^
-            -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_DEVICE_OPTIX=OFF ^
-            -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_DEVICE_HIPRT=OFF ^
+            -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF ^
             -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF ^
+            -DOPTIX_ROOT_DIR=%GITHUB_WORKSPACE%\optix ^
             -DCPACK_OVERRIDE_PACKAGENAME=%PACKAGE_NAME% || exit /b 1
           ninja -C build install || exit /b 1
           cd build
