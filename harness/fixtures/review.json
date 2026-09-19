@@ -1,0 +1,88 @@
+{
+ "items": [
+  {
+   "kind": "user",
+   "text": "Put a desk lamp on @Desk and point it at the keyboard.",
+   "checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+   "kind": "assistant",
+   "streaming": false,
+   "text": "The desk top is at z = 0.75, so the lamp goes on that."
+  },
+  {
+   "kind": "tool",
+   "name": "get_object_info",
+   "summary": "get_object_info",
+   "code": "",
+   "status": "done",
+   "output": "[{\"name\":\"Desk\"}]"
+  },
+  {
+   "kind": "tool",
+   "name": "run_python",
+   "summary": "Build the lamp and aim its spot light",
+   "code": "lamp = ...",
+   "status": "done",
+   "output": "OK (no output)"
+  },
+  {
+   "kind": "assistant",
+   "streaming": false,
+   "text": "Lamp is on the desk, aimed at the keyboard."
+  },
+  {
+   "kind": "changes",
+   "text": "3 added, 2 changed",
+   "checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "resolved": "",
+   "lines": [
+    "+ Lamp Base (mesh) at [0.4, 0.2, 0.75]..[0.56, 0.36, 0.78]",
+    "+ Lamp Arm (mesh) at [0.46, 0.26, 0.78]..[0.5, 0.3, 1.2]",
+    "+ Lamp Light (light)",
+    "+ material Brushed Metal",
+    "~ Desk: modifier Bevel: segments 1 -> 3",
+    "~ Keyboard: location (0.0, 0.1, 0.76) -> (0.0, 0.05, 0.76); bounds now [-0.22, -0.02, 0.75]..[0.22, 0.12, 0.78]",
+    "~ scene render.fps 24 -> 30"
+   ]
+  },
+  {
+   "kind": "user",
+   "text": "Now make the bulb warmer."
+  },
+  {
+   "kind": "tool",
+   "name": "run_python",
+   "summary": "Set the lamp light to 2700 K",
+   "code": "light = bpy.data.objects['Lamp Light'].data\nlight.use_temperature = True\nlight.temperature = 2700",
+   "status": "awaiting",
+   "output": ""
+  }
+ ],
+ "input": "and dim the @Ca",
+ "cursor": 15,
+ "anchor": 4,
+ "focused": true,
+ "busy": true,
+ "usage": {
+  "input": 18400,
+  "output": 2150
+ },
+ "ui": {
+  "view": "chat",
+  "mentions": [
+   [
+    "Camera",
+    "object"
+   ],
+   [
+    "Cable",
+    "object"
+   ],
+   [
+    "Carpet",
+    "material"
+   ]
+  ]
+ }
+}

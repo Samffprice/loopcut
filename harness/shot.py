@@ -16,7 +16,14 @@ from pathlib import Path
 import bpy
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "extension"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import checkout  # noqa: E402
+checkout.use()
+
+# Harness runs must not write conversations or checkpoints into the user's real Loopcut data.
+import os as _os
+import tempfile as _tempfile
+_os.environ.setdefault("LOOPCUT_DATA_DIR", _tempfile.mkdtemp(prefix="loopcut-harness-"))
 
 import loopcut  # noqa: E402
 from loopcut import state  # noqa: E402
@@ -55,6 +62,10 @@ def _guarded(step):
 
 def split():
     window = bpy.context.window_manager.windows[0]
+    STATE["window"] = window
+    if host.find_panel(window):  # The Loopcut build docks the panel itself at startup.
+        bpy.app.timers.register(_guarded(open_panel), first_interval=0.3)
+        return
     view = next(a for a in window.screen.areas if a.type == "VIEW_3D")
     region = next(r for r in view.regions if r.type == "WINDOW")
     with bpy.context.temp_override(window=window, area=view, region=region):
@@ -67,18 +78,25 @@ def split():
 def apply_fixture():
     fixture = json.loads(ARGS.fixture.read_text(encoding="utf-8"))
     session = state.session()
-    unknown = set(fixture) - set(session)
+    unknown = set(fixture) - set(session) - {"ui"}
     if unknown:
         fail(f"fixture has unknown session keys: {sorted(unknown)}")
+    ui = fixture.pop("ui", None)
     session.update(state.new_session())
     session.update(fixture)
+    state.ui.update(ui or {"view": "chat"})
+    for row in state.ui.get("history", []):
+        if row.get("id") == "CURRENT":
+            row["id"] = session["id"]
 
 
 def open_panel():
     window = STATE["window"]
-    panel = max((a for a in window.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.x)
-    with bpy.context.temp_override(window=window, area=panel):
-        bpy.ops.loopcut.open()
+    panel = host.find_panel(window)
+    if panel is None:
+        panel = max((a for a in window.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.x)
+        with bpy.context.temp_override(window=window, area=panel):
+            bpy.ops.loopcut.open()
     STATE["panel"] = panel
     apply_fixture()
     panel.tag_redraw()
@@ -88,6 +106,13 @@ def open_panel():
 def settle():
     # Real mouse or trackpad input can reach this window; reset to the fixture just before capture.
     apply_fixture()
+    STATE["panel"].tag_redraw()
+    bpy.app.timers.register(_guarded(present), first_interval=0.15)
+
+
+def present():
+    # A screenshot reads the frame before the last one drawn (the swap chain hands back an older
+    # buffer), so the final state is drawn twice.
     STATE["panel"].tag_redraw()
     bpy.app.timers.register(capture, first_interval=0.15)
 

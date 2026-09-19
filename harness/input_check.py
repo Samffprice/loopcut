@@ -7,7 +7,14 @@ from pathlib import Path
 
 import bpy
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "extension"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import checkout  # noqa: E402
+checkout.use()
+# Harness runs must not write conversations or checkpoints into the user's real Loopcut data.
+import os as _os
+import tempfile as _tempfile
+_os.environ.setdefault("LOOPCUT_DATA_DIR", _tempfile.mkdtemp(prefix="loopcut-harness-"))
+
 import loopcut  # noqa: E402
 from loopcut import state  # noqa: E402
 from loopcut.ui import host  # noqa: E402
@@ -39,9 +46,9 @@ def run_next():
     return 0.35
 
 
-def key(kind, unicode=""):
-    STATE["window"].event_simulate(type=kind, value="PRESS", unicode=unicode)
-    STATE["window"].event_simulate(type=kind, value="RELEASE")
+def key(kind, unicode="", **modifiers):
+    STATE["window"].event_simulate(type=kind, value="PRESS", unicode=unicode, **modifiers)
+    STATE["window"].event_simulate(type=kind, value="RELEASE", **modifiers)
 
 
 @step
@@ -96,10 +103,46 @@ def edit_text():
 
 
 @step
-def escape():
+def select_and_replace():
     session = state.session()
     assert (session["input"], session["cursor"]) == ("hoi", 2), (session["input"], session["cursor"])
     assert "Cube" in bpy.data.objects, "typing must not leak to the viewport (X/H would hide or delete)"
+    key("A", ctrl=True)     # Select all, then type over it.
+    key("Y", "y")
+
+
+@step
+def undo_typing():
+    session = state.session()
+    assert session["input"] == "y", repr(session["input"])
+    key("Z", ctrl=True)
+
+
+@step
+def start_mention():
+    session = state.session()
+    assert session["input"] == "hoi", f"undo should bring the replaced text back, got {session['input']!r}"
+    key("END")
+    key("SPACE", " ")
+    key("TWO", "@")
+    key("C", "c")
+
+
+@step
+def pick_mention():
+    rows = state.ui["mentions"]
+    assert [name for name, _ in rows][:2] == ["Cube", "Camera"], f"selected object first, got {rows}"
+    display = host._displays[STATE["panel"].as_pointer()]
+    assert any(h["id"] == "mentions.row0" for h in display["hits"]), "the completion list is not on screen"
+    key("DOWN_ARROW")
+    key("TAB")
+
+
+@step
+def escape():
+    session = state.session()
+    assert session["input"] == "hoi @Camera ", repr(session["input"])
+    assert state.ui["mentions"] == [], "the list closes after a pick"
     key("ESC")
 
 

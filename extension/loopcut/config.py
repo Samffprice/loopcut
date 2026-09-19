@@ -1,7 +1,11 @@
-"""Configuration, read from the environment or a .env file. Secrets never live in code.
+"""Configuration. Secrets never live in code.
 
-Lookup order per key: process environment, then the .env file named by
+Lookup order per key: process environment, then Loopcut's page in Blender's preferences
+(settings.py; the key itself is kept by credentials.py), then the .env file named by
 LOOPCUT_ENV_FILE, then a .env found by walking up from this package (dev checkouts).
+
+Preferences belong to Blender's main thread: load() is called there (agent.send) and the result
+handed to the worker.
 """
 
 import os
@@ -60,12 +64,21 @@ def _as_bool(value: str, key: str) -> bool:
     raise ConfigError(f"{key} must be a boolean, got {value!r}")
 
 
+def _preference_values() -> dict[str, str]:
+    try:
+        from . import settings
+    except (ImportError, AttributeError):  # Outside Blender (tests, harness/evals/run.py).
+        return {}
+    return settings.values()
+
+
 def _getter():
     env_file = _find_env_file()
     file_values = _parse_env_file(env_file) if env_file else {}
+    preference_values = _preference_values()
 
     def get(key: str, default: str = "") -> str:
-        return os.environ.get(key) or file_values.get(key) or default
+        return os.environ.get(key) or preference_values.get(key) or file_values.get(key) or default
     return env_file, get
 
 
@@ -78,6 +91,19 @@ def checkpoint_budget_mb() -> int:
     return int(value)
 
 
+def run_timeout() -> float:
+    """Seconds one run_python call may take before it is stopped. Readable without an API key."""
+    _, get = _getter()
+    value = get("LOOPCUT_RUN_TIMEOUT", "60")
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if not 1 <= seconds <= 3600:
+        raise ConfigError(f"LOOPCUT_RUN_TIMEOUT must be 1-3600 seconds, got {value!r}")
+    return seconds
+
+
 def load() -> Config:
     env_file, get = _getter()
 
@@ -87,8 +113,10 @@ def load() -> Config:
     missing = [k for k, v in (("LOOPCUT_API_KEY", api_key), ("LOOPCUT_BASE_URL", base_url),
                               ("LOOPCUT_MODEL", model)) if not v]
     if missing:
-        where = env_file or "the environment"
-        raise ConfigError(f"Missing {', '.join(missing)} (looked in {where})")
+        raise ConfigError("No API key yet. Add one in Preferences > Add-ons > Loopcut."
+                          if missing == ["LOOPCUT_API_KEY"] or len(missing) == 3 else
+                          f"Missing {', '.join(missing)} (looked in Loopcut's preferences and "
+                          f"{env_file or 'the environment'})")
     if not base_url.startswith("https://") and not base_url.startswith("http://127.0.0.1"):
         raise ConfigError("LOOPCUT_BASE_URL must be https (http is allowed only for 127.0.0.1)")
 

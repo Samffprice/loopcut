@@ -4,7 +4,9 @@ import contextlib
 import io
 import json
 import math
+import sys
 import tempfile
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,9 @@ import bpy
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 960
+# Above this many objects get_scene_info lists names only; details come from get_object_info.
+FULL_DETAIL_OBJECTS = 40
+DEFAULT_RUN_TIMEOUT = 60.0
 
 
 class ToolError(Exception):
@@ -24,6 +29,9 @@ class ToolResult:
     text: str
     image_path: Path | None = None
     ok: bool = True
+    # scene_diff snapshots around a scene-changing tool, for the turn's "what changed" card.
+    scene_before: dict | None = None
+    scene_after: dict | None = None
 
 
 SCHEMAS = [
@@ -34,8 +42,10 @@ SCHEMAS = [
             "description": (
                 "Execute Python in the running Blender session. `bpy` is imported. Runs with a 3D "
                 "viewport context, so bpy.ops work. Prefer the data API (bpy.data, obj.location) over "
-                "bpy.ops when both work. print() output and any traceback are returned. Each call is "
-                "one undo step."
+                "bpy.ops when both work. print() output and any traceback are returned, followed by "
+                "`Scene changes`: what the code actually added, removed and changed, measured from "
+                "the scene. Trust that over what the code was meant to do; there is no need to print "
+                "values just to verify them. Each call is one undo step."
             ),
             "parameters": {
                 "type": "object",
@@ -57,9 +67,58 @@ SCHEMAS = [
                 "as JSON. Call this before editing a scene you have not seen. `bounds` is the world-space "
                 "box the geometry actually occupies; judge placement and contact from it. `location` is "
                 "only the object's origin: it is relative to the parent when there is one, and can sit "
-                "far from the geometry (for example at 0,0,0 after transform_apply)."
+                "far from the geometry (for example at 0,0,0 after transform_apply). Large scenes are "
+                "listed by collection with names only; narrow with `name_contains` or `type`, or use "
+                "get_object_info."
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_contains": {"type": "string", "description": "Only objects whose name contains this"},
+                    "type": {"type": "string", "description": "Only objects of this type, e.g. MESH, LIGHT, CAMERA"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_object_info",
+            "description": (
+                "Everything about a few objects: modifier settings, material node trees (nodes, values "
+                "and links), geometry-nodes inputs, constraints, animation, children, custom properties. "
+                "Use it before changing an existing material, modifier or rig instead of guessing how it "
+                "is set up."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "Object names, at most 5"},
+                },
+                "required": ["names"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_api",
+            "description": (
+                "Look up the Blender Python API of THIS Blender version: exact property names, enum "
+                "values, defaults, operator arguments, and the input/output sockets of any node. Your "
+                "memory of bpy comes from older versions and is wrong in places. Use this before using "
+                "an API you are not certain of, and always after an AttributeError, TypeError or "
+                "'enum not found' instead of guessing again. `path` examples: bpy.types.BevelModifier, "
+                "Object.modifiers, bpy.ops.mesh.bevel, ShaderNodeTexNoise, bpy.data.node_groups, "
+                "bmesh.ops.bevel, mathutils.Vector. `search` finds names from words: 'action fcurves'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Dotted path to describe"},
+                    "search": {"type": "string", "description": "Words to find in names and descriptions"},
+                },
+            },
         },
     },
     {
@@ -69,16 +128,24 @@ SCHEMAS = [
             "description": (
                 "Return an image of the scene so you can check your work. The tool frames the objects "
                 "itself from a 3/4 angle with materials shown, and leaves the user's viewport as it was, "
-                "so never move the viewport or change shading yourself just to take a capture."
+                "so never move the viewport or change shading yourself just to take a capture. The "
+                "result also lists the framed objects nearest first, which settles what is in front of "
+                "what when objects of a similar color overlap in the image."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "focus": {"type": "array", "items": {"type": "string"},
                               "description": "Names of objects to frame. Omit to frame everything visible."},
-                    "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "user"],
-                              "description": "Default three_quarter. 'user' keeps the user's current view "
-                                             "unchanged and ignores focus."},
+                    "angle": {"type": "string",
+                              "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
+                              "description": "Default three_quarter. 'camera' looks through the scene camera "
+                                             "(use it to check framing). 'user' keeps the user's current "
+                                             "view. Both ignore focus."},
+                    "style": {"type": "string", "enum": ["material", "distinct"],
+                              "description": "Default material. 'distinct' gives every object its own flat "
+                                             "color: use it to judge shape, overlap and contact when "
+                                             "materials look alike."},
                 },
             },
         },
@@ -109,20 +176,56 @@ def _clip(text: str) -> str:
     return f"{text[:half]}\n... [{len(text) - MAX_OUTPUT_CHARS} chars omitted] ...\n{text[-half:]}"
 
 
+class _RunTimeout(BaseException):
+    """BaseException so that model code catching Exception in its loop cannot swallow it."""
+
+
+class _Deadline:
+    """sys.settrace hook that stops model-written code which runs too long. It runs on the main
+    thread, so an endless loop would otherwise freeze Blender with no way out but killing it.
+    Only lines of the model's own code are checked; one long call into Blender is not interrupted."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.at = time.monotonic() + seconds
+
+    def __call__(self, frame, event, arg):
+        return self._line if frame.f_code.co_filename == "<loopcut>" else None
+
+    def _line(self, frame, event, arg):
+        if time.monotonic() > self.at:
+            raise _RunTimeout()
+        return self._line
+
+
 def run_python(code: str, summary: str = "") -> ToolResult:
     # Running model-written code is the product; the approval gate lives in agent.py.
+    from . import config, scene_diff
     stdout = io.StringIO()
     ok = True
+    deadline = _Deadline(config.run_timeout())
+    before = scene_diff.snapshot()
     with bpy.context.temp_override(**_view3d_override()):
         bpy.ops.ed.undo_push(message=f"Before Loopcut: {summary or 'run_python'}"[:60])
+        previous_trace = sys.gettrace()
         try:
+            compiled = compile(code, "<loopcut>", "exec")
+            sys.settrace(deadline)
             with contextlib.redirect_stdout(stdout):
-                exec(compile(code, "<loopcut>", "exec"), {"bpy": bpy, "__name__": "__loopcut__"})
+                exec(compiled, {"bpy": bpy, "__name__": "__loopcut__"})
+        except _RunTimeout:
+            ok = False
+            stdout.write(f"\nStopped: the code ran for more than {deadline.seconds:g} s, which usually means a "
+                         f"loop that never ends. Whatever it changed before that is listed below.")
         except Exception:
             ok = False
             stdout.write("\n" + traceback.format_exc())
-    output = stdout.getvalue().strip()
-    return ToolResult(_clip(output) or "OK (no output)", ok=ok)
+        finally:
+            sys.settrace(previous_trace)
+    after = scene_diff.snapshot()
+    output = _clip(stdout.getvalue().strip()) or "OK (no output)"
+    changes = scene_diff.for_model(scene_diff.diff(before, after))
+    return ToolResult(f"{output}\n\n{changes}", ok=ok, scene_before=before, scene_after=after)
 
 
 def _round(values, digits=3) -> list:
@@ -138,34 +241,41 @@ def _world_bounds(obj) -> dict | None:
             "max": _round([max(c[i] for c in corners) for i in range(3)])}
 
 
-def get_scene_info() -> ToolResult:
+def object_summary(obj) -> dict:
+    entry = {
+        "name": obj.name,
+        "type": obj.type,
+        "location": _round(obj.location),
+        "rotation_deg": _round([math.degrees(a) for a in obj.rotation_euler], 2),
+        "scale": _round(obj.scale),
+        "visible": obj.visible_get(),
+        "selected": obj.select_get(),
+    }
+    bounds = _world_bounds(obj)
+    if bounds:
+        entry["bounds"] = bounds
+    if obj.parent:
+        entry["parent"] = obj.parent.name
+    if obj.material_slots:
+        entry["materials"] = [s.material.name for s in obj.material_slots if s.material]
+    if obj.modifiers:
+        entry["modifiers"] = [f"{m.name} ({m.type})" for m in obj.modifiers]
+    if obj.type == "MESH":
+        mesh = obj.data
+        entry["mesh"] = {"verts": len(mesh.vertices), "faces": len(mesh.polygons)}
+    return entry
+
+
+def _rows(entries: list) -> str:
+    # One entry per line: compact for the token budget, still valid JSON.
+    return "[\n" + ",\n".join(json.dumps(entry, separators=(",", ":")) for entry in entries) + "\n]"
+
+
+def get_scene_info(name_contains: str = "", type: str = "") -> ToolResult:
     scene = bpy.context.scene
-    view_layer = bpy.context.view_layer
-    active = view_layer.objects.active
-    objects = []
-    for obj in scene.objects:
-        entry = {
-            "name": obj.name,
-            "type": obj.type,
-            "location": _round(obj.location),
-            "rotation_deg": _round([math.degrees(a) for a in obj.rotation_euler], 2),
-            "scale": _round(obj.scale),
-            "visible": obj.visible_get(),
-            "selected": obj.select_get(),
-        }
-        bounds = _world_bounds(obj)
-        if bounds:
-            entry["bounds"] = bounds
-        if obj.parent:
-            entry["parent"] = obj.parent.name
-        if obj.material_slots:
-            entry["materials"] = [s.material.name for s in obj.material_slots if s.material]
-        if obj.modifiers:
-            entry["modifiers"] = [f"{m.name} ({m.type})" for m in obj.modifiers]
-        if obj.type == "MESH":
-            mesh = obj.data
-            entry["mesh"] = {"verts": len(mesh.vertices), "faces": len(mesh.polygons)}
-        objects.append(entry)
+    active = bpy.context.view_layer.objects.active
+    chosen = [o for o in scene.objects
+              if name_contains.lower() in o.name.lower() and (not type or o.type == type.upper())]
     info = {
         "blender_version": bpy.app.version_string,
         "scene": scene.name,
@@ -174,12 +284,48 @@ def get_scene_info() -> ToolResult:
         "frame": {"current": scene.frame_current, "start": scene.frame_start, "end": scene.frame_end},
         "render_engine": scene.render.engine,
         "unit_system": scene.unit_settings.system,
-        "object_count": len(objects),
+        "camera": scene.camera.name if scene.camera else None,
+        "object_count": len(scene.objects),
     }
-    # One object per line: compact for the token budget, still valid JSON.
-    rows = ",\n".join(json.dumps(entry, separators=(",", ":")) for entry in objects)
-    text = json.dumps(info, separators=(",", ":"))[:-1] + ',"objects":[\n' + rows + "\n]}"
-    return ToolResult(_clip(text))
+    head = json.dumps(info, separators=(",", ":"))[:-1]
+    if len(chosen) <= FULL_DETAIL_OBJECTS:
+        return ToolResult(_clip(f'{head},"objects":{_rows([object_summary(o) for o in chosen])}}}'))
+    # Too many to detail: every name, grouped the way the user organized them, plus full detail
+    # for what the user is working on right now.
+    by_collection: dict[str, list[str]] = {}
+    for obj in chosen:
+        for collection in obj.users_collection or [scene.collection]:
+            by_collection.setdefault(collection.name, []).append(f"{obj.name} ({obj.type})")
+    selected = [object_summary(o) for o in chosen if o.select_get()][:FULL_DETAIL_OBJECTS]
+    note = (f"{len(chosen)} objects match, so only names are listed. Narrow with name_contains or "
+            f"type, or call get_object_info for the ones that matter.")
+    body = (f'{head},"note":{json.dumps(note)},"selected_objects":{_rows(selected)},'
+            f'"objects_by_collection":{json.dumps(by_collection, separators=(",", ":"))}}}')
+    return ToolResult(_clip(body))
+
+
+def get_object_info(names: list[str]) -> ToolResult:
+    from . import object_info
+    if not names or len(names) > 5:
+        raise ToolError("Pass 1 to 5 object names.")
+    missing = [name for name in names if name not in bpy.data.objects]
+    if missing:
+        close = [o.name for o in bpy.data.objects if any(m.lower() in o.name.lower() for m in missing)][:10]
+        raise ToolError(f"No such object(s): {', '.join(missing)}."
+                        + (f" Similar names: {', '.join(close)}." if close else ""))
+    described = []
+    for name in names:
+        obj = bpy.data.objects[name]
+        described.append({**object_summary(obj), **object_info.describe(obj)})
+    return ToolResult(_clip(json.dumps(described, separators=(",", ":"), default=str)))
+
+
+def inspect_api(path: str = "", search: str = "") -> ToolResult:
+    from . import api_docs
+    try:
+        return ToolResult(api_docs.inspect_api(path, search))
+    except api_docs.ApiError as ex:
+        raise ToolError(str(ex)) from ex
 
 
 _VIEW_EULERS = {  # Degrees, as a viewport rotation.
@@ -214,64 +360,104 @@ def _frame_view(space, region, objects, angle: str) -> None:
     rv3d.view_distance = max(radius, 0.01) / math.sin(half_fov_short) * _FRAME_MARGIN
 
 
-def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter") -> ToolResult:
-    if angle != "user" and angle not in _VIEW_EULERS:
-        raise ToolError(f"angle must be one of {', '.join([*_VIEW_EULERS, 'user'])}")
+def _nearest_first(eye, objects) -> str:
+    """Two objects of a similar color overlapping in an image do not show which is in front; say it."""
+    ranked = sorted(((_bounding_sphere([o])[0] - eye).length, o.name) for o in objects)
+    listed = ", ".join(f"{name} {distance:.1f} m" for distance, name in ranked[:12])
+    return f" Nearest to the viewpoint first: {listed}." if len(ranked) > 1 else ""
+
+
+def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter",
+                     style: str = "material") -> ToolResult:
+    angles = [*_VIEW_EULERS, "camera", "user"]
+    if angle not in angles:
+        raise ToolError(f"angle must be one of {', '.join(angles)}")
+    if style not in ("material", "distinct"):
+        raise ToolError("style must be material or distinct")
+    scene = bpy.context.scene
+    if angle == "camera" and scene.camera is None:
+        raise ToolError("The scene has no active camera (scene.camera is None).")
     override = _view3d_override()
     region, space = override["region"], override["area"].spaces.active
     rv3d = space.region_3d
+    framed = angle in _VIEW_EULERS
 
-    if focus:
+    visible = [o for o in scene.objects
+               if o.visible_get() and o.type not in {"CAMERA", "LIGHT", "EMPTY", "SPEAKER", "LIGHT_PROBE"}]
+    if focus and framed:
         missing = [name for name in focus if name not in bpy.data.objects]
         if missing:
             raise ToolError(f"No such object(s): {', '.join(missing)}")
         targets = [bpy.data.objects[name] for name in focus]
     else:
-        targets = [o for o in bpy.context.scene.objects
-                   if o.visible_get() and o.type not in {"CAMERA", "LIGHT", "EMPTY", "SPEAKER", "LIGHT_PROBE"}]
-    if angle != "user" and not targets:
+        targets = visible
+    if framed and not targets:
         raise ToolError("Nothing visible to frame.")
 
-    render = bpy.context.scene.render
+    render, shading = scene.render, space.shading
     image_settings = render.image_settings
     saved_render = (render.filepath, render.resolution_x, render.resolution_y,
                     render.resolution_percentage, image_settings.file_format)
     saved_view = (rv3d.view_perspective, rv3d.view_rotation.copy(), rv3d.view_location.copy(),
-                  rv3d.view_distance, space.shading.type, space.overlay.show_overlays)
+                  rv3d.view_distance, shading.type, shading.color_type, shading.light,
+                  space.overlay.show_overlays, space.use_local_camera)
     out_dir = Path(tempfile.gettempdir()) / "loopcut"
     out_dir.mkdir(exist_ok=True)
     path = out_dir / "viewport.png"
     path.unlink(missing_ok=True)
     try:
         render.filepath = str(path)
+        # The camera view is rendered at the camera's own aspect, so "in frame" means in the image.
+        aspect = (render.resolution_y / max(1, render.resolution_x) if angle == "camera"
+                  else region.height / max(1, region.width))
         render.resolution_x = CAPTURE_WIDTH
-        render.resolution_y = max(1, round(CAPTURE_WIDTH * region.height / max(1, region.width)))
+        render.resolution_y = max(1, round(CAPTURE_WIDTH * aspect))
         render.resolution_percentage = 100
         image_settings.file_format = "PNG"
-        if angle != "user":
+        if framed:
             _frame_view(space, region, targets, angle)
-            space.shading.type = "MATERIAL"
+        if angle != "user":
+            if style == "distinct":
+                shading.type, shading.color_type, shading.light = "SOLID", "RANDOM", "STUDIO"
+            else:
+                shading.type = "MATERIAL"
             # Overlays are composited without depth, so the grid shows through solid objects and
             # makes it impossible to judge contact and occlusion.
             space.overlay.show_overlays = False
-            rv3d.update()
+        if angle == "camera":
+            # In camera view the viewport render is exactly the camera frame, at our resolution.
+            rv3d.view_perspective = "CAMERA"
+            space.use_local_camera = False
+        rv3d.update()
+        eye = scene.camera.matrix_world.translation if angle == "camera" else rv3d.view_matrix.inverted().translation
+        # Everything visible, not only what was framed: an object that was not asked for is
+        # exactly the one that turns up in front of the subject.
+        order = _nearest_first(eye.copy(), visible)
         with bpy.context.temp_override(**override):
             bpy.ops.render.opengl(write_still=True, view_context=True)
     finally:
         (render.filepath, render.resolution_x, render.resolution_y,
          render.resolution_percentage, image_settings.file_format) = saved_render
-        (rv3d.view_perspective, rv3d.view_rotation, rv3d.view_location,
-         rv3d.view_distance, space.shading.type, space.overlay.show_overlays) = saved_view
+        (rv3d.view_perspective, rv3d.view_rotation, rv3d.view_location, rv3d.view_distance,
+         shading.type, shading.color_type, shading.light, space.overlay.show_overlays,
+         space.use_local_camera) = saved_view
         rv3d.update()
     if not path.is_file():
         raise ToolError("Viewport capture produced no image.")
-    framed = "the user's current view" if angle == "user" else f"{angle} view of {', '.join(o.name for o in targets)}"
-    return ToolResult(f"Image attached: {framed}.", image_path=path)
+    if angle == "camera":
+        what = f"the view through {scene.camera.name}; the image edges are the camera frame"
+    elif angle == "user":
+        what = "the user's current view"
+    else:
+        what = f"{angle} view of {', '.join(o.name for o in targets[:12])}"
+    return ToolResult(f"Image attached: {what}.{order}", image_path=path)
 
 
 _DISPATCH = {
     "run_python": run_python,
     "get_scene_info": get_scene_info,
+    "get_object_info": get_object_info,
+    "inspect_api": inspect_api,
     "capture_viewport": capture_viewport,
 }
 

@@ -64,10 +64,12 @@ def split_markdown(text: str) -> list[tuple[str, str]]:
 
 
 class Frame:
-    def __init__(self, width: int, height: int, scale: float, measure, session=None, checkpoints=None):
+    def __init__(self, width: int, height: int, scale: float, measure, session=None, checkpoints=None,
+                 ui=None):
         self.width, self.height, self.scale, self.measure = width, height, scale, measure
         self.session = session or {}
         self.checkpoints = checkpoints or {}  # checkpoint id -> 'ok' | 'expired' | 'missing'
+        self.ui = ui or {}
 
         self.prims: list[dict] = []
         self.hits: list[dict] = []
@@ -153,7 +155,12 @@ def _checkpoint_row(f: Frame, n: int, item: dict, x, y, width) -> int:
 def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size = f.px(T.CARD_PAD), f.px(T.FONT_SIZE)
     mark = len(f.prims)
-    text_height = f.paragraph(f"item{n}.user", x + pad, y + pad, width - 2 * pad, item["text"], size, T.TEXT)
+    text_height = f.paragraph(f"item{n}.user", x + pad, y + pad, width - 2 * pad, item["text"], size, T.TEXT) \
+        if item["text"] else 0
+    if item.get("images"):
+        text_height += f.px(4) if item["text"] else 0
+        text_height += _image_chips(f, f"item{n}.image", x + pad, y + pad + text_height, width - 2 * pad,
+                                    item["images"], removable=False)
     if item.get("checkpoint"):
         text_height += _checkpoint_row(f, n, item, x + pad, y + pad + text_height, width - 2 * pad)
     height = text_height + 2 * pad
@@ -213,8 +220,12 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(8)
         run_width = f.button(f"item{n}.tool.run", inner_x, cursor, "Run  ⏎", T.BUTTON, T.BUTTON_TEXT,
                              ("approve", n))
-        f.button(f"item{n}.tool.reject", inner_x + run_width + f.px(8), cursor, "Reject  esc",
-                 T.BUTTON_GHOST, T.TEXT, ("reject", n))
+        reject_width = f.button(f"item{n}.tool.reject", inner_x + run_width + f.px(8), cursor, "Reject  esc",
+                                T.BUTTON_GHOST, T.TEXT, ("reject", n))
+        always_x = inner_x + run_width + reject_width + f.px(16)
+        if always_x + f.measure("ui", small, "Always allow") + f.px(20) <= inner_x + inner_w:
+            f.button(f"item{n}.tool.always", always_x, cursor, "Always allow", T.BUTTON_GHOST, T.TEXT_MUTED,
+                     ("approve_always", n))
         cursor += f.px(24)
     cursor += f.px(7)
 
@@ -253,7 +264,50 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
-_ITEM_LAYOUT = {"notice": _item_notice, "user": _item_user, "assistant": _item_assistant, "tool": _item_tool, "error": _item_error}
+_CHANGE_COLORS = {"+": T.OK, "-": T.ERROR, "~": T.TEXT_MUTED}
+CHANGES_PREVIEW_LINES = 6
+
+
+def _item_changes(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """What the turn did to the scene, and the way back: the panel's diff view."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    f.text(f"item{n}.changes.title", inner_x, cursor, "Scene changes", size, T.TEXT)
+    count_width = round(f.measure("ui", small, item["text"]))
+    f.text(f"item{n}.changes.count", x + width - pad - count_width,
+           cursor + (f.line_height(size) - f.line_height(small)) // 2, item["text"], small, T.TEXT_MUTED)
+    cursor += f.line_height(size) + f.px(4)
+
+    lines, expanded = item.get("lines", []), item.get("expanded", False)
+    shown = lines if expanded or len(lines) <= CHANGES_PREVIEW_LINES else lines[:CHANGES_PREVIEW_LINES - 1]
+    code = f.px(T.FONT_SIZE_CODE)
+    for k, line in enumerate(shown):
+        f.text(f"item{n}.changes.sign{k}", inner_x, cursor, line[:1], code, _CHANGE_COLORS.get(line[:1], T.TEXT_MUTED),
+               "mono")
+        cursor += f.paragraph(f"item{n}.changes.l{k}", inner_x + f.px(14), cursor, inner_w - f.px(14), line[2:],
+                              code, T.TEXT if line[:1] in "+-" else T.TEXT_MUTED, "mono")
+    if len(shown) < len(lines) or expanded and len(lines) > CHANGES_PREVIEW_LINES:
+        label = "Show less" if expanded else f"Show {len(lines) - len(shown)} more"
+        f.text(f"item{n}.changes.more", inner_x + f.px(14), cursor + f.px(2), label, small, T.ACCENT)
+        f.hit(f"item{n}.changes.more", inner_x, cursor, inner_w, f.line_height(small) + f.px(4), ("toggle", n))
+        cursor += f.line_height(small) + f.px(4)
+
+    undoable = item["checkpoint"] and f.checkpoints.get(item["checkpoint"], "ok") == "ok"
+    if not item.get("resolved") and undoable and not f.session.get("busy"):
+        cursor += f.px(8)
+        keep_width = f.button(f"item{n}.changes.keep", inner_x, cursor, "Keep", T.BUTTON, T.BUTTON_TEXT,
+                              ("keep_changes", n))
+        f.button(f"item{n}.changes.undo", inner_x + keep_width + f.px(8), cursor, "Undo all", T.BUTTON_GHOST,
+                 T.TEXT, ("restore", item["checkpoint"]))
+        cursor += f.px(24)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.changes.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
+
+
+_ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant, "tool": _item_tool, "error": _item_error}
 
 
 def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
@@ -273,10 +327,17 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     if not items:
         size = f.px(T.FONT_SIZE)
         middle = (top + bottom) // 2
-        for n, (line, color) in enumerate((("Loopcut", T.TEXT), ("Ask for anything in your scene.", T.TEXT_MUTED))):
+        needs_setup = bool(f.ui.get("needs_setup"))
+        second = "Add an API key to get started." if needs_setup else "Ask for anything in your scene."
+        for n, (line, color) in enumerate((("Loopcut", T.TEXT), (second, T.TEXT_MUTED))):
             line_width = f.measure("ui", size, line)
             f.text(f"chat.empty{n}", round((f.width - line_width) / 2), middle + (n - 1) * f.line_height(size),
                    line, size, color)
+        if needs_setup:
+            label = "Open settings"
+            button_width = round(f.measure("ui", f.px(T.FONT_SIZE_SMALL), label)) + 2 * f.px(10)
+            f.button("chat.setup", round((f.width - button_width) / 2), middle + f.line_height(size) + f.px(10),
+                     label, T.BUTTON, T.BUTTON_TEXT, ("open_settings", None))
         return 0.0
 
     content, view = cursor - gap + 2 * pad, bottom - top
@@ -293,6 +354,42 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     return max_scroll
 
 
+def relative_time(then: float, now: float) -> str:
+    seconds = max(0, now - then)
+    for limit, unit, name in ((60, 1, "just now"), (3600, 60, "min"), (86400, 3600, "h"), (86400 * 30, 86400, "d")):
+        if seconds < limit:
+            return name if unit == 1 else f"{int(seconds // unit)} {name} ago"
+    return f"{int(seconds // (86400 * 30))} mo ago"
+
+
+def _history(f: Frame, session: dict, ui: dict, top: int, bottom: int) -> None:
+    pad, size, small = f.px(T.PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    x, width, cursor = pad, f.width - 2 * pad, top + pad
+    f.text("history.heading", x, cursor, "Conversations for this file", small, T.TEXT_MUTED)
+    cursor += f.line_height(small) + f.px(8)
+    rows = ui.get("history") or []
+    if not rows:
+        f.text("history.empty", x, cursor, "Nothing saved yet.", size, T.TEXT_FAINT)
+    card_pad = f.px(T.CARD_PAD)
+    row_height = f.line_height(size) + f.line_height(small) + 2 * card_pad
+    for n, row in enumerate(rows):
+        if cursor + row_height > bottom:
+            break
+        current = row["id"] == session["id"]
+        f.rect(f"history.row{n}", x, cursor, width, row_height, T.CARD if current else T.BG, f.px(T.RADIUS), 1,
+               T.ACCENT if current else T.CARD_BORDER)
+        title = row.get("title") or "Untitled conversation"
+        line = wrap(title, "ui", size, width - 2 * card_pad - f.px(10), f.measure)[0][1].rstrip()
+        f.text(f"history.row{n}.title", x + card_pad, cursor + card_pad,
+               line + ("…" if len(line) < len(title.strip()) else ""), size, T.TEXT)
+        turns = row.get("turns", 0)
+        detail = f"{turns} message{'' if turns == 1 else 's'} · {relative_time(row.get('updated', 0), ui.get('now', 0))}"
+        f.text(f"history.row{n}.detail", x + card_pad, cursor + card_pad + f.line_height(size),
+               detail + ("  ·  open now" if current else ""), small, T.TEXT_MUTED)
+        f.hit(f"history.row{n}", x, cursor, width, row_height, ("open_conversation", row["id"]))
+        cursor += row_height + f.px(8)
+
+
 def _input_lines(f: Frame, session: dict, width: int):
     size = f.px(T.FONT_SIZE)
     lines = wrap(session["input"], "ui", size, width, f.measure)
@@ -300,10 +397,80 @@ def _input_lines(f: Frame, session: dict, width: int):
     return size, lines, visible
 
 
+def _context_row_height(f: Frame) -> int:
+    return f.px(26) if f.ui.get("selection") else 0
+
+
+def _image_chips(f: Frame, id: str, x: int, y: int, width: int, names: list[str], removable: bool) -> int:
+    """One chip per attached image, wrapping to as many rows as they need. Returns the height used."""
+    small, chip_h, gap = f.px(T.FONT_SIZE_SMALL), f.px(20), f.px(6)
+    cross_w = f.px(16) if removable else 0
+    left, top = x, y
+    for n, name in enumerate(names):
+        label = name if len(name) <= 24 else name[:14] + "…" + name[-9:]
+        chip_w = min(width, round(f.measure("ui", small, label)) + f.px(14) + cross_w)
+        if left > x and left + chip_w > x + width:
+            left, top = x, top + chip_h + gap
+        text_y = top + (chip_h - f.line_height(small)) // 2
+        f.rect(f"{id}{n}", left, top, chip_w, chip_h, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+        f.text(f"{id}{n}.label", left + f.px(7), text_y, label, small, T.TEXT_MUTED)
+        if removable:
+            f.text(f"{id}{n}.remove", left + chip_w - cross_w, text_y, "×", small, T.TEXT_FAINT)
+            f.hit(f"{id}{n}.remove", left + chip_w - cross_w - f.px(2), top, cross_w + f.px(2), chip_h,
+                  ("remove_attachment", n))
+        left += chip_w + gap
+    return top + chip_h - y if names else 0
+
+
+def _attachment_names(session: dict) -> list[str]:
+    return [a["name"] for a in session.get("attachments", [])]
+
+
 def input_height(f: Frame, session: dict) -> int:
     pad, card_pad = f.px(T.PAD), f.px(T.CARD_PAD)
-    size, _, visible = _input_lines(f, session, f.width - 2 * pad - 2 * card_pad)
-    return visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad
+    inner_w = f.width - 2 * pad - 2 * card_pad
+    size, _, visible = _input_lines(f, session, inner_w)
+    measuring = Frame(f.width, f.height, f.scale, f.measure)  # Chips wrap, so their height is laid out to be known.
+    chips = _image_chips(measuring, "measure", 0, 0, inner_w, _attachment_names(session), removable=True)
+    chips += f.px(6) if chips else 0
+    return visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad + _context_row_height(f) + chips
+
+
+def _context_row(f: Frame, x: int, y: int, width: int) -> None:
+    """What "this" means right now: the selection, which goes to the model with the message."""
+    names, small = f.ui["selection"], f.px(T.FONT_SIZE_SMALL)
+    label = ", ".join(names[:3]) + (f"  +{len(names) - 3}" if len(names) > 3 else "")
+    line = wrap(label, "ui", small, width - f.px(34), f.measure)[0][1].rstrip()
+    label = line + ("…" if len(line) < len(label) else "")
+    pill_width = round(f.measure("ui", small, label)) + f.px(30)
+    f.rect("input.context", x, y, pill_width, f.px(20), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+    f.text("input.context.at", x + f.px(7), y + (f.px(20) - f.line_height(small)) // 2, "@", small, T.ACCENT)
+    f.text("input.context.label", x + f.px(21), y + (f.px(20) - f.line_height(small)) // 2, label, small,
+           T.TEXT_MUTED)
+
+
+def _mention_list(f: Frame, session: dict, x: int, bottom: int, width: int) -> None:
+    """Completions for the @name being typed, floating above the input."""
+    rows, small = f.ui.get("mentions") or [], f.px(T.FONT_SIZE_SMALL)
+    if not rows:
+        return
+    size, row_height, pad = f.px(T.FONT_SIZE), f.px(24), f.px(4)
+    height = len(rows) * row_height + 2 * pad
+    top = bottom - height - f.px(4)
+    f.rect("mentions.bg", x, top, width, height, T.CARD, f.px(T.RADIUS), 1, T.INPUT_BORDER)
+    active = min(session.get("mention", 0), len(rows) - 1)
+    for n, (name, kind) in enumerate(rows):
+        y = top + pad + n * row_height
+        if n == active:
+            f.rect(f"mentions.row{n}.bg", x + pad, y, width - 2 * pad, row_height, T.BUTTON_GHOST,
+                   f.px(T.RADIUS_SMALL))
+        kind_width = round(f.measure("ui", small, kind))
+        line = wrap(name, "ui", size, width - kind_width - f.px(40), f.measure)[0][1].rstrip()
+        f.text(f"mentions.row{n}.name", x + f.px(12), y + (row_height - f.line_height(size)) // 2,
+               line + ("…" if len(line) < len(name) else ""), size, T.TEXT)
+        f.text(f"mentions.row{n}.kind", x + width - f.px(12) - kind_width,
+               y + (row_height - f.line_height(small)) // 2, kind, small, T.TEXT_FAINT)
+        f.hit(f"mentions.row{n}", x, y, width, row_height, ("mention_pick", n))
 
 
 def _input(f: Frame, session: dict, top: int, model: str) -> None:
@@ -322,12 +489,29 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     f.hit("input.card", x, card_y, width, card_h, ("focus", None))
 
     text_y = card_y + card_pad
+    if f.ui.get("selection"):
+        _context_row(f, inner_x, text_y, inner_w)
+        text_y += _context_row_height(f)
+    chips = _image_chips(f, "input.image", inner_x, text_y, inner_w, _attachment_names(session), removable=True)
+    text_y += chips + (f.px(6) if chips else 0)
     first = max(0, len(lines) - visible)  # Keep the tail in view once the box is full.
+    anchor = session.get("anchor")
+    if focused and anchor is not None and anchor != session["cursor"]:
+        low, high = sorted((anchor, session["cursor"]))
+        for n, (start, line) in enumerate(lines[first:]):
+            a, b = max(low, start), min(high, start + len(line))
+            if a < b or (a == b == start + len(line) and low <= a < high):  # The second: a selected newline.
+                left = inner_x + round(f.measure("ui", size, line[:a - start]))
+                right = inner_x + round(f.measure("ui", size, line[:b - start])) + (f.px(4) if a == b else 0)
+                f.rect(f"input.selection{n}", left, text_y + n * line_height + f.px(1), right - left,
+                       line_height - f.px(2), T.SELECTION)
     if session["input"]:
         for n, (_, line) in enumerate(lines[first:]):
             f.text(f"input.l{n}", inner_x, text_y + n * line_height, line.rstrip(), size, T.TEXT)
     else:
-        f.text("input.placeholder", inner_x, text_y, "Plan, build, fix anything in your scene", size, T.TEXT_FAINT)
+        placeholder = "Say what to do with these" if session.get("attachments") else \
+            "Plan, build, fix anything in your scene"
+        f.text("input.placeholder", inner_x, text_y, placeholder, size, T.TEXT_FAINT)
 
     if focused:
         cursor = session["cursor"]
@@ -339,13 +523,29 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
                    max(1, f.px(1.5)), line_height - f.px(4), T.ACCENT)
 
     footer_y = card_y + card_h - card_pad - f.line_height(small)
-    f.text("input.model", inner_x, footer_y, model, small, T.TEXT_MUTED)
+    usage = session.get("usage") or {}
+    tokens = usage.get("input", 0) + usage.get("output", 0)
     hint = "esc  stop" if session["busy"] else "⏎  send"
-    f.text("input.hint", inner_x + inner_w - round(f.measure("ui", small, hint)), footer_y, hint, small,
-           T.TEXT_FAINT)
+    if tokens:
+        counted = model + (f"  ·  {tokens / 1000:.1f}k tokens" if tokens >= 1000 else f"  ·  {tokens} tokens")
+        if f.measure("ui", small, counted) + f.measure("ui", small, hint) + f.px(16) <= inner_w:
+            model = counted  # Only where it fits beside the hint; a narrow panel keeps the model name.
+    f.text("input.model", inner_x, footer_y, model, small, T.TEXT_MUTED)
+    f.hit("input.model", inner_x - f.px(4), footer_y - f.px(4), round(f.measure("ui", small, model)) + f.px(8),
+          f.line_height(small) + f.px(8), ("open_settings", None))
+    if focused:
+        _mention_list(f, session, x, card_y, width)
+    hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))
+    f.text("input.hint", hint_x, footer_y, hint, small, T.TEXT_FAINT)
+    attach = "+ image"  # Also: drop image files anywhere on the panel.
+    attach_x = hint_x - round(f.measure("ui", small, attach)) - f.px(14)
+    if attach_x > inner_x + round(f.measure("ui", small, model)) + f.px(10):  # A narrow panel keeps the model name.
+        f.text("input.attach", attach_x, footer_y, attach, small, T.TEXT_MUTED)
+        f.hit("input.attach", attach_x - f.px(4), footer_y - f.px(4),
+              round(f.measure("ui", small, attach)) + f.px(8), f.line_height(small) + f.px(8), ("attach", None))
 
 
-def _header(f: Frame, session: dict) -> int:
+def _header(f: Frame, session: dict, view: str = "chat") -> int:
     height, pad, size = f.px(T.HEADER_HEIGHT), f.px(T.PAD), f.px(T.FONT_SIZE)
     f.rect("header.bg", 0, 0, f.width, height, T.HEADER_BG)
     f.rect("header.rule", 0, height - 1, f.width, 1, T.CARD_BORDER)
@@ -357,17 +557,29 @@ def _header(f: Frame, session: dict) -> int:
     label_x = f.width - pad - label_width
     f.text("header.new", label_x, (height - f.line_height(small)) // 2, label, small, T.TEXT_MUTED)
     f.hit("header.new", label_x - f.px(6), 0, label_width + f.px(12), height, ("new_chat", None))
+    other = "Back" if view == "history" else "History"
+    other_width = round(f.measure("ui", small, other))
+    other_x = label_x - f.px(18) - other_width
+    f.text("header.history", other_x, (height - f.line_height(small)) // 2, other, small, T.TEXT_MUTED)
+    f.hit("header.history", other_x - f.px(6), 0, other_width + f.px(12), height,
+          ("history_close" if view == "history" else "history_open", None))
     return height
 
 
 def build(session: dict, width: int, height: int, scale: float, measure, model: str = "",
-          checkpoints: dict | None = None) -> dict:
-    f = Frame(width, height, scale, measure, session, checkpoints)
+          checkpoints: dict | None = None, ui: dict | None = None) -> dict:
+    ui = ui or {}
+    view = ui.get("view", "chat")
+    f = Frame(width, height, scale, measure, session, checkpoints, ui)
     f.rect("bg", 0, 0, width, height, T.BG)
     input_top = height - input_height(f, session)
     header_bottom = f.px(T.HEADER_HEIGHT)
-    max_scroll = _chat(f, session, header_bottom, input_top)
-    _header(f, session)  # Header and input go last so they paint over scrolled chat content.
+    if view == "history":
+        max_scroll = 0.0
+        _history(f, session, ui, header_bottom, input_top)
+    else:
+        max_scroll = _chat(f, session, header_bottom, input_top)
+    _header(f, session, view)  # Header and input go last so they paint over scrolled chat content.
     _input(f, session, input_top, model)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
             "prims": f.prims, "hits": f.hits}

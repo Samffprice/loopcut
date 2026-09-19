@@ -2,12 +2,29 @@
 
 import os
 
+# Read by Blender when Loopcut ships inside the Loopcut build as a core add-on. As an extension
+# for stock Blender, blender_manifest.toml says the same.
+bl_info = {
+    "name": "Loopcut",
+    "description": "An AI agent that works inside Blender",
+    "author": "Loopcut",
+    "version": (0, 1, 0),
+    "blender": (5, 2, 0),
+    "location": "Editor Type > Loopcut",
+    "category": "Interface",
+}
+
 
 def register() -> None:
-    from . import mainthread
+    from . import lifecycle, mainthread, settings
     from .ui import host
+    settings.register()
     mainthread.register()
     host.register()
+    lifecycle.register()
+    if host.NATIVE:  # First run of the Loopcut build; stock Blender keeps its own splash.
+        from . import onboarding
+        onboarding.register()
     try:
         from . import checkpoints
         checkpoints.remove_stale_sessions()
@@ -19,9 +36,14 @@ def register() -> None:
 
 
 def unregister() -> None:
-    from . import agent, dev_reload, mainthread
+    from . import agent, dev_reload, lifecycle, mainthread, settings
     from .ui import host
     agent.stop()
+    if host.NATIVE:
+        from . import onboarding
+        onboarding.unregister()
+    lifecycle.unregister()
     dev_reload.unregister()
     host.unregister()
     mainthread.unregister()
+    settings.unregister()

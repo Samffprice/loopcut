@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "extension"))
+sys.path.insert(0, str(REPO / "tests"))
 
 # agent.py only needs bpy for the session store; give it a stand-in.
 fake_bpy = types.ModuleType("bpy")
@@ -80,7 +81,10 @@ class AgentLoopTest(unittest.TestCase):
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        import tempfile
+        cls.data_dir = tempfile.TemporaryDirectory()
         os.environ.update({
+            "LOOPCUT_DATA_DIR": cls.data_dir.name,  # The agent saves conversations as it goes.
             "LOOPCUT_API_KEY": "test-key",
             "LOOPCUT_BASE_URL": f"http://127.0.0.1:{cls.server.server_port}",
             "LOOPCUT_MODEL": "fake-model",
@@ -95,6 +99,7 @@ class AgentLoopTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.data_dir.cleanup()
 
     def setUp(self):
         SCRIPT.replies.clear()
@@ -120,7 +125,7 @@ class AgentLoopTest(unittest.TestCase):
         turn = agent.Turn()
         session["busy"], session["turn"] = True, turn
         turn.thread = threading.Thread(target=agent._run, daemon=True,
-                                       args=(session, turn, self.run_tool, self.ensure_checkpoint))
+                                       args=(session, turn, lambda *a: self.run_tool(*a), self.ensure_checkpoint))
         turn.thread.start()
         return turn
 
@@ -179,6 +184,20 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["items"][-1], state.item_error("Stopped."))
         self.assertFalse(self.session["busy"])
         self.assertEqual(self.ran, [])
+        # The cut-short call must be answered, or the API rejects the next request.
+        self.assertEqual(self.session["messages"][-1]["tool_call_id"], "call_1")
+        SCRIPT.replies.append(text_reply("Still here."))
+        self.start("and now?").thread.join(5)
+        roles = [m["role"] for m in SCRIPT.requests[-1]["messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
+
+    def test_conversation_is_on_disk_after_a_turn(self):
+        from loopcut import conversations
+        SCRIPT.replies.append(text_reply("Saved."))
+        self.start("remember me").thread.join(5)
+        loaded = conversations.load(self.session["id"])
+        self.assertEqual([i["text"] for i in loaded["items"]], ["remember me", "Saved."])
+        self.assertEqual(loaded["title"], "remember me")
 
     def test_checkpoint_is_requested_before_scene_changes_and_not_for_read_only_tools(self):
         SCRIPT.replies += [tool_reply("get_scene_info", {}), tool_reply("run_python", {"code": "a", "summary": "a"}),
@@ -202,6 +221,86 @@ class AgentLoopTest(unittest.TestCase):
         card = next(i for i in self.session["items"] if i["kind"] == "tool")
         self.assertEqual((card["status"], card["output"]), ("failed", "Not run. Disk full."))
         self.assertIn("NOT run", SCRIPT.requests[1]["messages"][-1]["content"])
+
+    def test_two_captures_in_one_step_send_two_different_images(self):
+        # capture_viewport always writes the same file; the second capture must not replace the first.
+        shot = Path(self.data_dir.name) / "viewport.png"
+        pictures = [b"\x89PNG front", b"\x89PNG side"]
+
+        def run_tool(name, arguments):
+            shot.write_bytes(pictures[len(self.ran)])
+            self.ran.append((name, arguments))
+            return types.SimpleNamespace(text="Image attached.", ok=True, image_path=shot)
+
+        self.run_tool = run_tool
+        calls = [{"index": i, "id": f"call_{i}", "type": "function",
+                  "function": {"name": "capture_viewport", "arguments": "{}"}} for i in range(2)]
+        SCRIPT.replies += [sse({"choices": [{"delta": {"tool_calls": calls}}]},
+                               {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                           text_reply("Looks right.")]
+        self.start("check both sides").thread.join(5)
+        sent = [part["image_url"]["url"] for m in SCRIPT.requests[1]["messages"] if isinstance(m["content"], list)
+                for part in m["content"] if part["type"] == "image_url"]
+        import base64
+        self.assertEqual([base64.b64decode(url.split(",", 1)[1]) for url in sent], pictures)
+
+    def test_turn_ends_with_a_card_of_what_changed_linked_to_the_checkpoint(self):
+        from test_scene_diff import cube, scene
+        before, after = scene(), scene({"Cube": cube(), "Sphere": cube(data="Sphere")})
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            return types.SimpleNamespace(text="ok", ok=True, image_path=None, scene_before=before, scene_after=after)
+
+        self.run_tool = run_tool
+        os.environ["LOOPCUT_AUTO_RUN"] = "true"
+        self.addCleanup(os.environ.update, {"LOOPCUT_AUTO_RUN": "false"})
+        SCRIPT.replies += [tool_reply("run_python", {"code": "add()", "summary": "Add"}), text_reply("Added.")]
+        turn = self.start("add a sphere")
+        self.session["items"][0]["checkpoint"] = "c" * 32
+        turn.thread.join(5)
+        card = self.session["items"][-1]
+        self.assertEqual((card["kind"], card["text"], card["checkpoint"]), ("changes", "1 added", "c" * 32))
+        self.assertEqual(card["lines"], ["+ Sphere (mesh) at [-1, -1, -1]..[1, 1, 1]"])
+
+    def test_chat_only_turn_has_no_changes_card(self):
+        SCRIPT.replies.append(text_reply("Three objects."))
+        self.start("what is here?").thread.join(5)
+        self.assertNotIn("changes", [i["kind"] for i in self.session["items"]])
+
+    def test_always_allow_stops_asking_for_the_rest_of_the_conversation(self):
+        SCRIPT.replies += [tool_reply("run_python", {"code": "a()", "summary": "a"}),
+                           tool_reply("run_python", {"code": "b()", "summary": "b"}), text_reply("Done.")]
+        turn = self.start("two steps")
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
+        self.assertTrue(agent.decide(True, always=True))
+        turn.thread.join(5)
+        self.assertEqual([json.loads(a)["code"] for _, a in self.ran], ["a()", "b()"], "second step ran unasked")
+        self.assertFalse(state.new_session()["auto_run"], "a new conversation asks again")
+
+    def test_token_usage_adds_up_over_the_conversation(self):
+        usage = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 8}}
+        SCRIPT.replies += [sse({"choices": [{"delta": {"content": "Hi."}}]}, usage)] * 2
+        self.start("hi").thread.join(5)
+        self.start("again").thread.join(5)
+        self.assertEqual(self.session["usage"], {"input": 240, "output": 16})
+        self.assertEqual(SCRIPT.requests[0]["stream_options"], {"include_usage": True})
+
+    def test_overloaded_api_is_retried_and_the_user_never_sees_it(self):
+        llm.RETRY_DELAYS, saved = (0.01, 0.01, 0.01), llm.RETRY_DELAYS
+        self.addCleanup(setattr, llm, "RETRY_DELAYS", saved)
+        SCRIPT.replies += [(503, {"error": {"message": "Overloaded."}}), (429, {"error": {"message": "Slow down."}}),
+                           text_reply("Here now.")]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Here now.")
+        self.assertEqual(len(SCRIPT.requests), 3)
+
+    def test_retries_give_up_and_show_the_last_error(self):
+        llm.RETRY_DELAYS, saved = (0.01, 0.01, 0.01), llm.RETRY_DELAYS
+        self.addCleanup(setattr, llm, "RETRY_DELAYS", saved)
+        SCRIPT.replies += [(503, {"error": {"message": "Overloaded."}})] * 4
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1], state.item_error("HTTP 503: Overloaded."))
 
     def test_http_error_is_shown_not_swallowed(self):
         SCRIPT.replies.append((402, {"error": {"message": "Billing verification failed."}}))

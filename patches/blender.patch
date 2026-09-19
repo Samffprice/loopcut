@@ -1,0 +1,841 @@
+diff --git a/intern/ghost/intern/GHOST_SystemPathsCocoa.mm b/intern/ghost/intern/GHOST_SystemPathsCocoa.mm
+index 762e0726b79..99c28fdc88e 100644
+--- a/intern/ghost/intern/GHOST_SystemPathsCocoa.mm
++++ b/intern/ghost/intern/GHOST_SystemPathsCocoa.mm
+@@ -28,9 +28,10 @@ static const char *GetApplicationSupportDir(const char *versionstr,
+     }
+     NSString *basePath = [paths objectAtIndex:0];
+ 
++    /* Loopcut: own folder, so stock Blender's preferences are never written to. */
+     snprintf(tempPath,
+              len_tempPath,
+-             "%s/Blender/%s",
++             "%s/Loopcut/%s",
+              [basePath cStringUsingEncoding:NSASCIIStringEncoding],
+              versionstr);
+   }
+diff --git a/intern/ghost/intern/GHOST_SystemPathsUnix.cc b/intern/ghost/intern/GHOST_SystemPathsUnix.cc
+index 81e9572d111..b38b7ccfa12 100644
+--- a/intern/ghost/intern/GHOST_SystemPathsUnix.cc
++++ b/intern/ghost/intern/GHOST_SystemPathsUnix.cc
+@@ -100,13 +100,14 @@ const char *GHOST_SystemPathsUnix::getUserDir(int version, const char *versionst
+ 
+     last_version = version;
+ 
++    /* Loopcut: own folder, so stock Blender's preferences are never written to. */
+     if (home) {
+-      user_path = string(home) + "/blender/" + versionstr;
++      user_path = string(home) + "/loopcut/" + versionstr;
+     }
+     else {
+       home = home_dir_get();
+       if (home) {
+-        user_path = string(home) + "/.config/blender/" + versionstr;
++        user_path = string(home) + "/.config/loopcut/" + versionstr;
+       }
+       else {
+         return nullptr;
+diff --git a/intern/ghost/intern/GHOST_SystemPathsWin32.cc b/intern/ghost/intern/GHOST_SystemPathsWin32.cc
+index 71d6d45ace5..9ca7624e5fe 100644
+--- a/intern/ghost/intern/GHOST_SystemPathsWin32.cc
++++ b/intern/ghost/intern/GHOST_SystemPathsWin32.cc
+@@ -53,7 +53,8 @@ const char *GHOST_SystemPathsWin32::getUserDir(int, const char *versionstr) cons
+ 
+   if (hResult == S_OK) {
+     conv_utf_16_to_8(knownpath_16, knownpath, MAX_PATH * 3);
+-    strcat(knownpath, "\\Blender Foundation\\Blender\\");
++    /* Loopcut: own folder, so stock Blender's preferences are never written to. */
++    strcat(knownpath, "\\Loopcut\\");
+     strcat(knownpath, versionstr);
+     user_dir = knownpath;
+   }
+diff --git a/scripts/modules/bl_keymap_utils/keymap_hierarchy.py b/scripts/modules/bl_keymap_utils/keymap_hierarchy.py
+index 6579d08ea81..42a995eba9a 100644
+--- a/scripts/modules/bl_keymap_utils/keymap_hierarchy.py
++++ b/scripts/modules/bl_keymap_utils/keymap_hierarchy.py
+@@ -178,6 +178,7 @@ _km_hierarchy = [
+     ]),
+ 
+     ('Spreadsheet Generic', 'SPREADSHEET', 'WINDOW', []),
++    ('Loopcut', 'LOOPCUT', 'WINDOW', []),
+ 
+     ('Video Sequence Editor', 'SEQUENCE_EDITOR', 'WINDOW', [
+         ('Sequencer', 'SEQUENCE_EDITOR', 'WINDOW', [
+diff --git a/scripts/startup/bl_operators/wm.py b/scripts/startup/bl_operators/wm.py
+index 06996c8ca84..1a2a0d9a83c 100644
+--- a/scripts/startup/bl_operators/wm.py
++++ b/scripts/startup/bl_operators/wm.py
+@@ -3359,12 +3359,23 @@ class WM_OT_batch_rename(Operator):
+         return wm.invoke_props_dialog(self, width=400)
+ 
+ 
++def _loopcut_onboarding_draw(layout, context, *, first_run):
++    # Loopcut: the bundled add-on draws the first-run steps (`loopcut/onboarding.py`).
++    # True when it drew in place of the calling menu.
++    import sys
++    onboarding = sys.modules.get("loopcut.onboarding")
++    return onboarding is not None and onboarding.draw_splash(layout, context, first_run)
++
++
+ class WM_MT_splash_quick_setup(Menu):
+     bl_label = "Quick Setup"
+ 
+     def draw(self, context):
+         layout = self.layout
+ 
++        if _loopcut_onboarding_draw(layout, context, first_run=True):
++            return
++
+         wm = context.window_manager
+         prefs = context.preferences
+ 
+@@ -3447,6 +3458,9 @@ class WM_MT_splash(Menu):
+ 
+     def draw(self, context):
+         layout = self.layout
++
++        if _loopcut_onboarding_draw(layout, context, first_run=False):
++            return
+         layout.operator_context = 'EXEC_DEFAULT'
+         layout.emboss = 'PULLDOWN_MENU'
+ 
+diff --git a/scripts/startup/bl_ui/__init__.py b/scripts/startup/bl_ui/__init__.py
+index 0ca45072f53..1c8ed71b859 100644
+--- a/scripts/startup/bl_ui/__init__.py
++++ b/scripts/startup/bl_ui/__init__.py
+@@ -77,6 +77,7 @@ _modules = [
+     "space_graph",
+     "space_image",
+     "space_info",
++    "space_loopcut",
+     "space_nla",
+     "space_node",
+     "space_outliner",
+diff --git a/scripts/startup/bl_ui/space_loopcut.py b/scripts/startup/bl_ui/space_loopcut.py
+new file mode 100644
+index 00000000000..8f21cb57040
+--- /dev/null
++++ b/scripts/startup/bl_ui/space_loopcut.py
+@@ -0,0 +1,24 @@
++# SPDX-FileCopyrightText: 2026 Loopcut Authors
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++from bpy.types import Header
++
++
++class LOOPCUT_HT_header(Header):
++    bl_space_type = 'LOOPCUT'
++
++    def draw(self, _context):
++        # The panel itself is drawn by the `loopcut` add-on. This header is hidden by default and
++        # only exists so the editor type can be changed.
++        self.layout.template_header()
++
++
++classes = (
++    LOOPCUT_HT_header,
++)
++
++if __name__ == "__main__":  # only for live edit.
++    from bpy.utils import register_class
++    for cls in classes:
++        register_class(cls)
+diff --git a/source/blender/blenkernel/intern/appdir.cc b/source/blender/blenkernel/intern/appdir.cc
+index a2c90560a21..e35ae6ab5be 100644
+--- a/source/blender/blenkernel/intern/appdir.cc
++++ b/source/blender/blenkernel/intern/appdir.cc
+@@ -216,18 +216,13 @@ void BKE_appdir_folder_caches(char *path, const size_t path_maxncpy)
+     return;
+   }
+ 
++  /* Loopcut: own cache folder, matching the user folder in GHOST_SystemPaths*. */
+ #ifdef WIN32
+-  BLI_path_join(path,
+-                path_maxncpy,
+-                caches_root_path->c_str(),
+-                "Blender Foundation",
+-                "Blender",
+-                "Cache",
+-                SEP_STR);
++  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Loopcut", "Cache", SEP_STR);
+ #elif defined(__APPLE__)
+-  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Blender", SEP_STR);
++  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Loopcut", SEP_STR);
+ #else /* __linux__ */
+-  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "blender", SEP_STR);
++  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "loopcut", SEP_STR);
+ #endif
+ }
+ 
+diff --git a/source/blender/blenkernel/intern/blendfile.cc b/source/blender/blenkernel/intern/blendfile.cc
+index d2eb290b064..186266acebc 100644
+--- a/source/blender/blenkernel/intern/blendfile.cc
++++ b/source/blender/blenkernel/intern/blendfile.cc
+@@ -1534,6 +1534,7 @@ UserDef *BKE_blendfile_userdef_from_defaults()
+         "cycles",
+         "pose_library",
+         "bl_pkg",
++        "loopcut",
+     };
+     for (int i = 0; i < ARRAY_SIZE(addons); i++) {
+       bAddon *addon = BKE_addon_new();
+diff --git a/source/blender/blenkernel/intern/grease_pencil_convert_legacy.cc b/source/blender/blenkernel/intern/grease_pencil_convert_legacy.cc
+index 3078ea7380a..80e2cac57fa 100644
+--- a/source/blender/blenkernel/intern/grease_pencil_convert_legacy.cc
++++ b/source/blender/blenkernel/intern/grease_pencil_convert_legacy.cc
+@@ -3038,6 +3038,7 @@ static void legacy_gpencil_sanitize_annotations(Main &bmain)
+           case SPACE_TOPBAR:
+           case SPACE_STATUSBAR:
+           case SPACE_SPREADSHEET:
++          case SPACE_LOOPCUT:
+             break;
+         }
+       }
+diff --git a/source/blender/blenloader/intern/versioning_userdef.cc b/source/blender/blenloader/intern/versioning_userdef.cc
+index 3c32936755a..21c02ff1556 100644
+--- a/source/blender/blenloader/intern/versioning_userdef.cc
++++ b/source/blender/blenloader/intern/versioning_userdef.cc
+@@ -1804,6 +1804,11 @@ void blo_do_versions_userdef(UserDef *userdef)
+    * \note Keep this message at the bottom of the function.
+    */
+ 
++  /* Loopcut: preferences carried over from stock Blender do not list the bundled add-on, and
++   * without it the Loopcut editor is empty. Not version-gated so the fork needs no subversion of
++   * its own, which keeps rebasing onto new releases free of conflicts here. */
++  BKE_addon_ensure(&userdef->addons, "loopcut");
++
+   for (bTheme &btheme : userdef->themes) {
+     do_versions_theme(userdef, &btheme);
+   }
+diff --git a/source/blender/editors/CMakeLists.txt b/source/blender/editors/CMakeLists.txt
+index 83b8d7d5f55..7ad6b39f1db 100644
+--- a/source/blender/editors/CMakeLists.txt
++++ b/source/blender/editors/CMakeLists.txt
+@@ -39,6 +39,7 @@ if(WITH_BLENDER)
+   add_subdirectory(space_graph)
+   add_subdirectory(space_image)
+   add_subdirectory(space_info)
++  add_subdirectory(space_loopcut)
+   add_subdirectory(space_nla)
+   add_subdirectory(space_node)
+   add_subdirectory(space_outliner)
+diff --git a/source/blender/editors/animation/anim_filter.cc b/source/blender/editors/animation/anim_filter.cc
+index cc6a19ba4a0..176a447b5be 100644
+--- a/source/blender/editors/animation/anim_filter.cc
++++ b/source/blender/editors/animation/anim_filter.cc
+@@ -398,6 +398,7 @@ bool ANIM_animdata_context_getdata(bAnimContext *ac)
+       case SPACE_TOPBAR:
+       case SPACE_STATUSBAR:
+       case SPACE_SPREADSHEET:
++      case SPACE_LOOPCUT:
+         break;
+     }
+   }
+diff --git a/source/blender/editors/include/ED_space_api.hh b/source/blender/editors/include/ED_space_api.hh
+index 93d62bd7563..2e697e070fd 100644
+--- a/source/blender/editors/include/ED_space_api.hh
++++ b/source/blender/editors/include/ED_space_api.hh
+@@ -43,6 +43,7 @@ void ED_spacetype_userpref();
+ void ED_spacetype_clip();
+ void ED_spacetype_statusbar();
+ void ED_spacetype_topbar();
++void ED_spacetype_loopcut();
+ 
+ namespace ed::vse {
+ void ED_spacetype_sequencer();
+diff --git a/source/blender/editors/interface/templates/interface_template_search_menu.cc b/source/blender/editors/interface/templates/interface_template_search_menu.cc
+index fb33e8c2442..2e035ef482f 100644
+--- a/source/blender/editors/interface/templates/interface_template_search_menu.cc
++++ b/source/blender/editors/interface/templates/interface_template_search_menu.cc
+@@ -646,6 +646,7 @@ static MenuSearch_Data *menu_items_from_ui_create(bContext *C,
+           SPACE_MENU_NOP(SPACE_STATUSBAR);
+           SPACE_MENU_NOP(SPACE_TOPBAR);
+           SPACE_MENU_NOP(SPACE_SPREADSHEET);
++          SPACE_MENU_NOP(SPACE_LOOPCUT);
+         }
+       }
+       for (int i = 0; i < idname_array_len; i++) {
+diff --git a/source/blender/editors/space_api/CMakeLists.txt b/source/blender/editors/space_api/CMakeLists.txt
+index 8b45bbc7f9f..41cac88221c 100644
+--- a/source/blender/editors/space_api/CMakeLists.txt
++++ b/source/blender/editors/space_api/CMakeLists.txt
+@@ -29,6 +29,7 @@ set(LIB
+   bf_editor_space_graph
+   bf_editor_space_image
+   bf_editor_space_info
++  bf_editor_space_loopcut
+   bf_editor_space_nla
+   bf_editor_space_node
+   bf_editor_space_outliner
+diff --git a/source/blender/editors/space_api/spacetypes.cc b/source/blender/editors/space_api/spacetypes.cc
+index ad21b369a72..e5a521f35e5 100644
+--- a/source/blender/editors/space_api/spacetypes.cc
++++ b/source/blender/editors/space_api/spacetypes.cc
+@@ -86,6 +86,7 @@ void ED_spacetypes_init()
+   ED_spacetype_statusbar();
+   ED_spacetype_topbar();
+   spreadsheet::register_spacetype();
++  ED_spacetype_loopcut();
+ 
+   /* Register operator types for screen and all spaces. */
+   ED_operatortypes_userpref();
+diff --git a/source/blender/editors/space_loopcut/CMakeLists.txt b/source/blender/editors/space_loopcut/CMakeLists.txt
+new file mode 100644
+index 00000000000..a9034a7187d
+--- /dev/null
++++ b/source/blender/editors/space_loopcut/CMakeLists.txt
+@@ -0,0 +1,27 @@
++# SPDX-FileCopyrightText: 2026 Loopcut Authors
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++set(INC
++  ../include
++  ../../makesrna
++)
++
++set(INC_SYS
++)
++
++set(SRC
++  space_loopcut.cc
++)
++
++set(LIB
++  PRIVATE bf::blenkernel
++  PRIVATE bf::blenlib
++  PRIVATE bf::blenloader
++  PRIVATE bf::dna
++  PRIVATE bf::gpu
++  PRIVATE bf::intern::guardedalloc
++  PRIVATE bf::windowmanager
++)
++
++blender_add_lib(bf_editor_space_loopcut "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+diff --git a/source/blender/editors/space_loopcut/space_loopcut.cc b/source/blender/editors/space_loopcut/space_loopcut.cc
+new file mode 100644
+index 00000000000..2bbfbefcc81
+--- /dev/null
++++ b/source/blender/editors/space_loopcut/space_loopcut.cc
+@@ -0,0 +1,156 @@
++/* SPDX-FileCopyrightText: 2026 Loopcut Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup sploopcut
++ *
++ * The Loopcut editor is a shell for the bundled `loopcut` Python add-on, which draws the whole
++ * panel from a `SpaceLoopcut.draw_handler_add(..., 'WINDOW', 'POST_PIXEL')` callback and takes
++ * input through operators in the "Loopcut" keymap. Keep logic out of this file.
++ */
++
++#include "DNA_space_types.h"
++
++#include "MEM_guardedalloc.h"
++
++#include "BLI_listbase.h"
++#include "BLI_string_utf8.h"
++#include "BLI_utildefines.h"
++
++#include "BKE_screen.hh"
++
++#include "ED_screen.hh"
++#include "ED_space_api.hh"
++
++#include "WM_api.hh"
++#include "WM_types.hh"
++
++#include "UI_resources.hh"
++
++#include "BLO_read_write.hh"
++
++namespace blender {
++
++static SpaceLink *loopcut_create(const ScrArea * /*area*/, const Scene * /*scene*/)
++{
++  SpaceLoopcut *sloopcut = MEM_new<SpaceLoopcut>("initloopcut");
++  sloopcut->spacetype = SPACE_LOOPCUT;
++
++  /* Header: only holds the editor-type menu, and the panel draws its own title bar, so it starts
++   * hidden. The arrow Blender shows for a hidden header brings it back. */
++  ARegion *region = BKE_area_region_new();
++  BLI_addtail(&sloopcut->regionbase, region);
++  region->regiontype = RGN_TYPE_HEADER;
++  region->alignment = (U.uiflag & USER_HEADER_BOTTOM) ? RGN_ALIGN_BOTTOM : RGN_ALIGN_TOP;
++  region->flag |= RGN_FLAG_HIDDEN;
++
++  /* Main region. */
++  region = BKE_area_region_new();
++  BLI_addtail(&sloopcut->regionbase, region);
++  region->regiontype = RGN_TYPE_WINDOW;
++
++  return reinterpret_cast<SpaceLink *>(sloopcut);
++}
++
++/* Doesn't free the space-link itself. */
++static void loopcut_free(SpaceLink * /*sl*/) {}
++
++static void loopcut_init(wmWindowManager * /*wm*/, ScrArea * /*area*/) {}
++
++static SpaceLink *loopcut_duplicate(SpaceLink *sl)
++{
++  SpaceLoopcut *sloopcutn = MEM_dupalloc(reinterpret_cast<SpaceLoopcut *>(sl));
++  return reinterpret_cast<SpaceLink *>(sloopcutn);
++}
++
++static void loopcut_keymap(wmKeyConfig *keyconf)
++{
++  WM_keymap_ensure(keyconf, "Loopcut", SPACE_LOOPCUT, RGN_TYPE_WINDOW);
++}
++
++static void loopcut_main_region_init(wmWindowManager *wm, ARegion *region)
++{
++  wmKeyMap *keymap = WM_keymap_ensure(
++      wm->runtime->defaultconf, "Loopcut", SPACE_LOOPCUT, RGN_TYPE_WINDOW);
++  WM_event_add_keymap_handler(&region->runtime->handlers, keymap);
++}
++
++static void loopcut_main_region_draw(const bContext * /*C*/, ARegion * /*region*/)
++{
++  /* The add-on's POST_PIXEL callback runs right after this, from #ED_region_do_draw. */
++  ui::theme::frame_buffer_clear(TH_BACK);
++}
++
++static void loopcut_main_region_listener(const wmRegionListenerParams *params)
++{
++  /* The panel shows what is selected and which file is open, so it follows both. Everything
++   * else it draws is its own state, and the add-on tags the redraw for that itself. */
++  const wmNotifier *wmn = params->notifier;
++  switch (wmn->category) {
++    case NC_SCENE:
++      if (ELEM(wmn->data, ND_OB_ACTIVE, ND_OB_SELECT, ND_MODE)) {
++        ED_region_tag_redraw(params->region);
++      }
++      break;
++    case NC_WM:
++      if (wmn->data == ND_FILEREAD) {
++        ED_region_tag_redraw(params->region);
++      }
++      break;
++    default:
++      break;
++  }
++}
++
++static void loopcut_header_region_init(wmWindowManager * /*wm*/, ARegion *region)
++{
++  ED_region_header_init(region);
++}
++
++static void loopcut_header_region_draw(const bContext *C, ARegion *region)
++{
++  ED_region_header(C, region);
++}
++
++static void loopcut_space_blend_write(BlendWriter *writer, SpaceLink *sl)
++{
++  writer->write_struct_cast<SpaceLoopcut>(sl);
++}
++
++void ED_spacetype_loopcut()
++{
++  std::unique_ptr<SpaceType> st = std::make_unique<SpaceType>();
++  ARegionType *art;
++
++  st->spaceid = SPACE_LOOPCUT;
++  STRNCPY_UTF8(st->name, "Loopcut");
++
++  st->create = loopcut_create;
++  st->free = loopcut_free;
++  st->init = loopcut_init;
++  st->duplicate = loopcut_duplicate;
++  st->keymap = loopcut_keymap;
++  st->blend_write = loopcut_space_blend_write;
++
++  /* regions: main window */
++  art = MEM_new_zeroed<ARegionType>("spacetype loopcut region");
++  art->regionid = RGN_TYPE_WINDOW;
++  art->init = loopcut_main_region_init;
++  art->draw = loopcut_main_region_draw;
++  art->listener = loopcut_main_region_listener;
++  BLI_addhead(&st->regiontypes, art);
++
++  /* regions: header */
++  art = MEM_new_zeroed<ARegionType>("spacetype loopcut region");
++  art->regionid = RGN_TYPE_HEADER;
++  art->prefsizey = HEADERY;
++  art->keymapflag = ED_KEYMAP_UI | ED_KEYMAP_VIEW2D | ED_KEYMAP_HEADER;
++  art->init = loopcut_header_region_init;
++  art->draw = loopcut_header_region_draw;
++  BLI_addhead(&st->regiontypes, art);
++
++  BKE_spacetype_register(std::move(st));
++}
++
++}  // namespace blender
+diff --git a/source/blender/makesdna/DNA_space_enums.h b/source/blender/makesdna/DNA_space_enums.h
+index bb3995cbb7e..e1ab980061d 100644
+--- a/source/blender/makesdna/DNA_space_enums.h
++++ b/source/blender/makesdna/DNA_space_enums.h
+@@ -1179,9 +1179,10 @@ enum eSpace_Type : char {
+   SPACE_CLIP = 20,
+   SPACE_TOPBAR = 21,
+   SPACE_STATUSBAR = 22,
+-  SPACE_SPREADSHEET = 23
++  SPACE_SPREADSHEET = 23,
++  SPACE_LOOPCUT = 24
+ 
+-#define SPACE_TYPE_NUM (SPACE_SPREADSHEET + 1)
++#define SPACE_TYPE_NUM (SPACE_LOOPCUT + 1)
+ };
+ 
+ /* use for function args */
+diff --git a/source/blender/makesdna/DNA_space_types.h b/source/blender/makesdna/DNA_space_types.h
+index 005251b9c1c..823d5d80a58 100644
+--- a/source/blender/makesdna/DNA_space_types.h
++++ b/source/blender/makesdna/DNA_space_types.h
+@@ -1275,6 +1275,20 @@ struct SpaceSpreadsheet {
+   ed::spreadsheet::SpaceSpreadsheet_Runtime *runtime = nullptr;
+ };
+ 
++/**
++ * Loopcut: the AI agent panel. The editor is a shell: everything in it is drawn and handled by
++ * the bundled `loopcut` Python add-on, so there is no state to store here.
++ */
++struct SpaceLoopcut {
++  SpaceLink *next = nullptr, *prev = nullptr;
++  /** Storage of regions for inactive spaces. */
++  ListBaseT<ARegion> regionbase = {nullptr, nullptr};
++  char spacetype = 0;
++  eSpace_Link_Flag link_flag = {};
++  char _pad0[6] = {};
++  /* End 'SpaceLink' header. */
++};
++
+ struct SpreadsheetRowFilter {
+   struct SpreadsheetRowFilter *next = nullptr, *prev = nullptr;
+ 
+diff --git a/source/blender/makesrna/intern/rna_space.cc b/source/blender/makesrna/intern/rna_space.cc
+index ef6c3a80f28..79a701bd216 100644
+--- a/source/blender/makesrna/intern/rna_space.cc
++++ b/source/blender/makesrna/intern/rna_space.cc
+@@ -114,6 +114,11 @@ const EnumPropertyItem rna_enum_space_type_items[] = {
+      "Video Sequencer",
+      "Non-linear editor for arranging and mixing scenes, video, audio, and effects"},
+     {SPACE_CLIP, "CLIP_EDITOR", ICON_TRACKER, "Movie Clip Editor", "Motion tracking tools"},
++    {SPACE_LOOPCUT,
++     "LOOPCUT",
++     ICON_SCRIPTPLUGINS,
++     "Loopcut",
++     "Chat with the AI agent that works in this scene"},
+ 
+     /* Animation. */
+     RNA_ENUM_ITEM_HEADING(N_("Animation"), nullptr),
+@@ -793,6 +798,8 @@ static StructRNA *rna_Space_refine(PointerRNA *ptr)
+       return RNA_SpaceClipEditor;
+     case SPACE_SPREADSHEET:
+       return RNA_SpaceSpreadsheet;
++    case SPACE_LOOPCUT:
++      return RNA_SpaceLoopcut;
+ 
+       /* Currently no type info. */
+     case SPACE_SCRIPT:
+@@ -9422,6 +9429,13 @@ static void rna_def_viewer_path(BlenderRNA *brna)
+   RNA_def_property_ui_text(prop, "Viewer Path", nullptr);
+ }
+ 
++static void rna_def_space_loopcut(BlenderRNA *brna)
++{
++  StructRNA *srna = RNA_def_struct(brna, "SpaceLoopcut", "Space");
++  RNA_def_struct_sdna(srna, "SpaceLoopcut");
++  RNA_def_struct_ui_text(srna, "Space Loopcut", "Loopcut agent panel space data");
++}
++
+ static void rna_def_space_spreadsheet(BlenderRNA *brna)
+ {
+   PropertyRNA *prop;
+@@ -9548,6 +9562,7 @@ void RNA_def_space(BlenderRNA *brna)
+   rna_def_space_node(brna);
+   rna_def_space_clip(brna);
+   rna_def_space_spreadsheet(brna);
++  rna_def_space_loopcut(brna);
+ }
+ 
+ }  // namespace blender
+diff --git a/source/blender/python/intern/bpy_rna_callback.cc b/source/blender/python/intern/bpy_rna_callback.cc
+index bfcd3289039..ade55e03108 100644
+--- a/source/blender/python/intern/bpy_rna_callback.cc
++++ b/source/blender/python/intern/bpy_rna_callback.cc
+@@ -246,6 +246,9 @@ static eSpace_Type rna_Space_refine_reverse(StructRNA *srna)
+   if (srna == RNA_SpaceSpreadsheet) {
+     return SPACE_SPREADSHEET;
+   }
++  if (srna == RNA_SpaceLoopcut) {
++    return SPACE_LOOPCUT;
++  }
+   return SPACE_EMPTY;
+ }
+ 
+diff --git a/source/blender/windowmanager/intern/wm_draw.cc b/source/blender/windowmanager/intern/wm_draw.cc
+index 82fb63076af..706e808dd57 100644
+--- a/source/blender/windowmanager/intern/wm_draw.cc
++++ b/source/blender/windowmanager/intern/wm_draw.cc
+@@ -614,6 +614,7 @@ static const char *wm_area_name(const ScrArea *area)
+     SPACE_NAME(SPACE_TOPBAR);
+     SPACE_NAME(SPACE_STATUSBAR);
+     SPACE_NAME(SPACE_SPREADSHEET);
++    SPACE_NAME(SPACE_LOOPCUT);
+   }
+ #undef SPACE_NAME
+ 
+diff --git a/source/blender/windowmanager/intern/wm_event_system.cc b/source/blender/windowmanager/intern/wm_event_system.cc
+index 3f6253d786e..cf6b6b5dceb 100644
+--- a/source/blender/windowmanager/intern/wm_event_system.cc
++++ b/source/blender/windowmanager/intern/wm_event_system.cc
+@@ -84,6 +84,7 @@
+ #include "wm.hh"
+ #include "wm_event_system.hh"
+ #include "wm_event_types.hh"
++#include "wm_files.hh"
+ #include "wm_surface.hh"
+ #include "wm_window.hh"
+ #include "wm_window_private.hh"
+@@ -635,7 +636,7 @@ void wm_event_do_notifiers(bContext *C)
+ 
+       if (note->category == NC_WM) {
+         if (ELEM(note->data, ND_FILEREAD, ND_FILESAVE)) {
+-          wm->file_saved = 1;
++          wm->file_saved = (note->data == ND_FILEREAD && wm_file_read_leaves_unsaved()) ? 0 : 1;
+           WM_window_title_refresh(wm, &win);
+         }
+         else if (note->data == ND_DATACHANGED) {
+diff --git a/source/blender/windowmanager/intern/wm_files.cc b/source/blender/windowmanager/intern/wm_files.cc
+index 39c8fa5df12..96abb6676eb 100644
+--- a/source/blender/windowmanager/intern/wm_files.cc
++++ b/source/blender/windowmanager/intern/wm_files.cc
+@@ -84,6 +84,7 @@
+ #include "BKE_lib_override.hh"
+ #include "BKE_lib_remap.hh"
+ #include "BKE_library.hh"
++#include "BKE_bpath.hh"
+ #include "BKE_main.hh"
+ #include "BKE_main_namemap.hh"
+ #include "BKE_node.hh"
+@@ -182,6 +183,17 @@ static CLG_LogRef LOG = {"blend"};
+ /** \name Misc Utility Functions
+  * \{ */
+ 
++/**
++ * Loopcut: set while the scene on screen came from restoring a snapshot in place, which is the
++ * one kind of file read that leaves unsaved changes behind. See #wm_file_read_leaves_unsaved.
++ */
++static bool g_loopcut_restored_in_place = false;
++
++bool wm_file_read_leaves_unsaved()
++{
++  return g_loopcut_restored_in_place;
++}
++
+ void WM_file_tag_modified()
+ {
+   wmWindowManager *wm = static_cast<wmWindowManager *>(G_MAIN->wm.first);
+@@ -1037,6 +1049,7 @@ bool WM_file_read(bContext *C,
+   wm_read_callback_pre_wrapper(C, filepath);
+ 
+   Main *bmain = CTX_data_main(C);
++  g_loopcut_restored_in_place = false;
+ 
+   /* So we can get the error message. */
+   errno = 0;
+@@ -1189,6 +1202,7 @@ void wm_homefile_read_ex(bContext *C,
+                          ReportList *reports,
+                          wmFileReadPost_Params **r_params_file_read_post)
+ {
++  g_loopcut_restored_in_place = false;
+   /* NOTE: unlike #WM_file_read, don't set the wait cursor when reading the home-file.
+    * While technically both are reading a file and could use the wait cursor,
+    * avoid doing so for the following reasons.
+@@ -3638,6 +3652,125 @@ void WM_OT_recover_auto_save(wmOperatorType *ot)
+ 
+ /** \} */
+ 
++/* -------------------------------------------------------------------- */
++/** \name Loopcut Snapshot Operators
++ *
++ * Checkpoints for the Loopcut agent, built on the auto-save machinery: a snapshot is a recovery
++ * file, which records the path of the file it was taken from and keeps relative paths as they
++ * are. Restoring one therefore puts the scene back *in place*: the open file keeps its path, is
++ * marked as having unsaved changes, and nothing on disk is written. Unlike "Save Copy" neither
++ * operator runs save handlers, touches the recent-files list or the auto-save timer.
++ * \{ */
++
++static wmOperatorStatus wm_loopcut_snapshot_write_exec(bContext *C, wmOperator *op)
++{
++  Main *bmain = CTX_data_main(C);
++  char filepath[FILE_MAX];
++  RNA_string_get(op->ptr, "filepath", filepath);
++  if (filepath[0] == '\0') {
++    BKE_report(op->reports, RPT_ERROR, "No file path given");
++    return OPERATOR_CANCELLED;
++  }
++  BLI_path_canonicalize_native(filepath, sizeof(filepath));
++
++  /* Same preparation as #WM_autosave_write: edit-mode data and painted images are in the file. */
++  ED_editors_flush_edits(bmain);
++  ED_image_internal_autosave_flush(bmain);
++
++  const int fileflags = G.fileflags | G_FILE_RECOVER_WRITE | G_FILE_COMPRESS;
++  BlendFileWriteParams params{};
++  if (!BLO_write_file(bmain, filepath, fileflags, &params, op->reports)) {
++    return OPERATOR_CANCELLED;
++  }
++  return OPERATOR_FINISHED;
++}
++
++void WM_OT_loopcut_snapshot_write(wmOperatorType *ot)
++{
++  ot->name = "Write Loopcut Snapshot";
++  ot->idname = "WM_OT_loopcut_snapshot_write";
++  ot->description = "Write the current state to a snapshot file, leaving the open file as it is";
++
++  ot->exec = wm_loopcut_snapshot_write_exec;
++  ot->flag = OPTYPE_INTERNAL;
++
++  RNA_def_string_file_path(
++      ot->srna, "filepath", nullptr, FILE_MAX, "File Path", "Snapshot file to write");
++}
++
++static wmOperatorStatus wm_loopcut_snapshot_restore_exec(bContext *C, wmOperator *op)
++{
++  char filepath[FILE_MAX];
++  RNA_string_get(op->ptr, "filepath", filepath);
++  BLI_path_canonicalize_native(filepath, sizeof(filepath));
++
++  /* "In place" means the file that is open stays the open file, even if it was saved under a
++   * new name after the snapshot was taken. */
++  char filepath_open[FILE_MAX];
++  STRNCPY(filepath_open, BKE_main_blendfile_path(CTX_data_main(C)));
++
++  /* The scene being replaced ran scripts or did not; the snapshot of it is no different. */
++  const bool use_scripts_autoexec_check = false;
++
++  G.fileflags |= G_FILE_RECOVER_READ;
++  const bool success = wm_file_read_opwrap(C, filepath, use_scripts_autoexec_check, op->reports);
++  G.fileflags &= ~G_FILE_RECOVER_READ;
++  if (!success) {
++    return OPERATOR_CANCELLED;
++  }
++
++  Main *bmain = CTX_data_main(C);
++  const bool recorded_path = BLI_path_cmp(bmain->filepath, filepath) != 0;
++  if (!recorded_path) {
++    /* Taken from a scene that was never saved, so there was no path to record. The snapshot
++     * store must never become the open file or a recent file. */
++    bmain->filepath[0] = '\0';
++    if (RecentFile *recent = wm_file_history_find(filepath)) {
++      wm_history_file_free(recent);
++      wm_history_file_write();
++    }
++  }
++  if (filepath_open[0] != '\0' && BLI_path_cmp(bmain->filepath, filepath_open) != 0) {
++    if (recorded_path) {
++      char dir_src[FILE_MAX], dir_dst[FILE_MAX];
++      BLI_path_split_dir_part(bmain->filepath, dir_src, sizeof(dir_src));
++      BLI_path_split_dir_part(filepath_open, dir_dst, sizeof(dir_dst));
++      if (BLI_path_cmp(dir_src, dir_dst) != 0) {
++        BKE_bpath_relative_rebase(bmain, dir_src, dir_dst, op->reports);
++      }
++    }
++    STRNCPY(bmain->filepath, filepath_open);
++  }
++  STRNCPY(G.filepath_last_blend, bmain->filepath);
++  /* Not a crash recovery, just a file with changes that are not on disk. The file-read notifier
++   * that is still queued would mark it saved again, hence the flag. */
++  bmain->recovered = false;
++  g_loopcut_restored_in_place = true;
++  WM_file_tag_modified();
++  /* The context's window does not survive a file read; go by the window manager. */
++  wmWindowManager *wm = static_cast<wmWindowManager *>(bmain->wm.first);
++  for (wmWindow &win : wm->windows) {
++    WM_window_title_refresh(wm, &win);
++  }
++  return OPERATOR_FINISHED;
++}
++
++void WM_OT_loopcut_snapshot_restore(wmOperatorType *ot)
++{
++  ot->name = "Restore Loopcut Snapshot";
++  ot->idname = "WM_OT_loopcut_snapshot_restore";
++  ot->description =
++      "Replace the scene with a snapshot, keeping the open file's path and leaving it unsaved";
++
++  ot->exec = wm_loopcut_snapshot_restore_exec;
++  ot->flag = OPTYPE_INTERNAL;
++
++  RNA_def_string_file_path(
++      ot->srna, "filepath", nullptr, FILE_MAX, "File Path", "Snapshot file to restore");
++}
++
++/** \} */
++
+ /* -------------------------------------------------------------------- */
+ /** \name Popup Shared Utilities
+  * \{ */
+diff --git a/source/blender/windowmanager/intern/wm_operators.cc b/source/blender/windowmanager/intern/wm_operators.cc
+index 6ac217112b1..f4de5fe1b60 100644
+--- a/source/blender/windowmanager/intern/wm_operators.cc
++++ b/source/blender/windowmanager/intern/wm_operators.cc
+@@ -4254,6 +4254,8 @@ void wm_operatortypes_register()
+   WM_operatortype_append(WM_OT_lib_reload);
+   WM_operatortype_append(WM_OT_recover_last_session);
+   WM_operatortype_append(WM_OT_recover_auto_save);
++  WM_operatortype_append(WM_OT_loopcut_snapshot_write);
++  WM_operatortype_append(WM_OT_loopcut_snapshot_restore);
+   WM_operatortype_append(WM_OT_save_as_mainfile);
+   WM_operatortype_append(WM_OT_save_mainfile);
+   WM_operatortype_append(WM_OT_clear_recent_files);
+diff --git a/source/blender/windowmanager/wm_files.hh b/source/blender/windowmanager/wm_files.hh
+index b3d01b06903..ba2be51d54e 100644
+--- a/source/blender/windowmanager/wm_files.hh
++++ b/source/blender/windowmanager/wm_files.hh
+@@ -120,6 +120,10 @@ void WM_OT_open_mainfile(wmOperatorType *ot);
+ void WM_OT_revert_mainfile(wmOperatorType *ot);
+ void WM_OT_recover_last_session(wmOperatorType *ot);
+ void WM_OT_recover_auto_save(wmOperatorType *ot);
++/** True after a Loopcut snapshot was restored in place, until the next file is read. */
++bool wm_file_read_leaves_unsaved();
++void WM_OT_loopcut_snapshot_write(wmOperatorType *ot);
++void WM_OT_loopcut_snapshot_restore(wmOperatorType *ot);
+ 
+ void WM_OT_save_as_mainfile(wmOperatorType *ot);
+ void WM_OT_save_mainfile(wmOperatorType *ot);
+diff --git a/source/creator/CMakeLists.txt b/source/creator/CMakeLists.txt
+index 985b969e727..ca1e2deceee 100644
+--- a/source/creator/CMakeLists.txt
++++ b/source/creator/CMakeLists.txt
+@@ -482,6 +482,23 @@ if(WITH_PYTHON)
+     PATTERN "addons_core/bl_pkg/example_extension" EXCLUDE
+   )
+ 
++  # Loopcut: bundle the add-on that fills the Loopcut editor. It is developed outside this
++  # repository (hot-reloaded from its checkout), so it is copied in at install time.
++  set(LOOPCUT_EXTENSION_DIR "${CMAKE_SOURCE_DIR}/../extension/loopcut" CACHE PATH
++    "The `loopcut` Python package to bundle as a core add-on"
++  )
++  if(NOT EXISTS "${LOOPCUT_EXTENSION_DIR}/__init__.py")
++    message(FATAL_ERROR
++      "LOOPCUT_EXTENSION_DIR (${LOOPCUT_EXTENSION_DIR}) is not the loopcut Python package"
++    )
++  endif()
++  install(
++    DIRECTORY ${LOOPCUT_EXTENSION_DIR}/
++    DESTINATION ${TARGETDIR_VER}/scripts/addons_core/loopcut
++    PATTERN "__pycache__" EXCLUDE
++    PATTERN ".env*" EXCLUDE
++  )
++
+   if(WITH_PYTHON_MODULE)
+     install(
+       FILES ${CMAKE_SOURCE_DIR}/scripts/site/sitecustomize.py

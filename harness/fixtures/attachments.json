@@ -1,0 +1,38 @@
+{
+ "items": [
+  {
+   "kind": "user",
+   "text": "Make the chair look like the one in these photos",
+   "images": [
+    "eames-front.jpg",
+    "IMG_20260912_living_room_reference_wide.png"
+   ]
+  },
+  {
+   "kind": "assistant",
+   "text": "I can see a moulded plywood lounge chair with a dark leather cushion. I'll start with the shell.",
+   "streaming": false
+  },
+  {
+   "kind": "user",
+   "text": "",
+   "images": [
+    "side-view.webp"
+   ]
+  }
+ ],
+ "attachments": [
+  {
+   "ref": "loopcut-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+   "name": "fabric-swatch.png"
+  },
+  {
+   "ref": "loopcut-image:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png",
+   "name": "a-very-long-file-name-from-a-phone-camera-0001.jpeg"
+  },
+  {
+   "ref": "loopcut-image:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.png",
+   "name": "legs.jpg"
+  }
+ ]
+}

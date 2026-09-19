@@ -12,7 +12,9 @@ from pathlib import Path
 
 import bpy
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "extension"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import checkout  # noqa: E402
+checkout.use()
 import loopcut  # noqa: E402
 from loopcut import checkpoints, state, tools  # noqa: E402
 from loopcut.ui import host  # noqa: E402
@@ -155,7 +157,11 @@ def verify_restored():
     assert round(bpy.data.objects["Cube"].location.z, 2) == 2.5, "manual edit before the checkpoint is kept"
 
     now = Path(bpy.data.filepath)
-    assert now.parent == PROJECT_DIR and now.name.startswith("kitchen.restored-"), now
+    if checkpoints.in_place_supported():  # The Loopcut build: same file, now with unsaved changes.
+        assert now == PROJECT and bpy.data.is_dirty, (now, bpy.data.is_dirty)
+        assert not list(PROJECT_DIR.glob("*.restored-*")), "an in-place restore writes no extra files"
+    else:
+        assert now.parent == PROJECT_DIR and now.name.startswith("kitchen.restored-"), now
     assert DATA_DIR not in now.parents, "Ctrl+S must never write into the checkpoint store"
     assert sha(PROJECT) == SEEN["project_sha"], "the user's original file was modified"
 
@@ -182,8 +188,11 @@ def verify_undone():
     assert kinds == ["user", "assistant"] * 3 + ["notice"], kinds
     assert len(session["messages"]) == 6 and session["input"] == ""
     now = Path(bpy.data.filepath)
-    assert now != SEEN["first_restored_file"] and now.name.startswith("kitchen.restored-"), now
-    assert SEEN["first_restored_file"].is_file(), "an earlier restored file must not be overwritten"
+    if checkpoints.in_place_supported():
+        assert now == PROJECT and bpy.data.is_dirty, (now, bpy.data.is_dirty)
+    else:
+        assert now != SEEN["first_restored_file"] and now.name.startswith("kitchen.restored-"), now
+        assert SEEN["first_restored_file"].is_file(), "an earlier restored file must not be overwritten"
     assert sha(PROJECT) == SEEN["project_sha"]
 
 
@@ -219,6 +228,9 @@ def budget_expiry_and_refusals():
 
 
 bpy.context.preferences.view.show_splash = False
+# Saving from a timer draws the file's thumbnail outside a draw context, which the assert-enabled
+# dev build of the fork aborts on (release Blenders do not check). The checks need no thumbnail.
+bpy.context.preferences.filepaths.file_preview_type = "NONE"
 loopcut.register()
 # persistent: a restore loads a file, and Blender drops ordinary timers when it does.
 bpy.app.timers.register(run_next, first_interval=0.6, persistent=True)

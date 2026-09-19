@@ -10,7 +10,14 @@ from pathlib import Path
 import bpy
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "extension"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import checkout  # noqa: E402
+checkout.use()
+# Harness runs must not write conversations or checkpoints into the user's real Loopcut data.
+import os as _os
+import tempfile as _tempfile
+_os.environ.setdefault("LOOPCUT_DATA_DIR", _tempfile.mkdtemp(prefix="loopcut-harness-"))
+
 import loopcut  # noqa: E402
 from loopcut import agent, state  # noqa: E402
 
@@ -21,7 +28,6 @@ STATE: dict = {}
 
 def write_transcript(session: dict, out: Path) -> None:
     """Everything the model wrote and saw, for diagnosing a bad run."""
-    import base64
     lines, shots = [], 0
     for message in session["messages"]:
         role, content = message["role"], message.get("content")
@@ -29,8 +35,9 @@ def write_transcript(session: dict, out: Path) -> None:
             for part in content:
                 if part["type"] == "image_url":
                     shots += 1
-                    data = part["image_url"]["url"].split(",", 1)[1]
-                    (out / ("live_capture_%d.png" % shots)).write_bytes(base64.b64decode(data))
+                    from loopcut import conversations
+                    source = conversations.image_path(session["id"], part["image_url"]["url"])
+                    (out / ("live_capture_%d.png" % shots)).write_bytes(source.read_bytes())
                     lines.append("## image -> live_capture_%d.png\n" % shots)
             continue
         if content:

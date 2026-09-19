@@ -7,10 +7,14 @@ be undone. The user's own .blend on disk is never written to.
 A snapshot is a compressed copy-save of the whole .blend. One is taken per user message, lazily,
 right before the first scene-changing step of that turn, so chat-only turns cost nothing.
 
-Python cannot restore in place: opening a snapshot leaves Blender's file path pointing at it, so
-the user's next Ctrl+S would land in our store. restore() therefore re-saves straight away as
-`<name>.restored-<time>.blend` beside the original. The fork will replace that step with an
-in-place restore; the store and index stay as they are.
+In the Loopcut build of Blender a snapshot is a recovery file (wm.loopcut_snapshot_write): it
+records the path of the file it was taken from, so restoring it (wm.loopcut_snapshot_restore)
+puts the scene back in place. The open file keeps its path and is marked unsaved.
+
+Stock Blender cannot do that from Python: opening a snapshot leaves Blender's file path pointing
+at it, so the user's next Ctrl+S would land in our store. There restore() re-saves straight away
+as `<name>.restored-<time>.blend` beside the original. Index entries say which kind they are
+(`in_place`), so a store written by one Blender is still restored correctly by the other.
 """
 
 import json
@@ -134,20 +138,31 @@ def _store(session: dict) -> Store:
     return Store(data_root(), session["id"])
 
 
+def in_place_supported() -> bool:
+    """True in the Loopcut build of Blender. (getattr on bpy.ops never fails, so ask dir().)"""
+    import bpy
+    return "loopcut_snapshot_restore" in dir(bpy.ops.wm)
+
+
 def _write_snapshot(store: Store, kind: str, label: str, **extra) -> dict:
     import bpy
     checkpoint_id = uuid.uuid4().hex
     path = store.snapshot_path(checkpoint_id)
+    in_place = in_place_supported()
     try:
         store.folder.mkdir(parents=True, exist_ok=True)
-        # copy=True: the open file, its path and its unsaved-changes state are left alone.
-        bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, compress=True)
+        # Either way the open file, its path and its unsaved-changes state are left alone.
+        if in_place:
+            if bpy.ops.wm.loopcut_snapshot_write(filepath=str(path)) != {"FINISHED"}:
+                raise RuntimeError("Blender could not write the snapshot file")
+        else:
+            bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, compress=True)
         size = path.stat().st_size
     except (OSError, RuntimeError) as ex:
         path.unlink(missing_ok=True)
         raise CheckpointError(f"Could not save a checkpoint to {store.folder}: {ex}") from ex
     entry = {"id": checkpoint_id, "kind": kind, "label": label[:80], "created": time.time(),
-             "size": size, "expired": False, "source": bpy.data.filepath, **extra}
+             "size": size, "expired": False, "source": bpy.data.filepath, "in_place": in_place, **extra}
     store.add(entry, _budget_bytes())
     return entry
 
@@ -190,8 +205,9 @@ def _blocking_job() -> str | None:
     return None
 
 
-def restore(session: dict, checkpoint_id: str) -> Path:
-    """Main thread, outside any operator. Returns the file the restored scene now lives in."""
+def restore(session: dict, checkpoint_id: str) -> Path | None:
+    """Main thread, outside any operator. Returns the new file the restored scene was saved to,
+    or None when it was restored in place."""
     import bpy
     from . import state
 
@@ -217,14 +233,28 @@ def restore(session: dict, checkpoint_id: str) -> Path:
             "input": session["input"]}
     store.tail_path(undo["id"]).write_text(json.dumps(tail), encoding="utf-8")
 
-    # 2. Load the snapshot, then move off it at once: Blender now thinks the snapshot is the
-    #    open file, and a Ctrl+S must never write into the store.
-    destination = restored_path(target["source"] or undo["source"], data_root() / "restored", time.time())
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.wm.open_mainfile(filepath=str(snapshot), load_ui=False)
-    bpy.ops.wm.save_as_mainfile(filepath=str(destination), compress=False)
-    if Path(bpy.data.filepath) != destination:
-        raise CheckpointError(f"Restored, but Blender is pointing at {bpy.data.filepath}; use Save As.")
+    # 2. Load the snapshot. Whichever way it goes, Blender must not end up thinking the snapshot
+    #    is the open file: a Ctrl+S must never write into the store.
+    in_place = in_place_supported() and target.get("in_place", False)
+    open_path = bpy.data.filepath
+    destination = None
+    state.restoring = True  # Tells lifecycle this file load is ours, not the user opening a file.
+    try:
+        if in_place:
+            if bpy.ops.wm.loopcut_snapshot_restore(filepath=str(snapshot)) != {"FINISHED"}:
+                raise CheckpointError("Blender could not read that checkpoint; nothing was changed.")
+        else:
+            destination = restored_path(target["source"] or undo["source"], data_root() / "restored", time.time())
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            bpy.ops.wm.open_mainfile(filepath=str(snapshot), load_ui=False)
+            bpy.ops.wm.save_as_mainfile(filepath=str(destination), compress=False)
+    finally:
+        state.restoring = False
+    # In place, the file that was open stays the open file; an unsaved scene takes the path the
+    # snapshot recorded, which for a scene that was never saved is none.
+    expected = str(destination) if destination else (open_path or target["source"])
+    if Path(bpy.data.filepath) != Path(expected):
+        raise CheckpointError(f"Restored, but Blender is pointing at {bpy.data.filepath or 'no file'}; use Save As.")
 
     # 3. The conversation.
     if target["kind"] == "turn":
@@ -232,7 +262,7 @@ def restore(session: dict, checkpoint_id: str) -> Path:
         text = next((i["text"] for i in removed if i["kind"] == "user"), "")
         del session["messages"][cut_messages:]
         del session["items"][cut_items:]
-        session["input"], session["cursor"] = text, len(text)
+        session["input"], session["cursor"], session["anchor"] = text, len(text), None
     else:
         tail_file = store.tail_path(checkpoint_id)
         saved = json.loads(tail_file.read_text(encoding="utf-8")) if tail_file.is_file() else None
@@ -241,16 +271,26 @@ def restore(session: dict, checkpoint_id: str) -> Path:
         if saved:
             session["messages"].extend(saved["messages"])
             session["items"].extend(saved["items"])
-            session["input"], session["cursor"] = saved["input"], len(saved["input"])
-    session["items"].append(state.item_notice(
-        f"Restored. You are now working in {destination.name}; your original file was not changed.",
-        "Undo restore", undo["id"]))
+            session["input"], session["cursor"], session["anchor"] = saved["input"], len(saved["input"]), None
+    if destination:
+        message = f"Restored. You are now working in {destination.name}; your original file was not changed."
+    elif open_path:
+        message = (f"Restored. {Path(open_path).name} on disk was not changed; save when you want to "
+                   f"keep this state.")
+    else:
+        message = "Restored."
+    session["items"].append(state.item_notice(message, "Undo restore", undo["id"]))
     session["scroll"], session["confirm_restore"], session["pending_checkpoint"] = 0.0, None, None
+    from . import conversations
+    if destination:
+        conversations.add_project(session, str(destination))  # The chat belongs to the restored file too.
+    conversations.save(session)
     return destination
 
 
 def remove_stale_sessions(now: float | None = None) -> None:
-    """Conversations do not outlive a Blender session yet, so old stores are unreachable."""
+    """Drop snapshot stores nothing has been added to for STALE_SESSION_DAYS. Snapshots are the
+    bulky part; the conversation itself is kept and shows those checkpoints as expired."""
     import shutil
     root = data_root() / "checkpoints"
     if not root.is_dir():

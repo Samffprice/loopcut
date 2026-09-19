@@ -4,6 +4,7 @@ Stdlib only, so the extension ships without wheels. Blocking; call from a worker
 """
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -20,6 +21,13 @@ class Cancelled(Exception):
     pass
 
 
+# Worth another try: rate limits and the provider being briefly unwell. Anything else (bad key,
+# bad request, no credit) will fail the same way again, so it is shown at once.
+RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
+RETRY_DELAYS = (1.0, 3.0, 8.0)
+MAX_RETRY_AFTER = 30.0
+
+
 @dataclass
 class ToolCall:
     id: str = ""
@@ -32,6 +40,7 @@ class Completion:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    usage: dict | None = None  # {"input": tokens, "output": tokens} when the API reports it.
 
     def as_message(self) -> dict:
         message = {"role": "assistant", "content": self.text or None}
@@ -55,6 +64,38 @@ def _error_detail(body: bytes) -> str:
     return json.dumps(payload)[:500]
 
 
+def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if is_cancelled():
+            raise Cancelled()
+        time.sleep(0.1)
+
+
+def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], bool]):
+    """Open the stream, retrying failures that are likely to pass. Nothing has been streamed to
+    the user yet at this point, so a retry is invisible apart from the wait."""
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        last = attempt == len(RETRY_DELAYS)
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as ex:
+            with ex:
+                detail = _error_detail(ex.read())
+                retry_after = ex.headers.get("Retry-After", "")
+            if last or ex.code not in RETRY_STATUSES:
+                raise LLMError(f"HTTP {ex.code}: {detail}", ex.code) from ex
+            delay = RETRY_DELAYS[attempt]
+            if retry_after.replace(".", "", 1).isdigit():
+                delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)
+        except urllib.error.URLError as ex:
+            if last:
+                raise LLMError(f"Could not reach {base_url}: {ex.reason}") from ex
+            delay = RETRY_DELAYS[attempt]
+        _wait(delay, is_cancelled)
+    raise AssertionError("unreachable")
+
+
 def stream_chat(
     *,
     base_url: str,
@@ -72,6 +113,7 @@ def stream_chat(
         "messages": messages,
         "tools": tools,
         "stream": True,
+        "stream_options": {"include_usage": True},
         "reasoning_effort": reasoning_effort,
     }
     request = urllib.request.Request(
@@ -84,14 +126,7 @@ def stream_chat(
         },
         method="POST",
     )
-    try:
-        response = urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as ex:
-        with ex:
-            detail = _error_detail(ex.read())
-        raise LLMError(f"HTTP {ex.code}: {detail}", ex.code) from ex
-    except urllib.error.URLError as ex:
-        raise LLMError(f"Could not reach {base_url}: {ex.reason}") from ex
+    response = _open(request, base_url, timeout, is_cancelled)
 
     completion = Completion()
     calls: dict[int, ToolCall] = {}
@@ -111,6 +146,10 @@ def stream_chat(
                 raise LLMError(f"Malformed stream chunk: {data[:200]}") from ex
             if chunk.get("error"):
                 raise LLMError(_error_detail(data.encode("utf-8")))
+            usage = chunk.get("usage")
+            if isinstance(usage, dict):
+                completion.usage = {"input": int(usage.get("prompt_tokens") or 0),
+                                    "output": int(usage.get("completion_tokens") or 0)}
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
                 text = delta.get("content")
