@@ -10,12 +10,15 @@ import urllib.request
 
 import bpy
 
-from . import credentials
+from . import account, credentials
 
 PACKAGE = __package__
 
 # (id, label, base URL, default model, note shown under the key field)
 PROVIDERS = (
+    ("LOOPCUT", "Loopcut", account.BASE_URL, "fast",
+     "Sign in with your Loopcut account. Fast and Pro are included in your plan; the Loopcut "
+     "service picks the model behind each and meters usage per 5-hour session and per week."),
     ("META", "Meta", "https://api.meta.ai/v1", "muse-spark-1.3-contributor",
      "On Meta's contributor tier your prompts, scene descriptions and viewport captures may be "
      "used for training. Pick another tier or provider for confidential work."),
@@ -34,9 +37,16 @@ def _changed(self=None, context=None) -> None:
     host.config_changed()
 
 
+def config_changed() -> None:
+    """For other modules that change the connection (account.py after a sign-in)."""
+    _changed()
+
+
 def _provider_changed(self, context) -> None:
     _, _, base_url, model, _ = _BY_ID[self.provider]
-    if self.provider != "CUSTOM":
+    if self.provider == "LOOPCUT":
+        self.base_url, self.model = base_url, self.tier
+    elif self.provider != "CUSTOM":
         self.base_url, self.model = base_url, model
     _models.clear()
     _changed()
@@ -44,6 +54,12 @@ def _provider_changed(self, context) -> None:
 
 def _get_key(self) -> str:
     return credentials.api_key(self.base_url)
+
+
+def _tier_changed(self, context) -> None:
+    if self.provider == "LOOPCUT":
+        self.model = self.tier
+    _changed()
 
 
 def _set_key(self, value: str) -> None:
@@ -61,7 +77,10 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
 
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],
-        default="META", update=_provider_changed)
+        default="LOOPCUT", update=_provider_changed)
+    tier: bpy.props.EnumProperty(
+        name="Model", items=account.MODELS, default="fast", update=_tier_changed,
+        description="Fast answers quickly; Pro thinks longer and uses more of your allowance")
     base_url: bpy.props.StringProperty(
         name="Base URL", default=PROVIDERS[0][2], update=_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
@@ -91,15 +110,19 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         layout.use_property_split = True
         column = layout.column()
         column.prop(self, "provider")
-        if self.provider == "CUSTOM":
-            column.prop(self, "base_url")
-        if not self.base_url.startswith("http://127.0.0.1"):
-            column.prop(self, "api_key")
-        row = column.row(align=True)
-        row.prop(self, "model")
-        row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
-        if _models:
-            row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
+        if self.provider == "LOOPCUT":
+            account.draw(column.column(align=True))
+            column.prop(self, "tier")
+        else:
+            if self.provider == "CUSTOM":
+                column.prop(self, "base_url")
+            if not self.base_url.startswith("http://127.0.0.1"):
+                column.prop(self, "api_key")
+            row = column.row(align=True)
+            row.prop(self, "model")
+            row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
+            if _models:
+                row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
         note = _BY_ID[self.provider][4]
         if note:
             box = layout.box().column(align=True)

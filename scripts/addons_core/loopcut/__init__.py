@@ -16,10 +16,11 @@ bl_info = {
 
 
 def register() -> None:
-    from . import lifecycle, mainthread, settings
+    from . import account, lifecycle, mainthread, settings
     from .ui import host
     settings.register()
     mainthread.register()
+    account.register()
     host.register()
     lifecycle.register()
     if host.NATIVE:  # First run of the Loopcut build; stock Blender keeps its own splash.
@@ -36,9 +37,10 @@ def register() -> None:
 
 
 def unregister() -> None:
-    from . import agent, dev_reload, lifecycle, mainthread, settings
+    from . import account, agent, dev_reload, lifecycle, mainthread, settings
     from .ui import host
     agent.stop()
+    account.unregister()
     if host.NATIVE:
         from . import onboarding
         onboarding.unregister()

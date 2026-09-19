@@ -16,9 +16,11 @@ from pathlib import Path
 
 import bpy
 
-from . import blender_import, config, settings
+from . import account, blender_import, config, settings
 
-_state = {"step": None, "imported": None, "failed": [], "error": ""}
+_state = {"step": None, "imported": None, "failed": [], "error": "", "own_key": False}
+_popups = set()  # Splash regions to repaint while a sign-in is in flight; see _refresh_popups.
+_REFRESH_SECONDS = 0.5
 
 
 def _source():
@@ -54,7 +56,7 @@ def draw_splash(layout, context, first_run: bool) -> bool:
     if step in ("import", "setup"):  # Preferences were just saved or imported.
         step = _state["step"] = _after_setup()
     if step == "connect":
-        _draw_connect(layout)
+        _draw_connect(layout, context)
     elif step == "privacy":
         _draw_privacy(layout)
     else:
@@ -104,28 +106,130 @@ def _draw_import(layout) -> None:
     layout.separator(factor=2.0)
 
 
-def _draw_connect(layout) -> None:
+def _draw_connect(layout, context) -> None:
     prefs = settings.preferences()
-    column = _content(layout, "Connect a Model")
+    if not _state["own_key"]:
+        _draw_sign_in(layout, context)
+        return
+    column = _content(layout, "Use Your Own Key")
     column.use_property_split = True
     column.use_property_decorate = False
     column.prop(prefs, "provider")
-    if prefs.provider == "CUSTOM":
-        column.prop(prefs, "base_url")
-    local = prefs.base_url.startswith("http://127.0.0.1")
-    if not local:
-        column.prop(prefs, "api_key")
-    row = column.row(align=True)
-    row.prop(prefs, "model")
-    row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
-    if settings.has_models():
-        row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
+    if prefs.provider == "LOOPCUT":
+        account.draw(column.column(align=True))
+    else:
+        if prefs.provider == "CUSTOM":
+            column.prop(prefs, "base_url")
+        local = prefs.base_url.startswith("http://127.0.0.1")
+        if not local:
+            column.prop(prefs, "api_key")
+        row = column.row(align=True)
+        row.prop(prefs, "model")
+        row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
+        if settings.has_models():
+            row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
     column.separator(factor=2)
     sub = column.column()
     sub.enabled = _connected()
     _step_button(sub, "Continue", "privacy", save=True)
-    _step_button(column, "Skip for Now", "done", save=True)
+    _link(column, "Back to Loopcut sign-in", "loopcut.onboarding_own_key").enable = False
     layout.separator(factor=2.0)
+
+
+def _centered(layout):
+    row = layout.row()
+    row.alignment = "CENTER"
+    return row
+
+
+def _link(layout, text: str, operator: str):
+    """A quiet, text-only button: the secondary choices under the big one."""
+    row = _centered(layout)
+    row.emboss = "NONE"
+    row.active = False
+    return row.operator(operator, text=text)
+
+
+def _region_exists(region) -> bool:
+    """Popup regions are freed when the popup closes and bpy does not invalidate the handle; the
+    context override is the one safe probe (the same workaround Blender's extension notifier uses)."""
+    try:
+        with bpy.context.temp_override(region=region):
+            return True
+    except TypeError:
+        return False
+
+
+def _refresh_popups():
+    """Timer: a popup only repaints on input, so while the sign-in thread works, repaint it here."""
+    for region in list(_popups):
+        if not _region_exists(region):
+            _popups.discard(region)
+            continue
+        region.tag_redraw()
+        region.tag_refresh_ui()
+    busy = account.status()["status"] in ("starting", "waiting")
+    return _REFRESH_SECONDS if busy and _popups else None
+
+
+def _watch_popup(context) -> None:
+    region = getattr(context, "region_popup", None)
+    if region is not None:
+        _popups.add(region)
+    if not bpy.app.timers.is_registered(_refresh_popups):
+        bpy.app.timers.register(_refresh_popups, first_interval=_REFRESH_SECONDS, persistent=True)
+
+
+def _draw_sign_in(layout, context) -> None:
+    """The Loopcut account step: one big button, the rest out of the way."""
+    state = account.status()
+    if state["status"] in ("starting", "waiting"):
+        _watch_popup(context)
+    layout.separator(factor=1.5)
+    _centered(layout).label(text="Welcome to Loopcut")
+    layout.separator(factor=2.0)
+
+    split = layout.split(factor=0.2)  # The button spans the middle 60 %.
+    split.label()
+    middle = split.split(factor=0.75).column()
+    middle.scale_y = 1.7
+    if state["status"] == "waiting":
+        middle.label(text=f"Approve code {state['user_code']} in your browser", icon="URL")
+        row = middle.row(align=True)
+        row.operator("loopcut.open_sign_in_page", text="Open the Page Again")
+        row.operator("loopcut.copy_sign_in_link", text="Copy Link")
+        sub = middle.row()
+        sub.scale_y = 0.6
+        sub.active = False
+        sub.label(text="Browser did not open? Copy the link and paste it in.")
+    elif state["status"] == "starting":
+        middle.label(text="Contacting Loopcut…", icon="TIME")
+    elif account.signed_in():
+        middle.label(text=f"Signed in as {account.account_line()}", icon="CHECKMARK")
+        _step_button(middle, "Continue", "privacy", save=True)
+    else:
+        middle.operator("loopcut.sign_in", text="Sign in to Loopcut", icon_value=account.mark_icon())
+    if state["status"] == "error" and state["error"]:
+        _centered(layout).label(text=state["error"], icon="ERROR")
+
+    layout.separator(factor=1.5)
+    if state["status"] == "waiting":
+        _link(layout, "Cancel", "loopcut.cancel_sign_in")
+    elif not account.signed_in():
+        props = _link(layout, "I don't want to use AI features yet", "loopcut.onboarding_step")
+        props.step, props.save = "done", True
+        _link(layout, "Use your own API key", "loopcut.onboarding_own_key").enable = True
+    layout.separator(factor=2.0)
+
+
+def _on_signed_in() -> None:
+    """Main thread, from account.py: the account step is done, move on."""
+    if _state["step"] == "connect":
+        _state["step"] = "privacy"
+        try:
+            bpy.ops.wm.save_userpref()
+        except RuntimeError as ex:
+            print(f"Loopcut: could not save preferences after sign-in: {ex}")
 
 
 def _draw_privacy(layout) -> None:
@@ -135,7 +239,8 @@ def _draw_privacy(layout) -> None:
     _notes(column,
            f"Your messages, a description of the scene and viewport captures go to {provider}. "
            "Your .blend files are never uploaded.",
-           settings.provider_note(prefs.provider))
+           "Loopcut passes them to the model provider behind Fast and Pro and keeps only token counts "
+           "for metering, never the content." if prefs.provider == "LOOPCUT" else settings.provider_note(prefs.provider))
     column.separator()
     column.prop(prefs, "auto_run")
     _notes(column, "Off: Loopcut asks before it runs code. Either way, every turn gets a checkpoint you can restore.")
@@ -241,6 +346,27 @@ class LOOPCUT_OT_import_blender_settings(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
+    """Connect a provider of your own instead of a Loopcut account"""
+    bl_idname = "loopcut.onboarding_own_key"
+    bl_label = "Use Your Own Key"
+    bl_options = {"INTERNAL"}
+
+    enable: bpy.props.BoolProperty(default=True)
+
+    def execute(self, context):
+        _state["own_key"] = self.enable
+        prefs = settings.preferences()
+        if prefs is not None:
+            if self.enable and prefs.provider == "LOOPCUT":
+                prefs.provider = "META"
+            elif not self.enable:
+                prefs.provider = "LOOPCUT"
+        if context.region_popup is not None:
+            context.region_popup.tag_refresh_ui()
+        return {"FINISHED"}
+
+
 class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
     bl_idname = "loopcut.onboarding_step"
     bl_label = "Continue"
@@ -258,14 +384,20 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
         return {"FINISHED"}
 
 
-_CLASSES = (LOOPCUT_OT_import_blender_settings, LOOPCUT_OT_onboarding_step)
+_CLASSES = (LOOPCUT_OT_import_blender_settings, LOOPCUT_OT_onboarding_own_key, LOOPCUT_OT_onboarding_step)
 
 
 def register() -> None:
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
+    account.on_signed_in.append(_on_signed_in)
 
 
 def unregister() -> None:
+    if bpy.app.timers.is_registered(_refresh_popups):
+        bpy.app.timers.unregister(_refresh_popups)
+    _popups.clear()
+    if _on_signed_in in account.on_signed_in:
+        account.on_signed_in.remove(_on_signed_in)
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
