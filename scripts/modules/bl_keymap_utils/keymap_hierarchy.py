@@ -178,6 +178,7 @@ _km_hierarchy = [
     ]),
 
     ('Spreadsheet Generic', 'SPREADSHEET', 'WINDOW', []),
+    ('Loopcut', 'LOOPCUT', 'WINDOW', []),
 
     ('Video Sequence Editor', 'SEQUENCE_EDITOR', 'WINDOW', [
         ('Sequencer', 'SEQUENCE_EDITOR', 'WINDOW', [

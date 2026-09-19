@@ -84,6 +84,7 @@
 #include "wm.hh"
 #include "wm_event_system.hh"
 #include "wm_event_types.hh"
+#include "wm_files.hh"
 #include "wm_surface.hh"
 #include "wm_window.hh"
 #include "wm_window_private.hh"
@@ -635,7 +636,7 @@ void wm_event_do_notifiers(bContext *C)
 
       if (note->category == NC_WM) {
         if (ELEM(note->data, ND_FILEREAD, ND_FILESAVE)) {
-          wm->file_saved = 1;
+          wm->file_saved = (note->data == ND_FILEREAD && wm_file_read_leaves_unsaved()) ? 0 : 1;
           WM_window_title_refresh(wm, &win);
         }
         else if (note->data == ND_DATACHANGED) {

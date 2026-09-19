@@ -28,9 +28,10 @@ static const char *GetApplicationSupportDir(const char *versionstr,
     }
     NSString *basePath = [paths objectAtIndex:0];
 
+    /* Loopcut: own folder, so stock Blender's preferences are never written to. */
     snprintf(tempPath,
              len_tempPath,
-             "%s/Blender/%s",
+             "%s/Loopcut/%s",
              [basePath cStringUsingEncoding:NSASCIIStringEncoding],
              versionstr);
   }

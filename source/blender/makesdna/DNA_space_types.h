@@ -1275,6 +1275,20 @@ struct SpaceSpreadsheet {
   ed::spreadsheet::SpaceSpreadsheet_Runtime *runtime = nullptr;
 };
 
+/**
+ * Loopcut: the AI agent panel. The editor is a shell: everything in it is drawn and handled by
+ * the bundled `loopcut` Python add-on, so there is no state to store here.
+ */
+struct SpaceLoopcut {
+  SpaceLink *next = nullptr, *prev = nullptr;
+  /** Storage of regions for inactive spaces. */
+  ListBaseT<ARegion> regionbase = {nullptr, nullptr};
+  char spacetype = 0;
+  eSpace_Link_Flag link_flag = {};
+  char _pad0[6] = {};
+  /* End 'SpaceLink' header. */
+};
+
 struct SpreadsheetRowFilter {
   struct SpreadsheetRowFilter *next = nullptr, *prev = nullptr;
 

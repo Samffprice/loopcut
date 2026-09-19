@@ -114,6 +114,11 @@ const EnumPropertyItem rna_enum_space_type_items[] = {
      "Video Sequencer",
      "Non-linear editor for arranging and mixing scenes, video, audio, and effects"},
     {SPACE_CLIP, "CLIP_EDITOR", ICON_TRACKER, "Movie Clip Editor", "Motion tracking tools"},
+    {SPACE_LOOPCUT,
+     "LOOPCUT",
+     ICON_SCRIPTPLUGINS,
+     "Loopcut",
+     "Chat with the AI agent that works in this scene"},
 
     /* Animation. */
     RNA_ENUM_ITEM_HEADING(N_("Animation"), nullptr),
@@ -793,6 +798,8 @@ static StructRNA *rna_Space_refine(PointerRNA *ptr)
       return RNA_SpaceClipEditor;
     case SPACE_SPREADSHEET:
       return RNA_SpaceSpreadsheet;
+    case SPACE_LOOPCUT:
+      return RNA_SpaceLoopcut;
 
       /* Currently no type info. */
     case SPACE_SCRIPT:
@@ -9422,6 +9429,13 @@ static void rna_def_viewer_path(BlenderRNA *brna)
   RNA_def_property_ui_text(prop, "Viewer Path", nullptr);
 }
 
+static void rna_def_space_loopcut(BlenderRNA *brna)
+{
+  StructRNA *srna = RNA_def_struct(brna, "SpaceLoopcut", "Space");
+  RNA_def_struct_sdna(srna, "SpaceLoopcut");
+  RNA_def_struct_ui_text(srna, "Space Loopcut", "Loopcut agent panel space data");
+}
+
 static void rna_def_space_spreadsheet(BlenderRNA *brna)
 {
   PropertyRNA *prop;
@@ -9548,6 +9562,7 @@ void RNA_def_space(BlenderRNA *brna)
   rna_def_space_node(brna);
   rna_def_space_clip(brna);
   rna_def_space_spreadsheet(brna);
+  rna_def_space_loopcut(brna);
 }
 
 }  // namespace blender

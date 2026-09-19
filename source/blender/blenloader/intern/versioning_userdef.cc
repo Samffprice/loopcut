@@ -1804,6 +1804,11 @@ void blo_do_versions_userdef(UserDef *userdef)
    * \note Keep this message at the bottom of the function.
    */
 
+  /* Loopcut: preferences carried over from stock Blender do not list the bundled add-on, and
+   * without it the Loopcut editor is empty. Not version-gated so the fork needs no subversion of
+   * its own, which keeps rebasing onto new releases free of conflicts here. */
+  BKE_addon_ensure(&userdef->addons, "loopcut");
+
   for (bTheme &btheme : userdef->themes) {
     do_versions_theme(userdef, &btheme);
   }

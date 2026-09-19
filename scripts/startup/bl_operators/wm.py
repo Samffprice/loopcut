@@ -3359,11 +3359,22 @@ class WM_OT_batch_rename(Operator):
         return wm.invoke_props_dialog(self, width=400)
 
 
+def _loopcut_onboarding_draw(layout, context, *, first_run):
+    # Loopcut: the bundled add-on draws the first-run steps (`loopcut/onboarding.py`).
+    # True when it drew in place of the calling menu.
+    import sys
+    onboarding = sys.modules.get("loopcut.onboarding")
+    return onboarding is not None and onboarding.draw_splash(layout, context, first_run)
+
+
 class WM_MT_splash_quick_setup(Menu):
     bl_label = "Quick Setup"
 
     def draw(self, context):
         layout = self.layout
+
+        if _loopcut_onboarding_draw(layout, context, first_run=True):
+            return
 
         wm = context.window_manager
         prefs = context.preferences
@@ -3447,6 +3458,9 @@ class WM_MT_splash(Menu):
 
     def draw(self, context):
         layout = self.layout
+
+        if _loopcut_onboarding_draw(layout, context, first_run=False):
+            return
         layout.operator_context = 'EXEC_DEFAULT'
         layout.emboss = 'PULLDOWN_MENU'
 

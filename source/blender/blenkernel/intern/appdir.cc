@@ -216,18 +216,13 @@ void BKE_appdir_folder_caches(char *path, const size_t path_maxncpy)
     return;
   }
 
+  /* Loopcut: own cache folder, matching the user folder in GHOST_SystemPaths*. */
 #ifdef WIN32
-  BLI_path_join(path,
-                path_maxncpy,
-                caches_root_path->c_str(),
-                "Blender Foundation",
-                "Blender",
-                "Cache",
-                SEP_STR);
+  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Loopcut", "Cache", SEP_STR);
 #elif defined(__APPLE__)
-  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Blender", SEP_STR);
+  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Loopcut", SEP_STR);
 #else /* __linux__ */
-  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "blender", SEP_STR);
+  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "loopcut", SEP_STR);
 #endif
 }
 

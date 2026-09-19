@@ -84,6 +84,7 @@
 #include "BKE_lib_override.hh"
 #include "BKE_lib_remap.hh"
 #include "BKE_library.hh"
+#include "BKE_bpath.hh"
 #include "BKE_main.hh"
 #include "BKE_main_namemap.hh"
 #include "BKE_node.hh"
@@ -181,6 +182,17 @@ static CLG_LogRef LOG = {"blend"};
 /* -------------------------------------------------------------------- */
 /** \name Misc Utility Functions
  * \{ */
+
+/**
+ * Loopcut: set while the scene on screen came from restoring a snapshot in place, which is the
+ * one kind of file read that leaves unsaved changes behind. See #wm_file_read_leaves_unsaved.
+ */
+static bool g_loopcut_restored_in_place = false;
+
+bool wm_file_read_leaves_unsaved()
+{
+  return g_loopcut_restored_in_place;
+}
 
 void WM_file_tag_modified()
 {
@@ -1037,6 +1049,7 @@ bool WM_file_read(bContext *C,
   wm_read_callback_pre_wrapper(C, filepath);
 
   Main *bmain = CTX_data_main(C);
+  g_loopcut_restored_in_place = false;
 
   /* So we can get the error message. */
   errno = 0;
@@ -1189,6 +1202,7 @@ void wm_homefile_read_ex(bContext *C,
                          ReportList *reports,
                          wmFileReadPost_Params **r_params_file_read_post)
 {
+  g_loopcut_restored_in_place = false;
   /* NOTE: unlike #WM_file_read, don't set the wait cursor when reading the home-file.
    * While technically both are reading a file and could use the wait cursor,
    * avoid doing so for the following reasons.
@@ -3634,6 +3648,125 @@ void WM_OT_recover_auto_save(wmOperatorType *ot)
                                  FILE_SORT_TIME);
 
   wm_open_mainfile_def_property_use_scripts(ot);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Loopcut Snapshot Operators
+ *
+ * Checkpoints for the Loopcut agent, built on the auto-save machinery: a snapshot is a recovery
+ * file, which records the path of the file it was taken from and keeps relative paths as they
+ * are. Restoring one therefore puts the scene back *in place*: the open file keeps its path, is
+ * marked as having unsaved changes, and nothing on disk is written. Unlike "Save Copy" neither
+ * operator runs save handlers, touches the recent-files list or the auto-save timer.
+ * \{ */
+
+static wmOperatorStatus wm_loopcut_snapshot_write_exec(bContext *C, wmOperator *op)
+{
+  Main *bmain = CTX_data_main(C);
+  char filepath[FILE_MAX];
+  RNA_string_get(op->ptr, "filepath", filepath);
+  if (filepath[0] == '\0') {
+    BKE_report(op->reports, RPT_ERROR, "No file path given");
+    return OPERATOR_CANCELLED;
+  }
+  BLI_path_canonicalize_native(filepath, sizeof(filepath));
+
+  /* Same preparation as #WM_autosave_write: edit-mode data and painted images are in the file. */
+  ED_editors_flush_edits(bmain);
+  ED_image_internal_autosave_flush(bmain);
+
+  const int fileflags = G.fileflags | G_FILE_RECOVER_WRITE | G_FILE_COMPRESS;
+  BlendFileWriteParams params{};
+  if (!BLO_write_file(bmain, filepath, fileflags, &params, op->reports)) {
+    return OPERATOR_CANCELLED;
+  }
+  return OPERATOR_FINISHED;
+}
+
+void WM_OT_loopcut_snapshot_write(wmOperatorType *ot)
+{
+  ot->name = "Write Loopcut Snapshot";
+  ot->idname = "WM_OT_loopcut_snapshot_write";
+  ot->description = "Write the current state to a snapshot file, leaving the open file as it is";
+
+  ot->exec = wm_loopcut_snapshot_write_exec;
+  ot->flag = OPTYPE_INTERNAL;
+
+  RNA_def_string_file_path(
+      ot->srna, "filepath", nullptr, FILE_MAX, "File Path", "Snapshot file to write");
+}
+
+static wmOperatorStatus wm_loopcut_snapshot_restore_exec(bContext *C, wmOperator *op)
+{
+  char filepath[FILE_MAX];
+  RNA_string_get(op->ptr, "filepath", filepath);
+  BLI_path_canonicalize_native(filepath, sizeof(filepath));
+
+  /* "In place" means the file that is open stays the open file, even if it was saved under a
+   * new name after the snapshot was taken. */
+  char filepath_open[FILE_MAX];
+  STRNCPY(filepath_open, BKE_main_blendfile_path(CTX_data_main(C)));
+
+  /* The scene being replaced ran scripts or did not; the snapshot of it is no different. */
+  const bool use_scripts_autoexec_check = false;
+
+  G.fileflags |= G_FILE_RECOVER_READ;
+  const bool success = wm_file_read_opwrap(C, filepath, use_scripts_autoexec_check, op->reports);
+  G.fileflags &= ~G_FILE_RECOVER_READ;
+  if (!success) {
+    return OPERATOR_CANCELLED;
+  }
+
+  Main *bmain = CTX_data_main(C);
+  const bool recorded_path = BLI_path_cmp(bmain->filepath, filepath) != 0;
+  if (!recorded_path) {
+    /* Taken from a scene that was never saved, so there was no path to record. The snapshot
+     * store must never become the open file or a recent file. */
+    bmain->filepath[0] = '\0';
+    if (RecentFile *recent = wm_file_history_find(filepath)) {
+      wm_history_file_free(recent);
+      wm_history_file_write();
+    }
+  }
+  if (filepath_open[0] != '\0' && BLI_path_cmp(bmain->filepath, filepath_open) != 0) {
+    if (recorded_path) {
+      char dir_src[FILE_MAX], dir_dst[FILE_MAX];
+      BLI_path_split_dir_part(bmain->filepath, dir_src, sizeof(dir_src));
+      BLI_path_split_dir_part(filepath_open, dir_dst, sizeof(dir_dst));
+      if (BLI_path_cmp(dir_src, dir_dst) != 0) {
+        BKE_bpath_relative_rebase(bmain, dir_src, dir_dst, op->reports);
+      }
+    }
+    STRNCPY(bmain->filepath, filepath_open);
+  }
+  STRNCPY(G.filepath_last_blend, bmain->filepath);
+  /* Not a crash recovery, just a file with changes that are not on disk. The file-read notifier
+   * that is still queued would mark it saved again, hence the flag. */
+  bmain->recovered = false;
+  g_loopcut_restored_in_place = true;
+  WM_file_tag_modified();
+  /* The context's window does not survive a file read; go by the window manager. */
+  wmWindowManager *wm = static_cast<wmWindowManager *>(bmain->wm.first);
+  for (wmWindow &win : wm->windows) {
+    WM_window_title_refresh(wm, &win);
+  }
+  return OPERATOR_FINISHED;
+}
+
+void WM_OT_loopcut_snapshot_restore(wmOperatorType *ot)
+{
+  ot->name = "Restore Loopcut Snapshot";
+  ot->idname = "WM_OT_loopcut_snapshot_restore";
+  ot->description =
+      "Replace the scene with a snapshot, keeping the open file's path and leaving it unsaved";
+
+  ot->exec = wm_loopcut_snapshot_restore_exec;
+  ot->flag = OPTYPE_INTERNAL;
+
+  RNA_def_string_file_path(
+      ot->srna, "filepath", nullptr, FILE_MAX, "File Path", "Snapshot file to restore");
 }
 
 /** \} */

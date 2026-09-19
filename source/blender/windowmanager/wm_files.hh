@@ -120,6 +120,10 @@ void WM_OT_open_mainfile(wmOperatorType *ot);
 void WM_OT_revert_mainfile(wmOperatorType *ot);
 void WM_OT_recover_last_session(wmOperatorType *ot);
 void WM_OT_recover_auto_save(wmOperatorType *ot);
+/** True after a Loopcut snapshot was restored in place, until the next file is read. */
+bool wm_file_read_leaves_unsaved();
+void WM_OT_loopcut_snapshot_write(wmOperatorType *ot);
+void WM_OT_loopcut_snapshot_restore(wmOperatorType *ot);
 
 void WM_OT_save_as_mainfile(wmOperatorType *ot);
 void WM_OT_save_mainfile(wmOperatorType *ot);

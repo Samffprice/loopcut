@@ -482,6 +482,23 @@ if(WITH_PYTHON)
     PATTERN "addons_core/bl_pkg/example_extension" EXCLUDE
   )
 
+  # Loopcut: bundle the add-on that fills the Loopcut editor. It is developed outside this
+  # repository (hot-reloaded from its checkout), so it is copied in at install time.
+  set(LOOPCUT_EXTENSION_DIR "${CMAKE_SOURCE_DIR}/../extension/loopcut" CACHE PATH
+    "The `loopcut` Python package to bundle as a core add-on"
+  )
+  if(NOT EXISTS "${LOOPCUT_EXTENSION_DIR}/__init__.py")
+    message(FATAL_ERROR
+      "LOOPCUT_EXTENSION_DIR (${LOOPCUT_EXTENSION_DIR}) is not the loopcut Python package"
+    )
+  endif()
+  install(
+    DIRECTORY ${LOOPCUT_EXTENSION_DIR}/
+    DESTINATION ${TARGETDIR_VER}/scripts/addons_core/loopcut
+    PATTERN "__pycache__" EXCLUDE
+    PATTERN ".env*" EXCLUDE
+  )
+
   if(WITH_PYTHON_MODULE)
     install(
       FILES ${CMAKE_SOURCE_DIR}/scripts/site/sitecustomize.py

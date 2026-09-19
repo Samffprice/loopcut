@@ -4254,6 +4254,8 @@ void wm_operatortypes_register()
   WM_operatortype_append(WM_OT_lib_reload);
   WM_operatortype_append(WM_OT_recover_last_session);
   WM_operatortype_append(WM_OT_recover_auto_save);
+  WM_operatortype_append(WM_OT_loopcut_snapshot_write);
+  WM_operatortype_append(WM_OT_loopcut_snapshot_restore);
   WM_operatortype_append(WM_OT_save_as_mainfile);
   WM_operatortype_append(WM_OT_save_mainfile);
   WM_operatortype_append(WM_OT_clear_recent_files);
