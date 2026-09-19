@@ -1,0 +1,15 @@
+{
+  "items": [
+    {"kind": "user", "text": "Build a wooden dining table with four legs.", "checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"kind": "tool", "name": "run_python", "summary": "Build table top and legs", "code": "", "status": "done", "output": "OK"},
+    {"kind": "assistant", "streaming": false, "text": "Built the table: 1.6 x 0.9 m top at 0.75 m, four legs."},
+    {"kind": "user", "text": "Add two chairs tucked in on opposite sides, darker wood.", "checkpoint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {"kind": "tool", "name": "run_python", "summary": "Build two dark wood chairs", "code": "", "status": "done", "output": "OK"},
+    {"kind": "assistant", "streaming": false, "text": "Added both chairs with seats, legs and slatted backrests."},
+    {"kind": "notice", "text": "Restored. You are now working in kitchen.restored-20260918-140535.blend; your original file was not changed.", "action_label": "Undo restore", "checkpoint": "cccccccccccccccccccccccccccccccc"}
+  ],
+  "confirm_restore": 3,
+  "input": "",
+  "focused": false,
+  "busy": false
+}

@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "loopcut"
+version = "0.1.0"
+name = "Loopcut"
+tagline = "An AI agent that works inside Blender"
+maintainer = "Loopcut"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Talks to the configured LLM API"
+files = "Reads its .env config and writes viewport captures to a temp folder"

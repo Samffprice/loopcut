@@ -1,0 +1,34 @@
+{
+ "items": [
+  {
+   "kind": "user",
+   "text": "Add two chairs tucked in on opposite sides."
+  }
+ ],
+ "input": "",
+ "focused": false,
+ "busy": false,
+ "ui": {
+  "view": "history",
+  "history": [
+   {
+    "id": "CURRENT",
+    "title": "Add two chairs tucked in on opposite sides, darker wood for the seats",
+    "turns": 4,
+    "updated": 1789758987.458965
+   },
+   {
+    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "title": "Build a wooden dining table with four legs",
+    "turns": 7,
+    "updated": 1789748207.458965
+   },
+   {
+    "id": "cccccccccccccccccccccccccccccccc",
+    "title": "",
+    "turns": 1,
+    "updated": 1789327007.458965
+   }
+  ]
+ }
+}

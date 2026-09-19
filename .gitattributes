@@ -110,3 +110,11 @@
 *.rgb filter=lfs diff=lfs merge=lfs -text
 *.btx filter=lfs diff=lfs merge=lfs -text
 scripts/modules/_bpy_internal/assets/remote_library/*_openapi.py linguist-generated=true
+
+# Loopcut: its brand files are small and are ours, so they are stored in Git itself. The LFS
+# files above are fetched from projects.blender.org (this repository is hosted elsewhere and
+# carries no LFS objects of its own), which does not have them.
+/release/loopcut/** !filter !diff !merge binary
+/release/loopcut/*.py !filter diff merge text
+/release/loopcut/*.svg !filter diff merge text
+/release/loopcut/*.md !filter diff merge text

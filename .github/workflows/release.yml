@@ -1,0 +1,157 @@
+# Builds the Loopcut build of Blender on GitHub's runners, for the platforms that cannot be built
+# at home: Windows by default (the Mac build comes from scripts/release_mac.sh). Only ever started
+# by hand, from the Actions tab or `gh workflow run release.yml -f release_tag=v0.1.0`. With a
+# release tag the installers are added to that release (created as a draft if it does not exist);
+# without one they are only kept as workflow artifacts.
+#
+# The fork is not in this repository. CI checks out upstream Blender at the tag in patches/BASE
+# and applies patches/blender.patch (written by scripts/make_patch.sh).
+#
+# A full build takes hours on a hosted runner. In a private repository macOS minutes are billed
+# at 10x and Windows at 2x; in a public one standard runners are free.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: What to build
+        type: choice
+        options: [windows-x64, macos-arm64, both]
+        default: windows-x64
+      release_tag:
+        description: Release to add the installers to, like v0.1.0 (empty keeps them as artifacts only)
+        type: string
+        default: ""
+
+env:
+  # Goes into file names and shell commands, so it is passed as data and checked, never pasted into a script.
+  RELEASE_TAG: ${{ inputs.release_tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON(
+            inputs.platforms == 'both' && '[{"name":"macos-arm64","os":"macos-14","lib":"macos_arm64"},{"name":"windows-x64","os":"windows-2022","lib":"windows_x64"}]'
+            || inputs.platforms == 'macos-arm64' && '[{"name":"macos-arm64","os":"macos-14","lib":"macos_arm64"}]'
+            || '[{"name":"windows-x64","os":"windows-2022","lib":"windows_x64"}]') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: loopcut
+
+      - name: Read the Blender base tag and name the package
+        run: |
+          if [ -n "$RELEASE_TAG" ] && ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9A-Za-z._-]+$'; then
+            echo "release_tag must look like v0.1.0, got: $RELEASE_TAG" >&2; exit 1
+          fi
+          echo "BLENDER_TAG=$(cat loopcut/patches/BASE)" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=loopcut-${RELEASE_TAG:-dev-$GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      # From projects.blender.org, not the GitHub mirror: only it serves the repository's LFS files.
+      # At loopcut/blender so the build finds the add-on at ../extension/loopcut, as it does locally.
+      - name: Check out Blender and apply the Loopcut patch
+        run: |
+          git lfs install
+          git clone --depth 1 --branch "$BLENDER_TAG" https://projects.blender.org/blender/blender.git loopcut/blender
+          git -C loopcut/blender apply --index ../patches/blender.patch
+
+      - name: Restore precompiled libraries
+        id: libs
+        uses: actions/cache@v4
+        with:
+          path: loopcut/blender/lib/${{ matrix.lib }}
+          key: blender-libs-${{ matrix.lib }}-${{ env.BLENDER_TAG }}
+
+      - name: Fetch precompiled libraries
+        if: steps.libs.outputs.cache-hit != 'true'
+        working-directory: loopcut/blender
+        run: python3 build_files/utils/make_update.py --no-blender
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # Release configuration, minus what a hosted runner cannot build: the CUDA, OptiX, HIP and
+      # oneAPI kernels need their vendor SDKs. Cycles still renders on the CPU, and on Metal on a Mac.
+      # The -D options come after -C on purpose: the release configuration force-sets the ones it names.
+      - name: Configure and build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S loopcut/blender -B build -G Ninja \
+            -C loopcut/blender/build_files/cmake/config/blender_release.cmake \
+            -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF \
+            -DCPACK_OVERRIDE_PACKAGENAME="$PACKAGE_NAME"
+          ninja -C build install
+          cd build && cpack -G DragNDrop
+
+      - name: Configure and build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S loopcut/blender -B build -G Ninja ^
+            -C loopcut/blender/build_files/cmake/config/blender_release.cmake ^
+            -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF ^
+            -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_DEVICE_OPTIX=OFF ^
+            -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_DEVICE_HIPRT=OFF ^
+            -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF ^
+            -DCPACK_OVERRIDE_PACKAGENAME=%PACKAGE_NAME% || exit /b 1
+          ninja -C build install || exit /b 1
+          cd build
+          cpack -G ZIP || exit /b 1
+          rem The .msi installer needs the WiX toolset; the .zip above is the release if it is missing.
+          cpack -G WIX || echo WiX packaging failed, shipping the zip only
+
+      - name: Smoke test the build
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Loopcut.app/Contents/MacOS/Loopcut; else blender=build/bin/blender.exe; fi
+          "$blender" -b --factory-startup --python-expr "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loopcut-${{ matrix.name }}
+          path: |
+            build/loopcut-*.dmg
+            build/loopcut-*.zip
+            build/loopcut-*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Add to the release
+    if: inputs.release_tag != ''
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # A new release starts as a draft: nothing is public until you press Publish on its page.
+      - name: Upload to the release, creating a draft if there is none
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "Loopcut $RELEASE_TAG"
+          gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
