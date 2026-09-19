@@ -164,6 +164,12 @@ if(WIN32 AND NOT UNIX)
     -DBLEN_VER_RC_4=0
   )
 
+  # Loopcut: winblender.rc names loopcut.ico, and the resource compiler looks next to the .rc file.
+  configure_file(
+    ${LOOPCUT_BRANDING_DIR}/loopcut.ico
+    ${CMAKE_SOURCE_DIR}/release/windows/icons/loopcut.ico
+    COPYONLY
+  )
   list(APPEND SRC
     ${CMAKE_SOURCE_DIR}/release/windows/icons/winblender.rc
   )
@@ -434,9 +440,9 @@ elseif(APPLE)
       set(TARGETDIR_LIB ${PYTHON_SITE_PACKAGES}/bpy/lib)
     endif()
   else()
-    set(TARGETDIR_VER "Blender.app/Contents/Resources/${BLENDER_VERSION}")
-    set(TARGETDIR_LIB "Blender.app/Contents/Resources/lib")
-    set(TARGETDIR_TEXT "Blender.app/Contents/Resources/text")
+    set(TARGETDIR_VER "Loopcut.app/Contents/Resources/${BLENDER_VERSION}")
+    set(TARGETDIR_LIB "Loopcut.app/Contents/Resources/lib")
+    set(TARGETDIR_TEXT "Loopcut.app/Contents/Resources/text")
   endif()
   set(TARGETDIR_SITE_PACKAGES "${TARGETDIR_VER}/python/lib/python${PYTHON_VERSION}/site-packages")
   # Skip re-linking on CPACK / install.
@@ -1713,8 +1719,8 @@ elseif(WIN32)
   endif()
 elseif(APPLE)
   if(NOT WITH_PYTHON_MODULE)
-    # Uppercase name for app bundle.
-    set_target_properties(blender PROPERTIES OUTPUT_NAME Blender)
+    # Loopcut: the bundle and its executable carry the product's name (upstream: Blender).
+    set_target_properties(blender PROPERTIES OUTPUT_NAME Loopcut)
   endif()
 
   set(OSX_APP_SOURCEDIR ${CMAKE_SOURCE_DIR}/release/darwin/Blender.app)
@@ -1758,11 +1764,11 @@ elseif(APPLE)
   # Give the bundle actual creation/modification date.
   #
   # Note that the directory might not yet exist, which happens when CMAKE is first run.
-  if(NOT EXISTS ${EXECUTABLE_OUTPUT_PATH}/Blender.app)
-    file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/Blender.app)
+  if(NOT EXISTS ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app)
+    file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app)
   endif()
   execute_process(
-    COMMAND SetFile -d ${SETFILE_DATE} -m ${SETFILE_DATE} ${EXECUTABLE_OUTPUT_PATH}/Blender.app
+    COMMAND SetFile -d ${SETFILE_DATE} -m ${SETFILE_DATE} ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app
   )
 
   set(BLENDER_BIN "bin/blender")
@@ -1773,18 +1779,24 @@ elseif(APPLE)
 
   install(
     FILES ${OSX_APP_SOURCEDIR}/Contents/PkgInfo
-    DESTINATION "Blender.app/Contents"
+    DESTINATION "Loopcut.app/Contents"
   )
 
   install_dir(
     ${OSX_APP_SOURCEDIR}/Contents/Resources
-    "Blender.app/Contents"
+    "Loopcut.app/Contents"
+  )
+
+  # Loopcut: the app icon is made in the Loopcut repository (branding/make_assets.py).
+  install(
+    FILES ${LOOPCUT_BRANDING_DIR}/loopcut.icns
+    DESTINATION "Loopcut.app/Contents/Resources"
   )
 
   if(WITH_BLENDER_THUMBNAILER)
     install(
       TARGETS blender-thumbnailer
-      DESTINATION "./Blender.app/Contents/PlugIns"
+      DESTINATION "./Loopcut.app/Contents/PlugIns"
     )
   endif()
 
@@ -1843,7 +1855,7 @@ elseif(APPLE)
     unset(PYTHON_EXECUTABLE_NAME_ONLY)
     install(
       PROGRAMS ${CMAKE_BINARY_DIR}/release/darwin/scripts/blender-system-info.sh
-      DESTINATION "Blender.app/Contents/Resources"
+      DESTINATION "Loopcut.app/Contents/Resources"
     )
   endif()
 

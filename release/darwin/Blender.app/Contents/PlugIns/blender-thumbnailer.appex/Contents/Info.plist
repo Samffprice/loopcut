@@ -11,7 +11,7 @@
 		<key>CFBundleExecutable</key>
 		<string>blender-thumbnailer</string>
 		<key>CFBundleIdentifier</key>
-		<string>org.blenderfoundation.blender.thumbnailer</string>
+		<string>io.github.samffprice.loopcut.thumbnailer</string>
 		<key>CFBundleInfoDictionaryVersion</key>
 		<string>6.0</string>
 		<key>CFBundlePackageType</key>

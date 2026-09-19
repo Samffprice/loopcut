@@ -32,21 +32,19 @@
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>Blender</string>
+	<string>Loopcut</string>
 	<key>CFBundleGetInfoString</key>
-	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Blender Foundation</string>
+	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Loopcut, based on Blender</string>
 	<!-- Legacy, non-Liquid Glass icon, used on pre-Tahoe / 26 macOS versions. -->
 	<key>CFBundleIconFile</key>
-	<string>blender_icon_legacy.icns</string>
-	<!-- Modern Liquid Glass icon, the app bundle Asset.car file needs to be regenerated in Xcode on modification -->
-	<key>CFBundleIconName</key>
-	<string>blender_liquid_glass</string>
+	<string>loopcut.icns</string>
+	<!-- Loopcut: no CFBundleIconName. It would select Blender's Liquid Glass icon from Assets.car on macOS 26. -->
 	<key>CFBundleIdentifier</key>
-	<string>org.blenderfoundation.blender</string>
+	<string>io.github.samffprice.loopcut</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Blender</string>
+	<string>Loopcut</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

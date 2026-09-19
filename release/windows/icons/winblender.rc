@@ -9,7 +9,7 @@
 	#define BLEN_VER_RC_STR STRINGIFY(BLEN_VER_RC_STR_M)
 #endif
 
-APPICON ICON DISCARDABLE "winblender.ico"
+APPICON ICON DISCARDABLE "loopcut.ico"
 BLENDERFILE ICON DISCARDABLE "winblenderfile.ico"
 
 IDR_VERSION1 VERSIONINFO
@@ -25,10 +25,10 @@ BEGIN
       VALUE "FileVersion", BLEN_VER_RC_STR
       VALUE "ProductVersion", BLEN_VER_RC_STR
       VALUE "CompanyName", "Blender Foundation"
-      VALUE "FileDescription", "Blender"
+      VALUE "FileDescription", "Loopcut"
       VALUE "LegalCopyright", "GPLv3 (Blender Foundation)"
       VALUE "OriginalFilename", "blender.exe"
-      VALUE "ProductName", "Blender"
+      VALUE "ProductName", "Loopcut"
     END
   END
   BLOCK "VarFileInfo"

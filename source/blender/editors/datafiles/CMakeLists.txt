@@ -1073,7 +1073,18 @@ if(WITH_BLENDER)
     data_to_c_simple(../../../../release/datafiles/preview_grease_pencil.blend SRC)
 
     # Images.
-    data_to_c_simple(../../../../release/datafiles/splash.png SRC)
+    # Loopcut: its own splash, from the Loopcut repository (upstream: release/datafiles/splash.png).
+    # Not `data_to_c_simple`, which only takes paths inside this source tree.
+    set(_loopcut_splash_c ${CMAKE_CURRENT_BINARY_DIR}/loopcut/splash.png.c)
+    add_custom_command(
+      OUTPUT ${_loopcut_splash_c}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/loopcut
+      COMMAND "$<TARGET_FILE:datatoc>" ${LOOPCUT_BRANDING_DIR}/splash.png ${_loopcut_splash_c}
+      DEPENDS ${LOOPCUT_BRANDING_DIR}/splash.png datatoc
+    )
+    set_source_files_properties(${_loopcut_splash_c} PROPERTIES GENERATED TRUE)
+    list(APPEND SRC ${_loopcut_splash_c})
+    unset(_loopcut_splash_c)
 
     unset(SVG_CONTENTS_H)
     unset(SVG_CONTENTS_C)
