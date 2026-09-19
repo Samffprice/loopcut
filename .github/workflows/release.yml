@@ -101,8 +101,8 @@ jobs:
             { echo "No pinned checksum for $name: update loopcut/official-builds.sha256" >&2; exit 1; }
           curl -fL --retry 3 -o "$name" "https://download.blender.org/release/Blender${version%.*}/$name"
           sha256sum -c pinned.sha256
-          mkdir kernels
-          unzip -q -j "$name" "*/scripts/addons_core/cycles/lib/*.zst" -d kernels
+          # Python, not unzip: its wildcards differ between the runners' unzip builds.
+          python3 blender/loopcut/scripts/extract_kernels.py "$name" kernels
           test "$(ls kernels | wc -l)" -ge 20
           mkdir -p blender/scripts/addons_core/cycles/lib
           mv kernels/* blender/scripts/addons_core/cycles/lib/
@@ -156,8 +156,14 @@ jobs:
           rem The .msi installer needs the WiX toolset; the .zip above is the release if it is missing.
           cpack -G WIX || echo WiX packaging failed, shipping the zip only
 
+      # The kernel step above may fail without failing the run; say so where it cannot be missed.
       - name: Smoke test the build
         run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            kernels=$(ls build/bin/*/scripts/addons_core/cycles/lib/*.zst 2>/dev/null | wc -l)
+            echo "GPU kernel files in the build: $kernels" | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$kernels" -ge 20 ] || echo "::warning title=No GPU kernels::Cycles will render on the CPU only in this Windows build. See the 'GPU kernels' step."
+          fi
           if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Loopcut.app/Contents/MacOS/Loopcut; else blender=build/bin/blender.exe; fi
           "$blender" -b --factory-startup --python-expr "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 
