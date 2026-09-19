@@ -1,9 +1,9 @@
 #!/bin/sh
 # First-run onboarding of the Loopcut build, in a throwaway home folder. See harness/onboarding_check.py.
-#   LOOPCUT_BLENDER=build/lite/bin/Blender.app/Contents/MacOS/Blender scripts/onboarding_check.sh
+#   LOOPCUT_BLENDER=build/lite/bin/Loopcut.app/Contents/MacOS/Loopcut scripts/onboarding_check.sh
 set -eu
 root="$(cd "$(dirname "$0")/.." && pwd)"
-loopcut="${LOOPCUT_BLENDER:-$root/build/lite/bin/Blender.app/Contents/MacOS/Blender}"
+loopcut="${LOOPCUT_BLENDER:-$root/build/lite/bin/Loopcut.app/Contents/MacOS/Loopcut}"
 stock="${LOOPCUT_STOCK_BLENDER:-$root/tools/Blender.app/Contents/MacOS/Blender}"
 home="$(mktemp -d)"
 trap 'rm -rf "$home"' EXIT

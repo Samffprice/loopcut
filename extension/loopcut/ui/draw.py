@@ -83,6 +83,24 @@ def measure(font: str, size: int, text: str) -> float:
     return width
 
 
+def _mark_texture(size: int):
+    """The Loopcut mark at exactly this many pixels, antialiased by brand.square rather than by the GPU."""
+    key = ("mark", size)
+    if key not in _cache:
+        from . import brand
+        pixels = brand.square(size, margin=0.0)[::-1]  # Textures start at the bottom row.
+        pixels[..., :3] *= pixels[..., 3:]  # Premultiplied, which is what the image shader blends.
+        buffer = gpu.types.Buffer("FLOAT", size * size * 4, pixels.astype("float32").ravel())
+        _cache[key] = gpu.types.GPUTexture((size, size), format="RGBA8", data=buffer)
+    return _cache[key]
+
+
+def _draw_mark(prim: dict, height: int) -> None:
+    from gpu_extras.presets import draw_texture_2d
+    gpu.state.blend_set("ALPHA_PREMULT")
+    draw_texture_2d(_mark_texture(prim["w"]), (prim["x"], height - prim["y"] - prim["h"]), prim["w"], prim["h"])
+
+
 def render(display: dict) -> None:
     height = display["height"]
     shader, batch = _rect_shader()
@@ -98,6 +116,8 @@ def render(display: dict) -> None:
             shader.uniform_float("border_color", prim["border_color"])
             shader.uniform_float("shape", (prim["radius"], prim["border"], 0.0, 0.0))
             batch.draw(shader)
+        elif prim["t"] == "mark":
+            _draw_mark(prim, height)
         else:
             fid, size = font_id(prim["font"]), prim["size"]
             blf.size(fid, size)

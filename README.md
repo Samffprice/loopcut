@@ -29,7 +29,7 @@ than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped, so an endless loop cannot freeze B
 
 ## The Loopcut build
 
-`blender/` is Blender with five additions, kept small so rebasing onto a new release stays cheap:
+`blender/` is Blender with six additions, kept small so rebasing onto a new release stays cheap:
 
 - `SpaceLoopcut`, an editor type that is a shell: it clears its region, fires the add-on's draw
   callback, owns the "Loopcut" keymap and redraws when selection, mode or the open file change.
@@ -45,6 +45,13 @@ than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped, so an endless loop cannot freeze B
   Fresh" shows Blender's quick setup; then connect a model, privacy, done. The steps are drawn by
   `extension/loopcut/onboarding.py`; the fork's splash menus only call it. Add-ons that did not
   load after an import are named on the last step.
+- The product's name and face: `Loopcut.app` (executable `Loopcut`, bundle id
+  `io.github.samffprice.loopcut`), "Loopcut (Blender 5.2.2)" in the window title, its own app
+  icon, splash and top-bar icon. "Blender" and its logo are the Blender Foundation's trademarks,
+  so a fork may not ship under them. The files come from `branding/` (`LOOPCUT_BRANDING_DIR`),
+  made by `branding/make_assets.py` from the mark's polygons in `extension/loopcut/ui/brand.py`.
+  On Windows the icon, product name and install folder are Loopcut's; the executable is still
+  `blender.exe`.
 - At startup the panel is docked right of the 3D viewport if the layout has none. Cmd+L
   (Ctrl+Alt+L elsewhere) focuses it, opening it first if needed.
 
@@ -72,7 +79,7 @@ are billed at 2x and macOS at 10x.
 Both use Blender's release configuration. On a Mac that is everything: Cycles' Metal kernels are
 compiled on the user's machine. The Windows build leaves out the CUDA, OptiX, HIP and oneAPI
 kernels for now, so Cycles renders on the CPU there. The builds are unsigned: macOS says the app
-is damaged until `xattr -cr /Applications/Blender.app` is run, and Windows shows a SmartScreen
+is damaged until `xattr -cr /Applications/Loopcut.app` is run, and Windows shows a SmartScreen
 warning; signing needs an Apple Developer ID and a Windows code-signing certificate.
 `.github/workflows/tests.yml` runs the Blender-free tests on every push.
 

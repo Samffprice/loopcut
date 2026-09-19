@@ -17,7 +17,7 @@ cmake -S "$root/blender" -B "$build" -G Ninja \
   -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF \
   -DCPACK_OVERRIDE_PACKAGENAME="loopcut-$version"
 ninja -C "$build" install
-"$build/bin/Blender.app/Contents/MacOS/Blender" -b --factory-startup --python-expr \
+"$build/bin/Loopcut.app/Contents/MacOS/Loopcut" -b --factory-startup --python-expr \
   "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 rm -f "$build"/loopcut-*.dmg
 (cd "$build" && cpack -G DragNDrop)

@@ -1,3 +1,114 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 141fdaf9fea..4bbe891e7f9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2427,6 +2427,24 @@ endif()
+ 
+ include(build_files/cmake/testing.cmake)
+ 
++# -----------------------------------------------------------------------------
++# Loopcut: Branding
++#
++# Icons and the splash are made in the Loopcut repository (branding/make_assets.py), next to this
++# checkout, the same way the add-on is bundled from there.
++
++set(LOOPCUT_BRANDING_DIR "${CMAKE_SOURCE_DIR}/../branding" CACHE PATH
++  "Folder with loopcut.icns, loopcut.ico and splash.png"
++)
++foreach(_loopcut_brand_file loopcut.icns loopcut.ico splash.png)
++  if(NOT EXISTS "${LOOPCUT_BRANDING_DIR}/${_loopcut_brand_file}")
++    message(FATAL_ERROR
++      "LOOPCUT_BRANDING_DIR (${LOOPCUT_BRANDING_DIR}) has no ${_loopcut_brand_file}"
++    )
++  endif()
++endforeach()
++unset(_loopcut_brand_file)
++
+ # -----------------------------------------------------------------------------
+ # Add Sub-Directories
+ 
+diff --git a/build_files/cmake/packaging.cmake b/build_files/cmake/packaging.cmake
+index b2513305e23..ca6f09a3d98 100644
+--- a/build_files/cmake/packaging.cmake
++++ b/build_files/cmake/packaging.cmake
+@@ -86,16 +86,16 @@ if(APPLE)
+ endif()
+ 
+ if(WIN32)
+-  set(CPACK_PACKAGE_INSTALL_DIRECTORY "Blender Foundation/Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
+-  set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "Blender Foundation/Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
++  set(CPACK_PACKAGE_INSTALL_DIRECTORY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
++  set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
+ 
+-  set(CPACK_NSIS_MUI_ICON ${CMAKE_SOURCE_DIR}/release/windows/icons/winblender.ico)
++  set(CPACK_NSIS_MUI_ICON ${LOOPCUT_BRANDING_DIR}/loopcut.ico)
+   set(CPACK_NSIS_COMPRESSOR "/SOLID lzma")
+ 
+   # Even though we no longer display this, we still need to set it otherwise it'll throw an error
+   # during the msi build.
+   set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/release/license/spdx/GPL-3.0-or-later.txt)
+-  set(CPACK_WIX_PRODUCT_ICON ${CMAKE_SOURCE_DIR}/release/windows/icons/winblender.ico)
++  set(CPACK_WIX_PRODUCT_ICON ${LOOPCUT_BRANDING_DIR}/loopcut.ico)
+ 
+   set(BLENDER_NAMESPACE_GUID "507F933F-5898-404A-9A05-18282FD491A6")
+ 
+diff --git a/build_files/cmake/platform/platform_apple.cmake b/build_files/cmake/platform/platform_apple.cmake
+index 99f766b7e1a..10004b384cc 100644
+--- a/build_files/cmake/platform/platform_apple.cmake
++++ b/build_files/cmake/platform/platform_apple.cmake
+@@ -501,7 +501,7 @@ if(PLATFORM_BUNDLED_LIBRARIES)
+   list(JOIN PLATFORM_BUNDLED_LIBRARY_DIRS ":" _library_paths)
+   # Intentionally double "$$" which expands into "$" when instantiated.
+   set(PLATFORM_ENV_BUILD "DYLD_LIBRARY_PATH=\"${_library_paths}:$$DYLD_LIBRARY_PATH\"")
+-  set(PLATFORM_ENV_INSTALL "DYLD_LIBRARY_PATH=${CMAKE_INSTALL_PREFIX_WITH_CONFIG}/Blender.app/Contents/Resources/lib/:$$DYLD_LIBRARY_PATH")
++  set(PLATFORM_ENV_INSTALL "DYLD_LIBRARY_PATH=${CMAKE_INSTALL_PREFIX_WITH_CONFIG}/Loopcut.app/Contents/Resources/lib/:$$DYLD_LIBRARY_PATH")
+   unset(_library_paths)
+ endif()
+ 
+diff --git a/build_files/cmake/testing.cmake b/build_files/cmake/testing.cmake
+index 6df52dc0192..b326bf0bf13 100644
+--- a/build_files/cmake/testing.cmake
++++ b/build_files/cmake/testing.cmake
+@@ -139,7 +139,7 @@ function(blender_add_ctests)
+   # Figure out the release dir, as some tests need files from there.
+   get_blender_test_install_dir(TEST_INSTALL_DIR)
+   if(APPLE)
+-    set(_test_release_dir ${TEST_INSTALL_DIR}/Blender.app/Contents/Resources/${BLENDER_VERSION})
++    set(_test_release_dir ${TEST_INSTALL_DIR}/Loopcut.app/Contents/Resources/${BLENDER_VERSION})
+   else()
+     if(WIN32 OR WITH_INSTALL_PORTABLE)
+       set(_test_release_dir ${TEST_INSTALL_DIR}/${BLENDER_VERSION})
+diff --git a/intern/ghost/intern/GHOST_SystemCocoa.mm b/intern/ghost/intern/GHOST_SystemCocoa.mm
+index 2337bf5c3b4..f6ed45f9f87 100644
+--- a/intern/ghost/intern/GHOST_SystemCocoa.mm
++++ b/intern/ghost/intern/GHOST_SystemCocoa.mm
+@@ -585,14 +585,14 @@ GHOST_TSuccess GHOST_SystemCocoa::init()
+         NSMenu *appMenu;
+ 
+         /* Create the application menu. */
+-        appMenu = [[NSMenu alloc] initWithTitle:@"Blender"];
++        appMenu = [[NSMenu alloc] initWithTitle:@"Loopcut"];
+ 
+-        [appMenu addItemWithTitle:@"About Blender"
++        [appMenu addItemWithTitle:@"About Loopcut"
+                            action:@selector(orderFrontStandardAboutPanel:)
+                     keyEquivalent:@""];
+         [appMenu addItem:[NSMenuItem separatorItem]];
+ 
+-        menuItem = [appMenu addItemWithTitle:@"Hide Blender"
++        menuItem = [appMenu addItemWithTitle:@"Hide Loopcut"
+                                       action:@selector(hide:)
+                                keyEquivalent:@"h"];
+         menuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+@@ -607,7 +607,7 @@ GHOST_TSuccess GHOST_SystemCocoa::init()
+                            action:@selector(unhideAllApplications:)
+                     keyEquivalent:@""];
+ 
+-        menuItem = [appMenu addItemWithTitle:@"Quit Blender"
++        menuItem = [appMenu addItemWithTitle:@"Quit Loopcut"
+                                       action:@selector(terminate:)
+                                keyEquivalent:@"q"];
+         menuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
 diff --git a/intern/ghost/intern/GHOST_SystemPathsCocoa.mm b/intern/ghost/intern/GHOST_SystemPathsCocoa.mm
 index 762e0726b79..99c28fdc88e 100644
 --- a/intern/ghost/intern/GHOST_SystemPathsCocoa.mm
@@ -49,6 +160,85 @@ index 71d6d45ace5..9ca7624e5fe 100644
      strcat(knownpath, versionstr);
      user_dir = knownpath;
    }
+diff --git a/release/darwin/Blender.app/Contents/Info.plist b/release/darwin/Blender.app/Contents/Info.plist
+index 12bb271debf..f48cac0fc16 100644
+--- a/release/darwin/Blender.app/Contents/Info.plist
++++ b/release/darwin/Blender.app/Contents/Info.plist
+@@ -32,21 +32,19 @@
+ 		</dict>
+ 	</array>
+ 	<key>CFBundleExecutable</key>
+-	<string>Blender</string>
++	<string>Loopcut</string>
+ 	<key>CFBundleGetInfoString</key>
+-	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Blender Foundation</string>
++	<string>${MACOSX_BUNDLE_LONG_VERSION_STRING}, Loopcut, based on Blender</string>
+ 	<!-- Legacy, non-Liquid Glass icon, used on pre-Tahoe / 26 macOS versions. -->
+ 	<key>CFBundleIconFile</key>
+-	<string>blender_icon_legacy.icns</string>
+-	<!-- Modern Liquid Glass icon, the app bundle Asset.car file needs to be regenerated in Xcode on modification -->
+-	<key>CFBundleIconName</key>
+-	<string>blender_liquid_glass</string>
++	<string>loopcut.icns</string>
++	<!-- Loopcut: no CFBundleIconName. It would select Blender's Liquid Glass icon from Assets.car on macOS 26. -->
+ 	<key>CFBundleIdentifier</key>
+-	<string>org.blenderfoundation.blender</string>
++	<string>io.github.samffprice.loopcut</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
+ 	<key>CFBundleName</key>
+-	<string>Blender</string>
++	<string>Loopcut</string>
+ 	<key>CFBundlePackageType</key>
+ 	<string>APPL</string>
+ 	<key>CFBundleShortVersionString</key>
+diff --git a/release/darwin/Blender.app/Contents/PlugIns/blender-thumbnailer.appex/Contents/Info.plist b/release/darwin/Blender.app/Contents/PlugIns/blender-thumbnailer.appex/Contents/Info.plist
+index 079d10ac606..6aaa795004c 100644
+--- a/release/darwin/Blender.app/Contents/PlugIns/blender-thumbnailer.appex/Contents/Info.plist
++++ b/release/darwin/Blender.app/Contents/PlugIns/blender-thumbnailer.appex/Contents/Info.plist
+@@ -11,7 +11,7 @@
+ 		<key>CFBundleExecutable</key>
+ 		<string>blender-thumbnailer</string>
+ 		<key>CFBundleIdentifier</key>
+-		<string>org.blenderfoundation.blender.thumbnailer</string>
++		<string>io.github.samffprice.loopcut.thumbnailer</string>
+ 		<key>CFBundleInfoDictionaryVersion</key>
+ 		<string>6.0</string>
+ 		<key>CFBundlePackageType</key>
+diff --git a/release/datafiles/icons_svg/blender.svg b/release/datafiles/icons_svg/blender.svg
+index d5e72472a22..60293d998b8 100644
+--- a/release/datafiles/icons_svg/blender.svg
++++ b/release/datafiles/icons_svg/blender.svg
+@@ -1 +1 @@
+-<svg id="svg2" height="1500" viewBox="0 0 1800 1499.9999" width="1800" xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"><sodipodi:namedview pagecolor="#303030" showgrid="true"><inkscape:grid id="grid5" units="px" spacingx="100" spacingy="100" color="#4772b3" opacity="0.2" visible="true" /></sodipodi:namedview><g id="g2" clip-rule="evenodd" enable-background="new" fill="#fff" stroke-linejoin="round" stroke-miterlimit="1.41421" transform="matrix(28.215572 0 0 28.232947 -5925.9322 10252.77)"><path id="path1" d="m243.08267-333.67977c.106-1.891 1.032-3.557 2.429-4.738 1.37-1.16 3.214-1.869 5.226-1.869 2.01 0 3.854.709 5.225 1.869 1.396 1.181 2.322 2.847 2.429 4.736.106 1.943-.675 3.748-2.045 5.086-1.397 1.361-3.384 2.215-5.609 2.215s-4.216-.854-5.612-2.215c-1.371-1.338-2.15-3.143-2.043-5.084z" fill="#fff"/><path id="path2" d="m230.94-329.894c.013.74.249 2.178.603 3.301.744 2.377 2.006 4.576 3.762 6.514 1.802 1.992 4.021 3.592 6.584 4.728 2.694 1.193 5.613 1.801 8.645 1.796 3.027-.004 5.946-.624 8.64-1.826 2.563-1.147 4.78-2.754 6.579-4.747 1.755-1.946 3.015-4.149 3.761-6.526.375-1.201.612-2.42.707-3.643.093-1.205.054-2.412-.117-3.618-.334-2.35-1.147-4.555-2.399-6.565-1.145-1.847-2.621-3.464-4.376-4.825l.004-.003-17.711-13.599c-.016-.012-.029-.025-.046-.036-1.162-.892-3.116-.889-4.394.005-1.292.904-1.44 2.399-.29 3.342l-.005.005 7.387 6.01506-22.515.024h-.03c-1.861.002-3.65 1.21494-4.004 2.75794-.364 1.572.9 2.876 2.835 2.883l-.003.007 11.412-.022-20.364 15.631c-.026.019-.054.039-.078.058-1.921 1.471-2.542 3.917-1.332 5.465 1.228 1.574 3.839 1.577 5.78.009l11.114-9.096s-.162 1.228-.149 1.965zm28.79015 4.112c-2.29 2.333-5.496 3.656-8.965 3.663-3.474.006-6.68-1.305-8.97-3.634-1.119-1.135-1.941-2.441-2.448-3.832-.497-1.367-.69-2.818-.562-4.282.121-1.431.547-2.796 1.227-4.031.668-1.214 1.588-2.311 2.724-3.239 2.226-1.814 5.06-2.796 8.024-2.8 2.967-.004 5.799.969 8.027 2.777 1.134.924 2.053 2.017 2.721 3.229.683 1.234 1.106 2.594 1.232 4.029.126 1.462-.067 2.911-.564 4.279-.508 1.395-1.327 2.701-2.446 3.841z"/></g></svg>
+\ No newline at end of file
++<svg height="1500" viewBox="0 0 1800 1500" width="1800" xmlns="http://www.w3.org/2000/svg"><path fill="#fff" fill-rule="evenodd" d="M276.1,114.5 L1523.9,153.2 L1624.6,339.2 L973.6,1385.5 L764.4,1385.5 L175.4,285.0 Z M586.1,339.2 L1260.4,339.2 L849.6,533.0 Z M500.9,494.2 L810.9,695.8 L795.4,1005.8 Z M1283.6,486.5 L989.1,638.4 L978.3,1036.8 Z"/></svg>
+diff --git a/release/windows/icons/winblender.rc b/release/windows/icons/winblender.rc
+index f56ca3b4f40..2dc699b026e 100644
+--- a/release/windows/icons/winblender.rc
++++ b/release/windows/icons/winblender.rc
+@@ -9,7 +9,7 @@
+ 	#define BLEN_VER_RC_STR STRINGIFY(BLEN_VER_RC_STR_M)
+ #endif
+ 
+-APPICON ICON DISCARDABLE "winblender.ico"
++APPICON ICON DISCARDABLE "loopcut.ico"
+ BLENDERFILE ICON DISCARDABLE "winblenderfile.ico"
+ 
+ IDR_VERSION1 VERSIONINFO
+@@ -25,10 +25,10 @@ BEGIN
+       VALUE "FileVersion", BLEN_VER_RC_STR
+       VALUE "ProductVersion", BLEN_VER_RC_STR
+       VALUE "CompanyName", "Blender Foundation"
+-      VALUE "FileDescription", "Blender"
++      VALUE "FileDescription", "Loopcut"
+       VALUE "LegalCopyright", "GPLv3 (Blender Foundation)"
+       VALUE "OriginalFilename", "blender.exe"
+-      VALUE "ProductName", "Blender"
++      VALUE "ProductName", "Loopcut"
+     END
+   END
+   BLOCK "VarFileInfo"
 diff --git a/scripts/modules/bl_keymap_utils/keymap_hierarchy.py b/scripts/modules/bl_keymap_utils/keymap_hierarchy.py
 index 6579d08ea81..42a995eba9a 100644
 --- a/scripts/modules/bl_keymap_utils/keymap_hierarchy.py
@@ -232,6 +422,30 @@ index cc6a19ba4a0..176a447b5be 100644
          break;
      }
    }
+diff --git a/source/blender/editors/datafiles/CMakeLists.txt b/source/blender/editors/datafiles/CMakeLists.txt
+index e33ebd5302e..6eba09bf23c 100644
+--- a/source/blender/editors/datafiles/CMakeLists.txt
++++ b/source/blender/editors/datafiles/CMakeLists.txt
+@@ -1073,7 +1073,18 @@ if(WITH_BLENDER)
+     data_to_c_simple(../../../../release/datafiles/preview_grease_pencil.blend SRC)
+ 
+     # Images.
+-    data_to_c_simple(../../../../release/datafiles/splash.png SRC)
++    # Loopcut: its own splash, from the Loopcut repository (upstream: release/datafiles/splash.png).
++    # Not `data_to_c_simple`, which only takes paths inside this source tree.
++    set(_loopcut_splash_c ${CMAKE_CURRENT_BINARY_DIR}/loopcut/splash.png.c)
++    add_custom_command(
++      OUTPUT ${_loopcut_splash_c}
++      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/loopcut
++      COMMAND "$<TARGET_FILE:datatoc>" ${LOOPCUT_BRANDING_DIR}/splash.png ${_loopcut_splash_c}
++      DEPENDS ${LOOPCUT_BRANDING_DIR}/splash.png datatoc
++    )
++    set_source_files_properties(${_loopcut_splash_c} PROPERTIES GENERATED TRUE)
++    list(APPEND SRC ${_loopcut_splash_c})
++    unset(_loopcut_splash_c)
+ 
+     unset(SVG_CONTENTS_H)
+     unset(SVG_CONTENTS_C)
 diff --git a/source/blender/editors/include/ED_space_api.hh b/source/blender/editors/include/ED_space_api.hh
 index 93d62bd7563..2e697e070fd 100644
 --- a/source/blender/editors/include/ED_space_api.hh
@@ -796,6 +1010,29 @@ index 6ac217112b1..f4de5fe1b60 100644
    WM_operatortype_append(WM_OT_save_as_mainfile);
    WM_operatortype_append(WM_OT_save_mainfile);
    WM_operatortype_append(WM_OT_clear_recent_files);
+diff --git a/source/blender/windowmanager/intern/wm_window.cc b/source/blender/windowmanager/intern/wm_window.cc
+index 4c0aa2cd5c6..8893f592052 100644
+--- a/source/blender/windowmanager/intern/wm_window.cc
++++ b/source/blender/windowmanager/intern/wm_window.cc
+@@ -607,7 +607,7 @@ static std::string wm_window_title_text(
+     if (is_single && area && area->spacetype != SPACE_EMPTY) {
+       return IFACE_(ED_area_name(area).c_str());
+     }
+-    return "Blender";
++    return "Loopcut";
+   }
+ 
+   /* This path may contain invalid UTF8 byte sequences on UNIX systems,
+@@ -690,7 +690,8 @@ static std::string wm_window_title_text(
+     }
+   }
+ 
+-  win_title.append(fmt::format(" - Blender {}", BKE_blender_version_string()));
++  /* Loopcut: the product's name, and the Blender version it is built on. */
++  win_title.append(fmt::format(" - Loopcut (Blender {})", BKE_blender_version_string()));
+ 
+   return win_title;
+ }
 diff --git a/source/blender/windowmanager/wm_files.hh b/source/blender/windowmanager/wm_files.hh
 index b3d01b06903..ba2be51d54e 100644
 --- a/source/blender/windowmanager/wm_files.hh
@@ -812,10 +1049,36 @@ index b3d01b06903..ba2be51d54e 100644
  void WM_OT_save_as_mainfile(wmOperatorType *ot);
  void WM_OT_save_mainfile(wmOperatorType *ot);
 diff --git a/source/creator/CMakeLists.txt b/source/creator/CMakeLists.txt
-index 985b969e727..ca1e2deceee 100644
+index 985b969e727..b3ecff05ef8 100644
 --- a/source/creator/CMakeLists.txt
 +++ b/source/creator/CMakeLists.txt
-@@ -482,6 +482,23 @@ if(WITH_PYTHON)
+@@ -164,6 +164,12 @@ if(WIN32 AND NOT UNIX)
+     -DBLEN_VER_RC_4=0
+   )
+ 
++  # Loopcut: winblender.rc names loopcut.ico, and the resource compiler looks next to the .rc file.
++  configure_file(
++    ${LOOPCUT_BRANDING_DIR}/loopcut.ico
++    ${CMAKE_SOURCE_DIR}/release/windows/icons/loopcut.ico
++    COPYONLY
++  )
+   list(APPEND SRC
+     ${CMAKE_SOURCE_DIR}/release/windows/icons/winblender.rc
+   )
+@@ -434,9 +440,9 @@ elseif(APPLE)
+       set(TARGETDIR_LIB ${PYTHON_SITE_PACKAGES}/bpy/lib)
+     endif()
+   else()
+-    set(TARGETDIR_VER "Blender.app/Contents/Resources/${BLENDER_VERSION}")
+-    set(TARGETDIR_LIB "Blender.app/Contents/Resources/lib")
+-    set(TARGETDIR_TEXT "Blender.app/Contents/Resources/text")
++    set(TARGETDIR_VER "Loopcut.app/Contents/Resources/${BLENDER_VERSION}")
++    set(TARGETDIR_LIB "Loopcut.app/Contents/Resources/lib")
++    set(TARGETDIR_TEXT "Loopcut.app/Contents/Resources/text")
+   endif()
+   set(TARGETDIR_SITE_PACKAGES "${TARGETDIR_VER}/python/lib/python${PYTHON_VERSION}/site-packages")
+   # Skip re-linking on CPACK / install.
+@@ -482,6 +488,23 @@ if(WITH_PYTHON)
      PATTERN "addons_core/bl_pkg/example_extension" EXCLUDE
    )
  
@@ -839,3 +1102,66 @@ index 985b969e727..ca1e2deceee 100644
    if(WITH_PYTHON_MODULE)
      install(
        FILES ${CMAKE_SOURCE_DIR}/scripts/site/sitecustomize.py
+@@ -1696,8 +1719,8 @@ elseif(WIN32)
+   endif()
+ elseif(APPLE)
+   if(NOT WITH_PYTHON_MODULE)
+-    # Uppercase name for app bundle.
+-    set_target_properties(blender PROPERTIES OUTPUT_NAME Blender)
++    # Loopcut: the bundle and its executable carry the product's name (upstream: Blender).
++    set_target_properties(blender PROPERTIES OUTPUT_NAME Loopcut)
+   endif()
+ 
+   set(OSX_APP_SOURCEDIR ${CMAKE_SOURCE_DIR}/release/darwin/Blender.app)
+@@ -1741,11 +1764,11 @@ elseif(APPLE)
+   # Give the bundle actual creation/modification date.
+   #
+   # Note that the directory might not yet exist, which happens when CMAKE is first run.
+-  if(NOT EXISTS ${EXECUTABLE_OUTPUT_PATH}/Blender.app)
+-    file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/Blender.app)
++  if(NOT EXISTS ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app)
++    file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app)
+   endif()
+   execute_process(
+-    COMMAND SetFile -d ${SETFILE_DATE} -m ${SETFILE_DATE} ${EXECUTABLE_OUTPUT_PATH}/Blender.app
++    COMMAND SetFile -d ${SETFILE_DATE} -m ${SETFILE_DATE} ${EXECUTABLE_OUTPUT_PATH}/Loopcut.app
+   )
+ 
+   set(BLENDER_BIN "bin/blender")
+@@ -1756,18 +1779,24 @@ elseif(APPLE)
+ 
+   install(
+     FILES ${OSX_APP_SOURCEDIR}/Contents/PkgInfo
+-    DESTINATION "Blender.app/Contents"
++    DESTINATION "Loopcut.app/Contents"
+   )
+ 
+   install_dir(
+     ${OSX_APP_SOURCEDIR}/Contents/Resources
+-    "Blender.app/Contents"
++    "Loopcut.app/Contents"
++  )
++
++  # Loopcut: the app icon is made in the Loopcut repository (branding/make_assets.py).
++  install(
++    FILES ${LOOPCUT_BRANDING_DIR}/loopcut.icns
++    DESTINATION "Loopcut.app/Contents/Resources"
+   )
+ 
+   if(WITH_BLENDER_THUMBNAILER)
+     install(
+       TARGETS blender-thumbnailer
+-      DESTINATION "./Blender.app/Contents/PlugIns"
++      DESTINATION "./Loopcut.app/Contents/PlugIns"
+     )
+   endif()
+ 
+@@ -1826,7 +1855,7 @@ elseif(APPLE)
+     unset(PYTHON_EXECUTABLE_NAME_ONLY)
+     install(
+       PROGRAMS ${CMAKE_BINARY_DIR}/release/darwin/scripts/blender-system-info.sh
+-      DESTINATION "Blender.app/Contents/Resources"
++      DESTINATION "Loopcut.app/Contents/Resources"
+     )
+   endif()
+ 

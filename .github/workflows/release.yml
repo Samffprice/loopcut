@@ -122,7 +122,7 @@ jobs:
 
       - name: Smoke test the build
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Blender.app/Contents/MacOS/Blender; else blender=build/bin/blender.exe; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Loopcut.app/Contents/MacOS/Loopcut; else blender=build/bin/blender.exe; fi
           "$blender" -b --factory-startup --python-expr "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 
       - uses: actions/upload-artifact@v4

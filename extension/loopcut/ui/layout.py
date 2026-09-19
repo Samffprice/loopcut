@@ -550,7 +550,9 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     f.rect("header.bg", 0, 0, f.width, height, T.HEADER_BG)
     f.rect("header.rule", 0, height - 1, f.width, 1, T.CARD_BORDER)
     y = (height - f.line_height(size)) // 2
-    f.text("header.title", pad, y, "Loopcut", size, T.TEXT)
+    mark = f.px(18)
+    f.prims.append({"t": "mark", "id": "header.mark", "x": pad, "y": (height - mark) // 2, "w": mark, "h": mark})
+    f.text("header.title", pad + mark + f.px(8), y, "Loopcut", size, T.TEXT)
     label = "New chat"
     small = f.px(T.FONT_SIZE_SMALL)
     label_width = round(f.measure("ui", small, label))

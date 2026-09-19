@@ -1,5 +1,5 @@
 """The Loopcut build's snapshot operators, which checkpoints restore in place with:
-    build/lite/bin/Blender.app/Contents/MacOS/Blender -b --factory-startup --python harness/snapshot_check.py
+    build/lite/bin/Loopcut.app/Contents/MacOS/Loopcut -b --factory-startup --python harness/snapshot_check.py
 After a restore the open file keeps its path, is marked unsaved, is untouched on disk, and its
 relative paths still resolve. Stock Blender has no such operators and is skipped."""
 import hashlib
