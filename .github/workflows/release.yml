@@ -127,11 +127,14 @@ jobs:
       # and oneAPI kernels needs the vendors' SDKs. The NVIDIA and AMD device code is still built (it
       # loads the drivers at run time) and uses the kernels from the step above; Intel's oneAPI is off.
       # The -D options come after -C on purpose: the release configuration force-sets the ones it names.
+      # CMAKE_BUILD_TYPE is explicit because CMake's MSVC platform module defaults it to Debug, and a
+      # Debug build needs the debug C runtime, which only machines with Visual Studio have.
       - name: Configure and build (macOS)
         if: runner.os == 'macOS'
         run: |
           cmake -S blender -B build -G Ninja \
             -C blender/build_files/cmake/config/blender_release.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
             -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF \
             -DCPACK_OVERRIDE_PACKAGENAME="$PACKAGE_NAME"
           ninja -C build install
@@ -145,6 +148,7 @@ jobs:
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cmake -S blender -B build -G Ninja ^
             -C blender/build_files/cmake/config/blender_release.cmake ^
+            -DCMAKE_BUILD_TYPE=Release ^
             -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF ^
             -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF ^
             -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF ^
@@ -159,7 +163,11 @@ jobs:
       # The kernel step above may fail without failing the run; say so where it cannot be missed.
       - name: Smoke test the build
         run: |
+          tr -d '\r' < build/CMakeCache.txt | grep -q '^CMAKE_BUILD_TYPE:STRING=Release$' || { echo "::error title=Not a Release build::CMAKE_BUILD_TYPE is not Release; the package would need the debug C runtime."; exit 1; }
           if [ "$RUNNER_OS" = "Windows" ]; then
+            if ls build/bin/*_d.dll build/bin/blender.shared/*_d.dll >/dev/null 2>&1; then
+              echo "::error title=Debug libraries in the package::Debug DLLs were installed; see the Configure step's install configuration."; exit 1
+            fi
             kernels=$(ls build/bin/*/scripts/addons_core/cycles/lib/*.zst 2>/dev/null | wc -l)
             echo "GPU kernel files in the build: $kernels" | tee -a "$GITHUB_STEP_SUMMARY"
             [ "$kernels" -ge 20 ] || echo "::warning title=No GPU kernels::Cycles will render on the CPU only in this Windows build. See the 'GPU kernels' step."

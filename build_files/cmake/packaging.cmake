@@ -4,10 +4,10 @@
 
 string(TIMESTAMP CURRENT_YEAR "%Y")
 
-set(PROJECT_DESCRIPTION  "Blender is the free and open source 3D creation suite software.")
+set(PROJECT_DESCRIPTION  "Loopcut is a build of Blender with an AI assistant in the editor.")
 set(PROJECT_COPYRIGHT    "Copyright (C) 2001-${CURRENT_YEAR} Blender Authors")
-set(PROJECT_CONTACT      "foundation@blender.org")
-set(PROJECT_VENDOR       "Blender Foundation")
+set(PROJECT_CONTACT      "samffprice@tamu.edu")
+set(PROJECT_VENDOR       "Loopcut")
 
 set(MAJOR_VERSION ${BLENDER_VERSION_MAJOR})
 set(MINOR_VERSION ${BLENDER_VERSION_MINOR})
@@ -86,6 +86,9 @@ if(APPLE)
 endif()
 
 if(WIN32)
+  # The product name in the installer, the Apps list and the shortcuts; the default is the
+  # CMake project name, Blender.
+  set(CPACK_PACKAGE_NAME "Loopcut")
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
   set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "Loopcut/Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
 
@@ -113,8 +116,8 @@ if(WIN32)
   set(CPACK_WIX_LIGHT_EXTRA_FLAGS -dcl:medium)
 endif()
 
-set(CPACK_PACKAGE_EXECUTABLES "blender-launcher" "Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
-set(CPACK_CREATE_DESKTOP_LINKS "blender-launcher" "Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
+set(CPACK_PACKAGE_EXECUTABLES "blender-launcher" "Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
+set(CPACK_CREATE_DESKTOP_LINKS "blender-launcher" "Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
 
 include(CPack)
 

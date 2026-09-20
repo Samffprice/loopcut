@@ -49,10 +49,8 @@
                 Control="Finish" 
                 Event="DoAction" 
                 Value="LaunchBrowser">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
-            <ProgressText Action="RegisterBlender">Registering Blender</ProgressText>
+            <ProgressText Action="RegisterBlender">Registering Loopcut</ProgressText>
         </UI>
-        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Learn how to support Blender" />
-        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
         <SetProperty Id="REINSTALLMODE" Value="amus" Before="FindRelatedProducts" Sequence="first">NOT REINSTALLMODE</SetProperty>
         
         <UIRef Id="WixUI_ErrorProgressText" />
