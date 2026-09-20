@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "loopcut"
-version = "0.1.2"
+version = "0.1.3"
 name = "Loopcut"
 tagline = "An AI agent that works inside Blender"
 maintainer = "Loopcut"

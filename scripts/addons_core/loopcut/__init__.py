@@ -8,7 +8,7 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
