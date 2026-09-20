@@ -37,11 +37,12 @@ def main() -> None:
     assert [a["name"] for a in session["attachments"]] == ["big photo.jpg"], session["attachments"]
     assert set(bpy.data.images.keys()) == before, "attaching left an image datablock behind"
 
-    stored = conversations.image_path(session["id"], session["attachments"][0]["ref"])
-    check = bpy.data.images.load(str(stored))
-    assert tuple(check.size) == (attachments.MAX_SIDE, attachments.MAX_SIDE // 4), tuple(check.size)
-    assert check.file_format == "PNG", check.file_format
-    bpy.data.images.remove(check)
+    for key, side in (("full", attachments.MAX_SIDE), ("ref", attachments.SEND_SIDE)):
+        stored = conversations.image_path(session["id"], session["attachments"][0][key])
+        check = bpy.data.images.load(str(stored))
+        assert tuple(check.size) == (side, side // 4), (key, tuple(check.size))
+        assert check.file_format == "PNG", check.file_format
+        bpy.data.images.remove(check)
 
     attachments.add(session, [str(work / "big photo.jpg")])
     assert len(session["attachments"]) == 1, "the same image attached twice"

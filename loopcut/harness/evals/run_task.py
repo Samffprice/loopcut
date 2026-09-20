@@ -75,6 +75,11 @@ def start():
             TASK.setup()
         RUN["before"] = tasks.snapshot()
         session = state.reset()
+        if TASK.attachments:
+            from loopcut import attachments
+            problems = attachments.add(session, TASK.attachments)
+            if problems:
+                raise RuntimeError(f"could not attach: {problems}")
         RUN["t0"] = time.monotonic()
         if not agent.send(TASK.prompt):
             raise RuntimeError("agent.send refused the prompt")

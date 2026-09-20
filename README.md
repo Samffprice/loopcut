@@ -117,12 +117,16 @@ the Blender Foundation.
 | `get_object_info` | How an object is set up: modifier settings, material and geometry node trees, constraints, animation. Read before editing someone's material. |
 | `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. |
 | `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. |
+| `compare_with_reference` | The attached reference on the left and a capture on the right in one image, for the compare-adjust loop of copying a picture. |
+| `look_at_reference` | The attached reference at full resolution, or a region of it, to check a detail. |
 
 Images can be attached to a message: drop image files on the panel or use "+ image" in the input
 box (png, jpg, webp, bmp, tif, tga; up to 6 per message). Each is decoded by Blender and stored as
 a PNG of at most 1568 px in the conversation's folder, so a dropped file is never sent as-is and
-nothing is added to the .blend. Attached images stay in the model's view for the turn they were
-attached to (the newest 3),
+nothing is added to the .blend. An attached image is a reference: the model writes a
+`<reference_card>` describing it before its first step (so the description survives any summary),
+a 768 px copy rides every request until its chip above the input box is closed (the newest 3),
+and the tools read details from the stored full-size copy. Attached images stay in the model's view
 counted apart from viewport captures, so a reference photo is not pushed out by captures.
 
 Every message also carries a `<scene_context>` block (file, mode, selection, and every object of a
@@ -221,9 +225,11 @@ budget", default 24000), in order:
    The summary is stored on the first message it does not cover, so checkpoint restores that cut
    the conversation cut or keep it correctly.
 3. Images: a capture is sent with the request right after it and dropped once the model has
-   acted on it, since that step also changed what it showed. Attached images are sent with every
-   request of the turn they were attached to, then dropped; on the gateway one image costs as
-   much as ten tool results on every request it rides in. A 960 px capture cost about 1700 tokens on the Loopcut gateway, ten times a
+   acted on it, since that step also changed what it showed. Attached references are pinned:
+   sent with every request, at 768 px, until unpinned; they sit early in the prefix, so the
+   provider cache pays for them. On the gateway one image costs as much as ten tool results on
+   every request it rides in. Looks at an unchanged scene are refused after three in a turn,
+   and any look after eight. A 960 px capture cost about 1700 tokens on the Loopcut gateway, ten times a
    typical tool result, so captures are taken at 640 px.
 
 Sizes are estimated from characters (3.4 per token, 1700 per image, both measured against the

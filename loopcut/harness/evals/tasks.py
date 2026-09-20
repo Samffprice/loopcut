@@ -10,7 +10,10 @@ Runs inside Blender.
 """
 
 import math
+import shutil
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import bpy
@@ -533,6 +536,80 @@ class Task:
     setup: Callable | None = None
     passes_untouched: bool = False  # True when doing nothing is the right answer.
     tags: list[str] = field(default_factory=list)
+    attachments: list[str] = field(default_factory=list)  # Image files attached to the prompt.
+
+
+# ------------------------------------------------------------------ copying a reference image
+
+REFERENCE_IMAGE = str(Path(tempfile.gettempdir()) / "loopcut-eval-reference.png")
+_REFERENCE_SCENE = (
+    "import bpy\n"
+    "def colored(obj, name, rgb):\n"
+    "    mat = bpy.data.materials.new(name); mat.use_nodes = True\n"
+    "    mat.node_tree.nodes['Principled BSDF'].inputs['Base Color'].default_value = (*rgb, 1)\n"
+    "    obj.data.materials.append(mat)\n"
+    "bpy.ops.mesh.primitive_plane_add(size=4, location=(0, 0, 0)); ground = bpy.context.object\n"
+    "ground.name = 'Ground'; colored(ground, 'Blue', (0.05, 0.2, 0.8))\n"
+    "bpy.ops.mesh.primitive_cube_add(size=1, location=(-1, 0, 0.5)); box = bpy.context.object\n"
+    "box.name = 'RedBox'; colored(box, 'Red', (0.8, 0.05, 0.05))\n"
+    "bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, location=(1, 0, 0.5)); ball = bpy.context.object\n"
+    "ball.name = 'GreenBall'; colored(ball, 'Green', (0.05, 0.7, 0.1))\n"
+)
+
+
+def setup_reference() -> None:
+    """Render the reference from a known scene, then put the scene back to just camera and light,
+    so the agent starts from nothing and the image is all it has."""
+    bpy.data.objects.remove(bpy.data.objects["Cube"])
+    exec(compile(_REFERENCE_SCENE, "<reference>", "exec"), {"__name__": "__reference__"})
+    try:
+        from loopcut import tools
+        shot = tools.capture_viewport(angle="three_quarter")
+        shutil.copy(shot.image_path, REFERENCE_IMAGE)
+    except Exception as ex:  # No viewport in a background selfcheck; the check needs no image.
+        print(f"reference image not rendered: {ex}")
+    for name in ("Ground", "RedBox", "GreenBall"):
+        bpy.data.objects.remove(bpy.data.objects[name])
+    for name in ("Blue", "Red", "Green"):
+        bpy.data.materials.remove(bpy.data.materials[name])
+
+
+def _dominant(color, channel: int) -> bool:
+    return color is not None and color[channel] > 0.35 and all(color[c] < 0.6 * color[channel] for c in range(3) if c != channel)
+
+
+def check_match_reference(ctx) -> list[str]:
+    added = new_objects(ctx.before)
+    ground = [o for o in added if _dominant(base_color(o), 2)]
+    boxes = [o for o in added if _dominant(base_color(o), 0)]
+    balls = [o for o in added if _dominant(base_color(o), 1)]
+    problems = []
+    if len(ground) != 1:
+        problems.append(f"expected one blue ground, found {[o.name for o in ground]}")
+    if len(boxes) != 1:
+        problems.append(f"expected one red box, found {[o.name for o in boxes]}")
+    if len(balls) != 1:
+        problems.append(f"expected one green ball, found {[o.name for o in balls]}")
+    if problems:
+        return problems
+    g_low, g_high = bounds(ground[0])
+    if g_high.z - g_low.z > 0.1 or min(g_high.x - g_low.x, g_high.y - g_low.y) < 3:
+        problems.append(f"ground is not a large flat surface: {tuple(round(v, 2) for v in g_high - g_low)}")
+    for obj, what in ((boxes[0], "box"), (balls[0], "ball")):
+        low, high = bounds(obj)
+        size = high - low
+        if not all(0.6 <= s <= 1.5 for s in size):
+            problems.append(f"{what} is not about 1 m: {tuple(round(s, 2) for s in size)}")
+        if abs(low.z - g_high.z) > CONTACT:
+            problems.append(f"{what} does not rest on the ground (bottom {low.z:.2f}, ground top {g_high.z:.2f})")
+    if len(balls[0].data.vertices) < 40:
+        problems.append("ball is not round")
+    b_low, b_high = bounds(boxes[0])
+    s_low, s_high = bounds(balls[0])
+    apart = ((b_low + b_high) / 2 - (s_low + s_high) / 2).xy.length
+    if not 1.2 <= apart <= 3.5:
+        problems.append(f"box and ball are {apart:.2f} m apart, expected side by side")
+    return problems
 
 
 _CUBE = "import bpy\ncube = bpy.data.objects['Cube']\n"
@@ -689,6 +766,9 @@ TASKS = [
     Task("question", "What objects are in this scene?", check_question, "", passes_untouched=True,
          tags=["chat"]),
 
+    Task("match_reference", "Recreate what you see in the attached reference image as closely as you can: the "
+         "same objects, colors, sizes and arrangement, standing on the ground.", check_match_reference,
+         _REFERENCE_SCENE, setup=setup_reference, attachments=[REFERENCE_IMAGE], tags=["reference", "vision"]),
     Task("checker", "Give the cube a black and yellow checker material, checker scale 8.", check_checker,
          _CUBE + (
         "mat = bpy.data.materials.new('Checker'); mat.use_nodes = True\n"

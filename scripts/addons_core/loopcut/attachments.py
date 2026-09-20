@@ -15,7 +15,8 @@ from . import conversations
 
 EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".tga")
 MAX_PER_MESSAGE = 6
-MAX_SIDE = 1568            # Larger images are scaled down; vision models resize past this anyway.
+MAX_SIDE = 1568            # The stored copy; look_at_reference reads details from it.
+SEND_SIDE = 768            # The copy in every request: a pinned reference must stay cheap.
 MAX_FILE_BYTES = 100_000_000
 
 
@@ -23,7 +24,7 @@ class AttachmentError(Exception):
     pass
 
 
-def _to_png(source: Path, target: Path) -> None:
+def _to_png(source: Path, target: Path, max_side: int = MAX_SIDE) -> None:
     try:
         image = bpy.data.images.load(str(source), check_existing=False)
     except RuntimeError as ex:
@@ -33,8 +34,8 @@ def _to_png(source: Path, target: Path) -> None:
         if width == 0 or height == 0:
             raise AttachmentError(f"{source.name} is not an image Blender can read")
         longest = max(width, height)
-        if longest > MAX_SIDE:
-            image.scale(max(1, round(width * MAX_SIDE / longest)), max(1, round(height * MAX_SIDE / longest)))
+        if longest > max_side:
+            image.scale(max(1, round(width * max_side / longest)), max(1, round(height * max_side / longest)))
         image.filepath_raw = str(target)
         image.file_format = "PNG"
         image.save()
@@ -62,13 +63,16 @@ def add(session: dict, paths: list[str]) -> list[str]:
             handle, temporary = tempfile.mkstemp(suffix=".png", prefix="loopcut-attach-")
             os.close(handle)
             try:
-                _to_png(source, Path(temporary))
-                reference = conversations.store_image(session, Path(temporary))
+                stored = []
+                for side in (MAX_SIDE, SEND_SIDE):
+                    _to_png(source, Path(temporary), side)
+                    stored.append(conversations.store_image(session, Path(temporary)))
             finally:
                 os.unlink(temporary)
         except (AttachmentError, OSError) as ex:
             problems.append(str(ex))
             continue
-        if all(a["ref"] != reference for a in session["attachments"]):
-            session["attachments"].append({"ref": reference, "name": source.name})
+        full, small = stored
+        if all(a["ref"] != small for a in session["attachments"]):
+            session["attachments"].append({"ref": small, "full": full, "name": source.name})
     return problems

@@ -21,7 +21,8 @@ def new_session() -> dict:
         "items": [],        # What the UI shows; see the item_* constructors.
         "messages": [],     # What the API sees.
         "input": "",
-        "attachments": [],  # Images for the next message: {"ref": stored image, "name": file name}.
+        "attachments": [],  # Images for the next message: {"ref": stored image, "full": stored image, "name": file name}.
+        "references": [],   # Every image attached so far, same shape plus "pinned": sent with each request while pinned.
         "cursor": 0,
         "anchor": None,     # Other end of the input's selection; see ui/textedit.py.
         "scroll": 0.0,      # Pixels scrolled up from the bottom of the chat.

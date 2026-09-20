@@ -84,6 +84,29 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         }},
     }},
     {"type": "function", "function": {
+        "name": "compare_with_reference",
+        "description": (
+            "One image: the reference the user attached on the left, a viewport capture on the right at "
+            "the same height. Use it after each change when copying a reference, and fix what differs."),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "File name of the attached image"},
+            "focus": {"type": "array", "items": {"type": "string"}, "description": "Objects to frame; default all"},
+            "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
+                      "description": "Default three_quarter; camera looks through the scene camera"},
+            "style": {"type": "string", "enum": ["material", "distinct"]},
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "look_at_reference",
+        "description": (
+            "The attached image at full resolution, or a part of it, to check a detail. `region` is "
+            "[x0, y0, x1, y1] as fractions of width and height from the top-left; omit for the whole."),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "File name of the attached image"},
+            "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
         "name": "capture_viewport",
         "description": (
             "An image of the scene, framed by the tool from a 3/4 angle with materials, leaving the "
@@ -419,12 +442,110 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
     return ToolResult(f"Image attached: {what}.{order}", image_path=path)
 
 
+# ------------------------------------------------------------------ reference images
+
+CROP_MAX_SIDE = 1024   # A crop is a look at a detail; a whole reference at full size is up to 1568.
+COMPARE_GAP = 8        # Pixels between the two halves of a comparison.
+
+
+def _reference(name: str) -> tuple[dict, Path]:
+    from . import conversations, state
+    session = state.session()
+    references = session.get("references") or []
+    wanted = name.strip().lower()
+    found = next((r for r in references if r["name"].lower() == wanted), None) or \
+        next((r for r in references if wanted and wanted in r["name"].lower()), None)
+    if found is None:
+        names = ", ".join(r["name"] for r in references) or "none"
+        raise ToolError(f"No attached image called {name!r}. Attached: {names}.")
+    path = conversations.image_path(session["id"], found.get("full") or found["ref"])
+    if not path.is_file():
+        raise ToolError(f"The image {found['name']} is no longer on disk.")
+    return found, path
+
+
+def _pixels(path: Path, height: int | None = None):
+    """Rows bottom-up, as Blender keeps them; scaled to `height` when given."""
+    import numpy as np
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        width, current = image.size
+        if height and current != height:
+            image.scale(max(1, round(width * height / current)), height)
+            width, current = image.size
+        pixels = np.empty(width * current * 4, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        return pixels.reshape(current, width, 4)
+    finally:
+        bpy.data.images.remove(image)  # Nothing may stay in the user's file.
+
+
+def _save_pixels(pixels, path: Path, max_side: int | None = None) -> tuple[int, int]:
+    height, width = pixels.shape[:2]
+    image = bpy.data.images.new("loopcut_tool_image", width, height, alpha=True)
+    try:
+        image.pixels.foreach_set(pixels.astype("float32").ravel())
+        if max_side and max(width, height) > max_side:
+            image.scale(max(1, round(width * max_side / max(width, height))),
+                        max(1, round(height * max_side / max(width, height))))
+        image.filepath_raw = str(path)
+        image.file_format = "PNG"
+        image.save()
+        return tuple(image.size)
+    finally:
+        bpy.data.images.remove(image)
+
+
+def look_at_reference(name: str, region: list | None = None) -> ToolResult:
+    found, path = _reference(name)
+    pixels = _pixels(path)
+    height, width = pixels.shape[:2]
+    if region is not None:
+        try:
+            x0, y0, x1, y1 = (float(v) for v in region)
+        except (TypeError, ValueError) as ex:
+            raise ToolError("region must be four numbers [x0, y0, x1, y1] between 0 and 1") from ex
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            raise ToolError("region must be [x0, y0, x1, y1] with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
+        top_down = pixels[::-1]
+        rows, cols = slice(round(y0 * height), max(round(y0 * height) + 8, round(y1 * height))), \
+            slice(round(x0 * width), max(round(x0 * width) + 8, round(x1 * width)))
+        pixels = top_down[rows, cols][::-1]
+        what = f"region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} from the top-left"
+    else:
+        what = "the whole image"
+    out = Path(tempfile.gettempdir()) / "loopcut" / "reference.png"
+    out.parent.mkdir(exist_ok=True)
+    shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
+    return ToolResult(f"Image attached: {found['name']}, {what}, {shown[0]}x{shown[1]} px "
+                      f"(the full image is {width}x{height}).", image_path=out)
+
+
+def compare_with_reference(name: str, focus: list[str] | None = None, angle: str = "three_quarter",
+                           style: str = "material") -> ToolResult:
+    import numpy as np
+    found, path = _reference(name)
+    shot = capture_viewport(focus, angle, style)
+    right = _pixels(shot.image_path)
+    height = right.shape[0]
+    left = _pixels(path, height)
+    canvas = np.ones((height, left.shape[1] + COMPARE_GAP + right.shape[1], 4), dtype=np.float32)
+    canvas[:, :left.shape[1]] = left
+    canvas[:, left.shape[1] + COMPARE_GAP:] = right
+    out = Path(tempfile.gettempdir()) / "loopcut" / "compare.png"
+    _save_pixels(canvas, out)
+    return ToolResult(f"Image attached: the reference {found['name']} on the left, {shot.text[len('Image attached: '):]}"
+                      f" on the right, at the same height.", image_path=out)
+
+
 _DISPATCH = {
     "run_python": run_python,
     "get_scene_info": get_scene_info,
     "get_object_info": get_object_info,
     "inspect_api": inspect_api,
     "capture_viewport": capture_viewport,
+    "compare_with_reference": compare_with_reference,
+    "look_at_reference": look_at_reference,
 }
 
 

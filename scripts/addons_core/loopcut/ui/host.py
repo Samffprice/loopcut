@@ -173,6 +173,11 @@ def _do_action(session: dict, action) -> None:
         bpy.ops.loopcut.attach_images("INVOKE_DEFAULT")
     elif kind == "remove_attachment":
         del session["attachments"][index]
+    elif kind == "unpin_reference":
+        pinned = [r for r in session["references"] if r.get("pinned", True)]
+        if index < len(pinned):
+            pinned[index]["pinned"] = False
+            conversations.save(session)
     elif kind == "reject":
         agent.decide(False)
     elif kind == "toggle":

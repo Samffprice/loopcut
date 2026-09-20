@@ -401,7 +401,8 @@ def _context_row_height(f: Frame) -> int:
     return f.px(26) if f.ui.get("selection") else 0
 
 
-def _image_chips(f: Frame, id: str, x: int, y: int, width: int, names: list[str], removable: bool) -> int:
+def _image_chips(f: Frame, id: str, x: int, y: int, width: int, names: list[str], removable: bool,
+                 action: str = "remove_attachment") -> int:
     """One chip per attached image, wrapping to as many rows as they need. Returns the height used."""
     small, chip_h, gap = f.px(T.FONT_SIZE_SMALL), f.px(20), f.px(6)
     cross_w = f.px(16) if removable else 0
@@ -417,7 +418,7 @@ def _image_chips(f: Frame, id: str, x: int, y: int, width: int, names: list[str]
         if removable:
             f.text(f"{id}{n}.remove", left + chip_w - cross_w, text_y, "×", small, T.TEXT_FAINT)
             f.hit(f"{id}{n}.remove", left + chip_w - cross_w - f.px(2), top, cross_w + f.px(2), chip_h,
-                  ("remove_attachment", n))
+                  (action, n))
         left += chip_w + gap
     return top + chip_h - y if names else 0
 
@@ -426,12 +427,25 @@ def _attachment_names(session: dict) -> list[str]:
     return [a["name"] for a in session.get("attachments", [])]
 
 
+def _reference_names(session: dict) -> list[str]:
+    """Pinned references: sent with every request until their chip is closed."""
+    return ["ref " + r["name"] for r in session.get("references", []) if r.get("pinned", True)]
+
+
+def _chip_rows(f: Frame, id: str, x: int, y: int, width: int, session: dict) -> int:
+    height = _image_chips(f, id + ".ref", x, y, width, _reference_names(session), True, "unpin_reference")
+    if height:
+        height += f.px(6)
+    height += _image_chips(f, id, x, y + height, width, _attachment_names(session), True)
+    return height
+
+
 def input_height(f: Frame, session: dict) -> int:
     pad, card_pad = f.px(T.PAD), f.px(T.CARD_PAD)
     inner_w = f.width - 2 * pad - 2 * card_pad
     size, _, visible = _input_lines(f, session, inner_w)
     measuring = Frame(f.width, f.height, f.scale, f.measure)  # Chips wrap, so their height is laid out to be known.
-    chips = _image_chips(measuring, "measure", 0, 0, inner_w, _attachment_names(session), removable=True)
+    chips = _chip_rows(measuring, "measure", 0, 0, inner_w, session)
     chips += f.px(6) if chips else 0
     return visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad + _context_row_height(f) + chips
 
@@ -508,7 +522,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     if f.ui.get("selection"):
         _context_row(f, inner_x, text_y, inner_w)
         text_y += _context_row_height(f)
-    chips = _image_chips(f, "input.image", inner_x, text_y, inner_w, _attachment_names(session), removable=True)
+    chips = _chip_rows(f, "input.image", inner_x, text_y, inner_w, session)
     text_y += chips + (f.px(6) if chips else 0)
     first = max(0, len(lines) - visible)  # Keep the tail in view once the box is full.
     anchor = session.get("anchor")

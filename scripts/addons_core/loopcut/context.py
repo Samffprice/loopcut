@@ -19,9 +19,10 @@ every step: a hundred steps over a 50k-token history is five million tokens. Thr
 3. Folding, at request time only. Finished steps (code and result both elided) and captures
    that are no longer sent are folded into one assistant message per run of them: one line per
    step, about 15 tokens instead of the 100 a stubbed step still costs with its envelopes.
-4. Images: kept_images() keeps only the newest KEEP_IMAGES captures of the current turn and the
-   newest KEEP_ATTACHED images the user attached. A capture on the provider we measured costs
-   IMAGE_TOKENS, ten times a typical tool result.
+4. Images: kept_images() keeps only the captures the model has not acted on yet, and the images
+   the user attached, which are references: they stay in every request until the user unpins
+   them, at a reduced size, so the cache pays for them. A capture on the provider we measured
+   costs IMAGE_TOKENS, ten times a typical tool result.
 
 Nothing here inserts or removes stored messages: checkpoints cut the conversation by index.
 Elision edits a message in place and the summary is a key on a message. Our keys on messages
@@ -39,8 +40,9 @@ SUMMARY = "loopcut_summary"   # On a message: a summary of everything before it.
 CAPTURE = "loopcut_capture"   # On a user message that carries a viewport capture; not a turn.
 CAPTURE_TEXT = "Viewport capture from capture_viewport:"  # Marks captures from before CAPTURE.
 ATTACHED = "loopcut_attached"  # On a user message whose images the user attached.
+REFERENCE_CARD = "loopcut_reference_card"  # On an attached message once its images were described.
 KEEP_IMAGES = 3      # Captures sent per request: the newest step's, until the model has acted on them.
-KEEP_ATTACHED = 3    # Attached images, counted apart, for the turn they were attached in.
+KEEP_ATTACHED = 3    # Pinned references sent per request, newest first.
 LEDGER_HEAD = "Earlier steps this turn (results elided; call a tool again if you need the details):"
 
 PROTECTED_RESULTS = 4   # The newest tool results are sent whole.
@@ -92,19 +94,30 @@ def _image_refs(message: dict) -> list[str]:
     return [p["image_url"]["url"] for p in content if p.get("type") == "image_url"]
 
 
-def kept_images(messages: list) -> set[str]:
-    """The image references still sent: the captures the model has not yet acted on (the
-    trailing run of capture messages, at most KEEP_IMAGES) and the images the user attached to
-    the current turn (newest KEEP_ATTACHED). A capture is consumed by the step after it, which
-    also changes what it shows; the model can look again. A reference image is for the work it
-    was attached to, and every request of that turn carries it; the user can attach it again.
-    An image once dropped stays dropped, so the request prefix before it holds."""
+def unpinned_refs(session: dict) -> frozenset:
+    return frozenset(r["ref"] for r in session.get("references") or [] if not r.get("pinned", True))
+
+
+def kept_messages(messages: list, unpinned: frozenset = frozenset()) -> set[int]:
+    """ids of the messages whose images are still sent: the captures the model has not yet
+    acted on (the trailing run of capture messages, at most KEEP_IMAGES) and the images the
+    user attached and has not unpinned (newest KEEP_ATTACHED), from any turn. A capture is
+    consumed by the step after it, which also changes what it shows; the model can look again.
+    A reference is what the work is measured against and stays until the user says otherwise.
+    An image once dropped stays dropped, so the request prefix before it holds. Messages, not
+    references: two identical captures share a file, and the older one must still drop."""
     turn_start = next((i for i in range(len(messages) - 1, -1, -1) if is_turn_start(messages[i])), 0)
-    batch: list[str] = []  # A step's captures come right after its results, consecutively.
+    batch: list[dict] = []  # A step's captures come right after its results, consecutively.
     for message in messages[turn_start + 1:]:
-        batch = batch + _image_refs(message) if is_capture(message) else []
-    attached = [ref for m in messages[turn_start:] if m.get(ATTACHED) for ref in _image_refs(m)]
-    return set(batch[-KEEP_IMAGES:]) | set(attached[-KEEP_ATTACHED:])
+        batch = batch + [message] if is_capture(message) else []
+    attached = [m for m in messages if m.get(ATTACHED) and any(ref not in unpinned for ref in _image_refs(m))]
+    return {id(m) for m in batch[-KEEP_IMAGES:]} | {id(m) for m in attached[-KEEP_ATTACHED:]}
+
+
+def kept_images(messages: list, unpinned: frozenset = frozenset()) -> set[str]:
+    """The image references still sent; see kept_messages."""
+    kept = kept_messages(messages, unpinned)
+    return {ref for m in messages if id(m) in kept for ref in _image_refs(m) if ref not in unpinned}
 
 
 def _size(message: dict) -> tuple[int, int]:
@@ -153,11 +166,11 @@ def _summary_message(summary: str) -> dict:
             "The block above stands for earlier messages of this conversation. It continues below."}
 
 
-def view(messages: list, upto: int | None = None) -> list[dict]:
+def view(messages: list, upto: int | None = None, unpinned: frozenset = frozenset()) -> list[dict]:
     """What is sent for messages[:upto]: the latest summary, then the messages after it with
     finished steps folded. Stored messages are returned as themselves, never copied or edited."""
     start, summary = window(messages)
-    tail = fold(messages[start:upto], kept_images(messages))
+    tail = fold(messages[start:upto], kept_messages(messages, unpinned))
     return ([_summary_message(summary)] if summary else []) + tail
 
 
@@ -176,7 +189,7 @@ def _ledger_line(call: dict, result: dict) -> str:
     return f"- {label}: {first}"
 
 
-def fold(messages: list, kept: set[str]) -> list[dict]:
+def fold(messages: list, kept: set[int]) -> list[dict]:
     """Runs of finished steps and dropped captures become one assistant message each. A step is
     finished when its results are all elided; the newest steps, user messages, replies to the
     user and kept captures stay as they are."""
@@ -197,7 +210,7 @@ def fold(messages: list, kept: set[str]) -> list[dict]:
                 ledger.extend(_ledger_line(call, result) for call, result in zip(calls, results))
                 index += 1 + len(calls)
                 continue
-        elif is_capture(message) and not any(ref in kept for ref in _image_refs(message)):
+        elif is_capture(message) and id(message) not in kept:
             ledger.append("- looked at the viewport")
             index += 1
             continue
@@ -306,15 +319,15 @@ def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summ
     """The messages for the next request, kept within cfg.context_budget, and how many stored
     messages a new summary now stands for (0 when none was made). Edits session["messages"]
     in place; never changes their number or order."""
-    messages = session["messages"]
+    messages, unpinned = session["messages"], unpinned_refs(session)
     budget, ratio = cfg.context_budget, session.get("token_ratio") or 1.0
     compacted = 0
     elide(messages)
-    if estimate_tokens(view(messages)) * ratio > budget:
+    if estimate_tokens(view(messages, unpinned=unpinned)) * ratio > budget:
         cut = compaction_cut(messages, budget, ratio)
         if cut is not None:
             try:
-                summary = summarize(cfg, view(messages, cut), is_cancelled)
+                summary = summarize(cfg, view(messages, cut, unpinned), is_cancelled)
             except llm.LLMError as ex:
                 print(f"Loopcut: could not summarize the conversation, sending it as is: {ex}")
                 summary = ""
@@ -322,4 +335,4 @@ def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summ
                 start, _ = window(messages)
                 messages[cut][SUMMARY] = summary
                 compacted = cut - start
-    return view(messages), compacted
+    return view(messages, unpinned=unpinned), compacted

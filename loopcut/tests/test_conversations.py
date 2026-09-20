@@ -186,6 +186,19 @@ class ConversationsTest(unittest.TestCase):
         self.assertEqual([part["type"] for part in wired], ["text"] * (cv.KEEP_IMAGES + 1) + ["image_url"])
         self.assertEqual(len(list((cv._folder(session["id"]) / "images").iterdir())), cv.KEEP_IMAGES + 2)
 
+    def test_references_survive_a_round_trip_and_a_malformed_one_is_refused(self):
+        session = self.session("/work/desk.blend", "copy this")
+        picture = Path(self.tmp.name) / "picture.png"
+        picture.write_bytes(b"\x89PNG")
+        ref = cv.store_image(session, picture)
+        session["references"] = [{"ref": ref, "full": ref, "name": "picture.png", "pinned": False}]
+        cv.save(session)
+        self.assertEqual(cv.load(session["id"])["references"], session["references"])
+        session["references"] = [{"ref": "loopcut-image:../evil.png", "name": "x", "pinned": True}]
+        cv.save(session)
+        with self.assertRaises(cv.ConversationError):
+            cv.load(session["id"])
+
     def test_a_changes_card_survives_a_round_trip_and_a_malformed_one_is_refused(self):
         session = self.session("/work/desk.blend", "add a sphere")
         session["items"].append(state.item_changes("1 added", ["+ Sphere (mesh)"], "c" * 32))

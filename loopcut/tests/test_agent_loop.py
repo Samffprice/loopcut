@@ -219,6 +219,61 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual([i["kind"] for i in self.session["items"]][-3:], ["user", "notice", "assistant"])
         self.assertIn("Summarized 4 earlier messages", self.session["items"][-2]["text"])
 
+    def test_looks_are_capped_when_nothing_changed_and_free_after_a_change(self):
+        from loopcut import conversations
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        shot.write_bytes(b"\x89PNG look")
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+        changed = types.SimpleNamespace(text="OK\n\nScene changes: +Cube", ok=True, image_path=None,
+                                        scene_before=empty, scene_after={**empty, "object_count": 1})
+        self.run_tool = lambda name, arguments: (
+            types.SimpleNamespace(text="Image attached.", ok=True, image_path=shot) if name == "capture_viewport" else changed)
+        look = lambda: tool_reply("capture_viewport", {})
+        SCRIPT.replies += [look(), look(), look(), look(), look(),                 # A first look, then 4 more at the same scene.
+                           tool_reply("run_python", {"code": "move()", "summary": "Move"}),
+                           look(), look(), text_reply("Done.")]
+        self.start("check it").thread.join(5)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual([c["status"] for c in cards], ["done"] * 4 + ["failed", "done", "done", "done"])
+        refusals = [m for m in self.session["messages"] if m["role"] == "tool" and "has not changed" in m["content"]]
+        self.assertEqual(len(refusals), 1)
+        sent = SCRIPT.requests[-1]["messages"]
+        images = [p for m in sent if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image_url"]
+        self.assertEqual(len(images), 1, "only the newest look is still an image")
+        self.assertTrue(any("looked at the viewport" in (m.get("content") or "") for m in sent), "older looks folded")
+
+    def test_attached_images_get_a_reference_card_before_the_first_request(self):
+        from loopcut import conversations, context
+        picture = Path(self.data_dir.name) / "chair.png"
+        picture.write_bytes(b"\x89PNG chair photo")
+        session = self.session
+        session["attachments"] = [{"ref": conversations.store_image(session, picture), "full": conversations.store_image(session, picture), "name": "chair.png"}]
+        SCRIPT.replies += [text_reply("A wooden chair: seat 0.45 m high, four round legs, #8B5A2B, matte."),
+                           text_reply("I will build it.")]
+        agent._scene_context = lambda text: "<scene_context>\nfile: unsaved\n</scene_context>"
+        self.assertTrue(agent.send("copy this chair"))
+        session["turn"].thread.join(5)
+        card_request = SCRIPT.requests[0]["messages"]
+        self.assertEqual(card_request[0]["content"], agent.REFERENCE_PROMPT)
+        self.assertEqual(card_request[1]["content"][1]["type"], "image_url")
+        message = session["messages"][0]
+        self.assertTrue(message[context.REFERENCE_CARD])
+        self.assertIn('<reference_card images="chair.png">\nA wooden chair', message["content"][0]["text"])
+        self.assertEqual(session["references"][0]["name"], "chair.png")
+        self.assertTrue(session["references"][0]["pinned"])
+        self.assertEqual([i["kind"] for i in session["items"]], ["user", "notice", "assistant"])
+        self.assertIn("reference_card", SCRIPT.requests[1]["messages"][1]["content"][0]["text"], "the card is in the real request")
+        SCRIPT.replies.append(text_reply("Still looking at it."))
+        self.start("now the legs").thread.join(5)
+        sent = SCRIPT.requests[2]["messages"]
+        self.assertEqual(sent[1]["content"][1]["type"], "image_url", "the reference is still sent next turn")
+        session["references"][0]["pinned"] = False
+        SCRIPT.replies.append(text_reply("Gone."))
+        self.start("and now").thread.join(5)
+        self.assertEqual(SCRIPT.requests[3]["messages"][1]["content"][1]["type"], "text", "unpinned: dropped")
+
     def test_conversation_is_on_disk_after_a_turn(self):
         from loopcut import conversations
         SCRIPT.replies.append(text_reply("Saved."))

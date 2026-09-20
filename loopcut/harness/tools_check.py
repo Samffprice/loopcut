@@ -108,6 +108,32 @@ def check():
         after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
         shutil.copy(shot.image_path, checkout.OUT / "capture_check.png")
+
+        # Reference images: a side-by-side comparison and a full-resolution crop, nothing left in bpy.data.
+        from loopcut import conversations, state
+        session = state.session()
+        session["references"] = [{"ref": conversations.store_image(session, shot.image_path),
+                                  "full": conversations.store_image(session, shot.image_path),
+                                  "name": "Reference Photo.png", "pinned": True}]
+        images_before = set(bpy.data.images.keys())
+        both = tools.execute("compare_with_reference", json.dumps({"name": "reference photo.png", "angle": "front"}))
+        assert both.ok and "on the left, front view" in both.text, both.text
+        side_by_side = bpy.data.images.load(str(both.image_path))
+        assert side_by_side.size[0] > 2 * tools.CAPTURE_WIDTH and side_by_side.size[1] > 100, tuple(side_by_side.size)
+        bpy.data.images.remove(side_by_side)
+        shutil.copy(both.image_path, out / "compare_check.png")
+        crop = tools.execute("look_at_reference", json.dumps({"name": "Reference Photo.png", "region": [0.25, 0.25, 0.75, 0.75]}))
+        assert crop.ok and "region x 0.25-0.75" in crop.text, crop.text
+        cropped = bpy.data.images.load(str(crop.image_path))
+        full = bpy.data.images.load(str(conversations.image_path(session["id"], session["references"][0]["full"])))
+        full_size = tuple(full.size)
+        bpy.data.images.remove(full)
+        assert all(abs(c - f / 2) <= 1 for c, f in zip(cropped.size, full_size)), (tuple(cropped.size), full_size)
+        bpy.data.images.remove(cropped)
+        assert not tools.execute("look_at_reference", json.dumps({"name": "nope.png"})).ok
+        assert not tools.execute("look_at_reference", json.dumps({"name": "Reference Photo.png", "region": [0.5, 0, 0.2, 1]})).ok
+        assert set(bpy.data.images.keys()) == images_before, "reference tools left an image datablock behind"
+        session["references"] = []
         assert bpy.context.scene.render.resolution_x == 1920, "render settings must be restored"
         print(f"TOOLS OK: capture at {shot.image_path} ({shot.image_path.stat().st_size} bytes)")
         code = 0

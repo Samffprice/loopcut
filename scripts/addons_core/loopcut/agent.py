@@ -20,8 +20,12 @@ Its result ends with "Scene changes", measured from the scene: trust that; do no
 - Your bpy knowledge is from older versions. When unsure of a name, and always after an AttributeError, \
 TypeError or "enum not found", look it up with inspect_api before retrying.
 - To see the result of a change, pass capture="three_quarter" (or "camera") to the run_python step that \
-makes it, or call capture_viewport. At most 3 captures per message. Never move the user's viewport or \
-shading. Fix what is actually wrong, then finish.
+makes it, or call capture_viewport. A look after a change is always fine; looking again at an unchanged \
+scene is refused after 3 times. Never move the user's viewport or shading. Fix what is actually wrong, \
+then finish.
+- A reference image the user attached stays in view, with a <reference_card> describing it. To copy it: \
+match the viewpoint with the camera, build from the card, then compare_with_reference after each \
+change and fix the differences you see; look_at_reference for a detail at full resolution.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Keep replies short: what you did and anything the user must decide. No code dumps.
@@ -30,7 +34,19 @@ sensibly; real-world scale in meters unless told otherwise.
 rather than trust memory, and write each step so it stands on its own."""
 
 _POLL_SECONDS = 0.1
-MAX_CAPTURES_PER_TURN = 3  # Each capture is resent with every later step of the turn; see context.py.
+# Looks at the scene cost an image each. A look after a change is what the loop is for; looking
+# again at a scene that has not changed is capped, with a ceiling on the total per turn.
+MAX_IDLE_CAPTURES = 3
+MAX_CAPTURES_PER_TURN = 8
+CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference"}
+
+REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
+Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
+1. Subject, composition, viewpoint (camera height and angle, wide or long lens), aspect ratio.
+2. Every distinct part: shape, size relative to the whole (as ratios), position, orientation, how parts meet.
+3. Colors as approximate sRGB hex, materials (matte, glossy, metal, glass; rough or smooth), patterns, textures.
+4. Lighting (direction, softness, color) and background.
+If several images are attached, describe each under its name."""
 
 
 class Turn:
@@ -39,7 +55,9 @@ class Turn:
         self.decided = threading.Event()
         self.approved = False
         self.thread: threading.Thread | None = None
-        self.captures = 0
+        self.captures = 0        # Looks at the scene this turn.
+        self.idle_captures = 0   # Looks with no scene change since the previous look.
+        self.changed = True      # The user's message itself is a change worth a look.
         # scene_diff snapshots from before the first and after the last scene-changing step.
         self.config: config.Config | None = None  # Loaded on the main thread by send().
         self.scene_before: dict | None = None
@@ -129,9 +147,49 @@ def _wait_for_approval(turn: Turn) -> bool:
 def _image_message(reference: str) -> dict:
     # A reference to a file in the conversation's folder; expanded when a request is sent.
     return {"role": "user", context.CAPTURE: True, "content": [
-        {"type": "text", "text": context.CAPTURE_TEXT},
+        {"type": "text", "text": "Image from the tool call above:"},
         {"type": "image_url", "image_url": {"url": reference}},
     ]}
+
+
+def _scene_changed(result) -> bool:
+    before = getattr(result, "scene_before", None)
+    return before is not None and before != getattr(result, "scene_after", None)
+
+
+def _capture_refusal(turn: Turn, call_name: str, arguments: str) -> str:
+    """Why this look is refused, or "" when it may go ahead. Counts it either way."""
+    if call_name not in CAPTURE_TOOLS and not (call_name == "run_python" and _wants_capture(arguments)):
+        return ""
+    turn.captures += 1
+    if call_name != "run_python" and not turn.changed:
+        turn.idle_captures += 1
+        if turn.idle_captures > MAX_IDLE_CAPTURES:
+            return (f"the scene has not changed since your last look, and you have looked {MAX_IDLE_CAPTURES} "
+                    f"times without changing anything. Change something first, or finish and tell the user "
+                    f"what you could not verify.")
+    if turn.captures > MAX_CAPTURES_PER_TURN:
+        return (f"you have already looked {MAX_CAPTURES_PER_TURN} times this turn. Finish with what you "
+                f"know, and tell the user anything you could not verify.")
+    return ""
+
+
+def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled) -> list[str]:
+    """Describe the images the user just attached, so the description outlives the turn and any
+    summary, and the model works from a checklist rather than a glance. Returns their names."""
+    refs = [p["image_url"]["url"] for p in message["content"] if p.get("type") == "image_url"]
+    names = [r["name"] for r in session["references"] if r["ref"] in refs]
+    wired = conversations.wire_messages(session["id"], [message])[0]["content"]
+    parts = [{"type": "text", "text": "Reference images: " + ", ".join(names) + "."}] + [p for p in wired if p.get("type") == "image_url"]
+    completion = llm.stream_chat(
+        base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+        messages=[{"role": "system", "content": REFERENCE_PROMPT}, {"role": "user", "content": parts}],
+        tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled)
+    card = completion.text.strip()
+    if card:
+        message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
+    message[context.REFERENCE_CARD] = True
+    return names
 
 
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
@@ -139,6 +197,13 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
     items, messages = session["items"], session["messages"]
     try:
         cfg = turn.config or config.load()
+        last = messages[-1] if messages else {}
+        if last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
+            try:
+                names = _reference_card(session, cfg, last, turn.cancel.is_set)
+                items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
+            except llm.LLMError as ex:
+                print(f"Loopcut: could not describe the attached images: {ex}")
         for _ in range(cfg.max_steps):
             prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set)
             if compacted:
@@ -155,7 +220,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                          *conversations.wire_messages(session["id"], prepared)],
+                          *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session))],
                 tools=_tool_schemas(), reasoning_effort=cfg.reasoning_effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
             )
@@ -187,18 +252,14 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 card["status"] = "running"
                 _redraw()
                 arguments, note = call.arguments, ""
-                if call.name == "capture_viewport" or (call.name == "run_python" and _wants_capture(arguments)):
-                    turn.captures += 1
-                    if turn.captures > MAX_CAPTURES_PER_TURN:
-                        refusal = (f"you have already looked {MAX_CAPTURES_PER_TURN} times this turn. Finish "
-                                   f"with what you know, and tell the user anything you could not verify.")
-                        if call.name == "capture_viewport":
-                            card["status"] = "failed"
-                            card["output"] = f"Not captured: already looked {MAX_CAPTURES_PER_TURN} times this turn."
-                            messages.append({"role": "tool", "tool_call_id": call.id,
-                                             "content": f"Not captured: {refusal}"})
-                            continue
-                        arguments, note = _without_capture(arguments), f"\n\nCapture skipped: {refusal}"
+                refusal = _capture_refusal(turn, call.name, arguments)
+                if refusal:
+                    if call.name in CAPTURE_TOOLS:
+                        card["status"] = "failed"
+                        card["output"] = "Not captured: " + refusal.split(".")[0] + "."
+                        messages.append({"role": "tool", "tool_call_id": call.id, "content": f"Not captured: {refusal}"})
+                        continue
+                    arguments, note = _without_capture(arguments), f"\n\nCapture skipped: {refusal}"
                 if _changes_scene(call.name):
                     try:
                         ensure_checkpoint(session)
@@ -213,6 +274,10 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 result = run_tool(call.name, arguments)
                 if note:
                     result.text += note
+                if call.name in CAPTURE_TOOLS or (call.name == "run_python" and _wants_capture(arguments)):
+                    turn.changed = False
+                if _scene_changed(result):
+                    turn.changed, turn.idle_captures = True, 0
                 card["status"] = "done" if result.ok else "failed"
                 card["output"] = result.text
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})
@@ -276,6 +341,9 @@ def send(text: str) -> bool:
         session["messages"].append({"role": "user", conversations.ATTACHED: True, "content": [
             {"type": "text", "text": content},
             *({"type": "image_url", "image_url": {"url": a["ref"]}} for a in attachments)]})
+        known = {r["ref"] for r in session["references"]}
+        session["references"] += [{"ref": a["ref"], "full": a.get("full", a["ref"]), "name": a["name"], "pinned": True}
+                                  for a in attachments if a["ref"] not in known]
         session["attachments"] = []
     else:
         session["messages"].append({"role": "user", "content": content})

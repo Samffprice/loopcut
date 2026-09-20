@@ -235,14 +235,16 @@ class FoldTest(unittest.TestCase):
         messages.append(capture("img:d"))
         self.assertEqual(cx.kept_images(messages), {"img:d"})
 
-    def test_attached_images_ride_the_turn_they_were_attached_to(self):
+    def test_attached_references_stay_pinned_across_turns_until_unpinned(self):
         messages = [{"role": "user", cx.ATTACHED: True, "content": [
             {"type": "text", "text": "like this"}, {"type": "image_url", "image_url": {"url": "img:ref"}}]}]
-        messages += turn(1, 1, 10)[1:]  # The steps of that turn.
-        self.assertEqual(cx.kept_images(messages), {"img:ref"})
+        messages += turn(1, 1, 10)[1:] + turn(2, 1, 10)
+        self.assertEqual(cx.kept_images(messages), {"img:ref"}, "a reference outlives its turn")
         self.assertIs(cx.view(messages)[0], messages[0])
-        messages += turn(2, 1, 10)
-        self.assertEqual(cx.kept_images(messages), set(), "the next turn no longer carries it")
+        self.assertEqual(cx.kept_images(messages, unpinned=frozenset({"img:ref"})), set())
+        session = {"references": [{"ref": "img:ref", "name": "photo.png", "pinned": False}]}
+        self.assertEqual(cx.unpinned_refs(session), frozenset({"img:ref"}))
+        self.assertEqual(cx.unpinned_refs({}), frozenset())
 
 
 class WireTest(unittest.TestCase):

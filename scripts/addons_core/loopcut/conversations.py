@@ -30,7 +30,7 @@ KEEP_IMAGES, KEEP_ATTACHED = context.KEEP_IMAGES, context.KEEP_ATTACHED
 PRIVATE_PREFIX, ATTACHED = context.PRIVATE_PREFIX, context.ATTACHED
 _ROLES = {"user", "assistant", "tool"}
 _USAGE = ("input", "output", "context")
-_PERSISTED = ("id", "items", "messages", "input", "attachments", "projects", "title", "created", "usage")
+_PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 
 
@@ -87,11 +87,14 @@ def _validate(body) -> dict:
     projects = body.get("projects", [])
     if not isinstance(projects, list) or any(not isinstance(p, str) for p in projects):
         raise ConversationError("projects must be a list of paths")
-    attachments = body.get("attachments", [])
-    if not isinstance(attachments, list) or any(
-            not isinstance(a, dict) or not isinstance(a.get("name"), str)
-            or not _IMAGE_NAME.match(str(a.get("ref", ""))[len(IMAGE_SCHEME):]) for a in attachments):
-        raise ConversationError("malformed attachments")
+    for key in ("attachments", "references"):
+        entries = body.get(key, [])
+        if not isinstance(entries, list) or any(
+                not isinstance(a, dict) or not isinstance(a.get("name"), str)
+                or not isinstance(a.get("pinned", True), bool)
+                or any(not _IMAGE_NAME.match(str(a.get(field, a.get("ref", "")))[len(IMAGE_SCHEME):])
+                       for field in ("ref", "full")) for a in entries):
+            raise ConversationError(f"malformed {key}")
     for item in items:
         if not isinstance(item, dict) or item.get("kind") not in _ITEM_KINDS:
             raise ConversationError(f"unknown item: {str(item)[:80]}")
@@ -211,10 +214,10 @@ def image_path(conversation_id: str, reference: str) -> Path:
     return _folder(conversation_id) / "images" / name
 
 
-def wire_messages(conversation_id: str, messages: list) -> list:
+def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset()) -> list:
     """Messages as the API wants them: stored image references become data URIs, and only the
     images context.kept_images names are sent; the conversation on disk keeps them all."""
-    kept = context.kept_images(messages)
+    kept = context.kept_messages(messages, unpinned)
     wired = []
     for message in messages:
         content = message.get("content")
@@ -222,7 +225,7 @@ def wire_messages(conversation_id: str, messages: list) -> list:
             parts = []
             for part in content:
                 url = part.get("image_url", {}).get("url", "") if part.get("type") == "image_url" else ""
-                if url and url not in kept:
+                if url and (id(message) not in kept or url in unpinned):
                     part = {"type": "text", "text": "[an earlier image, no longer attached]"}
                 elif url.startswith(IMAGE_SCHEME):
                     path = image_path(conversation_id, url)
