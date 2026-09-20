@@ -37,12 +37,29 @@ class Config:
 class ElisionTest(unittest.TestCase):
     def test_recent_steps_are_left_whole(self):
         messages = turn(1, 2, 100)
-        self.assertEqual(cx.elide(messages), 0)
+        self.assertEqual(cx.elide(messages, 0), 0, "the newest steps are never cut, whatever the budget")
         self.assertEqual(json.dumps(messages), json.dumps(turn(1, 2, 100)))
+
+    def test_nothing_is_cut_while_the_request_fits_the_budget(self):
+        messages = turn(1, 12, 500)
+        self.assertLess(cx.estimate_tokens(cx.view(messages)), Config.context_budget * cx.ELIDE_AT)
+        self.assertEqual(cx.elide(messages, Config.context_budget), 0)
+        self.assertEqual(json.dumps(messages), json.dumps(turn(1, 12, 500)))
+
+    def test_over_the_threshold_the_oldest_steps_are_cut_until_under_the_target(self):
+        messages = turn(1, 16, 1000)   # ~6.7k tokens: over 60% of 10k, and 40% is reachable.
+        edits = cx.elide(messages, Config.context_budget)
+        self.assertGreater(edits, 0)
+        self.assertLessEqual(cx.estimate_tokens(cx.view(messages)), Config.context_budget * cx.ELIDE_TO)
+        stubbed = [cx.ELIDED in m for m in messages if m["role"] == "tool"]
+        first_whole = stubbed.index(False)
+        self.assertTrue(all(stubbed[:first_whole]) and not any(stubbed[first_whole:]), "oldest first, in one run")
+        self.assertLess(first_whole, 16 - cx.PROTECTED_RESULTS, "stopped as soon as it fit")
+        self.assertEqual(cx.elide(messages, Config.context_budget), 0, "and nothing more while it fits")
 
     def test_older_results_and_code_are_cut_oldest_first(self):
         messages = turn(1, 12, 5000)
-        edits = cx.elide(messages)
+        edits = cx.elide(messages, Config.context_budget)  # Too big to fit even cut to the bone.
         results = [m for m in messages if m["role"] == "tool"]
         calls = [m["tool_calls"][0]["function"] for m in messages if m.get("tool_calls")]
         stubbed = [cx.ELIDED in m for m in results]
@@ -61,18 +78,18 @@ class ElisionTest(unittest.TestCase):
 
     def test_elision_is_stable_and_never_undone(self):
         messages = turn(1, 12, 5000)
-        cx.elide(messages)
+        cx.elide(messages, Config.context_budget)
         snapshot = json.dumps(messages)
-        self.assertEqual(cx.elide(messages), 0)
+        self.assertEqual(cx.elide(messages, Config.context_budget), 0)
         self.assertEqual(json.dumps(messages), snapshot, "a second pass changes nothing")
 
     def test_a_failed_step_keeps_its_code_until_the_retry_is_past(self):
         messages = turn(1, 2, 100)  # Step 1 failed, step 2 is the retry: both still whole.
         messages[2]["content"] = "Traceback...\nAttributeError: no"
-        cx.elide(messages)
+        cx.elide(messages, 0)
         self.assertIn("primitive_cube_add", messages[1]["tool_calls"][0]["function"]["arguments"])
         messages[-1:-1] = turn(1, 1, 100)[1:3]  # A third step: the failed one is now history.
-        cx.elide(messages)
+        cx.elide(messages, 0)
         self.assertIn("lines elided", messages[1]["tool_calls"][0]["function"]["arguments"])
         self.assertTrue(messages[2]["content"].startswith("Traceback..."), "the stub keeps the first line")
 
@@ -80,7 +97,7 @@ class ElisionTest(unittest.TestCase):
         messages = turn(1, 8, 4000)
         messages[1]["tool_calls"][0]["function"]["name"] = "get_scene_info"
         messages[1]["tool_calls"][0]["function"]["arguments"] = '{"name_contains": "Cube"}'
-        cx.elide(messages)
+        cx.elide(messages, 0)
         self.assertEqual(messages[1]["tool_calls"][0]["function"]["arguments"], '{"name_contains": "Cube"}')
 
 
@@ -197,7 +214,7 @@ class FoldTest(unittest.TestCase):
         messages = turn(1, 8, 500)
         messages[2]["content"] = "Traceback (most recent call last):\n  File x\nAttributeError: no such thing\n\nScene changes: none."
         messages[4]["content"] = "OK (no output)\n\nScene changes (+ added):\n+ Sphere (mesh) at [0, 0, 0]..[1, 1, 1]"
-        cx.elide(messages)
+        cx.elide(messages, 0)
         sent = cx.view(messages)
         self.assertIs(sent[0], messages[0], "the user's message is never folded")
         ledger = sent[1]
@@ -220,20 +237,37 @@ class FoldTest(unittest.TestCase):
         sent = cx.view(messages)
         self.assertEqual(len(sent), len(messages))
 
-    def test_a_capture_is_sent_once_then_folded_and_a_step_may_send_several(self):
+    def test_a_step_may_send_several_captures_and_the_newest_stays_until_replaced(self):
         messages = turn(1, 2, 100)[:-1]
         messages[3:3] = [capture("img:a")]                    # After step 1.
         messages += [capture("img:b"), capture("img:c")]      # After step 2: two angles, not yet seen.
         self.assertEqual(cx.kept_images(messages), {"img:b", "img:c"})
         sent = cx.view(messages)
-        self.assertTrue(all("img:a" not in json.dumps(m) for m in sent), "acted on: dropped")
+        self.assertTrue(all("img:a" not in json.dumps(m) for m in sent), "replaced: dropped")
         self.assertIn("- looked at the viewport", sent[3]["content"])
         self.assertEqual(sum("img:b" in json.dumps(m) or "img:c" in json.dumps(m) for m in sent), 2)
-        messages += turn(1, 1, 100)[1:3]                      # Step 3 consumed them.
-        self.assertEqual(cx.kept_images(messages), set())
+        messages += turn(1, 1, 100)[1:3]                      # Step 3 acted on them.
+        self.assertEqual(cx.kept_images(messages), {"img:c"}, "the newest look stays: the model is never blind")
         messages.append({"role": "user", "content": "next turn"})
+        self.assertEqual(cx.kept_images(messages), {"img:c"}, "across turns too, until a newer one")
         messages.append(capture("img:d"))
         self.assertEqual(cx.kept_images(messages), {"img:d"})
+        self.assertTrue(all("img:c" not in json.dumps(m) for m in cx.view(messages)))
+
+    def test_a_dropped_capture_is_remembered_by_what_it_showed(self):
+        described = capture("img:a")
+        described["content"][0]["text"] = cx.CAPTURE_LABEL + "front view of Cube, Sphere (after the step above).\nMore."
+        messages = turn(1, 1, 100)[:-1] + [described] + turn(1, 1, 100)[1:3] + [capture("img:b")]
+        ledger = next(m["content"] for m in cx.view(messages) if (m.get("content") or "").startswith(cx.LEDGER_HEAD))
+        self.assertIn("- looked: front view of Cube, Sphere (after the step above).", ledger)
+
+    def test_a_strip_of_earlier_looks_costs_less_than_a_capture(self):
+        with_strip = capture("img:a")
+        with_strip[cx.STRIP] = True
+        with_strip["content"] += [{"type": "text", "text": "earlier looks"}, {"type": "image_url", "image_url": {"url": "img:strip"}}]
+        self.assertEqual(cx.estimate_tokens([with_strip]) - cx.estimate_tokens([capture("img:a")]),
+                         cx.STRIP_TOKENS + round(len("earlier looks") / cx.CHARS_PER_TOKEN))
+        self.assertEqual(cx.kept_images([with_strip]), {"img:a", "img:strip"})
 
     def test_attached_references_stay_pinned_across_turns_until_unpinned(self):
         messages = [{"role": "user", cx.ATTACHED: True, "content": [

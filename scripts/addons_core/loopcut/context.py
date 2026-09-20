@@ -3,14 +3,15 @@
 Every request carries the whole conversation, so a long session pays for everything again on
 every step: a hundred steps over a 50k-token history is five million tokens. Three measures:
 
-1. Elision, on every request. A step's code is kept for the newest PROTECTED_CODE run_python
-   calls and then cut to a line, since the model only needs it while reacting to its result
-   (a failed step is still whole when the retry is written). Tool results are kept whole for
-   the newest PROTECTED_RESULTS and then cut down to their first line plus a note to call the
-   tool again: a result describes the scene as it was, and the scene can be read again. Both
-   edits land a few messages from the end of the request, so the provider's prompt cache keeps
-   everything before them; an elision once made is never undone, so nothing deep in the prefix
-   changes. In the conversation that motivated this, code and results were 43% of the input.
+1. Elision, once the request grows past ELIDE_AT of the budget. Then, oldest first, a step's
+   code is cut to a line (the model only needs it while reacting to its result; a failed step
+   is still whole when the retry is written) and its result is cut to its first line plus a
+   note to call the tool again (a result describes the scene as it was, and the scene can be
+   read again), until the request is down to ELIDE_TO of the budget. The newest PROTECTED_CODE
+   calls and PROTECTED_RESULTS results are never cut. Cutting in batches means the provider's
+   prompt cache is broken rarely rather than on every step; an elision once made is never
+   undone. Under the threshold nothing is cut: the budget is the user's to spend, and a model
+   that can still see its last ten steps repeats fewer of them.
 2. Compaction. If the budget is still exceeded, the model summarizes everything before the current
    turn (or a later point, if the current turn alone is too big) into one message. The summary
    rides on the first message it does not cover, so a restore that cuts the conversation cuts
@@ -19,10 +20,13 @@ every step: a hundred steps over a 50k-token history is five million tokens. Thr
 3. Folding, at request time only. Finished steps (code and result both elided) and captures
    that are no longer sent are folded into one assistant message per run of them: one line per
    step, about 15 tokens instead of the 100 a stubbed step still costs with its envelopes.
-4. Images: kept_images() keeps only the captures the model has not acted on yet, and the images
-   the user attached, which are references: they stay in every request until the user unpins
-   them, at a reduced size, so the cache pays for them. A capture on the provider we measured
-   costs IMAGE_TOKENS, ten times a typical tool result.
+4. Images: kept_images() keeps the captures the model has not acted on yet, the newest capture
+   of all (so the model always has a picture of the scene as it last saw it, until a newer one
+   replaces it), and the images the user attached, which are references: they stay in every
+   request until the user unpins them, at a reduced size, so the cache pays for them. A capture
+   on the provider we measured costs IMAGE_TOKENS, ten times a typical tool result. A capture
+   message may carry a second, smaller image: a strip of the earlier looks (STRIP), so the
+   history of a piece of work costs one small image instead of one large image per look.
 
 Nothing here inserts or removes stored messages: checkpoints cut the conversation by index.
 Elision edits a message in place and the summary is a key on a message. Our keys on messages
@@ -41,17 +45,21 @@ CAPTURE = "loopcut_capture"   # On a user message that carries a viewport captur
 CAPTURE_TEXT = "Viewport capture from capture_viewport:"  # Marks captures from before CAPTURE.
 ATTACHED = "loopcut_attached"  # On a user message whose images the user attached.
 REFERENCE_CARD = "loopcut_reference_card"  # On an attached message once its images were described.
+STRIP = "loopcut_strip"  # On a capture message whose last image is a strip of earlier looks.
 KEEP_IMAGES = 3      # Captures sent per request: the newest step's, until the model has acted on them.
 KEEP_ATTACHED = 3    # Pinned references sent per request, newest first.
 LEDGER_HEAD = "Earlier steps this turn (results elided; call a tool again if you need the details):"
 
-PROTECTED_RESULTS = 4   # The newest tool results are sent whole.
-PROTECTED_CODE = 2      # The newest run_python calls keep their code.
+PROTECTED_RESULTS = 4   # The newest tool results are never cut.
+PROTECTED_CODE = 2      # The newest run_python calls always keep their code.
+ELIDE_AT = 0.6          # Elision starts when a request would exceed this share of the budget...
+ELIDE_TO = 0.4          # ...and cuts, oldest first, until the request is under this share.
 STUB_CHARS = 160        # What an elided result keeps: enough to recognize it.
 COMPACT_TO = 0.5        # After a compaction the kept tail is at most this share of the budget.
 # Measured on the Loopcut gateway (Meta upstream) against 56 logged requests, within 7%:
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 800      # One capture at tools.CAPTURE_WIDTH (640 px); it was 1700 at 960 px, scaling with pixels.
+STRIP_TOKENS = 350      # A strip of earlier looks at tools.STRIP_HEIGHT: fewer pixels than one capture.
 FIXED_TOKENS = 1950     # System prompt and tool schemas.
 SUMMARY_TOKENS = 700    # What a summary costs, at most, once made.
 MIN_RATIO, MAX_RATIO = 0.5, 3.0
@@ -100,18 +108,21 @@ def unpinned_refs(session: dict) -> frozenset:
 
 def kept_messages(messages: list, unpinned: frozenset = frozenset()) -> set[int]:
     """ids of the messages whose images are still sent: the captures the model has not yet
-    acted on (the trailing run of capture messages, at most KEEP_IMAGES) and the images the
-    user attached and has not unpinned (newest KEEP_ATTACHED), from any turn. A capture is
-    consumed by the step after it, which also changes what it shows; the model can look again.
-    A reference is what the work is measured against and stays until the user says otherwise.
-    An image once dropped stays dropped, so the request prefix before it holds. Messages, not
-    references: two identical captures share a file, and the older one must still drop."""
+    acted on (the trailing run of capture messages, at most KEEP_IMAGES), the newest capture
+    of the conversation whatever came after it, and the images the user attached and has not
+    unpinned (newest KEEP_ATTACHED), from any turn. Several looks in one step are all seen
+    once; after that the newest stays as the model's picture of the scene until a newer look
+    replaces it, so the model is never without one. A reference is what the work is measured
+    against and stays until the user says otherwise. An image once dropped stays dropped, so
+    the request prefix before it holds. Messages, not references: two identical captures share
+    a file, and the older one must still drop."""
     turn_start = next((i for i in range(len(messages) - 1, -1, -1) if is_turn_start(messages[i])), 0)
     batch: list[dict] = []  # A step's captures come right after its results, consecutively.
     for message in messages[turn_start + 1:]:
         batch = batch + [message] if is_capture(message) else []
+    latest = [m for m in reversed(messages) if is_capture(m)][:1]
     attached = [m for m in messages if m.get(ATTACHED) and any(ref not in unpinned for ref in _image_refs(m))]
-    return {id(m) for m in batch[-KEEP_IMAGES:]} | {id(m) for m in attached[-KEEP_ATTACHED:]}
+    return {id(m) for m in batch[-KEEP_IMAGES:] + latest} | {id(m) for m in attached[-KEEP_ATTACHED:]}
 
 
 def kept_images(messages: list, unpinned: frozenset = frozenset()) -> set[str]:
@@ -139,11 +150,12 @@ def _size(message: dict) -> tuple[int, int]:
 
 def estimate_tokens(messages: list) -> int:
     """Rough and cheap; calibrate() corrects it from what the API reports."""
-    chars = images = 0
+    chars = images = strips = 0
     for message in messages:
         c, i = _size(message)
         chars, images = chars + c, images + i
-    return FIXED_TOKENS + round(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKENS
+        strips += 1 if i and message.get(STRIP) else 0
+    return FIXED_TOKENS + round(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKENS - strips * (IMAGE_TOKENS - STRIP_TOKENS)
 
 
 def calibrate(session: dict, estimated: int, reported: int) -> None:
@@ -189,6 +201,19 @@ def _ledger_line(call: dict, result: dict) -> str:
     return f"- {label}: {first}"
 
 
+CAPTURE_LABEL = "Viewport capture: "  # How a capture message's text starts; the rest says what it shows.
+
+
+def _look_line(message: dict) -> str:
+    """What a dropped capture is remembered by: what it showed, when the message says."""
+    content = message.get("content")
+    text = next((p.get("text", "") for p in content if p.get("type") == "text"), "") if isinstance(content, list) else ""
+    first = text.split("\n", 1)[0]
+    if first.startswith(CAPTURE_LABEL):
+        return f"- looked: {first[len(CAPTURE_LABEL):][:120]}"
+    return "- looked at the viewport"
+
+
 def fold(messages: list, kept: set[int]) -> list[dict]:
     """Runs of finished steps and dropped captures become one assistant message each. A step is
     finished when its results are all elided; the newest steps, user messages, replies to the
@@ -211,7 +236,7 @@ def fold(messages: list, kept: set[int]) -> list[dict]:
                 index += 1 + len(calls)
                 continue
         elif is_capture(message) and id(message) not in kept:
-            ledger.append("- looked at the viewport")
+            ledger.append(_look_line(message))
             index += 1
             continue
         flush()
@@ -252,21 +277,35 @@ def _elide_code(call: dict) -> bool:
     return True
 
 
-def elide(messages: list) -> int:
-    """Cut the results and code of steps the model has moved past, oldest first, in the part of
-    the conversation a summary does not cover. Returns how many edits were made."""
+def elide(messages: list, budget: int, ratio: float = 1.0, unpinned: frozenset = frozenset()) -> int:
+    """Once a request would exceed ELIDE_AT of the budget, cut the results and code of steps
+    the model has moved past, oldest first, until it is under ELIDE_TO of it; only in the part
+    of the conversation a summary does not cover, and never the newest steps. Returns how many
+    edits were made."""
+    def over(share: float) -> bool:
+        return estimate_tokens(view(messages, unpinned=unpinned)) * ratio > budget * share
+
+    if not over(ELIDE_AT):
+        return 0
     start, _ = window(messages)
-    edits = 0
-    results = [m for m in messages[start:] if m.get("role") == "tool" and ELIDED not in m
-               and isinstance(m.get("content"), str)]
-    for message in results[:-PROTECTED_RESULTS] if len(results) > PROTECTED_RESULTS else []:
-        message[ELIDED] = len(message["content"])
-        message["content"] = _stub(message["content"])
-        edits += 1
+    results = [m for m in messages[start:] if m.get("role") == "tool" and isinstance(m.get("content"), str)]
     calls = [call for m in messages[start:] if m.get("role") == "assistant"
              for call in m.get("tool_calls") or [] if (call.get("function") or {}).get("name") == "run_python"]
-    for call in calls[:-PROTECTED_CODE] if len(calls) > PROTECTED_CODE else []:
-        edits += _elide_code(call)
+    protected = {id(m) for m in results[-PROTECTED_RESULTS:]} | {id(c) for c in calls[-PROTECTED_CODE:]}
+    edits = 0
+    for message in messages[start:]:
+        if message.get("role") == "tool" and id(message) not in protected and ELIDED not in message \
+                and isinstance(message.get("content"), str):
+            message[ELIDED] = len(message["content"])
+            message["content"] = _stub(message["content"])
+            edits += 1
+        elif message.get("role") == "assistant":
+            edits += sum(_elide_code(call) for call in message.get("tool_calls") or []
+                         if id(call) not in protected and (call.get("function") or {}).get("name") == "run_python")
+        else:
+            continue
+        if edits and not over(ELIDE_TO):
+            break
     return edits
 
 
@@ -322,7 +361,7 @@ def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summ
     messages, unpinned = session["messages"], unpinned_refs(session)
     budget, ratio = cfg.context_budget, session.get("token_ratio") or 1.0
     compacted = 0
-    elide(messages)
+    elide(messages, budget, ratio, unpinned)
     if estimate_tokens(view(messages, unpinned=unpinned)) * ratio > budget:
         cut = compaction_cut(messages, budget, ratio)
         if cut is not None:

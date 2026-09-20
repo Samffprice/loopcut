@@ -12,6 +12,7 @@ import re
 
 MAX_SELECTED = 8
 MAX_MENTIONS = 5
+MAX_CHANGES = 12     # Lines of what the user changed since the agent's last step.
 DIGEST_OBJECTS = 20  # Up to this many objects, the block names them all: cheaper than a get_scene_info call.
 _MENTION = re.compile(r'(?<![\w@])@(?:"([^"\n]+)"|([\w.\-]+))')
 
@@ -101,8 +102,24 @@ def _digest(objects, selected) -> str:
     return f"objects by type: {listed}. get_scene_info lists them."
 
 
-def for_message(text: str) -> str:
-    """The context block for one user message. Small on purpose: it is paid for on every turn."""
+def _since_last_step(since: dict | None) -> list[str]:
+    """What changed in the scene since the agent last acted: the user's own edits, which the
+    model would otherwise learn of only by reading the scene again. A delta, not a listing."""
+    from . import scene_diff
+    if since is None:
+        return []
+    changes = scene_diff.diff(since, scene_diff.snapshot())
+    if scene_diff.is_empty(changes):
+        return []
+    listed = scene_diff.lines(changes)
+    if len(listed) > MAX_CHANGES:
+        listed = listed[:MAX_CHANGES] + [f"... and {len(listed) - MAX_CHANGES} more; get_scene_info changed_only=true lists them"]
+    return ["changed since your last step (by the user, not you):"] + ["  " + line for line in listed]
+
+
+def for_message(text: str, since: dict | None = None) -> str:
+    """The context block for one user message. Small on purpose: it is paid for on every turn.
+    `since` is the scene_diff snapshot from the end of the agent's previous step, if any."""
     import bpy
     from . import tools
     scene = bpy.context.scene
@@ -120,5 +137,6 @@ def for_message(text: str) -> str:
     else:
         lines.append("selected: nothing")
     lines.append(_digest(scene.objects, selected))
+    lines += _since_last_step(since)
     lines += [_describe_mention(name) for name in parse_mentions(text)[:MAX_MENTIONS]]
     return "<scene_context>\n" + "\n".join(lines) + "\n</scene_context>"

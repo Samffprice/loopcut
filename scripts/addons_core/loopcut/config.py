@@ -30,6 +30,7 @@ class Config:
     model: str
     reasoning_effort: str
     auto_run: bool
+    auto_look: bool  # Capture the viewport after every step that changes the scene; see agent._auto_look.
     max_steps: int
     context_budget: int  # Tokens one request may carry before old tool results are cut; see context.py.
 
@@ -142,6 +143,7 @@ def load() -> Config:
         reasoning_effort=get("LOOPCUT_REASONING_EFFORT", "medium"),
         # Model-written code only runs unprompted if the user opts in.
         auto_run=_as_bool(get("LOOPCUT_AUTO_RUN", "false"), "LOOPCUT_AUTO_RUN"),
+        auto_look=_as_bool(get("LOOPCUT_AUTO_LOOK", "true"), "LOOPCUT_AUTO_LOOK"),
         max_steps=int(max_steps),
         context_budget=int(context_budget),
     )
