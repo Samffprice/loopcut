@@ -12,6 +12,7 @@ import re
 
 MAX_SELECTED = 8
 MAX_MENTIONS = 5
+DIGEST_OBJECTS = 20  # Up to this many objects, the block names them all: cheaper than a get_scene_info call.
 _MENTION = re.compile(r'(?<![\w@])@(?:"([^"\n]+)"|([\w.\-]+))')
 
 
@@ -87,6 +88,19 @@ def _describe_mention(name: str) -> str:
     return f"@{name} is the {kind} {found.name!r}: {text}"
 
 
+def _digest(objects, selected) -> str:
+    """Every other object by name for a small scene; counts by type for a big one."""
+    chosen = {o.name for o in selected}
+    if len(objects) <= DIGEST_OBJECTS:
+        others = [f"{o.name} ({o.type})" for o in objects if o.name not in chosen]
+        return "other objects: " + (", ".join(others) if others else "none")
+    counts: dict[str, int] = {}
+    for o in objects:
+        counts[o.type] = counts.get(o.type, 0) + 1
+    listed = ", ".join(f"{t} {n}" for t, n in sorted(counts.items(), key=lambda c: -c[1]))
+    return f"objects by type: {listed}. get_scene_info lists them."
+
+
 def for_message(text: str) -> str:
     """The context block for one user message. Small on purpose: it is paid for on every turn."""
     import bpy
@@ -105,5 +119,6 @@ def for_message(text: str) -> str:
             lines.append(f"  ... and {len(selected) - MAX_SELECTED} more")
     else:
         lines.append("selected: nothing")
+    lines.append(_digest(scene.objects, selected))
     lines += [_describe_mention(name) for name in parse_mentions(text)[:MAX_MENTIONS]]
     return "<scene_context>\n" + "\n".join(lines) + "\n</scene_context>"

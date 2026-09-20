@@ -10,7 +10,7 @@ import urllib.request
 
 import bpy
 
-from . import account, credentials
+from . import account, config, credentials
 
 PACKAGE = __package__
 
@@ -95,6 +95,12 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         name="Run code without asking", default=False, update=_changed,
         description="Skip the Run / Reject step. Every turn still gets a checkpoint you can restore")
     max_steps: bpy.props.IntProperty(name="Steps per message", default=25, min=1, max=200, update=_changed)
+    context_budget: bpy.props.IntProperty(
+        name="Context budget (tokens)", default=config.DEFAULT_CONTEXT_BUDGET,
+        min=config.MIN_CONTEXT_BUDGET, max=config.MAX_CONTEXT_BUDGET, step=1000, update=_changed,
+        description="How much of the conversation each request may carry. Over this, old tool results "
+                    "are shortened and then the earlier conversation is summarized. Lower is cheaper; "
+                    "higher remembers more")
     run_timeout: bpy.props.IntProperty(
         name="Stop code after (s)", default=60, min=1, max=3600, update=_changed,
         description="A step that runs longer is stopped, so an endless loop cannot freeze Blender")
@@ -234,6 +240,7 @@ def values() -> dict[str, str]:
         "LOOPCUT_REASONING_EFFORT": prefs.reasoning_effort,
         "LOOPCUT_AUTO_RUN": "true" if prefs.auto_run else "false",
         "LOOPCUT_MAX_STEPS": str(prefs.max_steps),
+        "LOOPCUT_CONTEXT_BUDGET": str(prefs.context_budget),
         "LOOPCUT_RUN_TIMEOUT": str(prefs.run_timeout),
         "LOOPCUT_CHECKPOINT_BUDGET_MB": str(prefs.checkpoint_budget_mb),
     }

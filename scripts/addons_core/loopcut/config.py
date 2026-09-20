@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Tokens per request before the earlier conversation is summarized (context.py). With finished
+# steps folded, a request is typically 5-8k, so this holds a few turns whole.
+DEFAULT_CONTEXT_BUDGET = 24_000
+MIN_CONTEXT_BUDGET, MAX_CONTEXT_BUDGET = 8_000, 2_000_000
+
+
 class ConfigError(RuntimeError):
     pass
 
@@ -25,6 +31,7 @@ class Config:
     reasoning_effort: str
     auto_run: bool
     max_steps: int
+    context_budget: int  # Tokens one request may carry before old tool results are cut; see context.py.
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -123,6 +130,10 @@ def load() -> Config:
     max_steps = get("LOOPCUT_MAX_STEPS", "25")
     if not max_steps.isdigit() or not 1 <= int(max_steps) <= 200:
         raise ConfigError(f"LOOPCUT_MAX_STEPS must be 1-200, got {max_steps!r}")
+    context_budget = get("LOOPCUT_CONTEXT_BUDGET", str(DEFAULT_CONTEXT_BUDGET))
+    if not context_budget.isdigit() or not MIN_CONTEXT_BUDGET <= int(context_budget) <= MAX_CONTEXT_BUDGET:
+        raise ConfigError(f"LOOPCUT_CONTEXT_BUDGET must be {MIN_CONTEXT_BUDGET}-{MAX_CONTEXT_BUDGET} tokens, "
+                          f"got {context_budget!r}")
 
     return Config(
         api_key=api_key,
@@ -132,4 +143,5 @@ def load() -> Config:
         # Model-written code only runs unprompted if the user opts in.
         auto_run=_as_bool(get("LOOPCUT_AUTO_RUN", "false"), "LOOPCUT_AUTO_RUN"),
         max_steps=int(max_steps),
+        context_budget=int(context_budget),
     )

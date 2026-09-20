@@ -449,6 +449,22 @@ def _context_row(f: Frame, x: int, y: int, width: int) -> None:
            T.TEXT_MUTED)
 
 
+def _usage_labels(model: str, usage: dict) -> list[str]:
+    """Footer texts, most informative first: the latest request's size (what every step costs
+    from here) and the conversation's total."""
+    total, context = usage.get("input", 0) + usage.get("output", 0), usage.get("context", 0)
+    if not total:
+        return [model]
+    labels = []
+    if context:
+        labels.append(f"{model}  ·  {_k(context)} context  ·  {_k(total)} total")
+    return labels + [f"{model}  ·  {_k(total)} tokens", model]
+
+
+def _k(tokens: int) -> str:
+    return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+
+
 def _mention_list(f: Frame, session: dict, x: int, bottom: int, width: int) -> None:
     """Completions for the @name being typed, floating above the input."""
     rows, small = f.ui.get("mentions") or [], f.px(T.FONT_SIZE_SMALL)
@@ -523,13 +539,12 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
                    max(1, f.px(1.5)), line_height - f.px(4), T.ACCENT)
 
     footer_y = card_y + card_h - card_pad - f.line_height(small)
-    usage = session.get("usage") or {}
-    tokens = usage.get("input", 0) + usage.get("output", 0)
     hint = "esc  stop" if session["busy"] else "⏎  send"
-    if tokens:
-        counted = model + (f"  ·  {tokens / 1000:.1f}k tokens" if tokens >= 1000 else f"  ·  {tokens} tokens")
+    for counted in _usage_labels(model, session.get("usage") or {}):
+        # The most informative that fits beside the hint; a narrow panel keeps the model name.
         if f.measure("ui", small, counted) + f.measure("ui", small, hint) + f.px(16) <= inner_w:
-            model = counted  # Only where it fits beside the hint; a narrow panel keeps the model name.
+            model = counted
+            break
     f.text("input.model", inner_x, footer_y, model, small, T.TEXT_MUTED)
     f.hit("input.model", inner_x - f.px(4), footer_y - f.px(4), round(f.measure("ui", small, model)) + f.px(8),
           f.line_height(small) + f.px(8), ("open_settings", None))

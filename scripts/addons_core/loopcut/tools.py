@@ -14,7 +14,7 @@ from pathlib import Path
 import bpy
 
 MAX_OUTPUT_CHARS = 8000
-CAPTURE_WIDTH = 960
+CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
 # Above this many objects get_scene_info lists names only; details come from get_object_info.
 FULL_DETAIL_OBJECTS = 40
 DEFAULT_RUN_TIMEOUT = 60.0
@@ -34,122 +34,71 @@ class ToolResult:
     scene_after: dict | None = None
 
 
-SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": (
-                "Execute Python in the running Blender session. `bpy` is imported. Runs with a 3D "
-                "viewport context, so bpy.ops work. Prefer the data API (bpy.data, obj.location) over "
-                "bpy.ops when both work. print() output and any traceback are returned, followed by "
-                "`Scene changes`: what the code actually added, removed and changed, measured from "
-                "the scene. Trust that over what the code was meant to do; there is no need to print "
-                "values just to verify them. Each call is one undo step."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python source to execute"},
-                    "summary": {"type": "string",
-                                "description": "A few words on what this does, shown to the user"},
-                },
-                "required": ["code", "summary"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_scene_info",
-            "description": (
-                "Objects, transforms, materials, selection, mode and frame range of the current scene, "
-                "as JSON. Call this before editing a scene you have not seen. `bounds` is the world-space "
-                "box the geometry actually occupies; judge placement and contact from it. `location` is "
-                "only the object's origin: it is relative to the parent when there is one, and can sit "
-                "far from the geometry (for example at 0,0,0 after transform_apply). Large scenes are "
-                "listed by collection with names only; narrow with `name_contains` or `type`, or use "
-                "get_object_info."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name_contains": {"type": "string", "description": "Only objects whose name contains this"},
-                    "type": {"type": "string", "description": "Only objects of this type, e.g. MESH, LIGHT, CAMERA"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_object_info",
-            "description": (
-                "Everything about a few objects: modifier settings, material node trees (nodes, values "
-                "and links), geometry-nodes inputs, constraints, animation, children, custom properties. "
-                "Use it before changing an existing material, modifier or rig instead of guessing how it "
-                "is set up."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "names": {"type": "array", "items": {"type": "string"}, "description": "Object names, at most 5"},
-                },
-                "required": ["names"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_api",
-            "description": (
-                "Look up the Blender Python API of THIS Blender version: exact property names, enum "
-                "values, defaults, operator arguments, and the input/output sockets of any node. Your "
-                "memory of bpy comes from older versions and is wrong in places. Use this before using "
-                "an API you are not certain of, and always after an AttributeError, TypeError or "
-                "'enum not found' instead of guessing again. `path` examples: bpy.types.BevelModifier, "
-                "Object.modifiers, bpy.ops.mesh.bevel, ShaderNodeTexNoise, bpy.data.node_groups, "
-                "bmesh.ops.bevel, mathutils.Vector. `search` finds names from words: 'action fcurves'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Dotted path to describe"},
-                    "search": {"type": "string", "description": "Words to find in names and descriptions"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "capture_viewport",
-            "description": (
-                "Return an image of the scene so you can check your work. The tool frames the objects "
-                "itself from a 3/4 angle with materials shown, and leaves the user's viewport as it was, "
-                "so never move the viewport or change shading yourself just to take a capture. The "
-                "result also lists the framed objects nearest first, which settles what is in front of "
-                "what when objects of a similar color overlap in the image."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "focus": {"type": "array", "items": {"type": "string"},
-                              "description": "Names of objects to frame. Omit to frame everything visible."},
-                    "angle": {"type": "string",
-                              "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
-                              "description": "Default three_quarter. 'camera' looks through the scene camera "
-                                             "(use it to check framing). 'user' keeps the user's current "
-                                             "view. Both ignore focus."},
-                    "style": {"type": "string", "enum": ["material", "distinct"],
-                              "description": "Default material. 'distinct' gives every object its own flat "
-                                             "color: use it to judge shape, overlap and contact when "
-                                             "materials look alike."},
-                },
-            },
-        },
-    },
+SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
+    {"type": "function", "function": {
+        "name": "run_python",
+        "description": (
+            "Run Python in the live Blender session; `bpy` is imported and bpy.ops have a 3D viewport "
+            "context. Prefer the data API over bpy.ops. Returns print output, any traceback, and "
+            "`Scene changes`: what really changed, measured from the scene. One undo step per call."),
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python source to execute"},
+            "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
+            "capture": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera"],
+                        "description": "Also return a viewport capture afterwards, framed like "
+                                       "capture_viewport. Cheaper than a separate call."},
+        }, "required": ["code", "summary"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_scene_info",
+        "description": (
+            "The scene as JSON: objects with type, transforms, materials, modifiers, selection, mode and "
+            "frame range. `bounds` is the world-space box the geometry occupies: judge placement and "
+            "contact from it. `location` is only the origin, relative to a parent, and can sit far from "
+            "the geometry. Large scenes list names by collection; narrow with name_contains or type."),
+        "parameters": {"type": "object", "properties": {
+            "name_contains": {"type": "string", "description": "Only objects whose name contains this"},
+            "type": {"type": "string", "description": "Only this object type, e.g. MESH, LIGHT, CAMERA"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_object_info",
+        "description": (
+            "Full setup of up to 5 objects: modifier settings, material node trees (nodes, values, "
+            "links), geometry-nodes inputs, constraints, animation, children, custom properties. Read "
+            "before changing an existing setup."),
+        "parameters": {"type": "object", "properties": {
+            "names": {"type": "array", "items": {"type": "string"}, "description": "Object names"},
+        }, "required": ["names"]},
+    }},
+    {"type": "function", "function": {
+        "name": "inspect_api",
+        "description": (
+            "The Python API of THIS Blender: property names, enum values, defaults, operator arguments, "
+            "node sockets. Use before an API you are not sure of, and after any AttributeError, "
+            "TypeError or 'enum not found'. `path` like bpy.types.BevelModifier, Object.modifiers, "
+            "bpy.ops.mesh.bevel, ShaderNodeTexNoise, bmesh.ops.bevel; or `search` words: 'action fcurves'."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Dotted path to describe"},
+            "search": {"type": "string", "description": "Words to find in names and descriptions"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "capture_viewport",
+        "description": (
+            "An image of the scene, framed by the tool from a 3/4 angle with materials, leaving the "
+            "user's viewport untouched. Also lists the framed objects nearest first, which settles what "
+            "is in front when colors look alike."),
+        "parameters": {"type": "object", "properties": {
+            "focus": {"type": "array", "items": {"type": "string"},
+                      "description": "Objects to frame; default everything visible"},
+            "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
+                      "description": "Default three_quarter. camera: through the scene camera. user: the "
+                                     "user's current view. Both ignore focus."},
+            "style": {"type": "string", "enum": ["material", "distinct"],
+                      "description": "distinct gives each object a flat color, to judge shape and contact"},
+        }},
+    }},
 ]
 
 # Tools that can change the scene. A checkpoint is taken before the first one in a turn, and they
@@ -198,7 +147,15 @@ class _Deadline:
         return self._line
 
 
-def run_python(code: str, summary: str = "") -> ToolResult:
+def _model_traceback(ex: BaseException) -> str:
+    """Only the frames in the model's own code: our wrapper's frames and Blender's paths are
+    noise it pays for on every later step."""
+    frames = [f for f in traceback.extract_tb(ex.__traceback__) if f.filename == "<loopcut>"]
+    return "".join(["Traceback (most recent call last):\n", *traceback.format_list(frames),
+                    *traceback.format_exception_only(type(ex), ex)])
+
+
+def run_python(code: str, summary: str = "", capture: str = "") -> ToolResult:
     # Running model-written code is the product; the approval gate lives in agent.py.
     from . import config, scene_diff
     stdout = io.StringIO()
@@ -217,15 +174,24 @@ def run_python(code: str, summary: str = "") -> ToolResult:
             ok = False
             stdout.write(f"\nStopped: the code ran for more than {deadline.seconds:g} s, which usually means a "
                          f"loop that never ends. Whatever it changed before that is listed below.")
-        except Exception:
+        except Exception as ex:
             ok = False
-            stdout.write("\n" + traceback.format_exc())
+            stdout.write("\n" + _model_traceback(ex))
         finally:
             sys.settrace(previous_trace)
     after = scene_diff.snapshot()
     output = _clip(stdout.getvalue().strip()) or "OK (no output)"
     changes = scene_diff.for_model(scene_diff.diff(before, after))
-    return ToolResult(f"{output}\n\n{changes}", ok=ok, scene_before=before, scene_after=after)
+    result = ToolResult(f"{output}\n\n{changes}", ok=ok, scene_before=before, scene_after=after)
+    if capture:
+        # One request instead of two: the step and the look at what it did.
+        try:
+            shot = capture_viewport(angle=capture)
+            result.text += f"\n\n{shot.text}"
+            result.image_path = shot.image_path
+        except ToolError as ex:
+            result.text += f"\n\nCapture failed: {ex}"
+    return result
 
 
 def _round(values, digits=3) -> list:

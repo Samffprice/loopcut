@@ -34,6 +34,13 @@ def check():
         assert ok.scene_before["object_count"] == 3 and ok.scene_after["object_count"] == 4
         quiet = tools.execute("run_python", json.dumps({"summary": "Nothing", "code": "x = 1"}))
         assert "Scene changes: none" in quiet.text, quiet.text
+        # A step can look at its own result, so the model does not need a second request for it.
+        looked = tools.execute("run_python", json.dumps({"summary": "Look", "code": "x = 1", "capture": "front"}))
+        assert looked.ok and looked.image_path and looked.image_path.stat().st_size > 5_000, looked
+        assert "Scene changes: none" in looked.text and "Image attached: front view" in looked.text, looked.text
+        from loopcut import scene_context
+        block = scene_context.for_message("hi")
+        assert "other objects: " in block and "Camera (CAMERA)" in block and "Light (LIGHT)" in block, block
         assert "Sphere" in bpy.data.objects
 
         # After a default transform_apply the origin reads 0,0,0 but the geometry has not moved.
@@ -71,6 +78,7 @@ def check():
             "for i in range(60):\n    o = bpy.data.objects.new(f'Marker{i:02}', None)\n"
             "    bpy.context.scene.collection.objects.link(o)")}))
         big = json.loads(tools.execute("get_scene_info", "").text)
+        assert "objects by type: EMPTY 60" in scene_context.for_message("hi"), scene_context.for_message("hi")
         assert "objects" not in big and "Marker59 (EMPTY)" in big["objects_by_collection"]["Scene Collection"], big
         assert [o["name"] for o in big["selected_objects"]] == ["Sphere"], big["selected_objects"]
         lights = json.loads(tools.execute("get_scene_info", json.dumps({"type": "light"})).text)

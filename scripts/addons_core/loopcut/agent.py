@@ -3,36 +3,34 @@
 import json
 import threading
 
-from . import checkpoints, config, conversations, llm, state
+from . import checkpoints, config, context, conversations, llm, state
 
-SYSTEM_PROMPT = """You are Loopcut, an AI agent working inside the user's running Blender session.
+SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
+run_python runs bpy code; get_scene_info and get_object_info read the scene; inspect_api is this Blender's \
+Python API; capture_viewport shows you the scene.
 
-You act through tools. run_python executes bpy code in the live session. get_scene_info reports what \
-is in the scene and get_object_info how an object is set up (modifiers, material and geometry node \
-trees, animation). inspect_api is the Python API of this exact Blender version. capture_viewport \
-shows you the scene.
+Each user message starts with <scene_context>: the open file, mode, what the user has selected ("this", \
+"it", "these") and, for small scenes, every object. @Name in a message refers to that object, material \
+or collection, described in the same block.
 
-Each user message starts with a <scene_context> block: the open file, mode, and what the user has \
-selected. "This", "it" and "these" mean the selection. @Name in a message refers to the object, \
-material or collection with that name, described in the same block.
-
-How to work:
-- Look before you edit: call get_scene_info unless the context block already tells you enough. Before \
-changing an existing material, modifier or rig, read it with get_object_info and change what is \
-there; do not rebuild the user's work from scratch.
-- Make changes in small run_python steps. Its result ends with "Scene changes", measured from the \
-scene: that is what your code really did. Do not write extra code just to print and verify values.
-- Your memory of bpy is from older Blender versions. When you are not sure of a name, and always \
-after an AttributeError, TypeError or "enum not found", look it up with inspect_api before trying again.
-- After changes that affect how things look, capture_viewport once and check the result. It frames \
-the objects for you; do not move the user's viewport, change shading, or re-capture just for a nicer \
-angle. Use angle "camera" to check what the camera sees. Fix what is actually wrong, then finish.
-- Never delete or overwrite the user's existing objects, materials or files unless they asked.
-- Name the things you create sensibly. Use real-world scale in meters unless told otherwise.
-- Keep messages to the user short: what you did and anything they need to decide. No code dumps; \
-they can expand each step to see the code."""
+- Look before you edit: use the context block, and get_object_info before changing an existing material, \
+modifier or rig; change what is there instead of rebuilding the user's work.
+- One run_python step per coherent piece of work (a whole material, several objects), not one per object. \
+Its result ends with "Scene changes", measured from the scene: trust that; do not print values to check.
+- Your bpy knowledge is from older versions. When unsure of a name, and always after an AttributeError, \
+TypeError or "enum not found", look it up with inspect_api before retrying.
+- To see the result of a change, pass capture="three_quarter" (or "camera") to the run_python step that \
+makes it, or call capture_viewport. At most 3 captures per message. Never move the user's viewport or \
+shading. Fix what is actually wrong, then finish.
+- Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
+sensibly; real-world scale in meters unless told otherwise.
+- Keep replies short: what you did and anything the user must decide. No code dumps.
+- The code of all but your last two steps and older tool results are cut to a line, and a \
+<conversation_summary> may stand for earlier messages. The scene is the source of truth: look again \
+rather than trust memory, and write each step so it stands on its own."""
 
 _POLL_SECONDS = 0.1
+MAX_CAPTURES_PER_TURN = 3  # Each capture is resent with every later step of the turn; see context.py.
 
 
 class Turn:
@@ -41,6 +39,7 @@ class Turn:
         self.decided = threading.Event()
         self.approved = False
         self.thread: threading.Thread | None = None
+        self.captures = 0
         # scene_diff snapshots from before the first and after the last scene-changing step.
         self.config: config.Config | None = None  # Loaded on the main thread by send().
         self.scene_before: dict | None = None
@@ -105,6 +104,20 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
     return str(arguments.get("summary") or call.name), str(arguments.get("code") or "")
 
 
+def _wants_capture(arguments: str) -> bool:
+    try:
+        parsed = json.loads(arguments) if arguments.strip() else {}
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get("capture"))
+
+
+def _without_capture(arguments: str) -> str:
+    parsed = json.loads(arguments)
+    parsed.pop("capture", None)
+    return json.dumps(parsed)
+
+
 def _wait_for_approval(turn: Turn) -> bool:
     turn.decided.clear()
     while not turn.decided.wait(_POLL_SECONDS):
@@ -115,8 +128,8 @@ def _wait_for_approval(turn: Turn) -> bool:
 
 def _image_message(reference: str) -> dict:
     # A reference to a file in the conversation's folder; expanded when a request is sent.
-    return {"role": "user", "content": [
-        {"type": "text", "text": "Viewport capture from capture_viewport:"},
+    return {"role": "user", context.CAPTURE: True, "content": [
+        {"type": "text", "text": context.CAPTURE_TEXT},
         {"type": "image_url", "image_url": {"url": reference}},
     ]}
 
@@ -127,6 +140,11 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
     try:
         cfg = turn.config or config.load()
         for _ in range(cfg.max_steps):
+            prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set)
+            if compacted:
+                items.append(state.item_notice(
+                    f"Summarized {compacted} earlier messages so requests stay small."))
+            estimated = context.estimate_tokens(prepared)
             reply = state.item_assistant()
             items.append(reply)
 
@@ -137,7 +155,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                          *conversations.wire_messages(session["id"], messages)],
+                          *conversations.wire_messages(session["id"], prepared)],
                 tools=_tool_schemas(), reasoning_effort=cfg.reasoning_effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
             )
@@ -145,6 +163,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             if completion.usage:
                 for key in ("input", "output"):
                     session["usage"][key] += completion.usage[key]
+                session["usage"]["context"] = completion.usage["input"]
+                context.calibrate(session, estimated, completion.usage["input"])
             if not reply["text"].strip():
                 items.remove(reply)
             messages.append(completion.as_message())
@@ -166,6 +186,19 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                         continue
                 card["status"] = "running"
                 _redraw()
+                arguments, note = call.arguments, ""
+                if call.name == "capture_viewport" or (call.name == "run_python" and _wants_capture(arguments)):
+                    turn.captures += 1
+                    if turn.captures > MAX_CAPTURES_PER_TURN:
+                        refusal = (f"you have already looked {MAX_CAPTURES_PER_TURN} times this turn. Finish "
+                                   f"with what you know, and tell the user anything you could not verify.")
+                        if call.name == "capture_viewport":
+                            card["status"] = "failed"
+                            card["output"] = f"Not captured: already looked {MAX_CAPTURES_PER_TURN} times this turn."
+                            messages.append({"role": "tool", "tool_call_id": call.id,
+                                             "content": f"Not captured: {refusal}"})
+                            continue
+                        arguments, note = _without_capture(arguments), f"\n\nCapture skipped: {refusal}"
                 if _changes_scene(call.name):
                     try:
                         ensure_checkpoint(session)
@@ -177,7 +210,9 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                                          f"This step was NOT run, because a checkpoint could not be saved "
                                          f"first: {ex} Tell the user; do not retry."})
                         continue
-                result = run_tool(call.name, call.arguments)
+                result = run_tool(call.name, arguments)
+                if note:
+                    result.text += note
                 card["status"] = "done" if result.ok else "failed"
                 card["output"] = result.text
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})

@@ -111,11 +111,12 @@ def stream_chat(
     body = {
         "model": model,
         "messages": messages,
-        "tools": tools,
         "stream": True,
         "stream_options": {"include_usage": True},
         "reasoning_effort": reasoning_effort,
     }
+    if tools:  # An empty list is rejected by some providers.
+        body["tools"] = tools
     request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode("utf-8"),

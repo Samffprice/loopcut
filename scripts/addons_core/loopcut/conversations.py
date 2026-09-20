@@ -19,17 +19,18 @@ import threading
 import time
 from pathlib import Path
 
-from . import checkpoints, state
+from . import checkpoints, context, state
 
 IMAGE_SCHEME = "loopcut-image:"
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
 _ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes"}
-KEEP_IMAGES = 4  # Viewport captures sent per request; older ones cost tokens and show a stale scene.
-KEEP_ATTACHED = 8  # Images the user attached, counted apart: a reference photo must outlive captures.
-ATTACHED = "loopcut_attached"  # Marks a user message whose images the user attached. Never sent.
+# Which images are still sent is context.kept_images; an image costs about ten tool results.
+KEEP_IMAGES, KEEP_ATTACHED = context.KEEP_IMAGES, context.KEEP_ATTACHED
+PRIVATE_PREFIX, ATTACHED = context.PRIVATE_PREFIX, context.ATTACHED
 _ROLES = {"user", "assistant", "tool"}
-_PERSISTED = ("id", "items", "messages", "input", "attachments", "projects", "title", "created")
+_USAGE = ("input", "output", "context")
+_PERSISTED = ("id", "items", "messages", "input", "attachments", "projects", "title", "created", "usage")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 
 
@@ -103,6 +104,11 @@ def _validate(body) -> dict:
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in _ROLES:
             raise ConversationError(f"unknown message: {str(message)[:80]}")
+        if any(k.startswith(PRIVATE_PREFIX) and not isinstance(v, (str, int, bool)) for k, v in message.items()):
+            raise ConversationError(f"malformed message marker: {str(message)[:80]}")
+    usage = body.get("usage", {})
+    if not isinstance(usage, dict) or any(not isinstance(usage.get(k, 0), int) for k in _USAGE):
+        raise ConversationError("malformed usage")
     return body
 
 
@@ -116,6 +122,7 @@ def load(conversation_id: str) -> dict:
         raise ConversationError(f"{path} claims to be conversation {body['id']}")
     session = state.new_session()
     session.update({key: body[key] for key in _PERSISTED if key in body})
+    session["usage"] = {key: int(body.get("usage", {}).get(key, 0)) for key in _USAGE}
     # Whatever was in flight when Blender closed is over.
     for item in session["items"]:
         if item.get("streaming"):
@@ -205,15 +212,9 @@ def image_path(conversation_id: str, reference: str) -> Path:
 
 
 def wire_messages(conversation_id: str, messages: list) -> list:
-    """Messages as the API wants them: stored image references become data URIs. Only the newest
-    KEEP_IMAGES captures and KEEP_ATTACHED attached images are sent; the conversation on disk
-    keeps them all."""
-    dropped = set()
-    for attached, keep in ((False, KEEP_IMAGES), (True, KEEP_ATTACHED)):
-        references = [part["image_url"]["url"] for message in messages
-                      if isinstance(message.get("content"), list) and bool(message.get(ATTACHED)) == attached
-                      for part in message["content"] if part.get("type") == "image_url"]
-        dropped |= set(references[:-keep]) - set(references[-keep:])
+    """Messages as the API wants them: stored image references become data URIs, and only the
+    images context.kept_images names are sent; the conversation on disk keeps them all."""
+    kept = context.kept_images(messages)
     wired = []
     for message in messages:
         content = message.get("content")
@@ -221,7 +222,7 @@ def wire_messages(conversation_id: str, messages: list) -> list:
             parts = []
             for part in content:
                 url = part.get("image_url", {}).get("url", "") if part.get("type") == "image_url" else ""
-                if url in dropped:
+                if url and url not in kept:
                     part = {"type": "text", "text": "[an earlier image, no longer attached]"}
                 elif url.startswith(IMAGE_SCHEME):
                     path = image_path(conversation_id, url)
@@ -231,6 +232,6 @@ def wire_messages(conversation_id: str, messages: list) -> list:
                     else:
                         part = {"type": "text", "text": "[image no longer available]"}
                 parts.append(part)
-            message = {key: value for key, value in message.items() if key != ATTACHED} | {"content": parts}
-        wired.append(message)
+            message = message | {"content": parts}
+        wired.append({key: value for key, value in message.items() if not key.startswith(PRIVATE_PREFIX)})
     return wired

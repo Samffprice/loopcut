@@ -190,6 +190,35 @@ class AgentLoopTest(unittest.TestCase):
         roles = [m["role"] for m in SCRIPT.requests[-1]["messages"]]
         self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
 
+    def test_a_long_history_is_summarized_before_the_next_request(self):
+        from loopcut import context
+        os.environ["LOOPCUT_CONTEXT_BUDGET"] = "8000"
+        self.addCleanup(os.environ.pop, "LOOPCUT_CONTEXT_BUDGET")
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(text="x" * 60_000, ok=True, image_path=None)
+        SCRIPT.replies += [tool_reply("run_python", {"code": "big()", "summary": "Big"}), text_reply("Done.")]
+        turn = self.start("first")
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 2)
+
+        SCRIPT.replies += [text_reply("Turn 1 added a big thing."), text_reply("Sure.")]
+        self.start("second").thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 4)
+        summary_request = SCRIPT.requests[2]
+        self.assertEqual(summary_request["messages"][0]["content"], context.SUMMARY_PROMPT)
+        self.assertIn("TOOL RESULT: xxxx", summary_request["messages"][1]["content"])
+        self.assertNotIn("tools", summary_request)
+        sent = SCRIPT.requests[3]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["system", "user", "user"])
+        self.assertIn("Turn 1 added a big thing.", sent[1]["content"])
+        self.assertTrue(sent[2]["content"].endswith("second"))
+        self.assertFalse(any(k.startswith("loopcut_") for m in sent for k in m))
+        self.assertEqual(len(self.session["messages"]), 6, "the stored conversation is whole")
+        self.assertEqual(self.session["messages"][4][context.SUMMARY], "Turn 1 added a big thing.")
+        self.assertEqual([i["kind"] for i in self.session["items"]][-3:], ["user", "notice", "assistant"])
+        self.assertIn("Summarized 4 earlier messages", self.session["items"][-2]["text"])
+
     def test_conversation_is_on_disk_after_a_turn(self):
         from loopcut import conversations
         SCRIPT.replies.append(text_reply("Saved."))
@@ -282,7 +311,7 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies += [sse({"choices": [{"delta": {"content": "Hi."}}]}, usage)] * 2
         self.start("hi").thread.join(5)
         self.start("again").thread.join(5)
-        self.assertEqual(self.session["usage"], {"input": 240, "output": 16})
+        self.assertEqual(self.session["usage"], {"input": 240, "output": 16, "context": 120})
         self.assertEqual(SCRIPT.requests[0]["stream_options"], {"include_usage": True})
 
     def test_overloaded_api_is_retried_and_the_user_never_sees_it(self):

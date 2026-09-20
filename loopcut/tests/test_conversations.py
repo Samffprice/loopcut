@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 
+from loopcut import context as cx  # noqa: E402
 from loopcut import conversations as cv  # noqa: E402
 from loopcut import state  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
@@ -124,7 +125,7 @@ class ConversationsTest(unittest.TestCase):
         reference = cv.store_image(session, capture)
         self.assertEqual(reference, cv.store_image(session, capture))
         self.assertEqual(len(list((cv._folder(session["id"]) / "images").iterdir())), 1)
-        session["messages"].append({"role": "user", "content": [
+        session["messages"].append({"role": "user", cx.CAPTURE: True, "content": [
             {"type": "text", "text": "capture"}, {"type": "image_url", "image_url": {"url": reference}}]})
         cv.save(session)
         self.assertNotIn("base64", (cv._folder(session["id"]) / "conversation.json").read_text())
@@ -147,7 +148,7 @@ class ConversationsTest(unittest.TestCase):
             {"type": "image_url", "image_url": {"url": cv.store_image(session, picture)}}]})
         for number in range(cv.KEEP_IMAGES + 3):
             picture.write_bytes(b"\x89PNG capture %d" % number)
-            session["messages"].append({"role": "user", "content": [
+            session["messages"].append({"role": "user", cx.CAPTURE: True, "content": [
                 {"type": "text", "text": "capture"},
                 {"type": "image_url", "image_url": {"url": cv.store_image(session, picture)}}]})
         wired = [m for m in cv.wire_messages(session["id"], session["messages"]) if isinstance(m["content"], list)]
@@ -174,14 +175,15 @@ class ConversationsTest(unittest.TestCase):
     def test_only_the_newest_captures_are_sent_and_all_stay_on_disk(self):
         session = self.session("/work/desk.blend", "look")
         capture = Path(self.tmp.name) / "viewport.png"
-        for number in range(cv.KEEP_IMAGES + 2):
+        for number in range(cv.KEEP_IMAGES + 2):  # One capture per step: only the newest step's is sent.
             capture.write_bytes(b"\x89PNG %d" % number)
-            session["messages"].append({"role": "user", "content": [
+            session["messages"].append({"role": "assistant", "content": f"step {number}"})
+            session["messages"].append({"role": "user", cx.CAPTURE: True, "content": [
                 {"type": "text", "text": "capture"},
                 {"type": "image_url", "image_url": {"url": cv.store_image(session, capture)}}]})
         wired = [m["content"][1] for m in cv.wire_messages(session["id"], session["messages"])
                  if isinstance(m["content"], list)]
-        self.assertEqual([part["type"] for part in wired], ["text"] * 2 + ["image_url"] * cv.KEEP_IMAGES)
+        self.assertEqual([part["type"] for part in wired], ["text"] * (cv.KEEP_IMAGES + 1) + ["image_url"])
         self.assertEqual(len(list((cv._folder(session["id"]) / "images").iterdir())), cv.KEEP_IMAGES + 2)
 
     def test_a_changes_card_survives_a_round_trip_and_a_malformed_one_is_refused(self):

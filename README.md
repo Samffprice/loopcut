@@ -112,7 +112,7 @@ the Blender Foundation.
 
 | Tool | For |
 |---|---|
-| `run_python` | Change the scene. Its result ends with "Scene changes": what was really added, removed and changed, measured from the scene, so the model reads ground truth instead of printing values to check itself. |
+| `run_python` | Change the scene. Its result ends with "Scene changes": what was really added, removed and changed, measured from the scene, so the model reads ground truth instead of printing values to check itself. `capture` returns a viewport capture in the same result, one request instead of two. |
 | `get_scene_info` | What is in the scene. Large scenes list names by collection and take `name_contains` / `type`. |
 | `get_object_info` | How an object is set up: modifier settings, material and geometry node trees, constraints, animation. Read before editing someone's material. |
 | `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. |
@@ -121,11 +121,12 @@ the Blender Foundation.
 Images can be attached to a message: drop image files on the panel or use "+ image" in the input
 box (png, jpg, webp, bmp, tif, tga; up to 6 per message). Each is decoded by Blender and stored as
 a PNG of at most 1568 px in the conversation's folder, so a dropped file is never sent as-is and
-nothing is added to the .blend. Attached images stay in the model's view for the newest 8,
+nothing is added to the .blend. Attached images stay in the model's view for the turn they were
+attached to (the newest 3),
 counted apart from viewport captures, so a reference photo is not pushed out by captures.
 
-Every message also carries a `<scene_context>` block (file, mode, selection), so "make this
-shinier" works, and `@Name` pulls in that object, material or collection; the input box completes
+Every message also carries a `<scene_context>` block (file, mode, selection, and every object of a
+scene up to twenty), so "make this shinier" works and small scenes need no get_scene_info call, and `@Name` pulls in that object, material or collection; the input box completes
 names as you type. After a turn that changed something, a "Scene changes" card lists the diff with
 Keep and Undo all (which restores that turn's checkpoint).
 
@@ -199,6 +200,37 @@ fresh one without losing the old.
 
 Check: `loopcut/harness/persistence_check.py` (two launches sharing a data folder; see its docstring).
 Harness scripts default `LOOPCUT_DATA_DIR` to a temp folder so they never touch real data.
+
+## Context
+
+Every request carries the conversation, so a long session pays for its history again on every
+step; the cost of a conversation grows with the square of its length unless something is cut.
+`context.py` keeps each request within `LOOPCUT_CONTEXT_BUDGET` tokens (preference "Context
+budget", default 24000), in order:
+
+1. Elision, on every request. The code of all but the newest two `run_python` calls is cut to
+   a line, and all but the newest four tool results are cut to a headline (first line or the
+   exception, plus the first scene change) and a note to call the tool again. Both edits land a
+   few messages from the end and are never undone, so the prefix of a request stays stable and
+   provider prompt caches keep hitting. At request time, runs of finished steps are folded into
+   one "Earlier steps" message, one line each. Captures are limited to three per message by the
+   agent loop, counting `run_python` steps that asked for one.
+2. Compaction. If that is not enough, the model summarizes everything before the current turn
+   (or before a later point, if the current turn alone is too big) into one
+   `<conversation_summary>` message, and the chat shows a "Summarized N earlier messages" notice.
+   The summary is stored on the first message it does not cover, so checkpoint restores that cut
+   the conversation cut or keep it correctly.
+3. Images: a capture is sent with the request right after it and dropped once the model has
+   acted on it, since that step also changed what it showed. Attached images are sent with every
+   request of the turn they were attached to, then dropped; on the gateway one image costs as
+   much as ten tool results on every request it rides in. A 960 px capture cost about 1700 tokens on the Loopcut gateway, ten times a
+   typical tool result, so captures are taken at 640 px.
+
+Sizes are estimated from characters (3.4 per token, 1700 per image, both measured against the
+gateway's logs) and corrected with the token count the API reports for each request; the footer
+shows that count ("12.3k context") next to the conversation's total. The
+stored conversation keeps every message in place, so nothing above changes what the chat shows or
+where a checkpoint cuts.
 
 ## UI architecture
 
