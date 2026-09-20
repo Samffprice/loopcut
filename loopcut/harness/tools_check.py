@@ -73,47 +73,106 @@ def check():
         assert api.ok and "segments: int" in api.text, api.text
         assert not tools.execute("inspect_api", json.dumps({"path": "bpy.types.Nope"})).ok
 
-        # A big scene lists names and asks for a narrower question instead of truncating JSON.
+        # Many small objects still fit as rows, without their defaults, the selection first.
         tools.execute("run_python", json.dumps({"summary": "Many", "code": (
             "for i in range(60):\n    o = bpy.data.objects.new(f'Marker{i:02}', None)\n"
             "    bpy.context.scene.collection.objects.link(o)")}))
         big = json.loads(tools.execute("get_scene_info", "").text)
         assert "objects by type: EMPTY 60" in scene_context.for_message("hi"), scene_context.for_message("hi")
-        assert "objects" not in big and "Marker59 (EMPTY)" in big["objects_by_collection"]["Scene Collection"], big
-        assert [o["name"] for o in big["selected_objects"]] == ["Sphere"], big["selected_objects"]
+        assert len(big["objects"]) == 64 and big["objects"][0]["name"] == "Sphere", big["objects"][:2]
+        assert big["by_type"]["EMPTY"] == 60 and big["collections"]["Collection"] == 4 and big["matching"] == 64, big
+        marker = next(o for o in big["objects"] if o["name"] == "Marker59")
+        assert "rotation_deg" not in marker and "scale" not in marker and "visible" not in marker, marker
         lights = json.loads(tools.execute("get_scene_info", json.dumps({"type": "light"})).text)
         assert [o["name"] for o in lights["objects"]] == ["Light"], lights
+        # The cascade: only the turn's own changes with changed_only; when rows do not fit, names
+        # by collection and the selection as rows; detail=rows gets as many as fit; never a
+        # truncated JSON.
+        from loopcut import scene_context, scene_diff, state
+        session = state.session()
+        session["scene_turn_start"] = scene_diff.snapshot()
+        tools.execute("run_python", json.dumps({"summary": "Nudge", "code": "bpy.data.objects['Cube'].location.y = 2"}))
+        touched = json.loads(tools.execute("get_scene_info", json.dumps({"changed_only": True})).text)
+        assert [o["name"] for o in touched["objects"]] == ["Cube"], touched
+        assert "changed since your last step" in scene_context.for_message("hi", session["scene_turn_start"]), "user edits reach the model"
+        assert "changed since" not in scene_context.for_message("hi", scene_diff.snapshot())
+        tools.execute("run_python", json.dumps({"summary": "Many meshes", "code": (
+            "for i in range(40):\n    bpy.ops.mesh.primitive_cube_add(location=(i, 0, 0))\n"
+            "    bpy.context.object.name = f'Block{i:02}'\n    bpy.context.object.rotation_euler.z = 0.3")}))
+        blocks = tools.execute("get_scene_info", json.dumps({"name_contains": "Block"})).text
+        assert "chars omitted" not in blocks and len(blocks) <= tools.MAX_OUTPUT_CHARS, len(blocks)
+        parsed = json.loads(blocks)  # Valid whatever the size: names when rows do not fit.
+        assert "objects" not in parsed and "Block39 (MESH)" in parsed["objects_by_collection"]["Collection"], parsed.get("note")
+        assert [o["name"] for o in parsed["selected_objects"]] == ["Block39"], parsed["selected_objects"]
+        assert "only names are listed" in parsed["note"], parsed["note"]
+        in_collection = json.loads(tools.execute("get_scene_info", json.dumps({"collection": "Collection", "type": "EMPTY"})).text)
+        assert in_collection["matching"] == 0, in_collection  # The markers are in the scene collection only.
+        some = json.loads(tools.execute("get_scene_info", json.dumps({"name_contains": "Block", "detail": "rows"})).text)
+        assert 5 < len(some["objects"]) < 40 and "the first" in some["note"], (len(some["objects"]), some["note"])
+        tools.execute("run_python", json.dumps({"summary": "Clean up", "code": (
+            "for o in [o for o in bpy.data.objects if o.name.startswith('Block')]:\n    bpy.data.objects.remove(o)")}))
 
         assert not tools.execute("run_python", "{not json").ok
         assert not tools.execute("nope", "{}").ok
 
         space = next(a for a in bpy.context.window_manager.windows[0].screen.areas
                      if a.type == "VIEW_3D").spaces.active
-        before = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type)
+        before = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
+                  space.overlay.show_overlays, "Render Result" in bpy.data.images)
         shot = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"]}))
         assert shot.ok and shot.image_path.stat().st_size > 10_000, shot
-        after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type)
+        assert "labelled with their names" in shot.text, shot.text
+        out = checkout.OUT
+        shutil.copy(shot.image_path, out / "capture_check.png")  # viewport.png is rewritten by every capture.
+        assert ("Render Result" in bpy.data.images) == before[-1], "an offscreen capture must not write Render Result"
+        # The same picture twice is alike; after a change it is not.
+        same = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"]}))
+        shutil.copy(same.image_path, out_dir_same := same.image_path.with_name("same.png"))
+        assert tools.images_alike(shot.image_path, out_dir_same), "two captures of an unchanged scene must be alike"
+        after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
+                 space.overlay.show_overlays, "Render Result" in bpy.data.images)
         assert before == after, f"user's view must be restored: {before} -> {after}"
         assert not tools.execute("capture_viewport", json.dumps({"focus": ["Nope"]})).ok
+        assert not tools.execute("capture_viewport", json.dumps({"angle": "nope"})).ok
         assert "Nearest to the viewpoint first: " in shot.text, shot.text
-        out = checkout.OUT
         tools.execute("run_python", json.dumps({"summary": "Red cube in frame", "code": (
             "cube = bpy.data.objects['Cube']\ncube.location.x = 0\n"
             "cube.data.materials[0].node_tree.nodes['Principled BSDF'].inputs['Base Color'].default_value = (1, 0, 0, 1)")}))
+        moved = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"]}))  # viewport.png is reused per capture.
+        assert not tools.images_alike(moved.image_path, out_dir_same), "moving and recoloring the cube must show"
         for name, arguments in (("capture_camera", {"angle": "camera"}),
-                                ("capture_distinct", {"style": "distinct", "focus": ["Cube", "Sphere"]})):
+                                ("capture_distinct", {"style": "distinct", "focus": ["Cube", "Sphere"]}),
+                                ("capture_rendered", {"style": "rendered"}),
+                                ("capture_user", {"angle": "user"}),
+                                ("capture_sheet", {"angle": "sheet"})):
             extra = tools.execute("capture_viewport", json.dumps(arguments))
-            assert extra.ok and extra.image_path.stat().st_size > 5_000, extra
+            assert extra.ok and extra.image_path.stat().st_size > 5_000, (name, extra.text)
             shutil.copy(extra.image_path, out / f"{name}.png")
-        after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type)
+            if name == "capture_sheet":
+                sheet = bpy.data.images.load(str(extra.image_path))
+                assert tuple(sheet.size) == (tools.SHEET_TILE[0] * 2, tools.SHEET_TILE[1] * 2), tuple(sheet.size)
+                bpy.data.images.remove(sheet)
+                assert "four views of" in extra.text, extra.text
+            if name == "capture_user":
+                assert "labelled" not in extra.text, "the user's view is shown as is"
+        after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
+                 space.overlay.show_overlays, "Render Result" in bpy.data.images)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
-        shutil.copy(shot.image_path, checkout.OUT / "capture_check.png")
+        # The progress strip: earlier looks side by side, each STRIP_HEIGHT tall, one small image.
+        frames = [out / "capture_camera.png", out / "capture_distinct.png", out / "capture_check.png"]
+        strip = tools.progress_strip(frames)
+        strip_image = bpy.data.images.load(str(strip))
+        strip_size = tuple(strip_image.size)
+        bpy.data.images.remove(strip_image)
+        assert strip_size[1] == tools.STRIP_HEIGHT and strip_size[0] > 3 * tools.STRIP_HEIGHT, strip_size
+        assert tools.progress_strip([out / "nope.png"]) is None
+        shutil.copy(strip, out / "strip_check.png")
 
         # Reference images: a side-by-side comparison and a full-resolution crop, nothing left in bpy.data.
         from loopcut import conversations, state
         session = state.session()
-        session["references"] = [{"ref": conversations.store_image(session, shot.image_path),
-                                  "full": conversations.store_image(session, shot.image_path),
+        session["references"] = [{"ref": conversations.store_image(session, out / "capture_check.png"),
+                                  "full": conversations.store_image(session, out / "capture_check.png"),
                                   "name": "Reference Photo.png", "pinned": True}]
         images_before = set(bpy.data.images.keys())
         both = tools.execute("compare_with_reference", json.dumps({"name": "reference photo.png", "angle": "front"}))
@@ -135,6 +194,41 @@ def check():
         assert set(bpy.data.images.keys()) == images_before, "reference tools left an image datablock behind"
         session["references"] = []
         assert bpy.context.scene.render.resolution_x == 1920, "render settings must be restored"
+
+        # File tools: read an image the tool then shows, list, write, move, and the render.
+        from loopcut import files
+        work = Path(_tempfile.mkdtemp(prefix="loopcut-harness-work-"))  # Not under the data dir: that is off limits.
+        shutil.copy(shot.image_path, work / "photo.png")
+        seen = tools.execute("read_file", json.dumps({"path": str(work / "photo.png")}))
+        assert seen.ok and seen.text.startswith("Image attached: the file photo.png, ") and seen.image_path.stat().st_size > 5_000, seen
+        listing = tools.execute("list_files", json.dumps({"path": str(work)})).text
+        assert "photo.png  " in listing and "(1 entries)" in listing, listing
+        assert tools.execute("write_file", json.dumps({"path": str(work / "notes.txt"), "content": "hello"})).ok
+        assert not tools.execute("write_file", json.dumps({"path": str(work / "notes.txt"), "content": "x"})).ok
+        moved = tools.execute("move_file", json.dumps({"source": str(work / "notes.txt"), "destination": str(work / "done.txt")}))
+        assert moved.ok and (work / "done.txt").read_text() == "hello" and not (work / "notes.txt").exists(), moved.text
+        assert not tools.execute("read_file", json.dumps({"path": str(work / ".hidden")})).ok
+        roots = files.project_roots()
+        assert Path(bpy.app.tempdir).resolve() in roots, roots
+        files.LAST_RENDER.unlink(missing_ok=True)
+        if files.on_render_complete not in bpy.app.handlers.render_complete:  # lifecycle does this in the add-on.
+            bpy.app.handlers.render_complete.append(files.on_render_complete)
+        nothing = tools.execute("see_render", "{}")
+        assert not nothing.ok and "render=true" in nothing.text, nothing.text
+        scene = bpy.context.scene
+        engine, scene.render.engine = scene.render.engine, "BLENDER_WORKBENCH"  # Fast; put back before capturing.
+        before = (scene.render.filepath, scene.render.resolution_percentage, scene.render.image_settings.file_format)
+        rendered = tools.execute("see_render", json.dumps({"render": True}))
+        assert rendered.ok and rendered.text.startswith("Image attached: a preview render through Camera with BLENDER_WORKBENCH"), rendered.text
+        assert rendered.image_path.stat().st_size > 5_000, rendered.image_path
+        assert (scene.render.filepath, scene.render.resolution_percentage, scene.render.image_settings.file_format) == before
+        shutil.copy(rendered.image_path, out / "render_check.png")
+        scene.render.engine = engine  # Workbench has no material shading, which the capture needs.
+        again = tools.execute("capture_viewport", "{}")  # Goes through Render Result too; must not pass for a render.
+        assert again.ok and again.image_path.is_file(), again.text
+        last = tools.execute("see_render", "{}")
+        assert last.ok and last.text.startswith("Image attached: the last render, finished at "), last.text
+        assert set(bpy.data.images.keys()) - images_before <= {"Render Result"}, "file tools left an image datablock behind"
         print(f"TOOLS OK: capture at {shot.image_path} ({shot.image_path.stat().st_size} bytes)")
         code = 0
     except Exception:

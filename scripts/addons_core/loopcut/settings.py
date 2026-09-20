@@ -92,8 +92,13 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", "Slowest")],
         default="medium", update=_changed)
     auto_run: bpy.props.BoolProperty(
-        name="Run code without asking", default=False, update=_changed,
-        description="Skip the Run / Reject step. Every turn still gets a checkpoint you can restore")
+        name="Run code and file changes without asking", default=False, update=_changed,
+        description="Skip the Run / Reject step for code and file changes. Renders and bakes still ask. "
+                    "Every turn still gets a checkpoint you can restore")
+    auto_look: bpy.props.BoolProperty(
+        name="Look after every change", default=True, update=_changed,
+        description="After each step that changes the scene, the agent gets a picture of the result. "
+                    "One image per change; off, it only sees what it asks to see")
     max_steps: bpy.props.IntProperty(name="Steps per message", default=25, min=1, max=200, update=_changed)
     context_budget: bpy.props.IntProperty(
         name="Context budget (tokens)", default=config.DEFAULT_CONTEXT_BUDGET,
@@ -138,6 +143,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         column = layout.column(heading="Agent")
         column.prop(self, "reasoning_effort")
         column.prop(self, "auto_run")
+        column.prop(self, "auto_look")
         column.prop(self, "max_steps")
         column.prop(self, "run_timeout")
         column.prop(self, "checkpoint_budget_mb")
@@ -239,6 +245,7 @@ def values() -> dict[str, str]:
     found = {
         "LOOPCUT_REASONING_EFFORT": prefs.reasoning_effort,
         "LOOPCUT_AUTO_RUN": "true" if prefs.auto_run else "false",
+        "LOOPCUT_AUTO_LOOK": "true" if prefs.auto_look else "false",
         "LOOPCUT_MAX_STEPS": str(prefs.max_steps),
         "LOOPCUT_CONTEXT_BUDGET": str(prefs.context_budget),
         "LOOPCUT_RUN_TIMEOUT": str(prefs.run_timeout),

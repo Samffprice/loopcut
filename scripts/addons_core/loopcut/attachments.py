@@ -24,7 +24,8 @@ class AttachmentError(Exception):
     pass
 
 
-def _to_png(source: Path, target: Path, max_side: int = MAX_SIDE) -> None:
+def _to_png(source: Path, target: Path, max_side: int = MAX_SIDE) -> tuple[int, int]:
+    """Returns the source image's size."""
     try:
         image = bpy.data.images.load(str(source), check_existing=False)
     except RuntimeError as ex:
@@ -39,6 +40,7 @@ def _to_png(source: Path, target: Path, max_side: int = MAX_SIDE) -> None:
         image.filepath_raw = str(target)
         image.file_format = "PNG"
         image.save()
+        return width, height
     except RuntimeError as ex:
         raise AttachmentError(f"Could not convert {source.name}: {ex}") from ex
     finally:

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import math
+import re
 import sys
 import tempfile
 import time
@@ -15,8 +16,10 @@ import bpy
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
-# Above this many objects get_scene_info lists names only; details come from get_object_info.
-FULL_DETAIL_OBJECTS = 40
+STRIP_HEIGHT = 160   # A frame of the progress strip: enough to see what moved, a fraction of a capture's pixels.
+STRIP_GAP = 6
+NAMES_LIMIT = 400    # Names get_scene_info lists when rows do not fit; past this, narrow the question.
+MAX_SELECTED_ROWS = 40  # Rows for the selection when only names fit.
 DEFAULT_RUN_TIMEOUT = 60.0
 
 
@@ -44,7 +47,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "description": "Python source to execute"},
             "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
-            "capture": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera"],
+            "capture": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "sheet"],
                         "description": "Also return a viewport capture afterwards, framed like "
                                        "capture_viewport. Cheaper than a separate call."},
         }, "required": ["code", "summary"]},
@@ -52,13 +55,22 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "get_scene_info",
         "description": (
-            "The scene as JSON: objects with type, transforms, materials, modifiers, selection, mode and "
-            "frame range. `bounds` is the world-space box the geometry occupies: judge placement and "
-            "contact from it. `location` is only the origin, relative to a parent, and can sit far from "
-            "the geometry. Large scenes list names by collection; narrow with name_contains or type."),
+            "The scene as JSON, in as much detail as fits. Always: mode, frame, camera, counts by type and "
+            "by collection. Then one row per matching object (type, location, bounds, materials, modifiers, "
+            "mesh size; zero rotation, unit scale, visible and unselected are left out) when they fit, else "
+            "names by collection: then narrow with name_contains, type or collection, or ask detail=rows. "
+            "`bounds` is the world-space box the geometry occupies: judge placement and contact from it. "
+            "`location` is only the origin, relative to a parent, and can sit far from the geometry. "
+            "get_object_info has the full setup of an object."),
         "parameters": {"type": "object", "properties": {
             "name_contains": {"type": "string", "description": "Only objects whose name contains this"},
             "type": {"type": "string", "description": "Only this object type, e.g. MESH, LIGHT, CAMERA"},
+            "collection": {"type": "string", "description": "Only objects in a collection whose name contains this"},
+            "changed_only": {"type": "boolean", "description": "Only objects added or changed since this turn "
+                                                               "began: what you have touched so far"},
+            "detail": {"type": "string", "enum": ["rows", "names"],
+                       "description": "rows: as many full rows as fit, selected first. names: names only. "
+                                      "Default: rows if they all fit, else names."},
         }},
     }},
     {"type": "function", "function": {
@@ -109,17 +121,19 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "capture_viewport",
         "description": (
-            "An image of the scene, framed by the tool from a 3/4 angle with materials, leaving the "
-            "user's viewport untouched. Also lists the framed objects nearest first, which settles what "
-            "is in front when colors look alike."),
+            "An image of the scene, framed by the tool from a 3/4 angle with materials and object names "
+            "drawn on, leaving the user's viewport untouched. Also lists the visible objects nearest "
+            "first, which settles what is in front when colors look alike."),
         "parameters": {"type": "object", "properties": {
             "focus": {"type": "array", "items": {"type": "string"},
                       "description": "Objects to frame; default everything visible"},
-            "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
+            "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "user", "sheet"],
                       "description": "Default three_quarter. camera: through the scene camera. user: the "
-                                     "user's current view. Both ignore focus."},
-            "style": {"type": "string", "enum": ["material", "distinct"],
-                      "description": "distinct gives each object a flat color, to judge shape and contact"},
+                                     "user's current view. Both ignore focus. sheet: three_quarter, front, "
+                                     "side and top as one 2x2 image, for placement."},
+            "style": {"type": "string", "enum": ["material", "distinct", "rendered"],
+                      "description": "distinct: a flat color per object, to judge shape and contact. "
+                                     "rendered: EEVEE with scene lights and world, to judge lighting"},
         }},
     }},
 ]
@@ -128,6 +142,17 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # need the user's go-ahead unless auto-run is on.
 CHANGES_SCENE = {"run_python"}
 NEEDS_APPROVAL = CHANGES_SCENE
+# Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
+# user every time, whatever they have allowed: "Always allow" and auto-run do not cover it.
+HEAVY_CODE = re.compile(r"ops\.(?:render\.(?:render|opengl)|object\.bake|cycles\.bake|ptcache\.bake|"
+                        r"fluid\.bake|rigidbody\.bake|object\.(?:voxel|quadriflow)_remesh)")
+
+
+def is_heavy(name: str, arguments: dict) -> bool:
+    """A step that renders, bakes or simulates: the user approves it every time."""
+    if name == "run_python":
+        return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
+    return name == "see_render" and bool(arguments.get("render"))
 
 
 def _view3d_override() -> dict:
@@ -255,16 +280,59 @@ def object_summary(obj) -> dict:
     return entry
 
 
+_ROW_DEFAULTS = {"rotation_deg": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0], "visible": True, "selected": False}
+
+
+def object_row(obj) -> dict:
+    """object_summary without its defaults: what is not there is zero rotation, unit scale,
+    visible and not selected. A third shorter, and the exceptions stand out."""
+    return {key: value for key, value in object_summary(obj).items() if _ROW_DEFAULTS.get(key, _ROW_DEFAULTS) != value}
+
+
 def _rows(entries: list) -> str:
     # One entry per line: compact for the token budget, still valid JSON.
     return "[\n" + ",\n".join(json.dumps(entry, separators=(",", ":")) for entry in entries) + "\n]"
 
 
-def get_scene_info(name_contains: str = "", type: str = "") -> ToolResult:
+def _name_entry(obj) -> str:
+    entry = f"{obj.name} ({obj.type})"
+    return f"{entry} child of {obj.parent.name}" if obj.parent else entry
+
+
+def _changed_this_turn(objects: list) -> tuple[list, str]:
+    """The objects added or changed since the turn began, judged by scene_diff's own reading of
+    them; or all of them with a note when there is nothing to compare with."""
+    from . import scene_diff, state
+    since = state.session().get("scene_turn_start")
+    if not since or since.get("too_many"):
+        return objects, "changed_only: no snapshot from the start of this turn to compare with, so everything is listed. "
+    before, now = since["objects"], scene_diff.snapshot()["objects"]
+    return [o for o in objects if before.get(o.name) != now.get(o.name)], ""
+
+
+def get_scene_info(name_contains: str = "", type: str = "", collection: str = "", changed_only: bool = False,
+                   detail: str = "") -> ToolResult:
+    """The scene in as much detail as fits MAX_OUTPUT_CHARS: an overview always, rows when they
+    fit, names by collection otherwise. Never a truncated JSON: what does not fit is said to be
+    missing, and the narrower question that would fit is named."""
+    if detail not in ("", "rows", "names"):
+        raise ToolError('detail must be "rows" or "names"')
     scene = bpy.context.scene
     active = bpy.context.view_layer.objects.active
+    wanted = collection.lower()
+    # An exact collection name wins ("Collection" is not "Scene Collection"); else a part of one.
+    exact = wanted and any(c.name.lower() == wanted for c in [*bpy.data.collections, scene.collection])
+    in_collection = (lambda o: True) if not wanted else \
+        (lambda o: any((c.name.lower() == wanted) if exact else (wanted in c.name.lower()) for c in o.users_collection))
     chosen = [o for o in scene.objects
-              if name_contains.lower() in o.name.lower() and (not type or o.type == type.upper())]
+              if name_contains.lower() in o.name.lower() and (not type or o.type == type.upper()) and in_collection(o)]
+    note = ""
+    if changed_only:
+        chosen, note = _changed_this_turn(chosen)
+    chosen.sort(key=lambda o: (not o.select_get(), o.name))  # What the user is working on first.
+    by_type: dict[str, int] = {}
+    for obj in scene.objects:
+        by_type[obj.type] = by_type.get(obj.type, 0) + 1
     info = {
         "blender_version": bpy.app.version_string,
         "scene": scene.name,
@@ -275,19 +343,39 @@ def get_scene_info(name_contains: str = "", type: str = "") -> ToolResult:
         "unit_system": scene.unit_settings.system,
         "camera": scene.camera.name if scene.camera else None,
         "object_count": len(scene.objects),
+        "by_type": dict(sorted(by_type.items(), key=lambda item: -item[1])),
+        "collections": {c.name: len(c.objects) for c in bpy.data.collections if c.objects},
+        "matching": len(chosen),
     }
     head = json.dumps(info, separators=(",", ":"))[:-1]
-    if len(chosen) <= FULL_DETAIL_OBJECTS:
-        return ToolResult(_clip(f'{head},"objects":{_rows([object_summary(o) for o in chosen])}}}'))
-    # Too many to detail: every name, grouped the way the user organized them, plus full detail
-    # for what the user is working on right now.
+    room = MAX_OUTPUT_CHARS - len(head) - 400  # For the note and the envelope.
+    rows = [json.dumps(object_row(o), separators=(",", ":")) for o in chosen]
+    if detail != "names" and sum(len(r) + 2 for r in rows) <= room:
+        body = f'{head},"objects":[\n' + ",\n".join(rows) + "\n]"
+        return ToolResult(body + (f',"note":{json.dumps(note.strip())}' if note else "") + "}")
+    if detail == "rows":
+        fitting, used = [], 0
+        for row in rows:
+            if used + len(row) + 2 > room:
+                break
+            fitting.append(row)
+            used += len(row) + 2
+        note += (f"{len(chosen)} objects match; the first {len(fitting)} are listed (selected first, then by "
+                 f"name). Narrow with name_contains, type or collection for the rest.")
+        return ToolResult(f'{head},"note":{json.dumps(note)},"objects":[\n' + ",\n".join(fitting) + "\n]}")
+    # Names, grouped the way the user organized them, plus rows for what they are working on now.
     by_collection: dict[str, list[str]] = {}
+    listed = 0
     for obj in chosen:
-        for collection in obj.users_collection or [scene.collection]:
-            by_collection.setdefault(collection.name, []).append(f"{obj.name} ({obj.type})")
-    selected = [object_summary(o) for o in chosen if o.select_get()][:FULL_DETAIL_OBJECTS]
-    note = (f"{len(chosen)} objects match, so only names are listed. Narrow with name_contains or "
-            f"type, or call get_object_info for the ones that matter.")
+        for parent in obj.users_collection or [scene.collection]:
+            if listed < NAMES_LIMIT:
+                by_collection.setdefault(parent.name, []).append(_name_entry(obj))
+                listed += 1
+    selected = [object_row(o) for o in chosen if o.select_get()][:MAX_SELECTED_ROWS]
+    note += (f"{len(chosen)} objects match, so only names are listed, by collection"
+             + (f" (the first {NAMES_LIMIT})" if len(chosen) > NAMES_LIMIT else "")
+             + '. Narrow with name_contains, type or collection, or ask detail="rows" for as many rows as fit; '
+             "get_object_info has the full setup of one.")
     body = (f'{head},"note":{json.dumps(note)},"selected_objects":{_rows(selected)},'
             f'"objects_by_collection":{json.dumps(by_collection, separators=(",", ":"))}}}')
     return ToolResult(_clip(body))
@@ -323,7 +411,12 @@ _VIEW_EULERS = {  # Degrees, as a viewport rotation.
     "side": (90.0, 0.0, 90.0),
     "top": (0.0, 0.0, 0.0),
 }
+SHEET_ANGLES = ("three_quarter", "front", "side", "top")  # The tiles of a contact sheet, reading order.
+SHEET_TILE = (CAPTURE_WIDTH // 2, CAPTURE_WIDTH * 3 // 8)  # Four 4:3 tiles make one capture-sized image.
 _FRAME_MARGIN = 1.15
+LABEL_LIMIT = 12       # Names drawn onto a capture, nearest objects first; more would cover the picture.
+LABEL_SIZE = 12        # Font size in pixels at 640 wide.
+_HIDDEN_TYPES = {"CAMERA", "LIGHT", "EMPTY", "SPEAKER", "LIGHT_PROBE"}
 
 
 def _bounding_sphere(objects) -> tuple["Vector", float]:
@@ -335,18 +428,107 @@ def _bounding_sphere(objects) -> tuple["Vector", float]:
     return center, max((c - center).length for c in corners)
 
 
-def _frame_view(space, region, objects, angle: str) -> None:
-    from mathutils import Euler
-    rv3d = space.region_3d
+def _perspective(half_fov_x: float, width: int, height: int, near: float, far: float) -> "Matrix":
+    """A projection like the viewport's: the lens applies to the image width."""
+    from mathutils import Matrix
+    f = 1.0 / math.tan(half_fov_x)
+    return Matrix(((f, 0.0, 0.0, 0.0),
+                   (0.0, f * width / height, 0.0, 0.0),
+                   (0.0, 0.0, (far + near) / (near - far), 2.0 * far * near / (near - far)),
+                   (0.0, 0.0, -1.0, 0.0)))
+
+
+def _framed_view(space, objects, angle: str, width: int, height: int) -> tuple["Matrix", "Matrix", "Vector"]:
+    """View and projection matrices that show `objects` whole from `angle`, and the eye position.
+    The user's viewport is not touched: the matrices go straight to the offscreen draw."""
+    from mathutils import Euler, Matrix
     center, radius = _bounding_sphere(objects)
-    # The lens applies to the longer region side, so the shorter side sees less.
-    half_fov = math.atan(36.0 / space.lens)
-    aspect = min(region.width, region.height) / max(region.width, region.height)
-    half_fov_short = math.atan(math.tan(half_fov) * aspect)
-    rv3d.view_perspective = "PERSP"
-    rv3d.view_rotation = Euler([math.radians(a) for a in _VIEW_EULERS[angle]]).to_quaternion()
-    rv3d.view_location = center
-    rv3d.view_distance = max(radius, 0.01) / math.sin(half_fov_short) * _FRAME_MARGIN
+    half_fov_x = math.atan(36.0 / space.lens)
+    # The shorter image side sees less; fit the sphere into that.
+    half_fov_short = math.atan(math.tan(half_fov_x) * min(width, height) / max(width, height))
+    distance = max(radius, 0.01) / math.sin(half_fov_short) * _FRAME_MARGIN
+    rotation = Euler([math.radians(a) for a in _VIEW_EULERS[angle]]).to_matrix().to_4x4()
+    camera = Matrix.Translation(center) @ rotation @ Matrix.Translation((0.0, 0.0, distance))
+    far = max(space.clip_end, distance + radius * 2)
+    return camera.inverted(), _perspective(half_fov_x, width, height, space.clip_start, far), camera.translation
+
+
+def _to_pixel(view, projection, point, width: int, height: int):
+    """Image position of a world point, or None when it is behind the eye or outside the image."""
+    from mathutils import Vector
+    clip = projection @ view @ Vector((*point, 1.0))
+    if clip.w <= 0:
+        return None
+    x, y = (clip.x / clip.w * 0.5 + 0.5) * width, (clip.y / clip.w * 0.5 + 0.5) * height
+    return (x, y) if 0 <= x < width and 0 <= y < height else None
+
+
+def _labels(objects, eye, view, projection, width: int, height: int) -> list[tuple[str, float, float]]:
+    """(name, x, y) for the nearest LABEL_LIMIT objects whose centre is in the image, skipping a
+    label that would sit on one already placed. Pixel coordinates from the bottom-left."""
+    import blf
+    blf.size(0, LABEL_SIZE)
+    placed, boxes = [], []
+    by_distance = sorted(objects, key=lambda o: (_bounding_sphere([o])[0] - eye).length)
+    for obj in by_distance:
+        at = _to_pixel(view, projection, _bounding_sphere([obj])[0], width, height)
+        if at is None:
+            continue
+        w, h = blf.dimensions(0, obj.name)
+        box = (at[0], at[1], at[0] + w + 8, at[1] + h + 6)
+        if any(not (box[2] < b[0] or b[2] < box[0] or box[3] < b[1] or b[3] < box[1]) for b in boxes):
+            continue
+        boxes.append(box)
+        placed.append((obj.name, at[0], at[1]))
+        if len(placed) == LABEL_LIMIT:
+            break
+    return placed
+
+
+def _draw_text(width: int, height: int, labels: list[tuple[str, float, float]]) -> None:
+    """Draw name tags into the bound offscreen buffer, in pixel space."""
+    import blf
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+    from mathutils import Matrix
+    with gpu.matrix.push_pop():
+        gpu.matrix.load_matrix(Matrix.Identity(4))
+        gpu.matrix.load_projection_matrix(Matrix(((2.0 / width, 0.0, 0.0, -1.0), (0.0, 2.0 / height, 0.0, -1.0),
+                                                  (0.0, 0.0, -1.0, 0.0), (0.0, 0.0, 0.0, 1.0))))
+        gpu.state.blend_set("ALPHA")
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        shader.uniform_float("color", (0.0, 0.0, 0.0, 0.65))
+        blf.size(0, LABEL_SIZE)
+        for text, x, y in labels:
+            w, h = blf.dimensions(0, text)
+            x1, y1 = x + w + 8, y + h + 6
+            batch_for_shader(shader, "TRIS", {"pos": [(x, y), (x1, y), (x1, y1), (x, y), (x1, y1), (x, y1)]}).draw(shader)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        for text, x, y in labels:
+            blf.position(0, x + 4, y + 3, 0.0)
+            blf.draw(0, text)
+        gpu.state.blend_set("NONE")
+
+
+def _draw_offscreen(scene, space, region, view, projection, width: int, height: int,
+                    labels: list[tuple[str, float, float]]):
+    """The scene as the viewport would draw it with `space`'s shading, into a buffer of our own:
+    rows bottom-up, RGBA in 0..1, display colours. Nothing of the user's is touched, and
+    Blender's Render Result is not written."""
+    import gpu
+    import numpy as np
+    offscreen = gpu.types.GPUOffScreen(width, height, format="RGBA8")
+    try:
+        with offscreen.bind():
+            gpu.state.active_framebuffer_get().clear(color=(0.0, 0.0, 0.0, 1.0))
+            offscreen.draw_view3d(scene, bpy.context.view_layer, space, region, view, projection,
+                                  do_color_management=True, draw_background=True)
+            if labels:
+                _draw_text(width, height, labels)
+            pixels = np.asarray(offscreen.texture_color.read())
+    finally:
+        offscreen.free()
+    return pixels.reshape(height, width, 4).astype(np.float32) / 255.0
 
 
 def _nearest_first(eye, objects) -> str:
@@ -358,21 +540,21 @@ def _nearest_first(eye, objects) -> str:
 
 def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter",
                      style: str = "material") -> ToolResult:
-    angles = [*_VIEW_EULERS, "camera", "user"]
+    import numpy as np
+    angles = [*_VIEW_EULERS, "camera", "user", "sheet"]
     if angle not in angles:
         raise ToolError(f"angle must be one of {', '.join(angles)}")
-    if style not in ("material", "distinct"):
-        raise ToolError("style must be material or distinct")
+    if style not in ("material", "distinct", "rendered"):
+        raise ToolError("style must be material, distinct or rendered")
     scene = bpy.context.scene
     if angle == "camera" and scene.camera is None:
         raise ToolError("The scene has no active camera (scene.camera is None).")
     override = _view3d_override()
     region, space = override["region"], override["area"].spaces.active
     rv3d = space.region_3d
-    framed = angle in _VIEW_EULERS
+    framed = angle in _VIEW_EULERS or angle == "sheet"
 
-    visible = [o for o in scene.objects
-               if o.visible_get() and o.type not in {"CAMERA", "LIGHT", "EMPTY", "SPEAKER", "LIGHT_PROBE"}]
+    visible = [o for o in scene.objects if o.visible_get() and o.type not in _HIDDEN_TYPES]
     if focus and framed:
         missing = [name for name in focus if name not in bpy.data.objects]
         if missing:
@@ -383,62 +565,66 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
     if framed and not targets:
         raise ToolError("Nothing visible to frame.")
 
-    render, shading = scene.render, space.shading
-    image_settings = render.image_settings
-    saved_render = (render.filepath, render.resolution_x, render.resolution_y,
-                    render.resolution_percentage, image_settings.file_format)
-    saved_view = (rv3d.view_perspective, rv3d.view_rotation.copy(), rv3d.view_location.copy(),
-                  rv3d.view_distance, shading.type, shading.color_type, shading.light,
-                  space.overlay.show_overlays, space.use_local_camera)
+    shading = space.shading
+    saved_view = (shading.type, shading.color_type, shading.light, space.overlay.show_overlays)
     out_dir = Path(tempfile.gettempdir()) / "loopcut"
     out_dir.mkdir(exist_ok=True)
     path = out_dir / "viewport.png"
     path.unlink(missing_ok=True)
     try:
-        render.filepath = str(path)
-        # The camera view is rendered at the camera's own aspect, so "in frame" means in the image.
-        aspect = (render.resolution_y / max(1, render.resolution_x) if angle == "camera"
-                  else region.height / max(1, region.width))
-        render.resolution_x = CAPTURE_WIDTH
-        render.resolution_y = max(1, round(CAPTURE_WIDTH * aspect))
-        render.resolution_percentage = 100
-        image_settings.file_format = "PNG"
-        if framed:
-            _frame_view(space, region, targets, angle)
         if angle != "user":
+            # The user's view is shown as is; every other look uses our shading and no overlays,
+            # which the offscreen draw would otherwise include: grid, outlines, gizmos.
             if style == "distinct":
                 shading.type, shading.color_type, shading.light = "SOLID", "RANDOM", "STUDIO"
             else:
-                shading.type = "MATERIAL"
-            # Overlays are composited without depth, so the grid shows through solid objects and
-            # makes it impossible to judge contact and occlusion.
+                shading.type = "RENDERED" if style == "rendered" else "MATERIAL"
             space.overlay.show_overlays = False
-        if angle == "camera":
-            # In camera view the viewport render is exactly the camera frame, at our resolution.
-            rv3d.view_perspective = "CAMERA"
-            space.use_local_camera = False
-        rv3d.update()
-        eye = scene.camera.matrix_world.translation if angle == "camera" else rv3d.view_matrix.inverted().translation
-        # Everything visible, not only what was framed: an object that was not asked for is
-        # exactly the one that turns up in front of the subject.
-        order = _nearest_first(eye.copy(), visible)
-        with bpy.context.temp_override(**override):
-            bpy.ops.render.opengl(write_still=True, view_context=True)
+        if angle == "sheet":
+            tile_w, tile_h = SHEET_TILE
+            tiles = []
+            for tile_angle in SHEET_ANGLES:
+                view, projection, _ = _framed_view(space, targets, tile_angle, tile_w, tile_h)
+                tiles.append(_draw_offscreen(scene, space, region, view, projection, tile_w, tile_h,
+                                             [(tile_angle.replace("_", " "), 4.0, tile_h - LABEL_SIZE - 10.0)]))
+            # Rows are bottom-up: the first two tiles go on the upper row.
+            pixels = np.concatenate([np.concatenate(tiles[2:], axis=1), np.concatenate(tiles[:2], axis=1)], axis=0)
+            eye = _framed_view(space, targets, "three_quarter", tile_w, tile_h)[2]
+        else:
+            if framed:
+                width, height = CAPTURE_WIDTH, max(1, round(CAPTURE_WIDTH * region.height / max(1, region.width)))
+                view, projection, eye = _framed_view(space, targets, angle, width, height)
+            elif angle == "camera":
+                # The camera's own frame at its own aspect, so "in frame" means in the image.
+                render = scene.render
+                width = CAPTURE_WIDTH
+                height = max(1, round(CAPTURE_WIDTH * render.resolution_y / max(1, render.resolution_x)))
+                camera = scene.camera
+                view = camera.matrix_world.inverted()
+                projection = camera.calc_matrix_camera(bpy.context.evaluated_depsgraph_get(), x=width, y=height)
+                eye = camera.matrix_world.translation
+            else:
+                width, height = CAPTURE_WIDTH, max(1, round(CAPTURE_WIDTH * region.height / max(1, region.width)))
+                view, projection = rv3d.view_matrix.copy(), rv3d.window_matrix.copy()
+                eye = rv3d.view_matrix.inverted().translation
+            labels = _labels(visible, eye, view, projection, width, height) if angle != "user" else []
+            pixels = _draw_offscreen(scene, space, region, view, projection, width, height, labels)
     finally:
-        (render.filepath, render.resolution_x, render.resolution_y,
-         render.resolution_percentage, image_settings.file_format) = saved_render
-        (rv3d.view_perspective, rv3d.view_rotation, rv3d.view_location, rv3d.view_distance,
-         shading.type, shading.color_type, shading.light, space.overlay.show_overlays,
-         space.use_local_camera) = saved_view
-        rv3d.update()
-    if not path.is_file():
-        raise ToolError("Viewport capture produced no image.")
+        (shading.type, shading.color_type, shading.light, space.overlay.show_overlays) = saved_view
+    _save_pixels(pixels, path)
+    # Everything visible, not only what was framed: an object that was not asked for is
+    # exactly the one that turns up in front of the subject.
+    order = _nearest_first(eye.copy(), visible)
     if angle == "camera":
         what = f"the view through {scene.camera.name}; the image edges are the camera frame"
     elif angle == "user":
         what = "the user's current view"
+    elif angle == "sheet":
+        what = f"four views of {', '.join(o.name for o in targets[:12])}: three quarter, front (top row), side, top (bottom row)"
     else:
         what = f"{angle} view of {', '.join(o.name for o in targets[:12])}"
+    if angle != "user":
+        what += "; objects are labelled with their names"
     return ToolResult(f"Image attached: {what}.{order}", image_path=path)
 
 
@@ -496,6 +682,42 @@ def _save_pixels(pixels, path: Path, max_side: int | None = None) -> tuple[int, 
         bpy.data.images.remove(image)
 
 
+ALIKE_CHANNEL = 8 / 255   # A channel must move at least this much for a pixel to count as changed...
+ALIKE_FRACTION = 0.002    # ...and this share of pixels must change for two looks to differ.
+
+
+def images_alike(a: Path, b: Path) -> bool:
+    """Whether two captures show the same picture, to the eye: same size, and nearly no pixel
+    differs by more than a shade. The agent's automatic look is dropped when it would only
+    repeat the previous one."""
+    import numpy as np
+    first, second = _pixels(a), _pixels(b)
+    if first.shape != second.shape:
+        return False
+    changed = (np.abs(first[..., :3] - second[..., :3]) > ALIKE_CHANNEL).any(axis=-1)
+    return float(changed.mean()) < ALIKE_FRACTION
+
+
+def progress_strip(paths: list) -> "Path | None":
+    """The captures at `paths` side by side, oldest first, each STRIP_HEIGHT tall: the model's
+    earlier looks as one small image. None when none of the files is there any more."""
+    import numpy as np
+    frames = [_pixels(path, height=STRIP_HEIGHT) for path in paths if Path(path).is_file()]
+    if not frames:
+        return None
+    width = sum(frame.shape[1] for frame in frames) + STRIP_GAP * (len(frames) - 1)
+    canvas = np.zeros((STRIP_HEIGHT, width, 4), dtype=np.float32)
+    canvas[..., :3], canvas[..., 3] = 0.15, 1.0  # A dark gap: the frames read as separate pictures.
+    x = 0
+    for frame in frames:
+        canvas[:, x:x + frame.shape[1]] = frame
+        x += frame.shape[1] + STRIP_GAP
+    out = Path(tempfile.gettempdir()) / "loopcut" / "strip.png"
+    out.parent.mkdir(exist_ok=True)
+    _save_pixels(canvas, out)
+    return out
+
+
 def look_at_reference(name: str, region: list | None = None) -> ToolResult:
     found, path = _reference(name)
     pixels = _pixels(path)
@@ -550,9 +772,10 @@ _DISPATCH = {
 
 
 def execute(name: str, arguments_json: str) -> ToolResult:
-    fn = _DISPATCH.get(name)
+    from . import files
+    fn = _DISPATCH.get(name) or files.DISPATCH.get(name)
     if fn is None:
-        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(_DISPATCH)}", ok=False)
+        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join([*_DISPATCH, *files.DISPATCH])}", ok=False)
     try:
         arguments = json.loads(arguments_json) if arguments_json.strip() else {}
         if not isinstance(arguments, dict):

@@ -64,9 +64,15 @@ def _initial_resume():
     return None
 
 
+def _handlers() -> tuple:
+    from . import files
+    return ((bpy.app.handlers.load_post, _on_load_post), (bpy.app.handlers.save_post, _on_save_post),
+            (bpy.app.handlers.render_complete, files.on_render_complete))
+
+
 def register() -> None:
-    bpy.app.handlers.load_post.append(_on_load_post)
-    bpy.app.handlers.save_post.append(_on_save_post)
+    for handlers, fn in _handlers():
+        handlers.append(fn)
     bpy.app.timers.register(_initial_resume, first_interval=0.0, persistent=True)
 
 
@@ -74,6 +80,6 @@ def unregister() -> None:
     if bpy.app.timers.is_registered(_initial_resume):  # Disabled before its first tick.
         bpy.app.timers.unregister(_initial_resume)
     conversations.save(state.session())
-    for handlers, fn in ((bpy.app.handlers.load_post, _on_load_post), (bpy.app.handlers.save_post, _on_save_post)):
+    for handlers, fn in _handlers():
         if fn in handlers:
             handlers.remove(fn)

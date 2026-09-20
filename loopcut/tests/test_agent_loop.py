@@ -88,10 +88,14 @@ class AgentLoopTest(unittest.TestCase):
             "LOOPCUT_BASE_URL": f"http://127.0.0.1:{cls.server.server_port}",
             "LOOPCUT_MODEL": "fake-model",
             "LOOPCUT_AUTO_RUN": "false",
+            "LOOPCUT_AUTO_LOOK": "false",  # Tests that want the automatic look turn it on.
         })
+        agent._scene_snapshot = lambda: None
+        agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
+        agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
+        agent._build_strip_on_main = lambda paths: None  # Needs Blender's main thread; tests pass their own.
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
-        agent._needs_approval = lambda name: name == "run_python"
         agent._changes_scene = lambda name: name == "run_python"
 
     @classmethod
@@ -242,7 +246,114 @@ class AgentLoopTest(unittest.TestCase):
         sent = SCRIPT.requests[-1]["messages"]
         images = [p for m in sent if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image_url"]
         self.assertEqual(len(images), 1, "only the newest look is still an image")
-        self.assertTrue(any("looked at the viewport" in (m.get("content") or "") for m in sent), "older looks folded")
+        self.assertTrue(any("- looked" in (m.get("content") or "") for m in sent), "older looks folded")
+
+    def test_after_a_change_the_agent_looks_by_itself_at_the_angle_last_asked_for(self):
+        from loopcut import conversations, context
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        strips: list[list] = []
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            if name == "capture_viewport":
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached: the view through Camera. Nearest to the viewpoint first: Cube 1.0 m.",
+                                             ok=True, image_path=shot)
+            return types.SimpleNamespace(text="OK\n\nScene changes: +Cube", ok=True, image_path=None,
+                                         scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
+
+        def build_strip(paths):
+            strips.append(paths)
+            strip = Path(self.data_dir.name) / "strip.png"
+            strip.write_bytes(b"\x89PNG strip %d" % len(strips))
+            return strip
+
+        self.run_tool = run_tool
+        step = lambda: tool_reply("run_python", {"code": "add()", "summary": "Add"})
+        SCRIPT.replies += [tool_reply("capture_viewport", {"angle": "camera"}), step(), step(), text_reply("Done.")]
+        session = self.session
+        turn = agent.Turn()
+        session["items"].append(state.item_user("build it"))
+        session["messages"].append({"role": "user", "content": "build it"})
+        session["busy"], session["turn"] = True, turn
+        agent._run(session, turn, run_tool, self.ensure_checkpoint, build_strip)
+        self.assertEqual([(n, json.loads(a)) for n, a in self.ran],
+                         [("capture_viewport", {"angle": "camera"}), ("run_python", {"code": "add()", "summary": "Add"}),
+                          ("capture_viewport", {"angle": "camera"}), ("run_python", {"code": "add()", "summary": "Add"}),
+                          ("capture_viewport", {"angle": "camera"})], "a look after each change, the model's angle")
+        results = [m["content"] for m in session["messages"] if m["role"] == "tool"]
+        self.assertTrue(results[1].startswith("OK\n\nScene changes: +Cube\n\nImage attached: the view through Camera"),
+                        "the look is part of the step's result, as if the step had asked for it")
+        captures = [m for m in session["messages"] if context.is_capture(m)]
+        self.assertEqual(len(captures), 3)
+        self.assertTrue(captures[1]["content"][0]["text"].startswith(context.CAPTURE_LABEL + "the view through Camera"))
+        self.assertEqual([len(p) for p in strips], [1, 2], "each strip holds the looks before it")
+        self.assertTrue(all(context.STRIP in m for m in captures[1:]) and context.STRIP not in captures[0])
+        self.assertEqual(turn.captures, 1, "automatic looks are not counted against the model")
+        sent = SCRIPT.requests[-1]["messages"]
+        images = [p for m in sent if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image_url"]
+        self.assertEqual(len(images), 2, "the newest capture and its strip; earlier looks folded")
+        self.assertTrue(any("- looked: the view through Camera" in (m.get("content") or "") for m in sent))
+
+    def test_an_automatic_look_that_shows_nothing_new_is_a_note_not_an_image(self):
+        from loopcut import context
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+        compared: list[tuple] = []
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            if name == "capture_viewport":
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached: three_quarter view of Cube.", ok=True, image_path=shot)
+            return types.SimpleNamespace(text="OK\n\nScene changes: ~Cube", ok=True, image_path=None,
+                                         scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
+
+        def alike(previous, current):
+            compared.append((previous.name, current.name))
+            return len(compared) == 1  # The second step's look repeats the first; the third differs.
+
+        step = lambda: tool_reply("run_python", {"code": "tweak()", "summary": "Tweak"})
+        SCRIPT.replies += [step(), step(), step(), text_reply("Done.")]
+        session = self.session
+        turn = agent.Turn()
+        session["items"].append(state.item_user("tweak it"))
+        session["messages"].append({"role": "user", "content": "tweak it"})
+        session["busy"], session["turn"] = True, turn
+        agent._run(session, turn, run_tool, self.ensure_checkpoint, lambda paths: None, alike)
+        self.assertEqual([n for n, _ in self.ran], ["run_python", "capture_viewport"] * 3, "the capture is still taken: it is free")
+        captures = [m for m in session["messages"] if context.is_capture(m)]
+        self.assertEqual(len(captures), 2, "the repeated look is not stored as an image")
+        results = [m["content"] for m in session["messages"] if m["role"] == "tool"]
+        self.assertIn("Image attached", results[0])
+        self.assertIn("no visible difference from your last capture", results[1])
+        self.assertNotIn("Image attached", results[1])
+        self.assertIn("Image attached", results[2])
+        self.assertEqual(len(compared), 2, "the first look has nothing to compare with")
+        self.assertTrue(all(p.endswith(".png") for p, _ in compared))
+
+    def test_many_looks_are_nudged_not_refused(self):
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        shot.write_bytes(b"\x89PNG look")
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(text="Image attached: front view of Cube.", ok=True, image_path=shot)
+        angles = ["front", "side"] * 5  # Never the same look twice in a row: not idle, just many.
+        SCRIPT.replies += [tool_reply("capture_viewport", {"angle": a}) for a in angles] + [text_reply("Done.")]
+        self.start("check it").thread.join(5)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual([c["status"] for c in cards], ["done"] * 10, "no hard ceiling per turn")
+        self.assertNotIn("Look 8 this turn", cards[7]["output"])
+        self.assertIn("(Look 9 this turn.", cards[8]["output"])
+        self.assertIn("(Look 10 this turn.", cards[9]["output"])
 
     def test_attached_images_get_a_reference_card_before_the_first_request(self):
         from loopcut import conversations, context
@@ -252,7 +363,7 @@ class AgentLoopTest(unittest.TestCase):
         session["attachments"] = [{"ref": conversations.store_image(session, picture), "full": conversations.store_image(session, picture), "name": "chair.png"}]
         SCRIPT.replies += [text_reply("A wooden chair: seat 0.45 m high, four round legs, #8B5A2B, matte."),
                            text_reply("I will build it.")]
-        agent._scene_context = lambda text: "<scene_context>\nfile: unsaved\n</scene_context>"
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
         self.assertTrue(agent.send("copy this chair"))
         session["turn"].thread.join(5)
         card_request = SCRIPT.requests[0]["messages"]
@@ -360,6 +471,57 @@ class AgentLoopTest(unittest.TestCase):
         turn.thread.join(5)
         self.assertEqual([json.loads(a)["code"] for _, a in self.ran], ["a()", "b()"], "second step ran unasked")
         self.assertFalse(state.new_session()["auto_run"], "a new conversation asks again")
+
+    def test_a_render_asks_every_time_even_after_always_allow(self):
+        SCRIPT.replies += [tool_reply("run_python", {"code": "a()", "summary": "a"}),
+                           tool_reply("see_render", {"render": True}),
+                           tool_reply("run_python", {"code": "bpy.ops.render.render(write_still=True)", "summary": "render"}),
+                           text_reply("Done.")]
+        turn = self.start("render it")
+        awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
+        self.wait_for(awaiting, "first approval card")
+        self.assertFalse(awaiting()[0].get("heavy"))
+        self.assertTrue(agent.decide(True, always=True))
+        self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "see_render", "the render's card")
+        self.assertTrue(awaiting()[0]["heavy"], "a render is marked heavy so the card offers no Always")
+        self.assertEqual(awaiting()[0]["summary"], "Render the scene (preview)")
+        agent.decide(True)
+        self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "run_python", "the rendering code's card")
+        self.assertTrue(awaiting()[0]["heavy"])
+        agent.decide(False)
+        turn.thread.join(5)
+        self.assertEqual([n for n, _ in self.ran], ["run_python", "see_render"], "the rejected render never ran")
+
+    def test_a_render_asks_even_with_auto_run_on(self):
+        os.environ["LOOPCUT_AUTO_RUN"] = "true"
+        self.addCleanup(os.environ.update, {"LOOPCUT_AUTO_RUN": "false"})
+        SCRIPT.replies += [tool_reply("see_render", {"render": True}), text_reply("Done.")]
+        turn = self.start("render")
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertEqual([n for n, _ in self.ran], ["see_render"])
+
+    def test_file_reads_inside_the_project_run_unasked_and_writes_ask(self):
+        project = Path(self.data_dir.name) / "project"
+        project.mkdir(exist_ok=True)
+        SCRIPT.replies += [tool_reply("read_file", {"path": str(project / "notes.txt")}),
+                           tool_reply("see_render", {}),
+                           tool_reply("list_files", {"path": str(Path(self.data_dir.name) / "elsewhere")}),
+                           tool_reply("write_file", {"path": str(project / "out.txt"), "content": "hi"}),
+                           text_reply("Done.")]
+        turn = self.start("look around")
+        turn.roots = (project.resolve(),)
+        awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
+        self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "list_files", "the outside read's card")
+        self.assertEqual([n for n, _ in self.ran], ["read_file", "see_render"], "in-project read and last render ran unasked")
+        self.assertEqual(awaiting()[0]["summary"], f"List {Path(self.data_dir.name) / 'elsewhere'}")
+        agent.decide(True)
+        self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "write_file", "the write's card")
+        self.assertEqual(awaiting()[0]["code"], "hi", "the card shows what would be written")
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertEqual([n for n, _ in self.ran], ["read_file", "see_render", "list_files", "write_file"])
 
     def test_token_usage_adds_up_over_the_conversation(self):
         usage = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 8}}
