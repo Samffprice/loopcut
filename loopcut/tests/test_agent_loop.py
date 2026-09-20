@@ -627,6 +627,27 @@ class LayoutTest(unittest.TestCase):
     def measure(font, size, text):
         return len(text) * size * 0.5
 
+    def test_thinking_line_shimmers_and_counts_dots_with_the_clock(self):
+        session = state.new_session()
+        session["items"] += [state.item_user("hi"), state.item_assistant()]
+        session["busy"] = True
+
+        def prims_at(now):
+            display = layout.build(session, 400, 600, 1.0, self.measure, "m", None, {"now": now})
+            return [p for p in display["prims"] if p.get("id", "").startswith("item1.thinking")]
+
+        first, later = prims_at(0.0), prims_at(1.0)
+        self.assertEqual("".join(p["text"] for p in first), "Thinking.")
+        self.assertEqual("".join(p["text"] for p in later), "Thinking...")
+        brightest = lambda prims: max(prims[:-1], key=lambda p: p["color"][0])["text"]
+        self.assertNotEqual(brightest(first), brightest(later), "the highlight moves along the word")
+        self.assertNotIn("…", "".join(p.get("text", "") for p in first))
+        session["items"][-1]["streaming"] = False
+        session["items"][-1]["text"] = "Done."
+        display = layout.build(session, 400, 600, 1.0, self.measure, "m", None, {"now": 2.0})
+        self.assertTrue(any(p.get("id", "").startswith("chat.working") for p in display["prims"]),
+                        "between steps the same animation says Working")
+
     def test_wrap_offsets_reconstruct_the_text(self):
         text = "alpha beta  gamma\n\nsupercalifragilisticexpialidocious end"
         lines = layout.wrap(text, "ui", 10, 60, self.measure)

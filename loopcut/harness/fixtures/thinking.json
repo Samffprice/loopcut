@@ -1,0 +1,9 @@
+{
+  "items": [
+    {"kind": "user", "text": "Add a warm rim light behind the chair."},
+    {"kind": "assistant", "streaming": true, "text": ""}
+  ],
+  "input": "",
+  "focused": false,
+  "busy": true
+}

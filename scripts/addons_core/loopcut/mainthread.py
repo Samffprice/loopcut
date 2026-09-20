@@ -1,6 +1,7 @@
 """bpy is main-thread only. Worker threads hand work to a timer-driven pump here."""
 
 import queue
+import time
 from concurrent.futures import Future
 from typing import Callable
 
@@ -23,8 +24,17 @@ def request_redraw() -> None:
     _redraw_requested = True
 
 
+ANIMATE_EVERY = 1 / 15  # Redraws a second while a turn runs, for the thinking animation.
+_animated_at = 0.0
+
+
+def _animating() -> bool:
+    from . import state
+    return bool(state.session().get("busy"))
+
+
 def _pump() -> float:
-    global _redraw_requested
+    global _redraw_requested, _animated_at
     while True:
         try:
             fn, future = _jobs.get_nowait()
@@ -36,8 +46,9 @@ def _pump() -> float:
             future.set_result(fn())
         except BaseException as ex:  # Delivered to the waiting worker, which reports it.
             future.set_exception(ex)
-    if _redraw_requested:
-        _redraw_requested = False
+    now = time.monotonic()
+    if _redraw_requested or (now - _animated_at >= ANIMATE_EVERY and _animating()):
+        _redraw_requested, _animated_at = False, now
         from .ui import host
         host.tag_redraw_all()
     return _INTERVAL
