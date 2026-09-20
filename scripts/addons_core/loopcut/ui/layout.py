@@ -8,6 +8,7 @@ background.
 
 import re
 
+from .. import state
 from . import theme as T
 
 _FENCE = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
@@ -259,9 +260,54 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
         f.button(f"item{n}.notice.action", x + pad, cursor, item["action_label"], T.BUTTON_GHOST, T.TEXT,
                  ("restore", item["checkpoint"]))
         cursor += f.px(24)
+    elif item.get("url") and item["action_label"]:
+        cursor += f.px(8)
+        f.button(f"item{n}.notice.action", x + pad, cursor, item["action_label"], T.BUTTON_GHOST, T.TEXT,
+                 ("open_url", n))
+        cursor += f.px(24)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.notice.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.BG, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
+
+
+_LIMIT_TITLES = {"session_limit": "Session allowance used", "week_limit": "Weekly allowance used",
+                 "model_not_in_plan": "Pro is not in your plan"}
+
+
+def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """Out of allowance: what ran out, what the next plan offers, and the button that gets it.
+    The buttons show on the newest card only; older ones are history."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    status, upgrade = item.get("status", ""), item.get("upgrade")
+    if status == "done":
+        title, body, color = "Upgraded", item["text"], T.OK
+    elif status == "waiting":
+        title, color = "Waiting for your upgrade", T.WARN
+        body = "Finish in the browser. Loopcut picks this conversation up by itself once the plan is active."
+    else:
+        title, color = _LIMIT_TITLES.get(item["reason"], "Allowance used"), T.WARN
+        body = item["text"] + (f"\n{upgrade['note']}" if upgrade and upgrade.get("note") else "")
+    f.text(f"item{n}.limit.title", inner_x, cursor, title, size, color)
+    cursor += f.line_height(size) + f.px(4)
+    cursor += f.paragraph(f"item{n}.limit.text", inner_x, cursor, inner_w, body, small, T.TEXT)
+    newest = n == len(f.session["items"]) - 1
+    if newest and status != "done" and not f.session.get("busy"):
+        cursor += f.px(8)
+        bx = inner_x
+        if status == "" and upgrade:
+            bx += f.button(f"item{n}.limit.upgrade", bx, cursor, upgrade.get("label") or "Upgrade", T.BUTTON,
+                           T.BUTTON_TEXT, ("limit_upgrade", n)) + f.px(8)
+        if item["reason"] == "model_not_in_plan":
+            bx += f.button(f"item{n}.limit.fast", bx, cursor, "Use Fast instead", T.BUTTON_GHOST, T.TEXT,
+                           ("limit_fast", n)) + f.px(8)
+        f.button(f"item{n}.limit.retry", bx, cursor, "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("resume", n))
+        cursor += f.px(24)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.limit.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
     return height
 
 
@@ -308,7 +354,8 @@ def _item_changes(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
-_ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant, "tool": _item_tool, "error": _item_error}
+_ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant,
+                "tool": _item_tool, "error": _item_error, "limit": _item_limit}
 
 
 def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
@@ -480,6 +527,20 @@ def _k(tokens: int) -> str:
     return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
 
 
+SHOW_USAGE_FROM = 0.7  # The footer names the fuller window once this much of it is used.
+
+
+def usage_note(account: dict | None) -> tuple[str, float]:
+    """(text, share) for the footer: the fuller of the account's two windows once it is worth a
+    glance, else ("", share)."""
+    best = ("", 0.0)
+    for key in ("week", "session"):
+        used = ((account or {}).get(key) or {}).get("used")
+        if isinstance(used, (int, float)) and used > best[1]:
+            best = (f"{round(used * 100)}% of {key} used", float(used))
+    return best if best[1] >= SHOW_USAGE_FROM else ("", best[1])
+
+
 def _mention_list(f: Frame, session: dict, x: int, bottom: int, width: int) -> None:
     """Completions for the @name being typed, floating above the input."""
     rows, small = f.ui.get("mentions") or [], f.px(T.FONT_SIZE_SMALL)
@@ -563,6 +624,12 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     f.text("input.model", inner_x, footer_y, model, small, T.TEXT_MUTED)
     f.hit("input.model", inner_x - f.px(4), footer_y - f.px(4), round(f.measure("ui", small, model)) + f.px(8),
           f.line_height(small) + f.px(8), ("open_settings", None))
+    note, share = usage_note(state.ui.get("account"))
+    note_x = inner_x + round(f.measure("ui", small, model)) + f.px(14)
+    if note and note_x + f.measure("ui", small, note) + f.measure("ui", small, hint) + f.px(90) <= inner_x + inner_w:
+        f.text("input.usage", note_x, footer_y, note, small, T.ERROR if share >= 1 else T.WARN)
+        f.hit("input.usage", note_x - f.px(4), footer_y - f.px(4), round(f.measure("ui", small, note)) + f.px(8),
+              f.line_height(small) + f.px(8), ("open_account", None))
     if focused:
         _mention_list(f, session, x, card_y, width)
     hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))

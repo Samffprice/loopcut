@@ -1,0 +1,14 @@
+{
+  "items": [
+    {"kind": "user", "text": "Add a warm rim light behind the chair and tone down the key light."},
+    {"kind": "assistant", "streaming": false, "text": "I'll add a rim light behind the chair first."},
+    {"kind": "tool", "name": "run_python", "summary": "Add rim light", "code": "light = bpy.data.lights.new('Rim', 'AREA')", "status": "done", "output": "OK\n\nScene changes: + Rim (light)"},
+    {"kind": "notice", "text": "About 12% of this week's free allowance is left. Upgrading now keeps this conversation going without a stop.", "action_label": "See plans", "checkpoint": "", "url": "https://loopcut.org/pricing?from=app&reason=low_allowance"},
+    {"kind": "user", "text": "Now tone down the key light to about half."},
+    {"kind": "limit", "text": "You have used this week's allowance on the Free plan. It resets in 3 days.", "reason": "week_limit", "plan": "free", "resets_at": "2026-09-23T00:00:00Z", "status": "", "upgrade": {"url": "https://loopcut.org/pricing?from=app&reason=week_limit&plan=pro", "plan": "pro", "label": "Upgrade to Pro", "note": "Pro has 13× the allowance, $20/month. Your conversation continues where it stopped."}}
+  ],
+  "input": "",
+  "focused": false,
+  "busy": false,
+  "ui": {"view": "chat", "account": {"plan": "free", "session": {"used": 0.31, "resets_at": null}, "week": {"used": 1.0, "resets_at": "2026-09-23T00:00:00Z"}}}
+}

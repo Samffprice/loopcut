@@ -235,6 +235,13 @@ def preferences():
     return addon.preferences if addon else None
 
 
+def set_tier(tier: str) -> None:
+    """Pick Fast or Pro on the Loopcut provider, as the model menu would."""
+    prefs = preferences()
+    if prefs is not None and prefs.provider == "LOOPCUT":
+        prefs.tier = tier  # _tier_changed copies it to the model and reloads the config.
+
+
 def values() -> dict[str, str]:
     """Preferences as the LOOPCUT_* settings config.py understands. The connection is only
     reported once it is usable (a key is stored, or the endpoint is local); until then a dev

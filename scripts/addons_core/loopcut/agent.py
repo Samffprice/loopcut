@@ -49,6 +49,7 @@ MAX_IDLE_CAPTURES = 3
 SOFT_LOOKS = 8
 DEFAULT_ANGLE = "three_quarter"
 STRIP_LOOKS = 4  # Earlier looks shown in the progress strip under a new capture.
+LOW_ALLOWANCE = 0.8  # Share of the week's allowance used at which the conversation gets a heads-up, once.
 CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference"}
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
@@ -124,6 +125,37 @@ def _scene_snapshot() -> dict:
 def _project_roots() -> tuple:
     from . import files
     return files.project_roots()
+
+
+def _update_account(info: dict) -> None:
+    from . import account
+    account.update_usage(info)
+
+
+def _warn_low_allowance(session: dict, items: list, info: dict) -> None:
+    """Once per conversation, when the week's allowance is nearly used: the moment to upgrade
+    is before the stop, not at it."""
+    used = (info.get("week") or {}).get("used")
+    if session.get("warned_low") or not isinstance(used, (int, float)) or used < LOW_ALLOWANCE:
+        return
+    session["warned_low"] = True
+    left, plan = max(0, round((1 - used) * 100)), str(info.get("plan") or "")
+    if plan == "free":
+        items.append(state.item_notice(
+            f"About {left}% of this week's free allowance is left. Upgrading now keeps this conversation "
+            f"going without a stop.", "See plans", url=config.pricing_url("low_allowance")))
+    else:
+        items.append(state.item_notice(f"About {left}% of this week's allowance is left on the {plan.capitalize()} plan.",
+                                       "Account", url=config.account_url()))
+
+
+def _limit_item(ex: llm.LLMError) -> dict:
+    """The card for a 402: Loopcut's gateway says which window ran out, when it resets and what
+    the next plan offers; any other provider's 402 shows its message with no button."""
+    details = ex.details
+    upgrade = details.get("upgrade") if isinstance(details.get("upgrade"), dict) else None
+    return state.item_limit(str(details.get("message") or ex), ex.code or "limit", str(details.get("plan") or ""),
+                            str(details.get("resets_at") or ""), upgrade)
 
 
 def _build_strip_on_main(paths: list) -> "Path | None":
@@ -362,6 +394,9 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                     session["usage"][key] += completion.usage[key]
                 session["usage"]["context"] = completion.usage["input"]
                 context.calibrate(session, estimated, completion.usage["input"])
+            if completion.account:
+                _update_account(completion.account)
+                _warn_low_allowance(session, items, completion.account)
             if not reply["text"].strip():
                 items.remove(reply)
             messages.append(completion.as_message())
@@ -443,7 +478,10 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
     except llm.Cancelled:
         items.append(state.item_error("Stopped."))
     except (config.ConfigError, llm.LLMError) as ex:
-        items.append(state.item_error(str(ex)))
+        if getattr(ex, "status", None) == 402:
+            items.append(_limit_item(ex))
+        else:
+            items.append(state.item_error(str(ex)))
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
         import traceback
         traceback.print_exc()
@@ -499,11 +537,34 @@ def send(text: str) -> bool:
         session["attachments"] = []
     else:
         session["messages"].append({"role": "user", "content": content})
-    session["scroll"], session["confirm_restore"] = 0.0, None
     conversations.save(session)
+    _launch(session, turn)
+    return True
+
+
+def _launch(session: dict, turn: Turn) -> None:
+    session["scroll"], session["confirm_restore"] = 0.0, None
     session["busy"], session["turn"] = True, turn
     turn.thread = threading.Thread(target=_run, args=(session, turn), name="loopcut-turn", daemon=True)
     turn.thread.start()
+
+
+def resume() -> bool:
+    """Go on with the turn that stopped short: after a limit card, once the plan allows it, or
+    after any error the user wants retried. Nothing is added to the conversation; the request
+    is simply made again. False when a turn is running or the last one finished."""
+    session = state.session()
+    messages = session["messages"]
+    if session["busy"] or not messages or messages[-1].get("role") == "assistant":
+        return False
+    turn = Turn()
+    try:
+        turn.config = config.load()
+    except config.ConfigError as ex:
+        session["items"].append(state.item_error(str(ex)))
+        return False
+    turn.roots = _project_roots()
+    _launch(session, turn)
     return True
 
 

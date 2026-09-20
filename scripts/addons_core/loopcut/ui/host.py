@@ -12,7 +12,7 @@ from pathlib import Path
 
 import bpy
 
-from .. import agent, checkpoints, config, conversations, scene_context, state
+from .. import account, agent, checkpoints, config, conversations, scene_context, state
 from . import draw, layout, textedit
 
 NATIVE = hasattr(bpy.types, "SpaceLoopcut")
@@ -169,6 +169,18 @@ def _do_action(session: dict, action) -> None:
         _pick_mention(session, index)
     elif kind == "open_settings":
         _open_settings()
+    elif kind == "open_url":
+        account.open_browser(session["items"][index]["url"])
+    elif kind == "open_account":
+        account.open_browser(config.account_url())
+    elif kind == "limit_upgrade":
+        _start_upgrade(session, session["items"][index])
+    elif kind == "limit_fast":
+        from .. import settings
+        settings.set_tier("fast")
+        agent.resume()
+    elif kind == "resume":
+        agent.resume()
     elif kind == "attach":
         bpy.ops.loopcut.attach_images("INVOKE_DEFAULT")
     elif kind == "remove_attachment":
@@ -206,6 +218,24 @@ def _do_action(session: dict, action) -> None:
         _switch(session, fresh)
     elif kind == "close_panel":
         _close_area_later(bpy.context.window, bpy.context.area)
+
+
+def _start_upgrade(session: dict, item: dict) -> None:
+    """Open the plans page and wait for the plan to change; then the turn goes on by itself,
+    so the user comes back to Blender to find the work under way."""
+    account.open_browser(item["upgrade"]["url"])
+    item["status"] = "waiting"
+
+    def upgraded(payload: dict) -> None:
+        if item.get("status") != "waiting":
+            return
+        item["status"] = "done"
+        item["text"] = f"You are on the {str(payload.get('plan') or '').capitalize()} plan now. Continuing."
+        conversations.save(session)
+        if state.session() is session:
+            agent.resume()
+
+    account.watch_plan(item["plan"], upgraded)
 
 
 def _close_area_later(window, area) -> None:

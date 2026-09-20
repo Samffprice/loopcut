@@ -48,6 +48,7 @@ class Script:
     def __init__(self):
         self.replies: list = []
         self.requests: list[dict] = []
+        self.headers: dict = {}  # Sent with every reply, like the gateway's x-loopcut-* usage headers.
 
 
 SCRIPT = Script()
@@ -63,11 +64,15 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = reply
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            for name, value in SCRIPT.headers.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode())
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        for name, value in SCRIPT.headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(reply)
 
@@ -93,6 +98,7 @@ class AgentLoopTest(unittest.TestCase):
         agent._scene_snapshot = lambda: None
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
         agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
+        agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
         agent._build_strip_on_main = lambda paths: None  # Needs Blender's main thread; tests pass their own.
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
@@ -107,6 +113,8 @@ class AgentLoopTest(unittest.TestCase):
     def setUp(self):
         SCRIPT.replies.clear()
         SCRIPT.requests.clear()
+        SCRIPT.headers.clear()
+        state.ui["account"] = None
         self.session = state.reset()
         self.ran: list[tuple[str, str]] = []
         self.checkpoint_calls: list[int] = []  # How many tools had run when each was requested.
@@ -547,11 +555,70 @@ class AgentLoopTest(unittest.TestCase):
         self.start("hi").thread.join(5)
         self.assertEqual(self.session["items"][-1], state.item_error("HTTP 503: Overloaded."))
 
+    def test_out_of_allowance_is_a_card_with_the_gateway_s_offer_not_an_error(self):
+        SCRIPT.replies += [(402, {"error": {
+            "message": "You have used this week's allowance on the Free plan. It resets in 3 days.",
+            "type": "week_limit", "code": "week_limit", "plan": "free", "resets_at": "2026-09-23T00:00:00Z",
+            "upgrade": {"url": "https://loopcut.org/pricing?from=app&reason=week_limit&plan=pro", "plan": "pro",
+                        "label": "Upgrade to Pro", "note": "Pro has 13× the allowance, $20/month."}}})]
+        turn = self.start("make a chair")
+        turn.thread.join(5)
+        card = self.session["items"][-1]
+        self.assertEqual(card["kind"], "limit", card)
+        self.assertEqual((card["reason"], card["plan"], card["status"]), ("week_limit", "free", ""))
+        self.assertEqual(card["upgrade"]["label"], "Upgrade to Pro")
+        self.assertTrue(card["text"].startswith("You have used this week's allowance"))
+        self.assertFalse(any(i["kind"] == "error" for i in self.session["items"]), "no red error card as well")
+        self.assertFalse(self.session["busy"])
+        # The card's buttons are on the newest card only, and Upgrade comes first.
+        display = layout.build(self.session, 400, 600, 1.0, LayoutTest.measure, "m")
+        buttons = [h for h in display["hits"] if h["id"].startswith("item") and ".limit." in h["id"]]
+        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "resume"])
+        # A second 402 from a provider that says nothing structured still gets a card, without a button.
+        SCRIPT.replies += [(402, {"error": {"message": "Insufficient credit.", "type": "billing"}})]
+        turn = self.start("try again")
+        turn.thread.join(5)
+        card = self.session["items"][-1]
+        self.assertEqual((card["kind"], card["reason"], card["upgrade"]), ("limit", "billing", None))
+
+    def test_resume_makes_the_request_again_without_adding_a_message(self):
+        SCRIPT.replies += [(402, {"error": {"message": "Used up.", "code": "week_limit", "plan": "free"}}),
+                           text_reply("Here is your chair.")]
+        turn = self.start("make a chair")
+        turn.thread.join(5)
+        before = len(self.session["messages"])
+        self.assertTrue(agent.resume())
+        self.session["turn"].thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 2)
+        self.assertEqual(SCRIPT.requests[1]["messages"][-1]["content"], "make a chair", "the same message, sent again")
+        self.assertEqual(len(self.session["messages"]), before + 1, "only the reply was added")
+        self.assertEqual(self.session["items"][-1]["text"], "Here is your chair.")
+        self.assertFalse(agent.resume(), "nothing to resume once the turn has finished")
+
+    def test_usage_headers_update_the_account_and_warn_once_when_the_week_is_nearly_used(self):
+        SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
+                               "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})
+        SCRIPT.replies += [text_reply("One."), text_reply("Two.")]
+        turn = self.start("hello")
+        turn.thread.join(5)
+        self.assertEqual(state.ui["account"]["plan"], "free")
+        self.assertEqual(state.ui["account"]["week"], {"used": 0.842, "resets_at": "2026-09-23T00:00:00Z"})
+        notices = [i for i in self.session["items"] if i["kind"] == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("About 16% of this week's free allowance is left", notices[0]["text"])
+        self.assertEqual(notices[0]["action_label"], "See plans")
+        self.assertIn("/pricing?from=app&reason=low_allowance", notices[0]["url"])
+        turn = self.start("again")
+        turn.thread.join(5)
+        self.assertEqual(len([i for i in self.session["items"] if i["kind"] == "notice"]), 1, "warned once")
+        self.assertEqual(layout.usage_note(state.ui["account"]), ("84% of week used", 0.842))
+        self.assertEqual(layout.usage_note({"week": {"used": 0.2}, "session": {"used": 0.5}}), ("", 0.5))
+
     def test_http_error_is_shown_not_swallowed(self):
-        SCRIPT.replies.append((402, {"error": {"message": "Billing verification failed."}}))
+        SCRIPT.replies.append((403, {"error": {"message": "This key was revoked."}}))
         self.start("hi").thread.join(5)
         self.assertEqual(self.session["items"][-1],
-                         state.item_error("HTTP 402: Billing verification failed."))
+                         state.item_error("HTTP 403: This key was revoked."))
         self.assertFalse(self.session["busy"])
 
 

@@ -12,6 +12,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+SERVICE_URL = os.environ.get("LOOPCUT_SERVICE_URL", "https://loopcut.org").rstrip("/")
+
+
+def pricing_url(reason: str = "") -> str:
+    """The plans page, marked as coming from the app so it says Blender is waiting."""
+    return f"{SERVICE_URL}/pricing?from=app" + (f"&reason={reason}" if reason else "")
+
+
+def account_url() -> str:
+    return f"{SERVICE_URL}/account"
+
 
 # Tokens per request before the earlier conversation is summarized (context.py). With finished
 # steps folded, a request is typically 5-8k, so this holds a few turns whole.

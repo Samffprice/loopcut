@@ -12,9 +12,11 @@ from typing import Callable
 
 
 class LLMError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, code: str = "", details: dict | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code            # The API's error code, e.g. week_limit.
+        self.details = details or {}  # The whole error object: Loopcut's gateway adds plan, resets_at, upgrade.
 
 
 class Cancelled(Exception):
@@ -41,6 +43,7 @@ class Completion:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     usage: dict | None = None  # {"input": tokens, "output": tokens} when the API reports it.
+    account: dict | None = None  # Plan and window usage from Loopcut's gateway headers; see account_from_headers.
 
     def as_message(self) -> dict:
         message = {"role": "assistant", "content": self.text or None}
@@ -53,15 +56,41 @@ class Completion:
         return message
 
 
-def _error_detail(body: bytes) -> str:
+def _error_payload(body: bytes) -> dict:
+    """The error object of an API reply, or {} when there is none."""
     try:
         payload = json.loads(body)
     except ValueError:
-        return body.decode("utf-8", "replace")[:500]
+        return {}
     error = payload.get("error") if isinstance(payload, dict) else None
-    if isinstance(error, dict) and error.get("message"):
+    return error if isinstance(error, dict) else {}
+
+
+def _error_detail(body: bytes) -> str:
+    error = _error_payload(body)
+    if error.get("message"):
         return str(error["message"])
-    return json.dumps(payload)[:500]
+    try:
+        return json.dumps(json.loads(body))[:500]
+    except ValueError:
+        return body.decode("utf-8", "replace")[:500]
+
+
+def account_from_headers(headers) -> dict | None:
+    """What Loopcut's gateway says about the account on every reply: the plan, and how much of
+    the session and week windows is used (0..1). None from any other provider."""
+    plan = headers.get("x-loopcut-plan")
+    if not plan:
+        return None
+
+    def window(name: str) -> dict:
+        try:
+            used = float(headers.get(f"x-loopcut-{name}-used", ""))
+        except ValueError:
+            used = None
+        return {"used": used, "resets_at": headers.get(f"x-loopcut-{name}-resets-at") or None}
+
+    return {"plan": str(plan), "session": window("session"), "week": window("week")}
 
 
 def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
@@ -81,10 +110,12 @@ def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], boo
             return urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as ex:
             with ex:
-                detail = _error_detail(ex.read())
+                body = ex.read()
                 retry_after = ex.headers.get("Retry-After", "")
             if last or ex.code not in RETRY_STATUSES:
-                raise LLMError(f"HTTP {ex.code}: {detail}", ex.code) from ex
+                error = _error_payload(body)
+                raise LLMError(f"HTTP {ex.code}: {_error_detail(body)}", ex.code,
+                               str(error.get("code") or error.get("type") or ""), error) from ex
             delay = RETRY_DELAYS[attempt]
             if retry_after.replace(".", "", 1).isdigit():
                 delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)
@@ -129,7 +160,7 @@ def stream_chat(
     )
     response = _open(request, base_url, timeout, is_cancelled)
 
-    completion = Completion()
+    completion = Completion(account=account_from_headers(response.headers))
     calls: dict[int, ToolCall] = {}
     with response:
         for raw in response:

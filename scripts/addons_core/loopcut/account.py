@@ -20,10 +20,13 @@ import urllib.request
 import bpy
 import bpy.utils.previews
 
-from . import credentials, mainthread
+from . import config, credentials, mainthread, state
 
-SERVICE_URL = os.environ.get("LOOPCUT_SERVICE_URL", "https://loopcut.org").rstrip("/")
+SERVICE_URL = config.SERVICE_URL
 BASE_URL = f"{SERVICE_URL}/v1"
+WATCH_EVERY = 4.0          # Seconds between looks at /v1/me while the user upgrades in the browser.
+WATCH_FOR = 15 * 60.0      # How long to keep looking.
+_watch_generation = 0
 MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))
 
 _state = {
@@ -185,13 +188,58 @@ def _load_mark() -> None:
     preview.icon_pixels_float = pixels.astype("float32").ravel().tolist()
 
 
+def _set_account(payload: dict | None) -> None:
+    _state["account"] = payload
+    _state["fetched_at"] = time.monotonic()
+    state.ui["account"] = payload  # The panel footer reads it without touching bpy.
+
+
 def _refresh_account(key: str) -> None:
     try:
-        _state["account"] = _get("/v1/me", key)
-        _state["fetched_at"] = time.monotonic()
+        _set_account(_get("/v1/me", key))
     except AccountError as ex:
         _state["error"] = str(ex)
     _redraw()
+
+
+def update_usage(info: dict) -> None:
+    """Fold what a gateway reply's headers said (plan, session and week usage) into the account,
+    so the panel stays current without a request to /v1/me."""
+    _set_account({**(_state["account"] or {}), **info})
+
+
+def watch_plan(previous: str, on_change) -> None:
+    """The user went to the plans page: look at /v1/me every few seconds until the plan is no
+    longer `previous`, then call on_change(account) on the main thread. A newer watch replaces
+    an older one; WATCH_FOR later the watch gives up quietly."""
+    global _watch_generation
+    _watch_generation += 1
+    generation = _watch_generation
+    key = credentials.api_key(BASE_URL)
+    if not key:
+        return
+
+    def watch() -> None:
+        deadline = time.monotonic() + WATCH_FOR
+        while time.monotonic() < deadline and generation == _watch_generation:
+            time.sleep(WATCH_EVERY)
+            try:
+                payload = _get("/v1/me", key)
+            except AccountError:
+                continue
+            if str(payload.get("plan") or "") not in ("", previous):
+                if generation == _watch_generation:
+                    _set_account(payload)
+                    mainthread.run_on_main(lambda: on_change(payload))
+                    _redraw()
+                return
+
+    threading.Thread(target=watch, name="loopcut-plan-watch", daemon=True).start()
+
+
+def stop_watching() -> None:
+    global _watch_generation
+    _watch_generation += 1
 
 
 def sign_in() -> bool:
@@ -211,7 +259,8 @@ def sign_out() -> None:
     """Forgets the key on this computer. The account page on the site can revoke it as well."""
     from . import settings
     credentials.store(BASE_URL, "")
-    _state.update(account=None, error="", status="idle")
+    _set_account(None)
+    _state.update(error="", status="idle")
     settings.config_changed()
 
 

@@ -12,7 +12,8 @@ _session: dict | None = None
 restoring = False  # True while checkpoints.restore loads a file, so that load is not taken for the user's.
 # view: "chat" | "history"; history rows are loaded when the view opens. mentions: (name, kind)
 # completions for the @name being typed.
-ui = {"view": "chat", "history": [], "mentions": []}
+ui = {"view": "chat", "history": [], "mentions": [],
+      "account": None}  # Plan and window usage as the gateway last reported it; account.update_usage.
 hosts: set[int] = set()  # Pointers of the areas showing the panel. Same lifetime rules as the session.
 
 
@@ -78,8 +79,17 @@ def item_tool(name: str, summary: str, code: str) -> dict:
             "status": "running", "output": ""}
 
 
-def item_notice(text: str, action_label: str = "", checkpoint: str = "") -> dict:
-    return {"kind": "notice", "text": text, "action_label": action_label, "checkpoint": checkpoint}
+def item_notice(text: str, action_label: str = "", checkpoint: str = "", url: str = "") -> dict:
+    # The button restores `checkpoint`, or opens `url` in the browser.
+    return {"kind": "notice", "text": text, "action_label": action_label, "checkpoint": checkpoint, "url": url}
+
+
+def item_limit(text: str, reason: str, plan: str, resets_at: str, upgrade: dict | None) -> dict:
+    """The gateway refused a request for want of allowance. upgrade: {url, plan, label, note}
+    from the gateway, or None on the top plan. status: "" | waiting (the plans page is open and
+    the add-on polls for the new plan) | done (upgraded; the turn goes on by itself)."""
+    return {"kind": "limit", "text": text, "reason": reason, "plan": plan, "resets_at": resets_at or "",
+            "upgrade": dict(upgrade) if upgrade else None, "status": ""}
 
 
 def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:

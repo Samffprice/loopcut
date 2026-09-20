@@ -24,7 +24,7 @@ from . import checkpoints, context, state
 IMAGE_SCHEME = "loopcut-image:"
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
-_ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes"}
+_ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes", "limit"}
 # Which images are still sent is context.kept_images; an image costs about ten tool results.
 KEEP_IMAGES, KEEP_ATTACHED = context.KEEP_IMAGES, context.KEEP_ATTACHED
 PRIVATE_PREFIX, ATTACHED = context.PRIVATE_PREFIX, context.ATTACHED
