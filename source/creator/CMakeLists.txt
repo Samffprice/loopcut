@@ -1698,6 +1698,8 @@ elseif(APPLE)
   if(NOT WITH_PYTHON_MODULE)
     # Loopcut: the bundle and its executable carry the product's name (upstream: Blender).
     set_target_properties(blender PROPERTIES OUTPUT_NAME Loopcut)
+    # Beside the app on the disk image: how to get past Gatekeeper while the build is unsigned.
+    install(FILES "${CMAKE_SOURCE_DIR}/release/loopcut/Read me first.txt" DESTINATION ".")
   endif()
 
   set(OSX_APP_SOURCEDIR ${CMAKE_SOURCE_DIR}/release/darwin/Blender.app)

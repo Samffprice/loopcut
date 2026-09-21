@@ -152,6 +152,59 @@ def write_splash(here: Path, font: Path) -> None:
                        check=True, capture_output=True)
 
 
+def _font_face(name: str, font: Path) -> str:
+    data = base64.b64encode(font.read_bytes()).decode("ascii")
+    return f'@font-face {{ font-family: "{name}"; src: url("data:font/woff2;base64,{data}"); font-weight: 100 900; }}'
+
+
+def dmg_background_svg(inter: Path, mono: Path, width: float) -> str:
+    """The disk image window's background, 660 x 480 points drawn at 2x (1320 x 960) as the middle
+    band of a 1320 square canvas (see write_dmg_background). Coordinates are 2x points and match
+    dmg-layout.applescript: the app icon at (170, 150), Applications at (490, 150), the readme at
+    (80, 330), all 96-point icons."""
+    mark = 0.9  # Mark height 82 * 0.9 = 74px = 37 points.
+    row1, band = 300, 524  # Icon row centre; top of the first-launch card.
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 1320" width="{width}" height="{width}">
+<defs>
+<style>{_font_face("LoopcutInter", inter)} {_font_face("LoopcutMono", mono)}</style>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#202024"/><stop offset="1" stop-color="#101012"/></linearGradient>
+<radialGradient id="teal" cx="0.12" cy="0.1" r="0.7"><stop offset="0" stop-color="{PALETTE["teal_light"]}" stop-opacity="0.20"/><stop offset="1" stop-color="{PALETTE["teal_light"]}" stop-opacity="0"/></radialGradient>
+<radialGradient id="orange" cx="0.95" cy="1.0" r="0.75"><stop offset="0" stop-color="{PALETTE["orange"]}" stop-opacity="0.22"/><stop offset="1" stop-color="{PALETTE["orange"]}" stop-opacity="0"/></radialGradient>
+</defs>
+<g transform="translate(0,180)" font-family="LoopcutInter" fill="#f2efe9">
+<rect width="1320" height="960" fill="url(#bg)"/>
+<rect width="1320" height="960" fill="url(#teal)"/>
+<rect width="1320" height="960" fill="url(#orange)"/>
+{_mark_paths(mark, 48 - brand.LEFT * mark, 40 - brand.TOP * mark)}
+<text x="140" y="94" font-weight="650" font-size="40" letter-spacing="-1">Loopcut</text>
+<text x="1272" y="92" font-weight="400" font-size="22" fill="#a3a3ab" text-anchor="end">An AI agent that works inside Blender</text>
+<path d="M 500 {row1} L 800 {row1} M 760 {row1 - 34} L 800 {row1} L 760 {row1 + 34}" fill="none" stroke="#f2efe9" stroke-opacity="0.55" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="660" y="478" font-weight="500" font-size="28" text-anchor="middle"><tspan fill="{PALETTE["orange_light"]}">1</tspan>   Drag Loopcut into Applications</text>
+<rect x="48" y="{band}" width="1224" height="392" rx="22" fill="#ffffff" fill-opacity="0.045" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2"/>
+<text x="296" y="{band + 62}" font-weight="500" font-size="28"><tspan fill="{PALETTE["orange_light"]}">2</tspan>   The first time, macOS says it can't verify Loopcut.</text>
+<text x="296" y="{band + 118}" font-weight="400" font-size="24" fill="#c9c5be">Open System Settings › Privacy &amp; Security and click Open Anyway.</text>
+<text x="296" y="{band + 164}" font-weight="400" font-size="24" fill="#c9c5be">Or paste this into Terminal once:</text>
+<rect x="296" y="{band + 190}" width="880" height="60" rx="12" fill="#0c0c0e" fill-opacity="0.8" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>
+<text x="322" y="{band + 230}" font-family="LoopcutMono" font-size="24" fill="#e8e4dc">xattr -dr com.apple.quarantine /Applications/Loopcut.app</text>
+<text x="296" y="{band + 306}" font-weight="400" font-size="22" fill="#8f8b85">Read me first.txt says why. Updates Loopcut installs itself never ask again.</text>
+</g>
+</svg>
+'''
+
+
+def write_dmg_background(here: Path, inter: Path, mono: Path) -> None:
+    """dmg-background.png: 1320 x 960 pixels at 144 dpi, so Finder shows it at 660 x 480 points."""
+    with tempfile.TemporaryDirectory() as folder:
+        source = Path(folder) / "dmg.svg"
+        source.write_text(dmg_background_svg(inter, mono, width=1320 / 1.3), encoding="utf-8")  # See write_splash.
+        subprocess.run(["qlmanage", "-t", "-s", "1320", "-o", folder, str(source)], check=True, capture_output=True)
+        rendered = Path(folder) / "dmg.svg.png"
+        out = here / "dmg-background.png"
+        subprocess.run(["sips", "-c", "960", "1320", str(rendered), "--out", str(out)], check=True, capture_output=True)
+        subprocess.run(["sips", "-s", "dpiWidth", "144", "-s", "dpiHeight", "144", str(out)], check=True,
+                       capture_output=True)
+
+
 # The mark as one colour, for Blender's icon set: the outline and the three openings.
 SILHOUETTE = [
     [(20.5, 13.5), (101, 16), (107.5, 28), (65.5, 95.5), (52, 95.5), (14, 24.5)],
@@ -177,6 +230,7 @@ def main():
     fonts = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
     if sys.platform == "darwin" and fonts:
         write_splash(here, Path(fonts[0]))
+        write_dmg_background(here, Path(fonts[0]), Path(fonts[0]).with_name("DejaVuSansMono.woff2"))
     if "--quick" in sys.argv:  # Only the text files and the splash; the icon sizes take a minute.
         return
     (here / "mark.svg").write_text(svg(), encoding="utf-8")

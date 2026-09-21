@@ -1,0 +1,32 @@
+Loopcut for macOS
+
+Installing
+  1. Drag Loopcut into your Applications folder.
+  2. Open it from Applications.
+
+The first time, macOS says it "could not verify" Loopcut, or that it "may contain malware".
+That is because Loopcut is not yet notarized with Apple, not because anything is wrong with
+it. Get past it once, either way:
+
+  Without Terminal
+    Click Done. Open System Settings > Privacy & Security, scroll down to the line about
+    Loopcut and click "Open Anyway". Then open Loopcut again.
+
+  With Terminal
+    Paste this line and press Return:
+
+      xattr -dr com.apple.quarantine /Applications/Loopcut.app
+
+    It removes the "downloaded from the internet" flag from Loopcut.app and touches nothing
+    else. Only run it on a Loopcut you downloaded from github.com/Samffprice/loopcut.
+
+Afterwards
+  Loopcut looks for new versions itself and installs one when you choose "Restart to update".
+  Those updates never trigger the warning again.
+
+Why not just sign it?
+  Apple's notarization needs a paid developer account, which is on the list. Until then this
+  is the honest workaround. Loopcut is a build of Blender with an AI agent inside; the source
+  is at github.com/Samffprice/loopcut.
+
+Questions: samffprice@tamu.edu

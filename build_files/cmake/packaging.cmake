@@ -83,6 +83,16 @@ if(APPLE)
 
   # Libraries are bundled directly
   set(CPACK_COMPONENT_LIBRARIES_HIDDEN TRUE)
+
+  # The disk image's window: Loopcut's icon on the volume, a drawn background with the drag
+  # arrow and the first-launch steps (release/loopcut/make_assets.py), and the Finder layout
+  # that matches it. No click-through license: the GPL does not ask for one, and the prompt
+  # also stops hdiutil mounting the image without a terminal (the updater's helper does).
+  set(CPACK_DMG_VOLUME_NAME "Loopcut")
+  set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}/release/loopcut/loopcut.icns")
+  set(CPACK_DMG_BACKGROUND_IMAGE "${CMAKE_SOURCE_DIR}/release/loopcut/dmg-background.png")
+  set(CPACK_DMG_DS_STORE_SETUP_SCRIPT "${CMAKE_SOURCE_DIR}/release/loopcut/dmg-layout.applescript")
+  set(CPACK_DMG_SLA_USE_RESOURCE_FILE_LICENSE OFF)
 endif()
 
 if(WIN32)
