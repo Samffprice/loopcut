@@ -135,6 +135,7 @@ Keep and Undo all (which restores that turn's checkpoint).
 | `loopcut/scripts/shot.sh <fixture>` | ~10s | Renders `loopcut/harness/fixtures/<fixture>.json` to `../out/`: window PNG, panel-only PNG, and the frame's display list as JSON. No network. |
 | `python3 -m unittest discover -s loopcut/tests` | <1s | Agent loop and layout. |
 | `Blender --factory-startup --python loopcut/harness/tools_check.py` | ~8s | The real tools against a real scene. |
+| `Blender -b --factory-startup --python loopcut/harness/polyhaven_check.py` | ~30s | Poly Haven search and import against the live API (network; headless is fine). |
 | `Blender --factory-startup --enable-event-simulate --python loopcut/harness/input_check.py` | ~8s | Click, type, select, undo, complete an @mention, Esc through simulated events. |
 | `Blender -b --factory-startup --python loopcut/harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `loopcut/scripts/shot.sh attachments` shows the chips. |
 | `Blender -b --factory-startup --python loopcut/harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |

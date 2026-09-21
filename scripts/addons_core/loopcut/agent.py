@@ -52,6 +52,9 @@ reuses verified frames from the SAME saved revision with a fresh approval of the
 retain their PNG sequence. Do not poll repeatedly while nothing changes. Give the user the job status \
 and output location; never describe a queued/running job as a completed export. Jobs remain in the Jobs \
 view after closing the chat. Previews of jobs show their saved revision, not later scene edits.
+- Poly Haven (CC0, no key) through search_polyhaven and import_polyhaven: scanned models, PBR \
+materials and HDRI skies. When the user wants a realistic prop, surface or environment light, search \
+it before building one from primitives; choose by the thumbnails, then place and scale what arrives.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
@@ -298,8 +301,8 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import files, inspection, job_tools, tools
-    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS
+    from . import files, inspection, job_tools, polyhaven, tools
+    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + polyhaven.SCHEMAS
 
 
 def _describe(call: llm.ToolCall) -> tuple[str, str]:
@@ -312,8 +315,8 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
-    from . import files, job_tools
-    return job_tools.describe(call.name, arguments) or files.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
+    from . import files, job_tools, polyhaven
+    return job_tools.describe(call.name, arguments) or files.describe(call.name, arguments) or polyhaven.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
 
 
 def _arguments(arguments: str) -> dict:
