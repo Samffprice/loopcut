@@ -29,11 +29,19 @@ EVALS = WORKSPACE / "out" / "evals"
 
 
 def task_index() -> dict[str, list[str]]:
-    """Task ids and tags, read from tasks.py without importing it (it needs bpy)."""
-    tree = ast.parse((Path(__file__).parent / "tasks.py").read_text(encoding="utf-8"))
+    """Task ids and tags, read from tasks.py and projects.py without importing them (they need bpy)."""
+    index = {}
+    for name in ("tasks.py", "projects.py", "showcase.py"):
+        tree = ast.parse((Path(__file__).parent / name).read_text(encoding="utf-8"))
+        index.update(_task_calls(tree))
+    return index
+
+
+def _task_calls(tree) -> dict[str, list[str]]:
     index = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Task" and node.args:
+        if isinstance(node, ast.Call) and (getattr(node.func, "id", "") == "Task"
+                                           or getattr(node.func, "attr", "") == "Task") and node.args:
             tags = next((ast.literal_eval(k.value) for k in node.keywords if k.arg == "tags"), [])
             index[ast.literal_eval(node.args[0])] = tags
     return index

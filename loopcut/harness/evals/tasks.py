@@ -537,6 +537,14 @@ class Task:
     passes_untouched: bool = False  # True when doing nothing is the right answer.
     tags: list[str] = field(default_factory=list)
     attachments: list[str] = field(default_factory=list)  # Image files attached to the prompt.
+    render_frames: list[int] = field(default_factory=list)  # Frames grade.py renders for the judges.
+    # Two-turn tasks: a second instruction sent once the first is done, checked with the scene
+    # as it was after turn 1 (ctx.stage1, a snapshot) and whatever `remember` computed on that
+    # scene (ctx.memory), so "keep the cameras" and "faster than before" can be measured.
+    follow_up: str = ""
+    follow_up_check: Callable | None = None
+    follow_up_solution: str = ""
+    remember: Callable | None = None
 
 
 # ------------------------------------------------------------------ copying a reference image
@@ -781,4 +789,10 @@ TASKS = [
         "cube.data.materials.clear(); cube.data.materials.append(mat)\n"), tags=["material", "api"]),
 ]
 
+# projects.py needs the helpers above, so it is imported once they exist; import `tasks`, never
+# `projects` on its own.
+from projects import PROJECT_TASKS  # noqa: E402
+from showcase import SHOWCASE_TASKS  # noqa: E402
+
+TASKS += PROJECT_TASKS + SHOWCASE_TASKS
 BY_ID = {task.id: task for task in TASKS}

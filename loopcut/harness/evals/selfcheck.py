@@ -18,7 +18,7 @@ def run(task) -> list[str]:
     bpy.ops.wm.read_factory_settings(use_empty=False)
     if task.setup:
         task.setup()
-    ctx = SimpleNamespace(before=tasks.snapshot(), session=None)
+    ctx = SimpleNamespace(before=tasks.snapshot(), session=None, stage1=None, memory=None)
     complaints = []
     untouched = task.check(ctx)
     if task.passes_untouched and untouched:
@@ -30,6 +30,16 @@ def run(task) -> list[str]:
     solved = task.check(ctx)
     if solved:
         complaints.append(f"fails on the reference solution: {solved}")
+    if task.follow_up:
+        ctx.stage1 = tasks.snapshot()
+        ctx.memory = task.remember(ctx) if task.remember else {}
+        if not task.follow_up_check(ctx):
+            complaints.append("the follow-up check passes before the follow-up was done, so it checks nothing")
+        exec(compile(task.follow_up_solution, f"<follow_up:{task.id}>", "exec"), {"__name__": "__solution__"})
+        bpy.context.view_layer.update()
+        solved = task.follow_up_check(ctx)
+        if solved:
+            complaints.append(f"follow-up fails on the reference solution: {solved}")
     return complaints
 
 
