@@ -221,7 +221,6 @@ def _picker_key(session: dict, event) -> bool:
 
 
 def _open_settings() -> None:
-    from .. import settings
     if settings.preferences() is None:
         state.session()["items"].append(state.item_error(
             "Loopcut is running from a checkout, so it has no preferences page. Set LOOPCUT_API_KEY, "
@@ -264,7 +263,6 @@ def _do_action(session: dict, action) -> None:
     elif kind == "limit_upgrade":
         _start_upgrade(session, session["items"][index])
     elif kind == "limit_fast":
-        from .. import settings
         settings.set_tier("fast")
         agent.resume()
     elif kind == "resume":
