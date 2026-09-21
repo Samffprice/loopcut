@@ -118,3 +118,4 @@ scripts/modules/_bpy_internal/assets/remote_library/*_openapi.py linguist-genera
 /release/loopcut/*.py !filter diff merge text
 /release/loopcut/*.svg !filter diff merge text
 /release/loopcut/*.md !filter diff merge text
+/.github/readme/** !filter !diff !merge binary
