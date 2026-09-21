@@ -131,7 +131,7 @@ def for_message(text: str, since: dict | None = None) -> str:
     """The context block for one user message. Small on purpose: it is paid for on every turn.
     `since` is the scene_diff snapshot from the end of the agent's previous step, if any."""
     import bpy
-    from . import tools
+    from . import capabilities, tools
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
     active = view_layer.objects.active
@@ -139,6 +139,17 @@ def for_message(text: str, since: dict | None = None) -> str:
     file_name = bpy.path.basename(bpy.data.filepath) or "unsaved scene"
     lines = [f"file: {file_name} | mode: {bpy.context.mode} | frame: {scene.frame_current} | "
              f"objects: {len(scene.objects)} | active: {active.name if active else 'none'}"]
+    engines = capabilities.render_engines(scene.render)
+    lines.append(f"Blender {bpy.app.version_string} | render engines: {', '.join(engines)} | "
+                 f"current: {scene.render.engine} | camera: {scene.camera.name if scene.camera else 'none'}")
+    lines.append(f"output: {scene.render.resolution_x}x{scene.render.resolution_y} at "
+                 f"{scene.render.resolution_percentage}% | {scene.render.image_settings.file_format} | "
+                 f"frames: {scene.frame_start}-{scene.frame_end} | fps: "
+                 f"{scene.render.fps / scene.render.fps_base:g}")
+    lines.append(f"media type: {getattr(scene.render.image_settings, 'media_type', 'unknown')} | "
+                 f"video encoding available: {bpy.app.ffmpeg.supported} | "
+                 "editors: " + ", ".join(sorted({a.ui_type for w in bpy.context.window_manager.windows
+                                                 for a in w.screen.areas})))
     if selected:
         lines.append(f"selected ({len(selected)}), which is what \"this\", \"it\" and \"these\" mean:")
         lines += ["  " + json.dumps(tools.object_summary(o), separators=(",", ":")) for o in selected[:MAX_SELECTED]]

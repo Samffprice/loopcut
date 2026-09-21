@@ -39,10 +39,11 @@ Three layers, because "did it work" and "is it nice" are different questions:
 
 1. **Requirements** (objective, free): each task is a checklist read from the saved scene, such as
    "turns 340-380 degrees over the frame range" or "the opening is 1.2-2 m wide". A partial job
-   scores partially. selfcheck.py proves every requirement fails on the start scene and passes on
-   the task's reference solution, so a failed check is the tool's fault, not the check's.
-2. **Judge** (blind, cheap): grade.py renders the same frames of every arm the same way (EEVEE,
-   640 px, the scene's own camera). judge.py shows a vision model the brief and both arms'
+   scores partially. selfcheck.py proves the untouched task fails where expected and the reference
+   solution passes. This does not prove each requirement is independently discriminating; mutation
+   tests and review of the checks are still needed before attributing a failure to the agent.
+2. **Judge** (blind, cheap): grade.py renders the same frames of every arm at reduced resolution
+   with the saved scene's engine (Cycles or EEVEE) and camera. judge.py shows a vision model the brief and both arms'
    frames, scores five axes 1-5, picks one, then asks again with the arms swapped; a preference
    only counts when both orders agree. Set `LOOPCUT_JUDGE_BASE_URL/_API_KEY/_MODEL` to a model
    that is not one of the contestants; without them it uses Loopcut's own model and says so.
@@ -57,7 +58,7 @@ tokens (Loopcut only; the other tool's usage is whatever it reports).
 
 ```
 # 1. Loopcut arm: one or two real agent turns per task in a windowed Blender (costs tokens, minutes)
-python3 blender/loopcut/harness/evals/run.py perfume_ad --label "baseline" [--record]
+python3 blender/loopcut/harness/evals/run.py perfume_ad --label "baseline" --approve-heavy [--record]
 #    -> out/evals/<time>/perfume_ad.{json,md,work.blend,stage1.blend,final.blend,conversation/,mov}
 
 # 2. Other tool: export the start scene, do the task there, save <task>.final.blend next to it
@@ -72,6 +73,34 @@ python3 blender/loopcut/harness/evals/compare.py --arm loopcut=out/evals/<time> 
 Any number of arms works (a second Loopcut run with a different prompt is an arm too); `--judge`
 wants exactly two. Every task in projects.py can be exported and compared; start with one, since
 the other tool's usage is the expensive part.
+
+`run.py` defaults to one Blender process to avoid GPU contention. `--timeout` explicitly overrides
+the task's own limit, per brief. `--record` requires `--jobs 1`. `--approve-heavy` authorizes
+renders/bakes only inside these disposable eval processes; without it a waiting approval is
+reported as `approval_required`, not allowed to consume the full timeout. A first turn ending in
+an error, cancellation, timeout or step limit does not receive the follow-up. The result records
+each stage's outcome and the number of prompts actually sent.
+
+Each task now writes `<task>.manifest.json` and includes it in its result: source/fixture hashes,
+task contract, Blender build, model settings and budgets. Summary win/loss comparisons exclude
+changed or missing task contracts, including old unversioned results. Keep failed runs and compare
+multiple trials with fixed budgets; a passing scene checklist is not proof of visual quality.
+`start_scene.py` writes the same task-contract manifest for the manual arm. `compare.py` refuses
+mismatched task/check/fixture revisions before grading. For old runs without manifests,
+`--allow-unversioned` permits an explicitly labelled exploratory regrade, but still refuses a known
+different prompt or follow-up. Use a fresh export to make a defensible comparison.
+
+For model-free regressions before paying for an eval:
+
+```
+python3 -m unittest discover -s blender/loopcut/tests
+tools/Blender.app/Contents/MacOS/Blender --factory-startup --python blender/loopcut/harness/perception_check.py
+tools/Blender.app/Contents/MacOS/Blender -b --factory-startup --python-exit-code 1 --python blender/loopcut/harness/api_docs_check.py
+```
+
+`perception_check.py` requires a window/GPU and a Cycles-capable build. It measures a known bright
+object's pixels, checks real geometry-node inputs, and verifies editor/settings restoration on
+both successful and failed operations. The full design review is in [HARNESS_REVIEW.md](../../HARNESS_REVIEW.md).
 
 ## Replaying a run
 

@@ -12,6 +12,8 @@ import inspect
 
 import bpy
 
+from . import capabilities
+
 MAX_CHARS = 6000
 MAX_SEARCH_RESULTS = 40
 _NODE_TREES = ("ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree")
@@ -34,12 +36,21 @@ def _socket_types() -> list[str]:
 # read from the running Blender, say them. Key: (struct, function or "", property).
 _DYNAMIC_ENUMS = {
     ("NodeTreeInterface", "new_socket", "socket_type"): _socket_types,
+    ("RenderSettings", "", "engine"): lambda: capabilities.render_engines(bpy.context.scene.render),
 }
 
 # The few places where the API of recent versions differs from what most scripts online (and so
 # most models) assume, stated once where the model will look. harness/api_docs_check.py runs the
 # code in each note against the running Blender, so a note cannot outlive the API it describes.
 NOTES = {
+    "ImageFormatSettings": (
+        "In Blender 5.2, file_format depends on media_type. IMAGE lists only still formats; this "
+        "does not mean video encoding is unavailable. For MP4 output (when bpy.app.ffmpeg.supported):\n"
+        "  r = bpy.context.scene.render\n"
+        "  r.image_settings.media_type = 'VIDEO'\n"
+        "  r.image_settings.file_format = 'FFMPEG'\n"
+        "  r.ffmpeg.format = 'MPEG4'; r.ffmpeg.codec = 'H264'\n"
+        "For PNG output set media_type = 'IMAGE' before file_format = 'PNG'."),
     "NodeTree": (
         "Group inputs and outputs are made on the interface, not tree.inputs/outputs:\n"
         "  tree.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')\n"
@@ -166,14 +177,17 @@ def _node_sockets(identifier: str) -> list[str]:
 
 
 def _describe_struct(cls) -> list[str]:
-    rna = cls.bl_rna
+    return _describe_rna(cls.bl_rna, cls)
+
+
+def _describe_rna(rna, cls=None) -> list[str]:
     lines = [f"bpy.types.{rna.identifier}" + (f"({rna.base.identifier})" if rna.base else "")]
     if rna.description:
         lines.append(rna.description)
     own = _own_properties(rna)
     if own:
         lines.append("properties:")
-        lines += [_property_line(p) for p in own]
+        lines += [_property_line(p, owner=(rna.identifier, "")) for p in own]
     functions = [f for f in rna.functions if not rna.base or f.identifier not in rna.base.functions]
     if functions:
         lines.append("functions:")
@@ -181,14 +195,17 @@ def _describe_struct(cls) -> list[str]:
     if rna.base:
         names = [p.identifier for p in rna.base.properties if p.identifier != "rna_type"]
         lines.append(f"inherited from {rna.base.identifier} (inspect it for details): {', '.join(names)}")
-    subclasses = sorted(c.bl_rna.identifier for c in cls.__subclasses__() if hasattr(c, "bl_rna"))
+    subclasses = sorted(c.bl_rna.identifier for c in cls.__subclasses__() if hasattr(c, "bl_rna")) if cls else []
     if subclasses:
         lines.append(f"subtypes ({len(subclasses)}): {', '.join(subclasses[:60])}"
                      + (", ..." if len(subclasses) > 60 else ""))
-    if issubclass(cls, bpy.types.Node):
+    if cls and issubclass(cls, bpy.types.Node):
         lines += _node_sockets(rna.identifier)
     for name, note in NOTES.items():
-        if issubclass(cls, getattr(bpy.types, name)):
+        ancestor = rna
+        while ancestor and ancestor.identifier != name:
+            ancestor = ancestor.base
+        if ancestor:
             lines.append("NOTE: " + note)
     return lines
 
@@ -242,8 +259,8 @@ def _closest(name: str) -> str:
 
 def _walk_rna(cls, names: list[str]) -> list[str]:
     """Follow property names from an RNA type: Object -> modifiers -> (the collection's type)."""
+    rna = cls.bl_rna
     for position, name in enumerate(names):
-        rna = cls.bl_rna
         if name in rna.functions:
             return [f"bpy.types.{rna.identifier}.{name}", _function_line(rna.functions[name]).strip(),
                     *("  " + _property_line(p, with_default=False, owner=(rna.identifier, name)).strip()
@@ -253,16 +270,22 @@ def _walk_rna(cls, names: list[str]) -> list[str]:
             raise ApiError(f"bpy.types.{rna.identifier} has no property or function {name!r}. It has: "
                            + ", ".join(p.identifier for p in rna.properties if p.identifier != "rna_type"))
         if prop.type not in ("POINTER", "COLLECTION") or prop.fixed_type is None:
-            return [f"bpy.types.{rna.identifier}.{name}", _property_line(prop).strip()]
+            lines = [f"bpy.types.{rna.identifier}.{name}", _property_line(prop, owner=(rna.identifier, "")).strip()]
+            if rna.identifier in NOTES:
+                lines.append("NOTE: " + NOTES[rna.identifier])
+            return lines
         header = f"bpy.types.{rna.identifier}.{name} is a {_type_of(prop)}"
         # A collection's own methods (new, remove, link, ...) live on a separate RNA struct.
-        cls = getattr(bpy.types, (prop.srna or prop.fixed_type).identifier)
+        rna = prop.srna or prop.fixed_type
+        # Python add-ons can register RNA structs without exposing a bpy.types attribute
+        # (e.g. Scene.cycles -> CyclesRenderSettings). The RNA itself is authoritative.
+        cls = getattr(bpy.types, rna.identifier, None)
         if position == len(names) - 1:
-            described = _describe_struct(cls)
+            described = _describe_rna(rna, cls)
             if prop.srna and prop.fixed_type:
                 described.append(f"items are bpy.types.{prop.fixed_type.identifier}")
             return [header, *described]
-    return _describe_struct(cls)
+    return _describe_rna(rna, cls)
 
 
 def _resolve(path: str) -> list[str]:

@@ -6,13 +6,14 @@ import json
 import math
 import re
 import sys
-import tempfile
 import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 import bpy
+
+from . import scratch
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
@@ -83,7 +84,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "links), geometry-nodes inputs, constraints, animation, children, custom properties. Read "
             "before changing an existing setup."),
         "parameters": {"type": "object", "properties": {
-            "names": {"type": "array", "items": {"type": "string"}, "description": "Object names"},
+            "names": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5,
+                      "description": "Object names"},
         }, "required": ["names"]},
     }},
     {"type": "function", "function": {
@@ -136,7 +138,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
                                      "side and top as one 2x2 image, for placement."},
             "style": {"type": "string", "enum": ["material", "distinct", "rendered"],
                       "description": "distinct: a flat color per object, to judge shape and contact. "
-                                     "rendered: EEVEE with scene lights and world, to judge lighting"},
+                                     "rendered: EEVEE preview with scene lights and world; an approximation "
+                                     "when the final engine is Cycles. material uses studio lighting, not scene lights"},
         }},
     }},
 ]
@@ -193,12 +196,7 @@ def _editor_context(editor: str):
     """bpy.context for one step. The 3D viewport by default; another open editor of the asked
     kind; else the viewport is switched to that editor for the step and switched back, which
     keeps its view and shading. Nothing redraws in between, so the user sees no change."""
-    base = _view3d_override()
     editor = _editor_name(editor) if editor and editor.strip() else "VIEW_3D"
-    if editor == "VIEW_3D":
-        with bpy.context.temp_override(**base):
-            yield
-        return
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
@@ -206,8 +204,16 @@ def _editor_context(editor: str):
                 with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
                     yield
                 return
-    area = base["area"]
-    with bpy.context.temp_override(**base):
+    # The user may be in the Sequencer, render viewer, or a workspace without a 3D view.
+    # Borrow a regular editor only for this synchronous step and restore its exact UI type.
+    candidates = [(w, a) for w in bpy.context.window_manager.windows for a in w.screen.areas
+                  if a.type not in ("LOOPCUT", "TOPBAR", "STATUSBAR")
+                  and any(r.type == "WINDOW" for r in a.regions)]
+    if not candidates:
+        raise ToolError("No editor area is available for this operation.")
+    window, area = max(candidates, key=lambda pair: pair[1].width * pair[1].height)
+    saved_type, saved_ui = area.type, area.ui_type
+    with bpy.context.temp_override(window=window, screen=window.screen, area=area):
         if editor in _TREE_EDITORS:
             area.type = "NODE_EDITOR"
             area.ui_type = editor  # Points the editor at the active object's material or modifier.
@@ -215,10 +221,10 @@ def _editor_context(editor: str):
             area.type = editor
         try:
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
-            with bpy.context.temp_override(window=base["window"], screen=base["screen"], area=area, region=region):
+            with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
                 yield
         finally:
-            area.type = "VIEW_3D"
+            area.type, area.ui_type = saved_type, saved_ui
 
 
 def _clip(text: str) -> str:
@@ -372,6 +378,7 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
     missing, and the narrower question that would fit is named."""
     if detail not in ("", "rows", "names"):
         raise ToolError('detail must be "rows" or "names"')
+    from . import capabilities
     scene = bpy.context.scene
     active = bpy.context.view_layer.objects.active
     wanted = collection.lower()
@@ -395,6 +402,11 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
         "active_object": active.name if active else None,
         "frame": {"current": scene.frame_current, "start": scene.frame_start, "end": scene.frame_end},
         "render_engine": scene.render.engine,
+        "render_engines": capabilities.render_engines(scene.render),
+        "output": {"media_type": getattr(scene.render.image_settings, "media_type", None),
+                   "format": scene.render.image_settings.file_format, "path": scene.render.filepath,
+                   "video_encoding": bpy.app.ffmpeg.supported},
+        "editors": sorted({a.ui_type for w in bpy.context.window_manager.windows for a in w.screen.areas}),
         "unit_system": scene.unit_settings.system,
         "camera": scene.camera.name if scene.camera else None,
         "object_count": len(scene.objects),
@@ -595,6 +607,13 @@ def _nearest_first(eye, objects) -> str:
 
 def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter",
                      style: str = "material") -> ToolResult:
+    if angle == "user":
+        return _capture_viewport(focus, angle, style)
+    with _editor_context("VIEW_3D"):
+        return _capture_viewport(focus, angle, style)
+
+
+def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolResult:
     import numpy as np
     angles = [*_VIEW_EULERS, "camera", "user", "sheet"]
     if angle not in angles:
@@ -622,7 +641,10 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
 
     shading = space.shading
     saved_view = (shading.type, shading.color_type, shading.light, space.overlay.show_overlays)
-    out_dir = Path(tempfile.gettempdir()) / "loopcut"
+    saved_lighting = (shading.use_scene_lights, shading.use_scene_world,
+                      shading.use_scene_lights_render, shading.use_scene_world_render)
+    saved_engine = scene.render.engine
+    out_dir = scratch.folder()
     out_dir.mkdir(exist_ok=True)
     path = out_dir / "viewport.png"
     path.unlink(missing_ok=True)
@@ -633,6 +655,13 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
             if style == "distinct":
                 shading.type, shading.color_type, shading.light = "SOLID", "RANDOM", "STUDIO"
             else:
+                if style == "rendered":
+                    # Cycles viewport draws accumulate asynchronously. A single offscreen draw
+                    # returns a black buffer, not a lighting diagnosis. EEVEE draws synchronously.
+                    scene.render.engine = "BLENDER_EEVEE"
+                    shading.use_scene_lights_render = shading.use_scene_world_render = True
+                else:
+                    shading.use_scene_lights = shading.use_scene_world = False
                 shading.type = "RENDERED" if style == "rendered" else "MATERIAL"
             space.overlay.show_overlays = False
         if angle == "sheet":
@@ -666,6 +695,9 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
             pixels = _draw_offscreen(scene, space, region, view, projection, width, height, labels)
     finally:
         (shading.type, shading.color_type, shading.light, space.overlay.show_overlays) = saved_view
+        (shading.use_scene_lights, shading.use_scene_world,
+         shading.use_scene_lights_render, shading.use_scene_world_render) = saved_lighting
+        scene.render.engine = saved_engine
     _save_pixels(pixels, path)
     # Everything visible, not only what was framed: an object that was not asked for is
     # exactly the one that turns up in front of the subject.
@@ -680,6 +712,10 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
         what = f"{angle} view of {', '.join(o.name for o in targets[:12])}"
     if angle != "user":
         what += "; objects are labelled with their names"
+        if style == "rendered":
+            what += f"; EEVEE lighting preview (final scene engine: {saved_engine}), not a final render"
+        elif style == "material":
+            what += "; studio lighting, not the scene's lights or world"
     return ToolResult(f"Image attached: {what}.{order}", image_path=path)
 
 
@@ -767,7 +803,7 @@ def progress_strip(paths: list) -> "Path | None":
     for frame in frames:
         canvas[:, x:x + frame.shape[1]] = frame
         x += frame.shape[1] + STRIP_GAP
-    out = Path(tempfile.gettempdir()) / "loopcut" / "strip.png"
+    out = scratch.folder() / "strip.png"
     out.parent.mkdir(exist_ok=True)
     _save_pixels(canvas, out)
     return out
@@ -791,7 +827,7 @@ def look_at_reference(name: str, region: list | None = None) -> ToolResult:
         what = f"region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} from the top-left"
     else:
         what = "the whole image"
-    out = Path(tempfile.gettempdir()) / "loopcut" / "reference.png"
+    out = scratch.folder() / "reference.png"
     out.parent.mkdir(exist_ok=True)
     shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
     return ToolResult(f"Image attached: {found['name']}, {what}, {shown[0]}x{shown[1]} px "
@@ -809,7 +845,7 @@ def compare_with_reference(name: str, focus: list[str] | None = None, angle: str
     canvas = np.ones((height, left.shape[1] + COMPARE_GAP + right.shape[1], 4), dtype=np.float32)
     canvas[:, :left.shape[1]] = left
     canvas[:, left.shape[1] + COMPARE_GAP:] = right
-    out = Path(tempfile.gettempdir()) / "loopcut" / "compare.png"
+    out = scratch.folder() / "compare.png"
     _save_pixels(canvas, out)
     return ToolResult(f"Image attached: the reference {found['name']} on the left, {shot.text[len('Image attached: '):]}"
                       f" on the right, at the same height.", image_path=out)

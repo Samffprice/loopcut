@@ -22,8 +22,11 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import evidence
 
 REPO = Path(__file__).resolve().parents[3]   # The repository; see harness/checkout.py for the layout.
 WORKSPACE = REPO.parent
@@ -33,6 +36,7 @@ EVALS = WORKSPACE / "out" / "evals"
 def task_index() -> dict[str, list[str]]:
     """Task ids and tags, read from tasks.py and projects.py without importing them (they need bpy)."""
     index = {}
+    TIMEOUTS.clear()
     for name in ("tasks.py", "projects.py", "showcase.py"):
         tree = ast.parse((Path(__file__).parent / name).read_text(encoding="utf-8"))
         index.update(_task_calls(tree))
@@ -62,18 +66,22 @@ def blender() -> str:
     return path
 
 
-def run_one(task_id: str, out: Path, timeout: float, record: bool = False) -> dict:
+def run_one(task_id: str, out: Path, timeout: float, record: bool = False, approve_heavy: bool = False) -> dict:
     command = [blender(), "--factory-startup", "--python", str(Path(__file__).parent / "run_task.py"),
                "--", task_id, str(out)]
-    env = {**os.environ, "LOOPCUT_EVAL_TIMEOUT": str(timeout)}
+    env = {**os.environ, "LOOPCUT_EVAL_TIMEOUT": str(timeout),
+           "LOOPCUT_EVAL_APPROVE_HEAVY": "1" if approve_heavy else "0", "LOOPCUT_UPDATE_URL": "off"}
     log = out / f"{task_id}.log"
     recorder = None
     if record:  # macOS screen recording of the whole run; needs Screen Recording permission for the terminal.
         recorder = subprocess.Popen(["screencapture", "-v", "-x", str(out / f"{task_id}.mov")],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        with log.open("w", encoding="utf-8") as handle:
-            subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, env=env, timeout=2 * timeout + 60)
+        with tempfile.TemporaryDirectory(prefix=f".{task_id}-", dir=out) as runtime:
+            env.update(TMPDIR=runtime, LOOPCUT_DATA_DIR=str(Path(runtime) / "data"))
+            with log.open("w", encoding="utf-8") as handle:
+                process = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, env=env,
+                                         timeout=2 * timeout + 60)
     except subprocess.TimeoutExpired:
         return {"id": task_id, "passed": False, "problems": ["harness: Blender did not exit"]}
     finally:
@@ -83,6 +91,10 @@ def run_one(task_id: str, out: Path, timeout: float, record: bool = False) -> di
                 recorder.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 recorder.kill()
+                recorder.wait()
+    if process.returncode:
+        return {"id": task_id, "passed": False,
+                "problems": [f"harness: Blender exited with {process.returncode}, see {log.name}"]}
     result_file = out / f"{task_id}.json"
     if not result_file.is_file():
         return {"id": task_id, "passed": False, "problems": [f"harness: no result written, see {log.name}"]}
@@ -104,11 +116,16 @@ def summarize(run: dict, previous: dict | None) -> str:
              f"model steps: {sum(r.get('model_steps', 0) for r in results)}, "
              f"failed tool calls: {sum(r.get('failed_tool_calls', 0) for r in results)}", ""]
     if previous:
-        then = {r["id"]: r["passed"] for r in previous["results"]}
+        old = {r["id"]: r for r in previous["results"]}
+        then = {r["id"]: old[r["id"]]["passed"] for r in results
+                if r["id"] in old and evidence.comparable(r, old[r["id"]])}
+        excluded = [r["id"] for r in results if r["id"] in old and r["id"] not in then]
         won = [r["id"] for r in results if r["passed"] and then.get(r["id"]) is False]
         lost = [r["id"] for r in results if not r["passed"] and then.get(r["id"]) is True]
         lines += [f"Against the previous run ({previous['started']}, `{previous['model']}`, "
                   f"{previous['label'] or 'no label'}): won {won or 'nothing'}, lost {lost or 'nothing'}.", ""]
+        if excluded:
+            lines += [f"Not comparable (changed or unrecorded task contract): {', '.join(excluded)}.", ""]
     lines += ["| task | result | s | steps | tools | failed calls | what is wrong |", "|---|---|---|---|---|---|---|"]
     for r in results:
         tools = ", ".join(f"{k} x{v}" for k, v in (r.get("tool_calls") or {}).items())
@@ -131,12 +148,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("tasks", nargs="*", help="task ids; default all")
     parser.add_argument("--tag", action="append", default=[], help="only tasks with this tag")
-    parser.add_argument("--jobs", type=int, default=2, help="Blenders at once (default 2)")
-    parser.add_argument("--timeout", type=float, default=300.0, help="seconds per brief, unless the task sets its own")
+    parser.add_argument("--jobs", type=int, default=1, help="Blenders at once (default 1 for stable GPU timing)")
+    parser.add_argument("--timeout", type=float, help="override seconds per brief, including task-specific limits")
+    parser.add_argument("--approve-heavy", action="store_true", help="allow renders/bakes in disposable evals")
     parser.add_argument("--label", default="", help="what changed, for the comparison line")
     parser.add_argument("--list", action="store_true", help="list tasks and exit")
     parser.add_argument("--record", action="store_true", help="screen-record each task to <task>.mov (macOS)")
     args = parser.parse_args()
+    if args.timeout is not None and (not 0 < args.timeout < float("inf")):
+        parser.error("--timeout must be a positive finite number")
+    if args.record and args.jobs != 1:
+        parser.error("--record requires --jobs 1 so recordings do not mix task windows")
 
     unknown = [t for t in args.tasks if t not in index]
     if unknown:
@@ -147,13 +169,17 @@ def main() -> int:
         for task_id in chosen:
             print(f"{task_id:18} {', '.join(index[task_id])}")
         return 0
+    if not chosen:
+        parser.error("no tasks match the selected tags")
 
     started = time.strftime("%Y%m%d-%H%M%S")
     out = EVALS / started
     out.mkdir(parents=True)
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {task_id: pool.submit(run_one, task_id, out, TIMEOUTS.get(task_id, args.timeout), args.record)
+        futures = {task_id: pool.submit(run_one, task_id, out,
+                                       args.timeout if args.timeout is not None else TIMEOUTS.get(task_id, 300),
+                                       args.record, args.approve_heavy)
                    for task_id in chosen}
         results = []
         for task_id, future in futures.items():

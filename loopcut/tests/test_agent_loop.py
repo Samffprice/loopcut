@@ -269,6 +269,97 @@ class AgentLoopTest(unittest.TestCase):
         roles = [m["role"] for m in SCRIPT.requests[-1]["messages"]]
         self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
 
+    def test_stop_during_a_batch_does_not_execute_remaining_calls(self):
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            agent.stop()
+            return types.SimpleNamespace(text="first call finished", ok=True, image_path=None)
+
+        self.run_tool = run_tool
+        calls = [{"index": i, "id": f"call_{i}", "type": "function",
+                  "function": {"name": "get_scene_info", "arguments": "{}"}} for i in range(2)]
+        SCRIPT.replies.append(sse({"choices": [{"delta": {"tool_calls": calls}}]},
+                                  {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+        turn = self.start("inspect twice")
+        turn.thread.join(5)
+        self.assertEqual(len(self.ran), 1)
+        self.assertEqual(turn.outcome, "cancelled")
+        results = [m for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual([r["tool_call_id"] for r in results], ["call_0", "call_1"])
+        self.assertIn("Cancelled", results[-1]["content"])
+
+    def test_stop_during_checkpoint_does_not_run_the_mutation(self):
+        self.ensure_checkpoint = lambda session: agent.stop()
+        SCRIPT.replies.append(tool_reply("run_python", {"code": "add()", "summary": "Add"}))
+        turn = self.start("add")
+        self.awaiting()
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.session["turn_outcome"], "cancelled")
+
+    def test_step_limit_is_not_a_completed_turn(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"LOOPCUT_MAX_STEPS": "1"}):
+            SCRIPT.replies.append(tool_reply("get_scene_info", {}))
+            turn = self.start("inspect")
+            turn.thread.join(5)
+        self.assertEqual(turn.outcome, "step_limit")
+        self.assertEqual(self.session["turn_outcome"], "step_limit")
+
+    def test_cancelled_main_thread_job_never_executes_after_worker_stops(self):
+        from concurrent.futures import Future
+        from unittest.mock import patch
+        from loopcut import mainthread, tools
+        queued = []
+        future = Future()
+        cancelled = threading.Event()
+
+        def enqueue(fn):
+            queued.append(fn)
+            cancelled.set()
+            return future
+
+        with patch.object(mainthread, "run_on_main", enqueue), patch.object(tools, "execute", create=True) as execute:
+            with self.assertRaises(llm.Cancelled):
+                agent._run_tool_on_main("run_python", "{}", cancelled.is_set)
+            self.assertTrue(future.cancelled())
+            self.assertFalse(future.set_running_or_notify_cancel())
+            with self.assertRaises(llm.Cancelled):
+                queued[0]()  # Also protected if the pump got to it at the same instant.
+            execute.assert_not_called()
+
+    def test_a_tool_timeout_is_not_retried_as_a_poll_timeout(self):
+        from concurrent.futures import Future
+        from unittest.mock import patch
+        from loopcut import mainthread
+        future = Future()
+        future.set_exception(TimeoutError("tool timed out"))
+        with patch.object(mainthread, "run_on_main", return_value=future):
+            with self.assertRaisesRegex(TimeoutError, "tool timed out"):
+                agent._run_tool_on_main("get_scene_info", "{}")
+
+    def test_stop_during_auto_preview_preserves_the_completed_mutation(self):
+        from test_scene_diff import cube, scene
+        from unittest.mock import patch
+        before, after = scene(), scene({"Cube": cube(), "Sphere": cube(data="Sphere")})
+        def run_tool(name, arguments):
+            if name == "capture_viewport":
+                agent.stop()
+                raise llm.Cancelled()
+            return types.SimpleNamespace(text="sphere added", ok=True, image_path=None,
+                                         scene_before=before, scene_after=after)
+        self.run_tool = run_tool
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "true", "LOOPCUT_AUTO_RUN": "true"}):
+            SCRIPT.replies.append(tool_reply("run_python", {"code": "add()", "summary": "Add"}))
+            turn = self.start("add sphere")
+            turn.thread.join(5)
+        result = next(m for m in self.session["messages"] if m["role"] == "tool")
+        self.assertIn("sphere added", result["content"])
+        self.assertEqual(turn.scene_after, after)
+        self.assertEqual(turn.outcome, "cancelled")
+        self.assertEqual(next(i for i in self.session["items"] if i["kind"] == "tool")["status"], "done")
+
     def test_a_long_history_is_summarized_before_the_next_request(self):
         from loopcut import context
         os.environ["LOOPCUT_CONTEXT_BUDGET"] = "8000"

@@ -22,6 +22,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import evidence
 
 REPO = Path(__file__).resolve().parents[3]
 WORKSPACE = REPO.parent
@@ -148,33 +151,45 @@ def write_report(out: Path, arms: list[str], tasks: list[str], grades: dict, eff
 
 
 def write_blind(out: Path, arms: list[str], tasks: list[str], grades: dict) -> None:
-    key, lines = {}, ["# Blind comparison", "", "Same brief, two tools, names hidden and order shuffled per task. "
+    identity_key, lines = {}, ["# Blind comparison", "", "Same brief, names hidden and order shuffled per task. "
                       "For each task write which column you would rather hand to a client and why; "
                       "blind_key.json says which was which.", ""]
     labels = ["Left", "Right", "Third", "Fourth"][:len(arms)]
+    labels += [f"Column{n + 1}" for n in range(4, len(arms))]
+    assets = out / "blind_assets"
+    assets.mkdir(exist_ok=True)
     for task_id in tasks:
         order = arms[:]
         random.shuffle(order)
-        key[task_id] = dict(zip(labels, order))
-        lines += [f"## {task_id}", "", f"> {prompt_of(task_id)}", "",
-                  "| frame | " + " | ".join(labels) + " |", "|---|" + "---|" * len(arms)]
-        for key in ("stage_renders", "renders"):
-            frames = max(len(grades[a][task_id].get(key) or []) for a in arms)
+        identity_key[task_id] = dict(zip(labels, order))
+        lines += [f"## {task_id}", "", f"> {prompt_of(task_id)}", ""]
+        if prompt_of(task_id, follow_up=True):
+            lines += [f"> then: {prompt_of(task_id, follow_up=True)}", ""]
+        lines += ["| frame | " + " | ".join(labels) + " |", "|---|" + "---|" * len(arms)]
+        for render_key in ("stage_renders", "renders"):
+            frames = max(len(grades[a][task_id].get(render_key) or []) for a in arms)
             for i in range(frames):
                 row = []
-                for arm in order:
-                    renders = grades[arm][task_id].get(key) or []
-                    row.append(f"![]({arm}/{renders[i]})" if i < len(renders) else "-")
-                lines.append(f"| {key.replace('_renders', ' 1').replace('renders', 'final')} {i + 1} | " + " | ".join(row) + " |")
+                for label, arm in zip(labels, order):
+                    renders = grades[arm][task_id].get(render_key) or []
+                    if i < len(renders):
+                        name = f"{task_id}.{label.lower()}.{render_key}.{i + 1}.png"
+                        shutil.copyfile(out / arm / renders[i], assets / name)
+                        row.append(f"![](blind_assets/{name})")
+                    else:
+                        row.append("-")
+                stage = "stage 1" if render_key == "stage_renders" else "final"
+                lines.append(f"| {stage} {i + 1} | " + " | ".join(row) + " |")
         lines += ["", "Prefer: ", ""]
     (out / "blind.md").write_text("\n".join(lines), encoding="utf-8")
-    (out / "blind_key.json").write_text(json.dumps(key, indent=1), encoding="utf-8")
+    (out / "blind_key.json").write_text(json.dumps(identity_key, indent=1), encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--arm", action="append", required=True, help="name=dir, at least one")
     parser.add_argument("--judge", action="store_true", help="also ask the judge model (two arms)")
+    parser.add_argument("--allow-unversioned", action="store_true", help="allow clearly labelled historical regrades without manifests")
     parser.add_argument("--out", default="", help="report folder; default out/projects/<time>")
     parser.add_argument("tasks", nargs="*", help="task ids; default every task both arms finished")
     args = parser.parse_args()
@@ -193,6 +208,15 @@ def main() -> int:
     if not tasks:
         sys.exit("no task has a <task>.final.blend in every arm")
 
+    warnings = {}
+    for name, folder in arm_dirs.items():
+        for task_id in tasks:
+            task = SimpleNamespace(id=task_id, prompt=prompt_of(task_id), follow_up=prompt_of(task_id, follow_up=True))
+            try:
+                warnings[name, task_id] = evidence.validate_arm(folder, task, args.allow_unversioned)
+            except ValueError as error:
+                parser.error(str(error))
+
     grades, efforts = {}, {}
     for name, folder in arm_dirs.items():
         run_model = ""
@@ -205,6 +229,8 @@ def main() -> int:
             grades[name][task_id]["follow_up"] = prompt_of(task_id, follow_up=True)
             (out / name / f"{task_id}.grade.json").write_text(json.dumps(grades[name][task_id], indent=1), encoding="utf-8")
             efforts[name][task_id] = effort(folder, task_id, run_model)
+            if warnings[name, task_id]:
+                efforts[name][task_id]["notes"] = warnings[name, task_id] + "; " + efforts[name][task_id]["notes"]
             for suffix in (".md", ".transcript.md"):  # run.py's transcript, or the other tool's own log
                 if (folder / f"{task_id}{suffix}").is_file():
                     shutil.copy(folder / f"{task_id}{suffix}", out / name / f"{task_id}.transcript.md")

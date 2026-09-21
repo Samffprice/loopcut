@@ -16,12 +16,12 @@ MAX_FCURVES = 40
 
 
 def _value(value):
+    if isinstance(value, bpy.types.ID):
+        return f"{type(value).__name__} {value.name!r}"
     if hasattr(value, "__len__") and not isinstance(value, str):
         return [round(v, 4) if isinstance(v, float) else v for v in value]
     if isinstance(value, float):
         return round(value, 4)
-    if isinstance(value, bpy.types.ID):
-        return f"{type(value).__name__} {value.name!r}"
     return value
 
 
@@ -76,10 +76,23 @@ def _modifier(modifier) -> dict:
     group = getattr(modifier, "node_group", None) if modifier.type == "NODES" else None
     if group:
         inputs = {}
+        properties = getattr(modifier, "properties", None)
+        sockets = getattr(properties, "inputs", None)
         for item in group.interface.items_tree:
-            if item.item_type == "SOCKET" and item.in_out == "INPUT" and item.identifier in modifier.keys():
+            if item.item_type != "SOCKET" or item.in_out not in ("INPUT", "BOTH"):
+                continue
+            if sockets is not None:  # Blender 5.2 moved sockets off modifier ID properties.
+                socket = getattr(sockets, item.identifier, None)
+                if socket is None or not hasattr(socket, "value"):
+                    continue  # Geometry sockets have no editable value.
+                value = {"identifier": item.identifier, "value": _value(socket.value),
+                         "access": f"properties.inputs.{item.identifier}.value"}
+                if getattr(socket, "type", None) == "ATTRIBUTE":
+                    value.update(type="ATTRIBUTE", attribute_name=socket.attribute_name)
+                inputs[item.name] = value
+            elif item.identifier in modifier.keys():  # Older Blender releases.
                 inputs[item.name] = {"identifier": item.identifier, "value": _value(modifier[item.identifier])}
-        entry["inputs"] = inputs  # Set with modifier["<identifier>"] = value.
+        entry["inputs"] = inputs
         entry["node_group_tree"] = node_tree(group)
     return entry
 

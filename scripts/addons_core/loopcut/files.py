@@ -16,11 +16,11 @@ needs_approval and the path checks are pure; the tools run on Blender's main thr
 import fnmatch
 import os
 import shutil
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+from . import scratch
 from .tools import MAX_OUTPUT_CHARS, ToolError, ToolResult, _clip
 
 READ_TOOLS = {"list_files", "read_file"}
@@ -33,7 +33,7 @@ PREVIEW_SAMPLES = 32         # ...and with this many samples: a look, not the us
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".tga", ".exr", ".hdr")
 # A copy of the last finished render, kept by on_render_complete: the agent's own viewport captures
 # go through the same Render Result and would otherwise replace the user's render within a step.
-LAST_RENDER = Path(tempfile.gettempdir()) / "loopcut" / "last_render.png"
+LAST_RENDER = scratch.folder() / "last_render.png"
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
@@ -245,7 +245,7 @@ def _read_text(path: Path, lines) -> str:
 
 def _read_image(path: Path) -> ToolResult:
     from . import attachments
-    out = Path(tempfile.gettempdir()) / "loopcut" / "file.png"
+    out = scratch.folder() / "file.png"
     out.parent.mkdir(exist_ok=True)
     try:
         width, height = attachments._to_png(path, out, IMAGE_SIDE)
@@ -311,11 +311,13 @@ def _render_now(scene, out: Path, full: bool) -> str:
     render = scene.render
     settings = render.image_settings
     saved = {"filepath": render.filepath, "resolution_percentage": render.resolution_percentage,
-             "use_file_extension": render.use_file_extension, "file_format": settings.file_format,
-             "color_depth": settings.color_depth}
+             "use_file_extension": render.use_file_extension, "media_type": settings.media_type,
+             "file_format": settings.file_format, "color_depth": settings.color_depth,
+             "color_mode": settings.color_mode}
     samples = []  # (owner, attribute, value) to put back.
     try:
         render.filepath, render.use_file_extension = str(out), False
+        settings.media_type = "IMAGE"
         settings.file_format = "PNG"
         if not full:
             longest = max(render.resolution_x, render.resolution_y)
@@ -335,7 +337,7 @@ def _render_now(scene, out: Path, full: bool) -> str:
         for owner, attribute, value in samples:
             setattr(owner, attribute, value)
         for key, value in saved.items():
-            setattr(settings if key in ("file_format", "color_depth") else render, key, value)
+            setattr(settings if key in ("media_type", "file_format", "color_depth", "color_mode") else render, key, value)
     if not out.is_file():
         raise ToolError("The render produced no image.")
     return (f"a {'full' if full else 'preview'} render through {scene.camera.name} with {render.engine}"
@@ -350,15 +352,16 @@ def on_render_complete(scene, *_) -> None:
     if image is None:
         return
     settings = scene.render.image_settings
-    saved = settings.file_format, settings.color_depth  # Restored in this order: depth depends on format.
+    saved = settings.media_type, settings.file_format, settings.color_depth, settings.color_mode
     try:
         LAST_RENDER.parent.mkdir(exist_ok=True)
+        settings.media_type = "IMAGE"
         settings.file_format = "PNG"
         image.save_render(str(LAST_RENDER), scene=scene)
     except (RuntimeError, OSError) as ex:
         print(f"Loopcut: could not keep a copy of the render: {ex}")
     finally:
-        settings.file_format, settings.color_depth = saved
+        settings.media_type, settings.file_format, settings.color_depth, settings.color_mode = saved
 
 
 on_render_complete._bpy_persistent = None  # What bpy.app.handlers.persistent does: the handler survives file loads.
@@ -376,7 +379,7 @@ def see_render(render: bool = False, full: bool = False) -> ToolResult:
     import bpy
     from . import attachments
     scene = bpy.context.scene
-    folder = Path(tempfile.gettempdir()) / "loopcut"
+    folder = scratch.folder()
     folder.mkdir(exist_ok=True)
     out, shown = folder / "render.png", folder / "render_small.png"
     if render:

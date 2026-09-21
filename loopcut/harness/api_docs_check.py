@@ -28,6 +28,10 @@ CASES = [
     ({"path": "bpy.types.NodeTreeInterface.new_socket"}, ["'NodeSocketGeometry'", "'NodeSocketFloat'"]),
     ({"path": "bpy.types.GeometryNodeTree"}, ["NOTE:", "tree.interface.new_socket"]),
     ({"path": "bpy.types.Action"}, ["NOTE:", "channelbag(slot)"]),
+    ({"path": "bpy.context.scene.cycles.samples"}, ["samples", "int"]),
+    ({"path": "bpy.types.Scene.cycles"}, ["CyclesRenderSettings", "samples"]),
+    ({"path": "RenderSettings.engine"}, ["CYCLES", "BLENDER_EEVEE", "BLENDER_WORKBENCH"]),
+    ({"path": "ImageFormatSettings.file_format"}, ["NOTE:", "media_type", "VIDEO"]),
     ({"search": "bevel modifier"}, ["bpy.types.BevelModifier"]),
     ({"search": "shade smooth"}, ["bpy.ops.object.shade_smooth"]),
 ]
@@ -59,6 +63,17 @@ def notes_are_true() -> int:
         assert not hasattr(action, "fcurves"), "NOTES['Action'] says action.fcurves is gone"
         bag = action.layers[0].strips[0].channelbag(cube.animation_data.action_slot)
         assert len(list(bag.fcurves)) == 3
+        render = bpy.context.scene.render
+        assert bpy.app.ffmpeg.supported
+        saved = render.image_settings.media_type, render.image_settings.file_format
+        render.image_settings.media_type = "VIDEO"
+        render.image_settings.file_format = "FFMPEG"
+        render.ffmpeg.format, render.ffmpeg.codec = "MPEG4", "H264"
+        assert render.is_movie_format
+        render.image_settings.media_type = "IMAGE"
+        render.image_settings.file_format = "PNG"
+        assert not render.is_movie_format
+        render.image_settings.media_type, render.image_settings.file_format = saved
         print("ok   the code in NOTES runs on this Blender")
         return 0
     except Exception:

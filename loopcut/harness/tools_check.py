@@ -250,6 +250,16 @@ def check():
         last = tools.execute("see_render", "{}")
         assert last.ok and last.text.startswith("Image attached: the last render, finished at "), last.text
         assert set(bpy.data.images.keys()) - images_before <= {"Render Result"}, "file tools left an image datablock behind"
+        # A still preview while video output is configured must work and preserve the video setup.
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.render.image_settings.media_type = "VIDEO"
+        scene.render.image_settings.file_format = "FFMPEG"
+        scene.render.ffmpeg.format, scene.render.ffmpeg.codec = "MPEG4", "H264"
+        movie = tools.execute("see_render", json.dumps({"render": True}))
+        assert movie.ok, movie.text
+        assert scene.render.image_settings.media_type == "VIDEO"
+        assert scene.render.image_settings.file_format == "FFMPEG"
+        assert scene.render.ffmpeg.format == "MPEG4" and scene.render.ffmpeg.codec == "H264"
         print(f"TOOLS OK: capture at {shot.image_path} ({shot.image_path.stat().st_size} bytes)")
         code = 0
     except Exception:

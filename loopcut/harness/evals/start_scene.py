@@ -14,6 +14,7 @@ import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tasks  # noqa: E402
+import evidence  # noqa: E402
 
 RUN_TEMPLATE = {
     "tool": "",                # e.g. "ChatGPT app + blender-mcp"
@@ -39,6 +40,7 @@ def main() -> None:
             print(f"{task_id}: attach {task.attachments} to the first message as well")
         bpy.ops.wm.save_as_mainfile(filepath=str(arm / f"{task_id}.start.blend"))
         (arm / f"{task_id}.prompt.txt").write_text(task.prompt + "\n", encoding="utf-8")
+        (arm / f"{task_id}.manifest.json").write_text(json.dumps(evidence.task_manifest(task), indent=2), encoding="utf-8")
         if task.follow_up:
             (arm / f"{task_id}.followup.txt").write_text(task.follow_up + "\n", encoding="utf-8")
         run_file = arm / f"{task_id}.run.json"

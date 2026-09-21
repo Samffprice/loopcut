@@ -2,6 +2,7 @@
 
 import json
 import threading
+from concurrent.futures import TimeoutError as FutureTimeout
 
 from . import checkpoints, config, context, conversations, llm, state
 
@@ -19,6 +20,10 @@ modifier or rig; change what is there instead of rebuilding the user's work.
 Its result ends with "Scene changes", measured from the scene: trust that; do not print values to check.
 - Your bpy knowledge is from older versions. When unsure of a name, and always after an AttributeError, \
 TypeError or "enum not found", look it up with inspect_api before retrying.
+- The context lists the running Blender version and available render engines. Use those capabilities. \
+Material previews use studio lighting; rendered viewport captures use EEVEE and approximate Cycles. \
+Do not rebuild materials or boost lights to compensate for an unverified preview problem. Use a real \
+camera render when final lighting, glass or reflections need verification.
 - After every run_python step that changes the scene you get a capture of the result (three_quarter, or \
 the last angle you asked for) with object names drawn on and, below it, a strip of your earlier looks \
 oldest to newest: your progress. When that capture would look the same as your last one you get a note \
@@ -44,6 +49,14 @@ another editor's context runs with run_python's `editor`.
 (it may change the goal, add a constraint or answer a question) and continue; do not start over or redo \
 finished work.
 - Keep replies short: what you did and anything the user must decide. No code dumps.
+- When asked to do something Blender can do, use the tools to do it. Do not send the user through \
+menus you have not checked. When they report a missing control or unexpected output, inspect the \
+live editors, output settings and API before answering; never repeat instructions they said failed. \
+run_python can borrow another editor automatically, even when no 3D viewport is open. For video \
+output, inspect ImageFormatSettings: IMAGE and VIDEO media types expose different formats.
+- Before finishing a multi-part job, check each requested deliverable against the scene: camera framing, \
+animation endpoints and middle, preservation constraints, output settings and actual output files. \
+Distinguish a configured scene, a preview, and a completed render or export; say which you verified.
 - As the conversation grows, the code and results of older steps are cut to a line, and a \
 <conversation_summary> may stand for earlier messages. The scene is the source of truth: look again \
 rather than trust memory, and write each step so it stands on its own."""
@@ -85,6 +98,7 @@ class Turn:
         self.scene_before: dict | None = None
         self.scene_after: dict | None = None
         self.notes: list = []       # (text, chat item) sent while the turn runs; folded in at the next step.
+        self.outcome = "running"  # completed, cancelled, step_limit or error; retained by evals.
 
 
 def _redraw() -> None:
@@ -92,9 +106,25 @@ def _redraw() -> None:
     mainthread.request_redraw()
 
 
-def _run_tool_on_main(name: str, arguments: str):
+def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
     from . import mainthread, tools
-    return mainthread.run_on_main(lambda: tools.execute(name, arguments)).result()
+
+    def execute():
+        if is_cancelled():
+            raise llm.Cancelled()
+        return tools.execute(name, arguments)
+
+    future = mainthread.run_on_main(execute)
+    while True:
+        try:
+            return future.result(timeout=_POLL_SECONDS)
+        except FutureTimeout:
+            if future.done():
+                return future.result()  # Propagate a tool's TimeoutError; it is not a polling timeout.
+            if is_cancelled() and future.cancel():
+                raise llm.Cancelled()
+            # A native Blender operation already running cannot be interrupted safely. Keep
+            # the turn busy until its result is accounted for; do not start another tool.
 
 
 def _approval(name: str, arguments: str, roots) -> str:
@@ -297,10 +327,11 @@ def _without_capture(arguments: str) -> str:
 
 
 def _wait_for_approval(turn: Turn) -> bool:
-    turn.decided.clear()
     while not turn.decided.wait(_POLL_SECONDS):
         if turn.cancel.is_set():
             raise llm.Cancelled()
+    if turn.cancel.is_set():
+        raise llm.Cancelled()
     return turn.approved
 
 
@@ -382,8 +413,12 @@ def _auto_look(session: dict, turn: Turn, run_tool, result, alike) -> None:
     A look that shows the same picture as the previous capture is a note, not an image: the
     capture is free, the image in every later request is not."""
     from . import tools
-    shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle}))
+    try:
+        shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle}))
+    except llm.Cancelled:
+        return  # The mutation already ran; keep its result before honoring Stop.
     if not (shot.ok and shot.image_path):
+        result.text += f"\n\nAutomatic preview unavailable: {shot.text}"
         return
     turn.changed = False
     previous = _earlier_looks(session["messages"])[-1:]
@@ -404,6 +439,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
     items, messages = session["items"], session["messages"]
     build_strip = build_strip or _build_strip_on_main
     alike = alike or _alike_on_main
+    if run_tool is _run_tool_on_main:
+        run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
     try:
         cfg = turn.config or config.load()
         last = messages[-1] if messages else {}
@@ -414,6 +451,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             except llm.LLMError as ex:
                 print(f"Loopcut: could not describe the attached images: {ex}")
         for _ in range(cfg.max_steps):
+            if turn.cancel.is_set():
+                raise llm.Cancelled()
             _fold_notes(session, turn)
             prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set)
             if compacted:
@@ -447,15 +486,19 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 items.remove(reply)
             messages.append(completion.as_message())
             if not completion.tool_calls:
+                turn.outcome = "cancelled" if turn.cancel.is_set() else "completed"
                 return
 
             images = []
             for call in completion.tool_calls:
+                if turn.cancel.is_set():
+                    raise llm.Cancelled()
                 summary, code = _describe(call)
                 card = state.item_tool(call.name, summary, code)
                 items.append(card)
                 approval = _approval(call.name, call.arguments, turn.roots)
                 if approval == "heavy" or (approval and not (cfg.auto_run or session["auto_run"])):
+                    turn.decided.clear()
                     card["status"], card["heavy"] = "awaiting", approval == "heavy"
                     _redraw()
                     if not _wait_for_approval(turn):
@@ -485,6 +528,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                                          f"This step was NOT run, because a checkpoint could not be saved "
                                          f"first: {ex} Tell the user; do not retry."})
                         continue
+                if turn.cancel.is_set():
+                    raise llm.Cancelled()
                 result = run_tool(call.name, arguments)
                 if note:
                     result.text += note
@@ -494,7 +539,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                     turn.changed = False
                 if _scene_changed(result):
                     turn.changed, turn.idle_captures = True, 0
-                    if cfg.auto_look and not asked_look and not refusal:
+                    if cfg.auto_look and not asked_look and not refusal and not turn.cancel.is_set():
                         _auto_look(session, turn, run_tool, result, alike)
                 card["status"] = "done" if result.ok else "failed"
                 card["output"] = result.text
@@ -520,15 +565,19 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                             for n, (reference, what) in enumerate(images))
             conversations.save(session)  # The history is consistent here: every call has its result.
             _redraw()
+        turn.outcome = "step_limit"
         items.append(state.item_error(f"Stopped after {cfg.max_steps} steps without finishing."))
     except llm.Cancelled:
+        turn.outcome = "cancelled"
         items.append(state.item_error("Stopped."))
     except (config.ConfigError, llm.LLMError) as ex:
+        turn.outcome = "error"
         if getattr(ex, "status", None) == 402:
             items.append(_limit_item(ex))
         else:
             items.append(state.item_error(str(ex)))
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
+        turn.outcome = "error"
         import traceback
         traceback.print_exc()
         items.append(state.item_error(f"Internal error: {ex!r}"))
@@ -544,6 +593,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 item["streaming"] = False
             if item.get("status") in ("awaiting", "running"):
                 item["status"] = "rejected"
+        session["turn_outcome"] = turn.outcome
         session["busy"] = False
         session["turn"] = None
         # Notes that arrived after the last fold: sent as the next message, or, after a stop, put
@@ -612,6 +662,7 @@ def send(text: str) -> bool:
 def _launch(session: dict, turn: Turn) -> None:
     session["scroll"], session["confirm_restore"] = 0.0, None
     session["busy"], session["turn"] = True, turn
+    session["turn_outcome"] = "running"
     turn.thread = threading.Thread(target=_run, args=(session, turn), name="loopcut-turn", daemon=True)
     turn.thread.start()
 
