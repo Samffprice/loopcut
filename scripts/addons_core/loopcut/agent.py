@@ -36,6 +36,10 @@ change it, with the user's approval; nothing deletes. see_render shows the user'
 render=true renders now: that, like any render or bake in run_python, waits for the user's OK every time.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
+- Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
+prefixes. inspect_api describes their operators, modules and preferences \
+(bpy.context.preferences.addons[module].preferences) like the rest of the API. An operator that needs \
+another editor's context runs with run_python's `editor`.
 - Keep replies short: what you did and anything the user must decide. No code dumps.
 - As the conversation grows, the code and results of older steps are cut to a line, and a \
 <conversation_summary> may stand for earlier messages. The scene is the source of truth: look again \
@@ -115,6 +119,17 @@ def _ensure_checkpoint_on_main(session: dict) -> None:
 def _scene_context(text: str, since: dict | None) -> str:
     from . import scene_context
     return scene_context.for_message(text, since)
+
+
+def _addons_line() -> str:
+    from . import addons
+    return addons.line(addons.enabled())
+
+
+def _system_prompt(session: dict) -> str:
+    """The fixed prompt plus what is installed, read at the turn's start on the main thread."""
+    extra = session.get("addons_line") or ""
+    return f"{SYSTEM_PROMPT}\n\n{extra}" if extra else SYSTEM_PROMPT
 
 
 def _scene_snapshot() -> dict:
@@ -383,7 +398,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
 
             completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                messages=[{"role": "system", "content": _system_prompt(session)},
                           *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session))],
                 tools=_tool_schemas(), reasoning_effort=cfg.reasoning_effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
@@ -527,6 +542,7 @@ def send(text: str) -> bool:
     # chat shows only what they typed. The snapshot taken here is what changed_only measures from.
     content = f"{_scene_context(text, session.get('scene_seen'))}\n\n{text or 'See the attached images.'}"
     session["scene_seen"] = session["scene_turn_start"] = _scene_snapshot()
+    session["addons_line"] = _addons_line()
     if attachments:
         session["messages"].append({"role": "user", conversations.ATTACHED: True, "content": [
             {"type": "text", "text": content},

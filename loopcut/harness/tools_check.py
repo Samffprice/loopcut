@@ -73,6 +73,27 @@ def check():
         assert api.ok and "segments: int" in api.text, api.text
         assert not tools.execute("inspect_api", json.dumps({"path": "bpy.types.Nope"})).ok
 
+        # An add-on operator that polls for another editor gets it: an open one, or the viewport
+        # switched over for the step and back afterwards, with its view untouched.
+        view3d = next(a for w in bpy.context.window_manager.windows for a in w.screen.areas if a.type == "VIEW_3D")
+        region_3d = view3d.spaces.active.region_3d
+        view_before = (region_3d.view_rotation.copy(), region_3d.view_distance, view3d.spaces.active.shading.type)
+        assert not any(a.type == "NODE_EDITOR" for w in bpy.context.window_manager.windows for a in w.screen.areas)
+        bpy.context.view_layer.objects.active = bpy.data.objects["Cube"]  # The editor follows the active object.
+        bpy.data.objects["Cube"].active_material = bpy.data.materials.new("Probe")
+        bpy.data.materials["Probe"].use_nodes = True
+        node_step = tools.execute("run_python", json.dumps({
+            "summary": "Node context", "editor": "node_editor", "code":
+            "s = bpy.context.space_data\n"
+            "print(bpy.context.area.type, s.type, s.tree_type, s.id.name)\n"
+            "bpy.ops.node.select_all(action='SELECT')\n"
+            "print(sum(n.select for n in bpy.data.materials['Probe'].node_tree.nodes))"}))
+        assert node_step.ok and node_step.text.startswith("NODE_EDITOR NODE_EDITOR ShaderNodeTree Probe\n2\n"), node_step.text
+        assert view3d.type == "VIEW_3D", "the viewport was not switched back"
+        assert (region_3d.view_rotation, region_3d.view_distance, view3d.spaces.active.shading.type) == view_before
+        bad = tools.execute("run_python", json.dumps({"summary": "Bad", "editor": "SPACESHIP", "code": "x = 1"}))
+        assert not bad.ok and "No editor 'SPACESHIP'" in bad.text and "ShaderNodeTree" in bad.text, bad.text
+
         # Many small objects still fit as rows, without their defaults, the selection first.
         tools.execute("run_python", json.dumps({"summary": "Many", "code": (
             "for i in range(60):\n    o = bpy.data.objects.new(f'Marker{i:02}', None)\n"

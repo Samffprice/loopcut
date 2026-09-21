@@ -16,6 +16,7 @@ MAX_CHARS = 6000
 MAX_SEARCH_RESULTS = 40
 _NODE_TREES = ("ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree")
 _index: list[tuple[str, str]] | None = None  # (path, lowercased text to match against)
+_index_key: tuple = ()  # What was registered when the index was built; an add-on enabled since rebuilds it.
 
 
 class ApiError(Exception):
@@ -301,6 +302,12 @@ def _resolve(path: str) -> list[str]:
     return _describe_python(walked, obj)
 
 
+def _registered_key() -> tuple:
+    """Changes when an add-on is enabled or disabled, or a script registers a class: the index
+    built before that would not know the new operators. dir(bpy.types) is about a millisecond."""
+    return len(dir(bpy.types)), tuple(bpy.context.preferences.addons.keys())
+
+
 def _build_index() -> list[tuple[str, str]]:
     entries = []
     for name in dir(bpy.types):
@@ -324,12 +331,13 @@ def _build_index() -> list[tuple[str, str]]:
 
 
 def _search(query: str) -> list[str]:
-    global _index
+    global _index, _index_key
     terms = query.lower().split()
     if not terms:
         raise ApiError("search needs at least one word.")
-    if _index is None:
-        _index = _build_index()
+    key = _registered_key()
+    if _index is None or key != _index_key:
+        _index, _index_key = _build_index(), key
     # Matches in the identifier rank above matches in the description; shorter paths first.
     hits = sorted(((0 if all(t in path.lower() for t in terms) else 1, len(path), path)
                    for path, text in _index if all(t in text for t in terms)))

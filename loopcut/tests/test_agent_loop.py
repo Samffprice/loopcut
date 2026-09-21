@@ -20,7 +20,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, llm, state  # noqa: E402
+from loopcut import agent, checkpoints, conversations, llm, state  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
 
 
@@ -96,6 +96,7 @@ class AgentLoopTest(unittest.TestCase):
             "LOOPCUT_AUTO_LOOK": "false",  # Tests that want the automatic look turn it on.
         })
         agent._scene_snapshot = lambda: None
+        agent._addons_line = lambda: ""  # Reads bpy; the prompt test sets its own line.
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
         agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
         agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
@@ -157,6 +158,18 @@ class AgentLoopTest(unittest.TestCase):
         self.assertFalse(self.session["busy"])
         self.assertEqual(SCRIPT.requests[0]["_auth"], "Bearer test-key")
         self.assertEqual(SCRIPT.requests[0]["messages"][0]["role"], "system")
+
+    def test_installed_addons_are_named_at_the_end_of_the_system_prompt(self):
+        agent._addons_line = lambda: "Installed add-ons: Probe [probe] bpy.ops.probe.say_* (2)"
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+        SCRIPT.replies.append(text_reply("Hi."))
+        self.assertTrue(agent.send("hi"))  # send() reads the line; the loop puts it in the prompt.
+        self.session["turn"].thread.join(5)
+        system = SCRIPT.requests[0]["messages"][0]["content"]
+        self.assertTrue(system.startswith(agent.SYSTEM_PROMPT), "the fixed prompt comes first")
+        self.assertTrue(system.endswith("\n\nInstalled add-ons: Probe [probe] bpy.ops.probe.say_* (2)"), system[-120:])
+        # The line is read on the main thread at the start of each turn, not stored with the conversation.
+        self.assertNotIn("addons_line", conversations._PERSISTED)
 
     def test_tool_call_waits_for_approval_then_runs_and_continues(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),

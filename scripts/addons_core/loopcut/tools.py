@@ -42,11 +42,14 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         "name": "run_python",
         "description": (
             "Run Python in the live Blender session; `bpy` is imported and bpy.ops have a 3D viewport "
-            "context. Prefer the data API over bpy.ops. Returns print output, any traceback, and "
-            "`Scene changes`: what really changed, measured from the scene. One undo step per call."),
+            "context (or another editor's, see `editor`). Prefer the data API over bpy.ops. Returns print "
+            "output, any traceback, and `Scene changes`: what really changed, measured from the scene. "
+            "One undo step per call."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "description": "Python source to execute"},
             "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
+            "editor": {"type": "string", "description": "Editor whose context bpy.ops run in, for operators that "
+                       "need one: ShaderNodeTree, GeometryNodeTree, IMAGE_EDITOR, SEQUENCE_EDITOR... Default VIEW_3D."},
             "capture": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "sheet"],
                         "description": "Also return a viewport capture afterwards, framed like "
                                        "capture_viewport. Cheaper than a separate call."},
@@ -86,8 +89,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "inspect_api",
         "description": (
-            "The Python API of THIS Blender: property names, enum values, defaults, operator arguments, "
-            "node sockets. Use before an API you are not sure of, and after any AttributeError, "
+            "The Python API of THIS Blender, installed add-ons included: property names, enum values, "
+            "defaults, operator arguments, node sockets. Use before an API you are not sure of, and after any AttributeError, "
             "TypeError or 'enum not found'. `path` like bpy.types.BevelModifier, Object.modifiers, "
             "bpy.ops.mesh.bevel, ShaderNodeTexNoise, bmesh.ops.bevel; or `search` words: 'action fcurves'."),
         "parameters": {"type": "object", "properties": {
@@ -166,6 +169,58 @@ def _view3d_override() -> dict:
     raise ToolError("No 3D viewport is open; open one and try again.")
 
 
+_TREE_EDITORS = ("ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree")
+_EDITOR_ALIASES = {"NODE_EDITOR": "ShaderNodeTree"}  # A bare node editor shows no tree; the shader one follows the active material.
+
+
+def _editor_name(editor: str) -> str:
+    """An Area.type or a node tree kind, whatever case the model typed it in."""
+    wanted = editor.strip()
+    types = [e.identifier for e in bpy.types.Area.bl_rna.properties["type"].enum_items
+             if e.identifier not in ("EMPTY", "LOOPCUT")]
+    for name in (*types, *_TREE_EDITORS):
+        if name.lower() == wanted.lower():
+            return _EDITOR_ALIASES.get(name, name)
+    raise ToolError(f"No editor {editor!r}. Editors: {', '.join([*_TREE_EDITORS, *types])}.")
+
+
+def _editor_matches(area, editor: str) -> bool:
+    return area.type == editor or (editor in _TREE_EDITORS and area.ui_type == editor)
+
+
+@contextlib.contextmanager
+def _editor_context(editor: str):
+    """bpy.context for one step. The 3D viewport by default; another open editor of the asked
+    kind; else the viewport is switched to that editor for the step and switched back, which
+    keeps its view and shading. Nothing redraws in between, so the user sees no change."""
+    base = _view3d_override()
+    editor = _editor_name(editor) if editor and editor.strip() else "VIEW_3D"
+    if editor == "VIEW_3D":
+        with bpy.context.temp_override(**base):
+            yield
+        return
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            if region and _editor_matches(area, editor):
+                with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
+                    yield
+                return
+    area = base["area"]
+    with bpy.context.temp_override(**base):
+        if editor in _TREE_EDITORS:
+            area.type = "NODE_EDITOR"
+            area.ui_type = editor  # Points the editor at the active object's material or modifier.
+        else:
+            area.type = editor
+        try:
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            with bpy.context.temp_override(window=base["window"], screen=base["screen"], area=area, region=region):
+                yield
+        finally:
+            area.type = "VIEW_3D"
+
+
 def _clip(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
@@ -203,14 +258,14 @@ def _model_traceback(ex: BaseException) -> str:
                     *traceback.format_exception_only(type(ex), ex)])
 
 
-def run_python(code: str, summary: str = "", capture: str = "") -> ToolResult:
+def run_python(code: str, summary: str = "", capture: str = "", editor: str = "") -> ToolResult:
     # Running model-written code is the product; the approval gate lives in agent.py.
     from . import config, scene_diff
     stdout = io.StringIO()
     ok = True
     deadline = _Deadline(config.run_timeout())
     before = scene_diff.snapshot()
-    with bpy.context.temp_override(**_view3d_override()):
+    with _editor_context(editor):
         bpy.ops.ed.undo_push(message=f"Before Loopcut: {summary or 'run_python'}"[:60])
         previous_trace = sys.gettrace()
         try:
