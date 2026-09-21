@@ -79,6 +79,8 @@ def _handlers() -> tuple:
 
 
 def register() -> None:
+    from . import inspection
+    inspection.register()
     for handlers, fn in _handlers():
         handlers.append(fn)
     bpy.app.timers.register(_initial_resume, first_interval=0.0, persistent=True)
@@ -86,6 +88,8 @@ def register() -> None:
 
 
 def unregister() -> None:
+    from . import inspection
+    inspection.unregister()
     if bpy.app.timers.is_registered(_poll_jobs):
         bpy.app.timers.unregister(_poll_jobs)
     if bpy.app.timers.is_registered(_initial_resume):  # Disabled before its first tick.

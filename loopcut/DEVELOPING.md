@@ -107,6 +107,7 @@ warning; signing needs an Apple Developer ID and a Windows code-signing certific
 | `get_object_info` | How an object is set up: modifier settings, material and geometry node trees, constraints, animation. Read before editing someone's material. |
 | `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. |
 | `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. |
+| `inspect_scene` | [Real inspection renders](VISUAL_INSPECTION.md) across named cameras and frames, in a labeled sheet; geometry, studio materials, or actual scene lighting, with stale-result rejection. |
 | `compare_with_reference` | The attached reference on the left and a capture on the right in one image, for the compare-adjust loop of copying a picture. |
 | `look_at_reference` | The attached reference at full resolution, or a region of it, to check a detail. |
 | `start_render_job` / `render_job_status` | Render a saved scene copy to a verified PNG sequence or MP4; progress persists in the Jobs view. |

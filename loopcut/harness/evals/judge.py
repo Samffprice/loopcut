@@ -70,9 +70,15 @@ def ask(base: str, key: str, model: str, prompt: str, first: list[tuple[str, Pat
 
 def load(arm: Path, task_id: str) -> tuple[dict, list[tuple[str, Path]]]:
     grade = json.loads((arm / f"{task_id}.grade.json").read_text(encoding="utf-8"))
-    frames = [("after the first brief", arm / name) for name in grade.get("stage_renders") or []]
+    evidence = {e["file"]: e for key in ("stage_render_evidence", "render_evidence") for e in grade.get(key, [])}
+
+    def label(stage, name):
+        record = evidence.get(name)
+        return stage + (f", camera {record['camera']}, frame {record['frame']}, {record['engine']}" if record else "")
+
+    frames = [(label("after the first brief", name), arm / name) for name in grade.get("stage_renders") or []]
     final = "after the follow-up" if grade.get("follow_up") else "frame"
-    return grade, frames + [(final, arm / name) for name in grade.get("renders") or []]
+    return grade, frames + [(label(final, name), arm / name) for name in grade.get("renders") or []]
 
 
 def judge_task(base, key, model, task_id: str, prompt: str, arms: dict[str, Path]) -> dict:

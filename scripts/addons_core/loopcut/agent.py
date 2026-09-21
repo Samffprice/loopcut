@@ -24,6 +24,12 @@ TypeError or "enum not found", look it up with inspect_api before retrying.
 Material previews use studio lighting; rendered viewport captures use EEVEE and approximate Cycles. \
 Do not rebuild materials or boost lights to compensate for an unverified preview problem. Use a real \
 camera render when final lighting, glass or reflections need verification.
+- inspect_scene returns a labeled contact sheet across named cameras and frames. Use geometry for \
+shape, materials for neutral studio lighting, final_lighting for the actual scene engine and lights. \
+It renders a copy with a bounded budget while the editor stays responsive; stale results are rejected. \
+Use it to check all requested cameras and meaningful animation phases. Its metadata reports the \
+engine, quality limits, saved revision and signal measurements. A nearly black image can be a scene \
+problem; it is not proof that materials or lights need rebuilding. Inspect the cause first.
 - After every run_python step that changes the scene you get a capture of the result (three_quarter, or \
 the last angle you asked for) with object names drawn on and, below it, a strip of your earlier looks \
 oldest to newest: your progress. When that capture would look the same as your last one you get a note \
@@ -77,7 +83,7 @@ SOFT_LOOKS = 8
 DEFAULT_ANGLE = "three_quarter"
 STRIP_LOOKS = 4  # Earlier looks shown in the progress strip under a new capture.
 LOW_ALLOWANCE = 0.8  # Share of the week's allowance used at which the conversation gets a heads-up, once.
-CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference"}
+CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene"}
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -124,7 +130,8 @@ def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
     future = mainthread.run_on_main(execute)
     while True:
         try:
-            return future.result(timeout=_POLL_SECONDS)
+            result = future.result(timeout=_POLL_SECONDS)
+            break
         except FutureTimeout:
             if future.done():
                 return future.result()  # Propagate a tool's TimeoutError; it is not a polling timeout.
@@ -132,6 +139,28 @@ def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
                 raise llm.Cancelled()
             # A native Blender operation already running cannot be interrupted safely. Keep
             # the turn busy until its result is accounted for; do not start another tool.
+    if getattr(result, "pending_job", None):
+        from . import inspection
+        return inspection.wait_result(result.pending_job, is_cancelled, mainthread.run_on_main)
+    return result
+
+
+def _inspection_current(token: dict) -> bool:
+    from . import inspection, mainthread
+    return mainthread.run_on_main(lambda: token == inspection.live_token()).result()
+
+
+def _fresh_images(images: list) -> list:
+    """A later tool in one model batch can invalidate an earlier asynchronous inspection."""
+    fresh = []
+    for reference, what, token, card, message in images:
+        if token is not None and not _inspection_current(token):
+            note = "\nInspection image omitted: the scene changed later in this tool batch. Inspect the new revision."
+            card["status"], card["output"] = "failed", card["output"] + note
+            message["content"] += note
+        else:
+            fresh.append((reference, what))
+    return fresh
 
 
 def _approval(name: str, arguments: str, roots) -> str:
@@ -269,8 +298,8 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import files, job_tools, tools
-    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS
+    from . import files, inspection, job_tools, tools
+    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS
 
 
 def _describe(call: llm.ToolCall) -> tuple[str, str]:
@@ -280,6 +309,9 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
         return call.name, call.arguments
     if not isinstance(arguments, dict):
         return call.name, call.arguments
+    if call.name == "inspect_scene":
+        from . import inspection
+        return inspection.describe(arguments)
     from . import files, job_tools
     return job_tools.describe(call.name, arguments) or files.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
 
@@ -301,7 +333,7 @@ def _asked_angle(call_name: str, arguments: str) -> str:
     parsed = _arguments(arguments)
     if call_name == "run_python":
         return str(parsed.get("capture") or "")
-    if call_name in CAPTURE_TOOLS:
+    if call_name in CAPTURE_TOOLS - {"inspect_scene"}:
         return str(parsed.get("angle") or DEFAULT_ANGLE)
     return ""
 
@@ -554,12 +586,14 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 if result.image_path:
                     # Stored now: every capture is written to the same file, so a second capture in
                     # this batch would otherwise replace the first before it is read.
-                    images.append((conversations.store_image(session, result.image_path), _image_what(result.text)))
+                    images.append((conversations.store_image(session, result.image_path), _image_what(result.text),
+                                   getattr(result, "evidence_token", None), card, messages[-1]))
                 if getattr(result, "scene_before", None) is not None:
                     turn.scene_before = turn.scene_before or result.scene_before
                     turn.scene_after = result.scene_after
             # Tool messages must directly follow the assistant message, so images go after them all.
             # The newest carries the strip of earlier looks, built before this step's are among them.
+            images = _fresh_images(images)
             strip = None
             earlier = _earlier_looks(messages) if images else []
             if earlier:

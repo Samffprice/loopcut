@@ -538,6 +538,7 @@ class Task:
     tags: list[str] = field(default_factory=list)
     attachments: list[str] = field(default_factory=list)  # Image files attached to the prompt.
     render_frames: list[int] = field(default_factory=list)  # Frames grade.py renders for the judges.
+    render_cameras: list[str] = field(default_factory=list)  # Names, or ["*"] for every scene camera.
     # Two-turn tasks: a second instruction sent once the first is done, checked with the scene
     # as it was after turn 1 (ctx.stage1, a snapshot) and whatever `remember` computed on that
     # scene (ctx.memory), so "keep the cameras" and "faster than before" can be measured.

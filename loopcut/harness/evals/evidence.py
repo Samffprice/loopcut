@@ -16,7 +16,7 @@ def fingerprint(paths, root: Path) -> str:
 
 def task_manifest(task) -> dict:
     here = Path(__file__).resolve().parent
-    sources = [here / name for name in ("tasks.py", "projects.py", "showcase.py")]
+    sources = [here / name for name in ("tasks.py", "projects.py", "showcase.py", "grade.py")]
     fixtures = list((here.parent / "fixtures").glob("*.blend"))
     contract = {"id": task.id, "prompt": task.prompt, "follow_up": task.follow_up,
                 "evaluator_sha256": fingerprint(sources, here),

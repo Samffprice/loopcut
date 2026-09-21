@@ -43,7 +43,9 @@ Three layers, because "did it work" and "is it nice" are different questions:
    solution passes. This does not prove each requirement is independently discriminating; mutation
    tests and review of the checks are still needed before attributing a failure to the agent.
 2. **Judge** (blind, cheap): grade.py renders the same frames of every arm at reduced resolution
-   with the saved scene's engine (Cycles or EEVEE) and camera. judge.py shows a vision model the brief and both arms'
+   with the saved scene's engine and requested cameras. Perfume covers all scene cameras; animation
+   tasks include quarter phases as well as endpoints and middle. Each image records camera, frame,
+   engine, source revision, dimensions, samples, hash and render time. judge.py shows a vision model the brief and both arms'
    frames, scores five axes 1-5, picks one, then asks again with the arms swapped; a preference
    only counts when both orders agree. Set `LOOPCUT_JUDGE_BASE_URL/_API_KEY/_MODEL` to a model
    that is not one of the contestants; without them it uses Loopcut's own model and says so.
@@ -67,7 +69,7 @@ tools/Blender.app/Contents/MacOS/Blender -b --factory-startup --python blender/l
 
 # 3. Grade both the same way, judge, write the report
 python3 blender/loopcut/harness/evals/compare.py --arm loopcut=out/evals/<time> --arm chatgpt=out/projects/chatgpt --judge
-#    -> out/projects/<time>/comparison.md, blind.md, blind_key.json, judge.json, <arm>/<task>.f*.png
+#    -> out/projects/<time>/comparison.md, blind.md, blind_key.json, judge.json, <arm>/<task>.c*.f*.png
 ```
 
 Any number of arms works (a second Loopcut run with a different prompt is an arm too); `--judge`

@@ -10,7 +10,9 @@ at 64 samples, denoised, on the GPU), one that left EEVEE gets EEVEE. From the s
 or from a camera added to frame everything when there is none."""
 
 import json
+import hashlib
 import sys
+import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,33 +63,98 @@ def use_gpu() -> None:
             return
 
 
-def render(task, out: Path, suffix: str = "") -> tuple[list[str], list[str]]:
+def render(task, out: Path, suffix: str = "") -> tuple[list[str], list[str], list[dict]]:
     scene = bpy.context.scene
-    notes, files = [], []
-    if scene.camera is None:
-        frame_everything()
-        notes.append("no camera in the scene: rendered from a camera added to frame everything")
+    notes, files, evidence = [], [], []
+    source_revision = None
+    if bpy.data.filepath and Path(bpy.data.filepath).is_file():
+        with Path(bpy.data.filepath).open("rb") as handle:
+            source_revision = hashlib.file_digest(handle, "sha256").hexdigest()
+    saved_camera, saved_frame, saved_subframe = scene.camera, scene.frame_current, scene.frame_subframe
     r = scene.render
-    if scene.render.engine == "CYCLES":
-        scene.cycles.samples = min(scene.cycles.samples, CYCLES_SAMPLES)
-        scene.cycles.use_denoising = True
-        use_gpu()
-        notes.append(f"rendered with Cycles, {scene.cycles.samples} samples")
-    else:
-        scene.render.engine = "BLENDER_EEVEE"
-        scene.eevee.taa_render_samples = EEVEE_SAMPLES
-        notes.append("rendered with EEVEE, the engine the scene was left on")
-    r.resolution_percentage = max(1, min(100, int(MAX_SIDE * 100 / max(r.resolution_x, r.resolution_y, 1))))
-    r.film_transparent = False
-    r.image_settings.file_format, r.image_settings.color_mode = "PNG", "RGB"
-    r.use_border = False
-    for frame in task.render_frames or [scene.frame_current]:
-        scene.frame_set(frame)
-        path = out / f"{task.id}{suffix}.f{frame:03d}.png"
-        r.filepath = str(path)
-        bpy.ops.render.render(write_still=True)
-        files.append(path.name)
-    return files, notes
+    properties = [(r, key) for key in ("resolution_percentage", "filepath", "use_border", "use_file_extension")]
+    properties += [(r.image_settings, key) for key in ("media_type", "file_format", "color_mode", "color_depth")]
+    if r.engine == "CYCLES":
+        properties += [(scene.cycles, key) for key in ("samples", "use_denoising", "device")]
+    elif r.engine == "BLENDER_EEVEE":
+        properties.append((scene.eevee, "taa_render_samples"))
+    elif r.engine != "BLENDER_WORKBENCH":
+        raise ValueError(f"Unsupported evaluation engine: {r.engine}")
+    saved = [(owner, key, getattr(owner, key)) for owner, key in properties]
+    muted = []
+    generated = None
+    try:
+        requested = getattr(task, "render_cameras", [])
+        cameras = sorted((o for o in scene.objects if o.type == "CAMERA"), key=lambda o: o.name)
+        if requested and requested != ["*"]:
+            missing = [name for name in requested if name not in scene.objects or scene.objects[name].type != "CAMERA"]
+            if missing:
+                raise ValueError(f"Requested evaluation camera(s) missing: {', '.join(missing)}")
+            cameras = [scene.objects[name] for name in requested]
+        elif requested != ["*"]:
+            cameras = [scene.camera] if scene.camera else []
+        if not cameras:
+            frame_everything()
+            generated = scene.camera
+            cameras = [generated]
+            notes.append("no camera in the scene: rendered from a temporary camera framing everything")
+        if r.engine == "CYCLES":
+            scene.cycles.samples = min(scene.cycles.samples, CYCLES_SAMPLES)
+            scene.cycles.use_denoising = True
+            use_gpu()
+            samples = scene.cycles.samples
+        elif r.engine == "BLENDER_EEVEE":
+            scene.eevee.taa_render_samples = min(scene.eevee.taa_render_samples, EEVEE_SAMPLES)
+            samples = scene.eevee.taa_render_samples
+        else:
+            samples = None
+        # Side outputs must not write to paths from a contestant's scene.
+        trees = list(bpy.data.node_groups)
+        if getattr(scene, "node_tree", None):
+            trees.append(scene.node_tree)
+        for tree in trees:
+            for node in tree.nodes:
+                if node.bl_idname == "CompositorNodeOutputFile":
+                    muted.append((node, node.mute))
+                    node.mute = True
+        notes.append(f"rendered {len(cameras)} camera(s) with {r.engine}, {samples} samples; original scene lighting and color management")
+        r.resolution_percentage = max(1, min(r.resolution_percentage, int(MAX_SIDE * 100 / max(r.resolution_x, r.resolution_y, 1))))
+        r.image_settings.media_type = "IMAGE"
+        r.image_settings.file_format, r.image_settings.color_mode = "PNG", "RGBA"
+        r.use_border, r.use_file_extension = False, False
+        for index, camera in enumerate(cameras):
+            for frame in task.render_frames or [saved_frame]:
+                scene.frame_set(frame)
+                scene.camera = camera
+                path = out / f"{task.id}{suffix}.c{index:02d}.f{frame:03d}.png"
+                r.filepath = str(path)
+                started = time.monotonic()
+                bpy.ops.render.render(write_still=True)
+                image = bpy.data.images.load(str(path), check_existing=False)
+                try:
+                    size = list(image.size)  # Loading is lazy; accessing size triggers decoding.
+                    if min(size) <= 0 or not image.has_data or len(image.pixels[:4]) != 4:
+                        raise RuntimeError(f"Evaluation image does not decode: {path.name}")
+                finally:
+                    bpy.data.images.remove(image)
+                files.append(path.name)
+                evidence.append({"file": path.name, "camera": camera.name, "frame": frame, "engine": r.engine,
+                                 "scene_revision": source_revision,
+                                 "samples": samples, "size": size, "view_transform": scene.view_settings.view_transform,
+                                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                 "elapsed_seconds": round(time.monotonic() - started, 3)})
+        return files, notes, evidence
+    finally:
+        for owner, key, value in saved:
+            setattr(owner, key, value)
+        for node, value in muted:
+            node.mute = value
+        scene.frame_set(saved_frame, subframe=saved_subframe)
+        scene.camera = saved_camera
+        if generated:
+            data = generated.data
+            bpy.data.objects.remove(generated, do_unlink=True)
+            bpy.data.cameras.remove(data)
 
 
 def open_file(path: Path) -> None:
@@ -116,7 +183,7 @@ def main() -> None:
                 problems += task.check(ctx)
                 ctx.stage1 = tasks.snapshot()
                 ctx.memory = task.remember(ctx) if task.remember else {}
-                result["stage_renders"], notes = render(task, out, suffix=".s1")
+                result["stage_renders"], notes, result["stage_render_evidence"] = render(task, out, suffix=".s1")
                 result["notes"] += [f"stage 1: {n}" for n in notes]
             else:
                 problems.append("stage 1: no <task>.stage1.blend was saved after the first brief, so it was not graded")
@@ -129,7 +196,7 @@ def main() -> None:
         result["problems"] = problems
         result["met"] = len(result["requirements"]) - len([p for p in problems if not p.startswith("stage 1:")])
         result["passed"] = not problems
-        result["renders"], notes = render(task, out)
+        result["renders"], notes, result["render_evidence"] = render(task, out)
         result["notes"] += notes
     except Exception:
         result["problems"] = ["harness: " + traceback.format_exc()]
@@ -139,5 +206,6 @@ def main() -> None:
           f"{'; '.join(result['problems'])[:300]}")
 
 
-main()
-sys.stdout.flush()
+if __name__ == "__main__":
+    main()
+    sys.stdout.flush()

@@ -36,6 +36,8 @@ class ToolResult:
     # scene_diff snapshots around a scene-changing tool, for the turn's "what changed" card.
     scene_before: dict | None = None
     scene_after: dict | None = None
+    pending_job: Path | None = None  # Inspections wait on the agent thread, never in the UI pump.
+    evidence_token: dict | None = None  # Rechecked if later tools in the same batch change the scene.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -158,7 +160,7 @@ def is_heavy(name: str, arguments: dict) -> bool:
     """A step that renders, bakes or simulates: the user approves it every time."""
     if name == "run_python":
         return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
-    if name in {"start_render_job", "resume_render_job"}:
+    if name in {"start_render_job", "resume_render_job", "inspect_scene"}:
         return True
     return name == "see_render" and bool(arguments.get("render"))
 
@@ -865,10 +867,11 @@ _DISPATCH = {
 
 
 def execute(name: str, arguments_json: str) -> ToolResult:
-    from . import files, job_tools
-    fn = _DISPATCH.get(name) or files.DISPATCH.get(name) or job_tools.DISPATCH.get(name)
+    from . import files, inspection, job_tools
+    tables = (_DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH)
+    fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
-        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join([*_DISPATCH, *files.DISPATCH, *job_tools.DISPATCH])}", ok=False)
+        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)
     try:
         arguments = json.loads(arguments_json) if arguments_json.strip() else {}
         if not isinstance(arguments, dict):

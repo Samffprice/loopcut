@@ -886,7 +886,10 @@ def _jobs(f: Frame, top, bottom):
     page = min(f.ui.get("jobs_page", 0), (len(rows) - 1) // count)
     for row in rows[page * count:(page + 1) * count]:
         id, progress = row["id"], row.get("progress", {})
-        title = f"{row['state'].title()} · {progress.get('completed', 0)}/{len(row['frames'])} frames · {row['format']}"
+        total = progress.get("total", len(row["frames"]))
+        kind = row.get("purpose", row["format"]).replace("_", " ")
+        unit = "views" if row.get("kind") == "inspection" else "frames"
+        title = f"{row['state'].title()} · {progress.get('completed', 0)}/{total} {unit} · {kind}"
         f.text(f"job.{id}.title", pad, cursor, title, small, T.TEXT)
         detail = f"{row['camera']} · {row['width']}×{row['height']} · {row['samples']} samples · {row['budget_seconds']}s/attempt"
         f.text(f"job.{id}.detail", pad, cursor + f.px(22), _ellipsize(f, detail, small, f.width - pad * 2), small, T.TEXT_MUTED)

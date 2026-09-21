@@ -30,7 +30,7 @@ cancelled, failed and interrupted are distinct states.
 Current boundaries:
 
 - EEVEE, Cycles (CPU), and Workbench; 1–10,000 explicit frames; up to 8192 pixels per side.
-- PNG output is 8-bit RGBA. MP4 is silent H.264 and requires even dimensions and FFmpeg. Each requested
+- PNG output is 8-bit RGBA. MP4 is opaque, silent H.264 and requires even dimensions and FFmpeg. Each requested
   source frame becomes one movie frame at the scene's FPS, including when the frame list has gaps.
 - The requested camera is fixed, including across camera markers. File Output compositor nodes are
   disabled in the copy so they cannot write outside the job's directory. Other compositor processing

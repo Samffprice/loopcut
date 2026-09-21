@@ -1,5 +1,10 @@
 # Loopcut system and harness review — 2026-09-21
 
+**Follow-up implemented:** roadmap items 1 and 2 below now have working implementations and
+Blender acceptance checks. See [durable jobs](RENDER_JOBS.md) and [visual inspection](VISUAL_INSPECTION.md)
+for behavior, measured evidence and boundaries. The original observations and remaining roadmap
+are retained below; these changes have not been released or evaluated as a new live-model suite.
+
 The biggest opportunity is to make Loopcut reliably finish a user's job across modeling, materials,
 animation, rendering, and export. Its execution tools already do useful work. The weakest parts are
 trustworthy visual feedback, current Blender API knowledge, recovery when the user changes workspace,

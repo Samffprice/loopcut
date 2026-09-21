@@ -13,7 +13,7 @@ SCHEMAS = [
         "name": "start_render_job",
         "description": "Render a frozen scene in the background. Asks once for this job and time budget. "
                        "Creates a NEW subfolder under output_dir; never overwrites other work. PNG frames, "
-                       "optionally silent MP4 from that sequence. File Output nodes are disabled. "
+                       "optionally opaque, silent MP4 from that sequence. File Output nodes are disabled. "
                        "Returns a job id, not a finished render. Inspect status later; closing chat is safe.",
         "parameters": {"type": "object", "properties": {
             "output_dir": {"type": "string"},
@@ -45,19 +45,36 @@ def _path(job_id):
     return jobs.folder(checkpoints.data_root(), job_id)
 
 
+def preview_path(row: dict) -> Path | None:
+    output = Path(row["output"])
+    if row.get("kind") == "inspection" and row["state"] == "complete":
+        record = jobs.read_json(output / "inspection.json")
+        target, expected = output / "contact_sheet.png", record["sheet_sha256"]
+    else:
+        records = row["progress"].get("files", [])
+        if not records:
+            return None
+        record = records[-1]
+        target, expected = output / record["file"], record["sha256"]
+    if target.parent != output or jobs.digest(target) != expected:
+        raise jobs.JobError("Preview changed after verification.")
+    return target
+
+
 def create_spec(output_dir: str, frames: list[int], budget_seconds: int, camera=None, format="PNG",
-                width=None, height=None, samples=None) -> tuple[dict, Path]:
+                width=None, height=None, samples=None, _allow_no_camera=False, _engine=None) -> tuple[dict, Path]:
     import bpy
     from . import files
     scene, r = bpy.context.scene, bpy.context.scene.render
     selected = bpy.data.objects.get(camera) if camera is not None else scene.camera
-    if selected is None or selected.type != "CAMERA" or selected.name not in scene.objects:
+    if (selected is None and not _allow_no_camera) or (selected is not None and
+            (selected.type != "CAMERA" or selected.name not in scene.objects)):
         raise jobs.JobError("Choose a camera in this scene before starting a render job.")
     job_id = uuid.uuid4().hex
     output = files.check(files.resolve(output_dir)) / f"loopcut-{job_id}"
     spec = {"version": 1, "id": job_id, "kind": "render", "created": time.time(),
             "session_id": state.session()["id"], "source": bpy.data.filepath, "scene": scene.name,
-            "camera": selected.name, "engine": r.engine, "frames": frames, "format": format,
+            "camera": selected.name if selected else "", "engine": _engine or r.engine, "frames": frames, "format": format,
             "width": width if width is not None else max(4, r.resolution_x * r.resolution_percentage // 100),
             "height": height if height is not None else max(4, r.resolution_y * r.resolution_percentage // 100),
             "samples": samples if samples is not None else (scene.cycles.samples if r.engine == "CYCLES" else
@@ -75,6 +92,9 @@ def create_spec(output_dir: str, frames: list[int], budget_seconds: int, camera=
 
 def save_snapshot(spec: dict, path: Path) -> None:
     import bpy
+    for obj in bpy.context.objects_in_mode:
+        obj.update_from_editmode()
+    bpy.context.view_layer.update()
     # Keep external dependencies evidence-bound. A changed asset invalidates resume rather than
     # silently mixing two versions of a texture or linked scene into one sequence.
     assets = []
@@ -98,7 +118,7 @@ def save_snapshot(spec: dict, path: Path) -> None:
 
 def _summary(row):
     p = row.get("progress", {})
-    return {key: row.get(key) for key in ("id", "kind", "state", "scene_revision", "source", "camera", "engine",
+    return {key: row.get(key) for key in ("id", "kind", "purpose", "state", "scene_revision", "source", "camera", "engine",
              "width", "height", "samples", "budget_seconds", "output", "error")} | {
         "frame_count": len(row["frames"]), "first_frame": row["frames"][0], "last_frame": row["frames"][-1],
         "completed": p.get("completed", 0), "total": p.get("total", len(row["frames"])),
@@ -106,9 +126,10 @@ def _summary(row):
         "movie": p.get("movie"), "verified_complete": row["state"] == "complete" and p.get("verified_complete", False)}
 
 
-def start_render_job(**kwargs) -> ToolResult:
+def start_render_job(output_dir, frames, budget_seconds, camera=None, format="PNG", width=None,
+                     height=None, samples=None) -> ToolResult:
     try:
-        spec, path = create_spec(**kwargs)
+        spec, path = create_spec(output_dir, frames, budget_seconds, camera, format, width, height, samples)
         save_snapshot(spec, path)
         row = jobs.launch(path)
     except (jobs.JobError, OSError, ValueError, RuntimeError) as ex:
@@ -124,14 +145,10 @@ def render_job_status(job_id: str | None = None, preview: bool = False) -> ToolR
         image = None
         if preview:
             from . import attachments, files, scratch
-            records = row["progress"].get("files", [])
-            if records:
-                record = records[-1]
-                source = Path(row["output"]) / record["file"]
-                if source.parent != Path(row["output"]) or jobs.digest(source) != record["sha256"]:
-                    raise jobs.JobError("The preview file changed after verification.")
+            source = preview_path(row)
+            if source:
                 # Existing helper bounds the image the model sees.
-                image = scratch.folder() / f"job-{job_id}-{record['sha256'][:12]}.png"
+                image = scratch.folder() / f"job-{job_id}-{jobs.digest(source)[:12]}.png"
                 attachments._to_png(source, image, files.IMAGE_SIDE)
         return ToolResult(json.dumps(_summary(row)) + "\nAny preview is from this job's SAVED revision, not the live scene.",
                           image_path=image)
@@ -186,13 +203,9 @@ def ui_action(kind: str, job_id: str):
             row = jobs.status(path)
             target = Path(row["output"])
             if kind == "job_preview":
-                records = row["progress"].get("files", [])
-                if not records:
+                target = preview_path(row)
+                if target is None:
                     raise jobs.JobError("No verified frame yet.")
-                record = records[-1]
-                target = target / record["file"]
-                if target.parent != Path(row["output"]) or jobs.digest(target) != record["sha256"]:
-                    raise jobs.JobError("Preview changed after verification.")
             bpy.ops.wm.path_open(filepath=str(target))
         state.ui["job_error"] = ""
     except (jobs.JobError, OSError, ValueError, RuntimeError) as ex:

@@ -985,7 +985,7 @@ PROJECT_TASKS = [
                       ("settles", req_logo_settles), ("camera", has_camera), ("framed", req_logo_framed),
                       ("colors", req_logo_colors), ("timing", timing(72, 24)), ("output", output(1920, 1080))]),
            BRAND_MOTION_SOLUTION, setup=t.setup_empty, tags=["project", "advertising", "animation", "text"],
-           render_frames=[1, 36, 72]),
+           render_frames=[1, 18, 36, 54, 72]),
 
     t.Task("game_prop",
            "Model a game-ready wooden crate: a 1 m cube shape with chamfered edges and plank or frame detail "
@@ -1015,5 +1015,5 @@ PROJECT_TASKS = [
            checklist([("ring of 8", req_ring), ("candy colors", req_candy_colors), ("wave", req_wave),
                       ("seamless", req_seamless), ("pastel background", req_pastel_background),
                       ("camera", req_ring_camera), ("timing", timing(72, 24)), ("output", output(1080, 1080))]),
-           SOCIAL_LOOP_SOLUTION, tags=["project", "social", "animation"], render_frames=[1, 24, 48]),
+           SOCIAL_LOOP_SOLUTION, tags=["project", "social", "animation"], render_frames=[1, 18, 36, 54, 72]),
 ]

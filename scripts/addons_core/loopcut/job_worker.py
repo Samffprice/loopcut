@@ -135,6 +135,13 @@ def render_job(path: Path) -> None:
     if scene is None:
         raise jobs.JobError("Saved scene is missing.")
     bpy.context.window.scene = scene
+    if spec.get("kind") == "inspection":
+        from inspection_worker import render_inspection
+        render_inspection(path, spec, scene)
+        for asset in spec.get("assets", []):
+            if jobs.digest(Path(asset["path"])) != asset["sha256"]:
+                raise jobs.JobError("An external asset changed during inspection; request a fresh inspection.")
+        return
     scene.camera = bpy.data.objects.get(spec["camera"])
     if scene.camera is None or scene.camera.type != "CAMERA":
         raise jobs.JobError("Saved camera is missing.")
