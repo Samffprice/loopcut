@@ -515,6 +515,9 @@ def _tick() -> float:
 
 def register() -> None:
     import bpy
+    global _CLASSES
+    if not _CLASSES:
+        _CLASSES = _operators()
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
     _cancel.clear()
@@ -557,7 +560,5 @@ def _operators() -> tuple:
     return LOOPCUT_OT_check_for_updates, LOOPCUT_OT_restart_to_update
 
 
-try:
-    _CLASSES = _operators()
-except ImportError:  # Outside Blender (tests).
-    _CLASSES = ()
+# Pure updater helpers are also imported outside Blender; construct operators at registration.
+_CLASSES = ()
