@@ -23,9 +23,10 @@ def register() -> None:
     account.register()
     host.register()
     lifecycle.register()
-    if host.NATIVE:  # First run of the Loopcut build; stock Blender keeps its own splash.
-        from . import onboarding
+    if host.NATIVE:  # The Loopcut build: its first run, and its updates. Stock Blender has its own.
+        from . import onboarding, update
         onboarding.register()
+        update.register()
     try:
         from . import checkpoints
         checkpoints.remove_stale_sessions()
@@ -42,7 +43,8 @@ def unregister() -> None:
     agent.stop()
     account.unregister()
     if host.NATIVE:
-        from . import onboarding
+        from . import onboarding, update
+        update.unregister()
         onboarding.unregister()
     lifecycle.unregister()
     dev_reload.unregister()

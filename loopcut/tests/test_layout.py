@@ -139,5 +139,47 @@ class QueuedTest(unittest.TestCase):
         self.assertNotIn("item0.queued", ids(build(session), "prims"))
 
 
+class UpdateBannerTest(unittest.TestCase):
+    def test_no_banner_leaves_the_chat_under_the_header(self):
+        display = build()
+        self.assertNotIn("update.bg", ids(display, "prims"))
+        self.assertFalse([h for h in display["hits"] if h["id"].startswith("update.")])
+
+    def test_banner_sits_under_the_header_and_pushes_the_chat_down(self):
+        banner = {"text": "Loopcut 0.1.4 is ready.", "button": ("Restart to update", "update_restart"),
+                  "dismiss": True, "progress": None}
+        session = state.new_session()
+        session["items"].append(state.item_user("hi"))
+        plain = build(session)
+        with_banner = build(session, update=banner)
+        bg = next(p for p in with_banner["prims"] if p["id"] == "update.bg")
+        self.assertEqual(bg["y"], T.HEADER_HEIGHT)
+        self.assertEqual(bg["h"], T.BANNER_HEIGHT)
+        card = lambda d: next(p for p in d["prims"] if p["id"] == "item0.user.card")  # noqa: E731
+        self.assertEqual(card(with_banner)["y"] - card(plain)["y"], T.BANNER_HEIGHT)
+        self.assertEqual(hit(with_banner, "update.button")["action"], ("update_restart", None))
+        self.assertEqual(hit(with_banner, "update.dismiss")["action"], ("update_dismiss", None))
+        text = next(p for p in with_banner["prims"] if p["id"] == "update.text")
+        self.assertEqual(text["text"], banner["text"])
+        button = next(p for p in with_banner["prims"] if p["id"] == "update.button")
+        self.assertLess(text["x"] + measure("ui", T.FONT_SIZE_SMALL, text["text"]), button["x"])
+
+    def test_download_progress_has_a_bar_and_no_buttons(self):
+        banner = {"text": "Downloading Loopcut 0.1.4… 43%", "button": None, "dismiss": False, "progress": 0.43}
+        display = build(update=banner)
+        bar = next(p for p in display["prims"] if p["id"] == "update.progress")
+        self.assertEqual(bar["w"], round(420 * 0.43))
+        self.assertFalse([h for h in display["hits"] if h["id"].startswith("update.")])
+
+    def test_long_text_is_cut_short_of_the_button(self):
+        banner = {"text": "Update failed: " + "x" * 200, "button": ("Try again", "update_download"), "dismiss": True,
+                  "progress": None}
+        display = build(update=banner)
+        text = next(p for p in display["prims"] if p["id"] == "update.text")
+        button = next(p for p in display["prims"] if p["id"] == "update.button")
+        self.assertTrue(text["text"].endswith("…"))
+        self.assertLessEqual(text["x"] + measure("ui", T.FONT_SIZE_SMALL, text["text"]), button["x"])
+
+
 if __name__ == "__main__":
     unittest.main()

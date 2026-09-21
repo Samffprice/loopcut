@@ -115,6 +115,10 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     dock_on_startup: bpy.props.BoolProperty(
         name="Open the panel at startup", default=True,
         description="Dock Loopcut at the right of the 3D viewport when Blender starts without it")
+    auto_update: bpy.props.BoolProperty(
+        name="Download updates automatically", default=True,
+        description="Look for a newer Loopcut now and then and download it in the background. "
+                    "Installing waits until you choose Restart to update")
 
     def draw(self, context):
         layout = self.layout
@@ -163,6 +167,22 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         column.prop(self, "context_budget")
         column.prop(self, "run_timeout")
         column.prop(self, "checkpoint_budget_mb")
+
+        from .ui import host
+        if host.NATIVE:  # As an extension in stock Blender, updates come through Blender's own extension system.
+            from . import update
+            box = layout.box()
+            box.label(text="Updates", icon="FILE_REFRESH")
+            column = box.column()
+            column.use_property_split = False
+            column.prop(self, "auto_update")
+            row = column.row(align=True)
+            row.label(text=update.preferences_line())
+            status = update.state()["status"]
+            if status == "ready":
+                row.operator("loopcut.restart_to_update")
+            elif status not in ("checking", "downloading", "installing"):
+                row.operator("loopcut.check_for_updates", text="Check Now")
 
 
 def wrap(text: str, width: int) -> list[str]:

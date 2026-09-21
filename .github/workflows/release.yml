@@ -61,8 +61,13 @@ jobs:
       - name: Name the package
         id: names
         run: |
-          if [ -n "$RELEASE_TAG" ] && ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9A-Za-z._-]+$'; then
+          if [ -n "$RELEASE_TAG" ] && ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "release_tag must look like v0.1.0, got: $RELEASE_TAG" >&2; exit 1
+          fi
+          # The installed app compares this version with the release to know when to update.
+          addon="$(blender/loopcut/scripts/addon_version.sh)"
+          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "$addon" ]; then
+            echo "the add-on says $addon (bl_info in scripts/addons_core/loopcut/__init__.py); bump it first" >&2; exit 1
           fi
           echo "PACKAGE_NAME=loopcut-${RELEASE_TAG:-dev-$GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "libs=$(git -C blender rev-parse "HEAD:lib/${{ matrix.lib }}")" >> "$GITHUB_OUTPUT"

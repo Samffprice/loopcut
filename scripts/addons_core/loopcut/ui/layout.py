@@ -823,6 +823,50 @@ def _tooltip(f: Frame) -> None:
         f.text(f"tooltip.l{n}", x + pad_x, y + pad_y + n * f.line_height(small), line, small, T.TEXT)
 
 
+def _ellipsize(f: Frame, text: str, size: int, max_width: float) -> str:
+    if f.measure("ui", size, text) <= max_width:
+        return text
+    while text and f.measure("ui", size, text + "…") > max_width:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _update_banner(f: Frame, top: int) -> int:
+    """The update notice under the header (ui["update"], see update.banner_for): one line of
+    text, a button at the right, and a dismiss cross where the notice can be put off."""
+    banner = f.ui.get("update")
+    if not banner:
+        return 0
+    height, pad, small = f.px(T.BANNER_HEIGHT), f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    f.rect("update.bg", 0, top, f.width, height, T.CARD)
+    f.rect("update.rule", 0, top + height - 1, f.width, 1, T.CARD_BORDER)
+    right = f.width - pad
+    if banner.get("dismiss"):
+        box = f.px(24)
+        bx, by = right - box, top + (height - box) // 2
+        active = f.ui.get("hover") == "update.dismiss"
+        if active:
+            f.rect("update.dismiss.bg", bx, by, box, box, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
+        glyph_w = round(f.measure("ui", small, "×"))
+        f.text("update.dismiss.glyph", bx + (box - glyph_w) // 2, top + (height - f.line_height(small)) // 2, "×",
+               small, T.TEXT if active else T.TEXT_MUTED)
+        f.hit("update.dismiss", bx, top, box, height, ("update_dismiss", None), tip="Not now")
+        right = bx - f.px(4)
+    if banner.get("button"):
+        label, kind = banner["button"]
+        width = round(f.measure("ui", small, label)) + 2 * f.px(10)
+        f.button("update.button", right - width, top + (height - f.px(24)) // 2, label, T.BUTTON, T.BUTTON_TEXT,
+                 (kind, None))
+        right -= width + f.px(8)
+    text = _ellipsize(f, banner["text"], small, right - pad)
+    f.text("update.text", pad, top + (height - f.line_height(small)) // 2, text, small, T.TEXT)
+    if banner.get("progress") is not None:
+        bar = f.px(2)
+        f.rect("update.progress.track", 0, top + height - 1 - bar, f.width, bar, T.CARD_BORDER)
+        f.rect("update.progress", 0, top + height - 1 - bar, round(f.width * banner["progress"]), bar, T.ACCENT)
+    return height
+
+
 def build(session: dict, width: int, height: int, scale: float, measure, model: str = "",
           checkpoints: dict | None = None, ui: dict | None = None) -> dict:
     ui = ui or {}
@@ -831,12 +875,14 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     f.rect("bg", 0, 0, width, height, T.BG)
     input_top = height - input_height(f, session)
     header_bottom = f.px(T.HEADER_HEIGHT)
+    top = header_bottom + (f.px(T.BANNER_HEIGHT) if ui.get("update") else 0)
     if view == "history":
         max_scroll = 0.0
-        _history(f, session, ui, header_bottom, input_top)
+        _history(f, session, ui, top, input_top)
     else:
-        max_scroll = _chat(f, session, header_bottom, input_top)
-    _header(f, session, view)  # Header and input go last so they paint over scrolled chat content.
+        max_scroll = _chat(f, session, top, input_top)
+    _header(f, session, view)  # Header, banner and input go last so they paint over scrolled chat content.
+    _update_banner(f, header_bottom)
     _input(f, session, input_top, model)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,

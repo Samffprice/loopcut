@@ -12,7 +12,7 @@ from pathlib import Path
 
 import bpy
 
-from .. import account, agent, checkpoints, config, conversations, scene_context, settings, state
+from .. import account, agent, checkpoints, config, conversations, scene_context, settings, state, update
 from . import draw, layout, textedit
 
 NATIVE = hasattr(bpy.types, "SpaceLoopcut")
@@ -110,7 +110,7 @@ def draw_area() -> None:
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
-                            "context_budget": budget, "model_options": options})
+                            "context_budget": budget, "model_options": options, "update": update.banner()})
     session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
@@ -306,6 +306,14 @@ def _do_action(session: dict, action) -> None:
         _switch(session, fresh)
     elif kind == "close_panel":
         _close_area_later(bpy.context.window, bpy.context.area)
+    elif kind == "update_download":
+        update.download()
+    elif kind == "update_restart":
+        update.restart_to_update()
+    elif kind == "update_page":
+        update.open_notes()
+    elif kind == "update_dismiss":
+        update.dismiss()
 
 
 def _start_upgrade(session: dict, item: dict) -> None:

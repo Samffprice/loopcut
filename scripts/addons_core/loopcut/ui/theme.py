@@ -39,6 +39,7 @@ RADIUS = 8
 RADIUS_SMALL = 5
 GAP = 10                 # Between chat items.
 HEADER_HEIGHT = 34
+BANNER_HEIGHT = 32       # The update notice under the header.
 CODE_PREVIEW_LINES = 10
 INPUT_MIN_LINES = 2
 INPUT_MAX_LINES = 8
