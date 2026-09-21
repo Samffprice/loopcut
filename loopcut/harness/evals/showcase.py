@@ -166,19 +166,24 @@ def camera_roles(ctx) -> dict:
     points = [c for o in parts for c in pj.corners(o)]
     scene = bpy.context.scene
     saved = scene.camera
+    framing = {}
     try:
         for camera in cameras():
             scene.camera = camera
             outside, width, height = pj.in_frame(points)
-            span = max(width, height)
-            if outside == 0 and 0.25 <= span <= 0.85:
-                roles["hero"].append(camera)
-            if span > 0.9 or (outside and product_distance(camera, box) < 0.8):
-                roles["close"].append(camera)
-            if pj.camera_forward(camera).z < -0.8:
-                roles["overhead"].append(camera)
+            framing[camera] = (outside, max(width, height), product_distance(camera, box))
     finally:
         scene.camera = saved
+    for camera, (outside, span, distance) in framing.items():
+        if outside == 0 and 0.25 <= span <= 0.85:
+            roles["hero"].append(camera)
+        if pj.camera_forward(camera).z < -0.8:
+            roles["overhead"].append(camera)
+    hero_distance = min((framing[c][2] for c in roles["hero"]), default=None)
+    for camera, (outside, span, distance) in framing.items():
+        # A close-up crops the product or fills the frame with it, from nearer than the hero.
+        if (outside > 0 or span > 0.85) and (hero_distance is None or distance < hero_distance):
+            roles["close"].append(camera)
     return roles
 
 
@@ -1161,7 +1166,7 @@ SHOWCASE_TASKS = [
                          ("three cameras", req_three_cameras), ("hero active", req_hero_active),
                          ("cycles", req_cycles), ("output", pj.output(1080, 1080))]),
            PERFUME_SOLUTION, setup=pj.setup_perfume, tags=["project", "showcase", "product", "lighting"],
-           render_frames=[1],
+           render_frames=[1], timeout=1200,
            follow_up="Change the setting to bright pastel pink with soft daylight, keeping the same bottle and "
                      "camera compositions.",
            follow_up_check=pj.checklist([("product kept", pj.req_product_kept), ("cameras kept", req_cameras_kept),
@@ -1180,7 +1185,7 @@ SHOWCASE_TASKS = [
                          ("dark studio", req_dark_studio), ("moving rim", req_moving_rim), ("cycles", req_cycles),
                          ("output", pj.output(1920, 1080))]),
            REVEAL_SOLUTION, setup=setup_camera_product, tags=["project", "showcase", "product", "animation"],
-           render_frames=[1, 96, 192],
+           render_frames=[1, 96, 192], timeout=1200,
            follow_up="Make the reveal feel energetic instead of luxurious: speed up the middle section of the camera "
                      "move and change the lighting to electric blue.",
            follow_up_check=pj.checklist([("product kept", req_camera_kept), ("timing", pj.timing(192, 24)),
@@ -1199,7 +1204,7 @@ SHOWCASE_TASKS = [
            pj.checklist([("props named", req_props_named), ("low poly", req_low_poly), ("origins at base", req_origins_at_base),
                          ("palette", req_palette), ("arranged", req_arranged), ("glb", req_glb("asset_pack.glb")),
                          ("cycles", req_cycles)]),
-           PACK_SOLUTION, setup=t.setup_empty, tags=["project", "showcase", "game", "modeling"], render_frames=[1],
+           PACK_SOLUTION, setup=t.setup_empty, tags=["project", "showcase", "game", "modeling"], render_frames=[1], timeout=1200,
            follow_up="Turn the whole pack into an ice-themed variation while preserving each object's name, size and "
                      "origin. Export asset_pack.glb again.",
            follow_up_check=pj.checklist([("pack preserved", req_pack_preserved), ("icy palette", req_icy),
@@ -1219,7 +1224,7 @@ SHOWCASE_TASKS = [
                          ("crystals glow", req_crystals), ("walkthrough", req_walkthrough), ("timing", pj.timing(120, 24)),
                          ("glb", req_glb("dungeon.glb")), ("cycles", req_cycles)]),
            DUNGEON_SOLUTION, setup=t.setup_empty, tags=["project", "showcase", "game", "environment"],
-           render_frames=[1, 60, 120],
+           render_frames=[1, 60, 120], timeout=1200,
            follow_up="Using the same modules, add a connected treasure room through a second doorway, without "
                      "changing anything in the original room.",
            follow_up_check=pj.checklist([("original untouched", req_original_untouched), ("second room", req_second_room),
@@ -1240,7 +1245,7 @@ SHOWCASE_TASKS = [
                          ("timing", pj.timing(120, 30)), ("output", pj.output(1920, 1080)), ("cycles", req_cycles),
                          ("sequence", req_sequence)]),
            EXPLODED_SOLUTION, setup=setup_camera_product, tags=["project", "showcase", "product", "animation", "web"],
-           render_frames=[1, 60, 120],
+           render_frames=[1, 60, 120], timeout=1200,
            follow_up="Mirror the composition: the product inside the left 60% of the frame and the empty space on "
                      "the right. Render the preview sequence again.",
            follow_up_check=pj.checklist([("assembled at both ends", req_assembled_ends), ("camera fixed", req_camera_fixed),

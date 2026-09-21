@@ -56,6 +56,10 @@ else the model is told lives in AGENTS.md, like Loopcut's system prompt.
 ```
 You are doing a Blender job on the .blend file in this folder whose name ends in .start.blend; the
 task id is the part of that name before the first dot. Work until the brief is fully done, then stop.
+Some tasks have a second part: if <task>.followup.txt exists, the person will paste it as a second
+message once you have finished the first brief. When you finish the first brief, save the scene as
+<task>.stage1.blend before you say you are done; after the follow-up, save <task>.final.blend. If
+there is no followup file, <task>.final.blend is the end.
 
 - If Blender MCP tools are available, use them on the open file. Otherwise work headless with the
   shell: Blender is at ../../../tools/Blender.app/Contents/MacOS/Blender relative to this folder
@@ -80,13 +84,16 @@ task id is the part of that name before the first dot. Work until the brief is f
 
 ## Running one task
 
-1. Start a timer. Paste the contents of `perfume_ad.prompt.txt` as the first message, verbatim.
+1. Start a timer. Paste the contents of `<task>.prompt.txt` as the first message, verbatim.
 2. Answer questions if it asks, and say "continue" if it stalls, but count every message you type.
-   Anything you do in Blender yourself counts as a manual fix. Give up after 20 minutes.
-3. When it says it is done, check that the three files are in `out/projects/chatgpt/`. If it did not
-   write `run.json`, fill the template that start_scene.py left there. If it did not save, save
-   the scene as `perfume_ad.final.blend` yourself and note it.
-4. Run the Loopcut arm and the comparison (see PROJECTS.md).
+   Anything you do in Blender yourself counts as a manual fix. Give up after 20 minutes per brief.
+3. Two-turn tasks: when it says the first brief is done, make sure `<task>.stage1.blend` exists,
+   then paste `<task>.followup.txt` as the next message, verbatim. The follow-up is one of the two
+   prompts the task expects, so it does not count against the tool.
+4. When it says it is done, check that `<task>.final.blend`, `<task>.run.json` and (two-turn) the
+   stage1 file are in the arm folder. If it did not write `run.json`, fill the template that
+   start_scene.py left there. If it did not save, save the scene yourself and note it.
+5. Run the Loopcut arm and the comparison (see PROJECTS.md).
 
 The transcript is copied into the report folder and linked from comparison.md when it exists. The
 app keeps its own session logs under `~/.codex/sessions/` if you want the raw record.

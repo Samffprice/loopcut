@@ -4,6 +4,7 @@
     python3 harness/evals/run.py                 # every task
     python3 harness/evals/run.py table camera    # some tasks
     python3 harness/evals/run.py --tag spatial --jobs 3 --label "bounds in scene info"
+    python3 harness/evals/run.py perfume_ad --jobs 1 --record    # plus a screen recording, for demos
 
 Each task gets its own windowed Blender (LOOPCUT_BLENDER, default tools/Blender.app) and a real
 agent turn, so a run costs tokens and a few minutes. Results land in out/evals/<time>/ with one
@@ -17,6 +18,7 @@ import argparse
 import ast
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -37,6 +39,9 @@ def task_index() -> dict[str, list[str]]:
     return index
 
 
+TIMEOUTS: dict[str, float] = {}  # Per-task overrides from Task(timeout=...), filled by task_index.
+
+
 def _task_calls(tree) -> dict[str, list[str]]:
     index = {}
     for node in ast.walk(tree):
@@ -44,6 +49,9 @@ def _task_calls(tree) -> dict[str, list[str]]:
                                            or getattr(node.func, "attr", "") == "Task") and node.args:
             tags = next((ast.literal_eval(k.value) for k in node.keywords if k.arg == "tags"), [])
             index[ast.literal_eval(node.args[0])] = tags
+            timeout = next((ast.literal_eval(k.value) for k in node.keywords if k.arg == "timeout"), 0)
+            if timeout:
+                TIMEOUTS[ast.literal_eval(node.args[0])] = float(timeout)
     return index
 
 
@@ -54,16 +62,27 @@ def blender() -> str:
     return path
 
 
-def run_one(task_id: str, out: Path, timeout: float) -> dict:
+def run_one(task_id: str, out: Path, timeout: float, record: bool = False) -> dict:
     command = [blender(), "--factory-startup", "--python", str(Path(__file__).parent / "run_task.py"),
                "--", task_id, str(out)]
     env = {**os.environ, "LOOPCUT_EVAL_TIMEOUT": str(timeout)}
     log = out / f"{task_id}.log"
+    recorder = None
+    if record:  # macOS screen recording of the whole run; needs Screen Recording permission for the terminal.
+        recorder = subprocess.Popen(["screencapture", "-v", "-x", str(out / f"{task_id}.mov")],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         with log.open("w", encoding="utf-8") as handle:
-            subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, env=env, timeout=timeout + 60)
+            subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, env=env, timeout=2 * timeout + 60)
     except subprocess.TimeoutExpired:
         return {"id": task_id, "passed": False, "problems": ["harness: Blender did not exit"]}
+    finally:
+        if recorder is not None:
+            recorder.send_signal(signal.SIGINT)
+            try:
+                recorder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                recorder.kill()
     result_file = out / f"{task_id}.json"
     if not result_file.is_file():
         return {"id": task_id, "passed": False, "problems": [f"harness: no result written, see {log.name}"]}
@@ -93,7 +112,8 @@ def summarize(run: dict, previous: dict | None) -> str:
     lines += ["| task | result | s | steps | tools | failed calls | what is wrong |", "|---|---|---|---|---|---|---|"]
     for r in results:
         tools = ", ".join(f"{k} x{v}" for k, v in (r.get("tool_calls") or {}).items())
-        wrong = "; ".join((r.get("problems") or []) + (r.get("errors") or [])).replace("\n", " ")[:300]
+        wrong = "; ".join((r.get("problems") or []) + [f"then: {p}" for p in r.get("follow_up_problems") or []]
+                          + (r.get("errors") or [])).replace("\n", " ")[:300]
         lines.append(f"| [{r['id']}]({r['id']}.md) | {'pass' if r['passed'] else '**FAIL**'} | "
                      f"{r.get('seconds', '')} | {r.get('model_steps', '')} | {tools} | "
                      f"{r.get('failed_tool_calls', '')} | {wrong} |")
@@ -112,9 +132,10 @@ def main() -> int:
     parser.add_argument("tasks", nargs="*", help="task ids; default all")
     parser.add_argument("--tag", action="append", default=[], help="only tasks with this tag")
     parser.add_argument("--jobs", type=int, default=2, help="Blenders at once (default 2)")
-    parser.add_argument("--timeout", type=float, default=300.0, help="seconds per task")
+    parser.add_argument("--timeout", type=float, default=300.0, help="seconds per brief, unless the task sets its own")
     parser.add_argument("--label", default="", help="what changed, for the comparison line")
     parser.add_argument("--list", action="store_true", help="list tasks and exit")
+    parser.add_argument("--record", action="store_true", help="screen-record each task to <task>.mov (macOS)")
     args = parser.parse_args()
 
     unknown = [t for t in args.tasks if t not in index]
@@ -132,7 +153,8 @@ def main() -> int:
     out.mkdir(parents=True)
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {task_id: pool.submit(run_one, task_id, out, args.timeout) for task_id in chosen}
+        futures = {task_id: pool.submit(run_one, task_id, out, TIMEOUTS.get(task_id, args.timeout), args.record)
+                   for task_id in chosen}
         results = []
         for task_id, future in futures.items():
             result = future.result()

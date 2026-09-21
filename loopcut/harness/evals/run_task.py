@@ -8,6 +8,7 @@ wrote and was shown), <task_id>.stage1.blend after the first brief of a two-turn
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -99,10 +100,6 @@ def start():
     bpy.app.timers.register(poll, first_interval=0.5)
 
 
-def errors_since(session: dict, index: int) -> list[str]:
-    return [i["text"] for i in session["items"][index:] if i["kind"] == "error"]
-
-
 def context() -> SimpleNamespace:
     return SimpleNamespace(before=RUN["before"], session=state.session(),
                            stage1=RUN.get("stage1"), memory=RUN.get("memory"))
@@ -148,6 +145,13 @@ def poll():
         for call in calls:
             by_name[call["name"]] = by_name.get(call["name"], 0) + 1
         (OUT / f"{TASK.id}.md").write_text(transcript(session), encoding="utf-8")
+        # The raw conversation (messages, tool results, captures) and the ordered steps, so
+        # replay.py can re-enact the run and the conversation can be replayed through the model.
+        folder = conversations._folder(session["id"])
+        if folder.is_dir():
+            shutil.copytree(folder, OUT / f"{TASK.id}.conversation", dirs_exist_ok=True)
+        steps = [{"name": i["name"], "summary": i.get("summary", ""), "code": i.get("code"), "status": i["status"],
+                  "output": (i.get("output") or "")[:2000]} for i in items if i["kind"] == "tool"]
         # The finished scene, so grade.py can score and render it the same way as a scene made
         # in any other tool (see compare.py).
         bpy.ops.wm.save_as_mainfile(filepath=str(OUT / f"{TASK.id}.final.blend"), copy=True)
@@ -161,6 +165,8 @@ def poll():
             "tool_calls": by_name,
             "failed_tool_calls": sum(1 for c in calls if c["status"] == "failed"),
             "usage": session.get("usage"),
+            "steps": steps,
+            "stage1_items": RUN.get("items_after_stage1"),
         })
     except Exception:
         fail(traceback.format_exc())

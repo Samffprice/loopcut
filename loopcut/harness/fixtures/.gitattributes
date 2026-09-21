@@ -1,0 +1,3 @@
+# Eval fixtures stay plain blobs: the release workflow fetches this repository's LFS objects from
+# projects.blender.org (Blender's), which does not have ours.
+*.blend -filter -diff -merge

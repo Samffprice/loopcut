@@ -545,6 +545,7 @@ class Task:
     follow_up_check: Callable | None = None
     follow_up_solution: str = ""
     remember: Callable | None = None
+    timeout: float = 0.0  # Seconds per brief; 0 means run.py's --timeout. Showcase briefs get 20 minutes.
 
 
 # ------------------------------------------------------------------ copying a reference image
