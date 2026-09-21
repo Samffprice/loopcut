@@ -136,6 +136,9 @@ Keep and Undo all (which restores that turn's checkpoint).
 | `python3 -m unittest discover -s loopcut/tests` | <1s | Agent loop and layout. |
 | `Blender --factory-startup --python loopcut/harness/tools_check.py` | ~8s | The real tools against a real scene. |
 | `Blender -b --factory-startup --python loopcut/harness/polyhaven_check.py` | ~30s | Poly Haven search and import against the live API (network; headless is fine). |
+| `Blender -b --factory-startup --python loopcut/harness/asset_libraries_check.py` | ~20s | search_assets / import_asset on a kit made on the spot, then Online Essentials (network; downloads into Blender's own remote-assets cache). |
+| `LOOPCUT_POLYPIZZA_KEY=… Blender -b --factory-startup --python loopcut/harness/polypizza_check.py` | ~20s | Poly Pizza search and GLB import; without the key it checks the no-key message and exits SKIPPED. |
+| `Blender -b --factory-startup --python loopcut/harness/blenderkit_check.py` | ~40s | BlenderKit search and import of a free model, material and HDRI with no key; `LOOPCUT_BLENDERKIT_KEY` adds the plan-assets search. |
 | `Blender --factory-startup --enable-event-simulate --python loopcut/harness/input_check.py` | ~8s | Click, type, select, undo, complete an @mention, Esc through simulated events. |
 | `Blender -b --factory-startup --python loopcut/harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `loopcut/scripts/shot.sh attachments` shows the chips. |
 | `Blender -b --factory-startup --python loopcut/harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |

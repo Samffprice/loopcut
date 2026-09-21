@@ -62,6 +62,32 @@ def _tier_changed(self, context) -> None:
     _changed()
 
 
+def _get_polypizza_key(self) -> str:
+    from . import polypizza
+    return credentials.api_key(polypizza.KEY_ID)
+
+
+def _set_polypizza_key(self, value: str) -> None:
+    from . import polypizza
+    try:
+        credentials.store(polypizza.KEY_ID, value.strip())
+    except OSError as ex:
+        print(f"Loopcut: could not save the Poly Pizza key: {ex}")
+
+
+def _get_blenderkit_key(self) -> str:
+    from . import blenderkit
+    return credentials.api_key(blenderkit.KEY_ID)
+
+
+def _set_blenderkit_key(self, value: str) -> None:
+    from . import blenderkit
+    try:
+        credentials.store(blenderkit.KEY_ID, value.strip())
+    except OSError as ex:
+        print(f"Loopcut: could not save the BlenderKit key: {ex}")
+
+
 def _set_key(self, value: str) -> None:
     if not self.base_url:
         return  # No endpoint to file it under; the page says to fill that in first.
@@ -115,6 +141,16 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     dock_on_startup: bpy.props.BoolProperty(
         name="Open the panel at startup", default=True,
         description="Dock Loopcut at the right of the 3D viewport when Blender starts without it")
+    blenderkit_key: bpy.props.StringProperty(
+        name="BlenderKit API key", subtype="PASSWORD", options={"SKIP_SAVE"},
+        get=_get_blenderkit_key, set=_set_blenderkit_key,
+        description="Only for Full or Business plan assets; free BlenderKit assets need no key. Read from the "
+                    "BlenderKit add-on when it is installed. Stored in Loopcut's credentials file")
+    polypizza_key: bpy.props.StringProperty(
+        name="Poly Pizza API key", subtype="PASSWORD", options={"SKIP_SAVE"},
+        get=_get_polypizza_key, set=_set_polypizza_key,
+        description="Free key from poly.pizza (account > API) for low-poly models. Stored in Loopcut's "
+                    "credentials file. Poly Haven and your Blender asset libraries need no key")
     auto_update: bpy.props.BoolProperty(
         name="Download updates automatically", default=True,
         description="Look for a newer Loopcut now and then and download it in the background. "
@@ -167,6 +203,21 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         column.prop(self, "context_budget")
         column.prop(self, "run_timeout")
         column.prop(self, "checkpoint_budget_mb")
+
+        box = layout.box()
+        box.label(text="Asset Libraries", icon="ASSET_MANAGER")
+        column = box.column()
+        row = column.row(align=True)
+        row.prop(self, "blenderkit_key")
+        row.operator("loopcut.blenderkit_get_key", text="", icon="URL")
+        row = column.row(align=True)
+        row.prop(self, "polypizza_key")
+        row.operator("loopcut.polypizza_get_key", text="", icon="URL")
+        info = column.column(align=True)
+        info.scale_y = 0.85
+        info.label(text="BlenderKit's free assets, Poly Haven and the asset libraries in Preferences > File Paths", icon="INFO")
+        info.label(text="need no key. A BlenderKit plan key adds its paid assets. Poly Pizza's key is free; its", icon="BLANK1")
+        info.label(text="terms ask for attribution and allow no commercial use by anyone earning over $50,000 a year.", icon="BLANK1")
 
         from .ui import host
         if host.NATIVE:  # As an extension in stock Blender, updates come through Blender's own extension system.
@@ -332,7 +383,30 @@ def values() -> dict[str, str]:
     return found
 
 
-_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_pick_model, LOOPCUT_MT_models)
+class LOOPCUT_OT_polypizza_get_key(bpy.types.Operator):
+    """Open Poly Pizza's API page in the browser: sign in, copy the key, paste it here"""
+    bl_idname = "loopcut.polypizza_get_key"
+    bl_label = "Get a Poly Pizza key"
+
+    def execute(self, context):
+        account.open_browser("https://poly.pizza/settings/api")
+        self.report({"INFO"}, "Poly Pizza's API page is open in your browser; the terms are at poly.pizza/docs/api/v1.1")
+        return {"FINISHED"}
+
+
+class LOOPCUT_OT_blenderkit_get_key(bpy.types.Operator):
+    """Open BlenderKit's plans page in the browser; a plan's key is under your profile > API"""
+    bl_idname = "loopcut.blenderkit_get_key"
+    bl_label = "BlenderKit plans"
+
+    def execute(self, context):
+        from . import blenderkit
+        account.open_browser(blenderkit.PLANS)
+        return {"FINISHED"}
+
+
+_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_pick_model, LOOPCUT_MT_models,
+            LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key)
 
 
 def register() -> None:

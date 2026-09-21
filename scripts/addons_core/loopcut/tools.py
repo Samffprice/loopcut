@@ -148,7 +148,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 
 # Tools that can change the scene. A checkpoint is taken before the first one in a turn, and they
 # need the user's go-ahead unless auto-run is on.
-CHANGES_SCENE = {"run_python", "import_polyhaven"}
+CHANGES_SCENE = {"run_python", "import_polyhaven", "import_asset", "import_polypizza", "import_blenderkit"}
 NEEDS_APPROVAL = CHANGES_SCENE
 # Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
 # user every time, whatever they have allowed: "Always allow" and auto-run do not cover it.
@@ -867,8 +867,9 @@ _DISPATCH = {
 
 
 def execute(name: str, arguments_json: str) -> ToolResult:
-    from . import files, inspection, job_tools, polyhaven
-    tables = (_DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, polyhaven.DISPATCH)
+    from . import asset_libraries, blenderkit, files, inspection, job_tools, polyhaven, polypizza
+    tables = (_DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, polyhaven.DISPATCH,
+              asset_libraries.DISPATCH, polypizza.DISPATCH, blenderkit.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
         return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)

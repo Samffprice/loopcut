@@ -6,38 +6,31 @@ The API (https://api.polyhaven.com) and CDN are public; downloads are verified a
 the API publishes and kept in a cache under Loopcut's data folder so a second import is free.
 
 Import runs on Blender's main thread like every tool, so a download blocks the UI for its
-duration: resolutions are capped at 4k and 1k is the default.
+duration: resolutions are capped at 4k and 1k is the default. Downloads, thumbnails and ranking
+are asset_common's, shared with the other library tools.
 """
 
-import hashlib
 import json
 import re
-import shutil
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import bpy
 
-from . import scratch
-from .tools import ToolError, ToolResult, _clip, _pixels, _save_pixels, object_summary
+from . import asset_common
+from .asset_common import NotFound, download, get_json, rank, sheet, valid_slug  # noqa: F401  (re-exported for tests)
+from .tools import ToolError, ToolResult, _clip, object_summary
 
 API = "https://api.polyhaven.com"
 SITE = "https://polyhaven.com/a/"
-TIMEOUT = 30.0            # One HTTP call.
 LIST_TTL = 3600.0         # The asset list changes weekly; a process re-reads it after an hour.
 TYPES = ("hdris", "textures", "models")
 TYPE_CODES = {0: "hdris", 1: "textures", 2: "models"}
 RESOLUTIONS = ("1k", "2k", "4k")
 DEFAULT_LIMIT = 8
 MAX_LIMIT = 12
-THUMB_SIDE = 256          # What the CDN serves for thumbnails...
-TILE = 160                # ...and the size of a tile on the sheet: four across make a capture's width.
-SHEET_COLUMNS = 4
-SHEET_GAP = 4
-SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
+THUMB_SIDE = 256          # What the CDN serves for thumbnails; the sheet scales them down.
 # Map keys the API uses, and the Principled input each drives. nor_gl is the OpenGL-convention
 # normal Blender's Normal Map node expects; nor_dx is skipped. AO is left out: Principled has no
 # input for it and multiplying it into base color darkens the scan twice under real lighting.
@@ -75,36 +68,17 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
 ]
 
-class NotFound(ToolError):
-    """HTTP 404: an asset id the model made up, or one Poly Haven has since removed."""
-
-
 _lists: dict[str, tuple[float, dict]] = {}  # type -> (fetched, assets), per process.
 
 
 # ------------------------------------------------------------------ pure helpers (unit tested)
 
-def valid_slug(asset_id: str) -> bool:
-    """Ids come from the model and become file names: letters, digits, _ and - only."""
-    return bool(asset_id) and bool(SLUG.match(asset_id)) and len(asset_id) <= 100
-
-
 def match_assets(query: str, assets: dict, limit: int = DEFAULT_LIMIT) -> list[tuple[str, dict]]:
-    """Rank assets by how many query words hit their name, id, tags and categories; ties by
-    popularity. A word that matches nothing is ignored, so 'red brick wall' still finds bricks."""
-    words = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if len(w) > 1]
-    scored = []
-    for slug, record in assets.items():
-        haystack = " ".join([slug, record.get("name", ""), *record.get("tags", []),
-                             *record.get("categories", [])]).lower()
-        name = f"{slug} {record.get('name', '')}".lower()
-        hits = sum(1 for w in words if w in haystack)
-        if not hits:
-            continue
-        in_name = sum(1 for w in words if w in name)
-        scored.append((hits, in_name, record.get("download_count", 0), slug, record))
-    scored.sort(key=lambda s: (-s[0], -s[1], -s[2], s[3]))
-    return [(slug, record) for _, _, _, slug, record in scored[:limit]]
+    """(slug, record) pairs ranked by query words in slug, name, tags and categories; ties by popularity."""
+    return rank(query, assets.items(),
+                text_of=lambda it: " ".join([it[0], it[1].get("name", ""), *it[1].get("tags", []), *it[1].get("categories", [])]),
+                name_of=lambda it: f"{it[0]} {it[1].get('name', '')}",
+                weight_of=lambda it: it[1].get("download_count", 0), limit=limit)
 
 
 def describe_asset(index: int, slug: str, record: dict) -> str:
@@ -177,61 +151,21 @@ def describe(name: str, arguments: dict):
 # ------------------------------------------------------------------ network
 
 def cache_root() -> Path:
-    from .checkpoints import data_root
-    return data_root() / "polyhaven"
-
-
-def _open(url: str, timeout: float = TIMEOUT):
-    request = urllib.request.Request(url, headers={"User-Agent": "Loopcut (Blender add-on)"})
-    try:
-        return urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as ex:
-        if ex.code == 404:
-            raise NotFound(f"Poly Haven has nothing at {url.split('?')[0]}") from ex
-        raise ToolError(f"Poly Haven returned HTTP {ex.code} for {url.split('?')[0]}") from ex
-    except (urllib.error.URLError, TimeoutError, OSError) as ex:
-        raise ToolError(f"Could not reach Poly Haven: {getattr(ex, 'reason', ex)}") from ex
-
-
-def get_json(path: str) -> dict:
-    with _open(f"{API}/{path}") as response:
-        try:
-            return json.load(response)
-        except ValueError as ex:
-            raise ToolError(f"Poly Haven sent something that is not JSON for {path}") from ex
+    return asset_common.cache_root("polyhaven")
 
 
 def assets(kind: str) -> dict:
     fetched, cached = _lists.get(kind, (0.0, None))
     if cached is None or time.time() - fetched > LIST_TTL:
-        cached = get_json(f"assets?type={kind}")
+        cached = get_json(f"{API}/assets?type={kind}")
         _lists[kind] = (time.time(), cached)
     return cached
 
 
-def download(record: dict, dest: Path) -> Path:
-    """Fetch one published file into the cache unless a verified copy is already there."""
-    expected = record.get("md5")
-    if dest.exists() and (not expected or _md5(dest) == expected):
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    partial = dest.with_suffix(dest.suffix + ".part")
-    with _open(record["url"], timeout=max(TIMEOUT, record.get("size", 0) / 200_000)) as response, \
-            open(partial, "wb") as out:
-        shutil.copyfileobj(response, out, 1 << 20)
-    if expected and _md5(partial) != expected:
-        partial.unlink(missing_ok=True)
-        raise ToolError(f"Download of {dest.name} did not match its published checksum; try again")
-    partial.replace(dest)
-    return dest
-
-
-def _md5(path: Path) -> str:
-    digest = hashlib.md5()  # Integrity against a truncated transfer, as the API publishes it; not security.
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _file(record: dict, dest: Path) -> Path:
+    """One published file into the cache, checked against the md5 the API gives."""
+    md5 = record.get("md5")
+    return download(record["url"], dest, f"md5:{md5}" if md5 else None, record.get("size", 0))
 
 
 def thumbnail_url(slug: str, record: dict) -> str:
@@ -245,11 +179,7 @@ def thumbnail_url(slug: str, record: dict) -> str:
 
 def _thumbnail(slug: str, record: dict) -> Path | None:
     dest = cache_root() / "thumbs" / f"{slug}_{record.get('img_version', '0')}.png"
-    try:
-        return download({"url": thumbnail_url(slug, record)}, dest)
-    except ToolError as ex:
-        print(f"Loopcut: no thumbnail for {slug}: {ex}")
-        return None
+    return asset_common.thumbnail(thumbnail_url(slug, record), dest)
 
 
 # ------------------------------------------------------------------ tools
@@ -264,43 +194,12 @@ def search_polyhaven(query: str, type: str, limit: int = DEFAULT_LIMIT) -> ToolR
     if not found:
         raise ToolError(f"No Poly Haven {type} match {query!r}. Try fewer or more general words.")
     lines = [describe_asset(i, slug, record) for i, (slug, record) in enumerate(found, 1)]
-    sheet = _sheet([_thumbnail(slug, record) for slug, record in found])
+    image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png")
     text = f"{len(found)} Poly Haven {type} for {query!r}, numbered as on the sheet (left to right, top to bottom):\n" \
            + "\n".join(lines)
-    if sheet:
+    if image:
         text += "\n\nImage attached: thumbnails in that order. Import with import_polyhaven(asset_id)."
-    return ToolResult(_clip(text), image_path=sheet)
-
-
-def _sheet(paths: list) -> Path | None:
-    """Thumbnails as one image, a capture's width, numbered by position."""
-    import numpy as np
-    tiles = []
-    for path in paths:
-        try:
-            tiles.append(_pixels(path, TILE) if path else None)
-        except Exception:
-            tiles.append(None)
-    if not any(t is not None for t in tiles):
-        return None
-    rows = (len(tiles) + SHEET_COLUMNS - 1) // SHEET_COLUMNS
-    width = SHEET_COLUMNS * TILE + (SHEET_COLUMNS - 1) * SHEET_GAP
-    height = rows * TILE + (rows - 1) * SHEET_GAP
-    canvas = np.zeros((height, width, 4), dtype=np.float32)
-    canvas[..., :3], canvas[..., 3] = 0.15, 1.0
-    for index, tile in enumerate(tiles):
-        if tile is None:
-            continue
-        row, column = divmod(index, SHEET_COLUMNS)
-        tile = tile[:TILE, :TILE]
-        # Pixel rows run bottom-up in Blender images: row 0 of the sheet is its top band.
-        y0 = height - (row + 1) * TILE - row * SHEET_GAP
-        x0 = column * (TILE + SHEET_GAP)
-        canvas[y0:y0 + tile.shape[0], x0:x0 + tile.shape[1]] = tile
-    out = scratch.folder() / "polyhaven_sheet.png"
-    out.parent.mkdir(exist_ok=True)
-    _save_pixels(canvas, out)
-    return out
+    return ToolResult(_clip(text), image_path=image)
 
 
 def import_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] | None = None) -> ToolResult:
@@ -310,13 +209,13 @@ def import_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] 
     if resolution not in RESOLUTIONS:
         raise ToolError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
     try:
-        info = get_json(f"info/{urllib.parse.quote(asset_id, safe='')}")
+        info = get_json(f"{API}/info/{urllib.parse.quote(asset_id, safe='')}")
     except NotFound:
         info = {}
     kind = TYPE_CODES.get(info.get("type"))
     if kind is None:
         raise ToolError(f"Poly Haven has no asset {asset_id!r}. Search first and use the id it gives.")
-    files = get_json(f"files/{urllib.parse.quote(asset_id, safe='')}")
+    files = get_json(f"{API}/files/{urllib.parse.quote(asset_id, safe='')}")
     folder = cache_root() / asset_id / resolution
     if kind == "hdris":
         return _import_hdri(asset_id, info, files, resolution, folder)
@@ -350,30 +249,10 @@ def _import_hdri(asset_id, info, files, resolution, folder) -> ToolResult:
     record = (files.get("hdri") or {}).get(resolution, {}).get("hdr")
     if not record:
         raise ToolError(f"{asset_id} has no {resolution} HDR; available: {available(files)}")
-    path = download(record, folder / f"{asset_id}_{resolution}.hdr")
-    world = bpy.data.worlds.new(f"{asset_id}")
-    world.use_nodes = True
-    nodes, links = world.node_tree.nodes, world.node_tree.links
-    nodes.clear()
-    coords = nodes.new("ShaderNodeTexCoord")
-    coords.location = (-800, 0)
-    mapping = nodes.new("ShaderNodeMapping")
-    mapping.location = (-600, 0)
-    env = nodes.new("ShaderNodeTexEnvironment")
-    env.location = (-400, 0)
-    env.image = bpy.data.images.load(str(path), check_existing=True)
-    env.image.pack()  # The .blend must not depend on Loopcut's cache folder.
-    background = nodes.new("ShaderNodeBackground")
-    background.location = (-100, 0)
-    output = nodes.new("ShaderNodeOutputWorld")
-    output.location = (100, 0)
-    links.new(coords.outputs["Generated"], mapping.inputs["Vector"])
-    links.new(mapping.outputs["Vector"], env.inputs["Vector"])
-    links.new(env.outputs["Color"], background.inputs["Color"])
-    links.new(background.outputs["Background"], output.inputs["Surface"])
+    path = _file(record, folder / f"{asset_id}_{resolution}.hdr")
     previous = bpy.context.scene.world.name if bpy.context.scene.world else None
-    bpy.context.scene.world = world
-    _tag([world, env.image], asset_id, info)
+    world = asset_common.hdri_world(asset_id, path)
+    _tag([world], asset_id, info)
     note = f" The previous world {previous!r} is kept, unused." if previous else ""
     return ToolResult(f"HDRI {asset_id} ({resolution}) is now the scene world {world.name!r}; rotate it with "
                       f"its Mapping node.{note} {_credit(asset_id, info)}")
@@ -445,7 +324,7 @@ def _import_texture(asset_id, info, files, resolution, folder, apply_to: list[st
         raise ToolError(f"No such object(s) to apply to: {', '.join(missing)}")
     maps = {}
     for role, record in picked.items():
-        path = download(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name)
+        path = _file(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name)
         image = bpy.data.images.load(str(path), check_existing=True)
         _set_colorspace(image, role in COLOR_ROLES)
         image.pack()
@@ -473,13 +352,13 @@ def _fetch_model(files: dict, fmt: str, resolution: str, folder: Path) -> Path |
     record = (files.get(fmt) or {}).get(resolution, {}).get(fmt)
     if not record:
         return None
-    main = download(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name)
+    main = _file(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name)
     for include_path, include in (record.get("include") or {}).items():
         target = safe_include(folder, include_path)
         if target is None:
             print(f"Loopcut: skipping Poly Haven include with unsafe path {include_path!r}")
             continue
-        download(include, target)
+        _file(include, target)
     return main
 
 

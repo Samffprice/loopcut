@@ -52,9 +52,12 @@ reuses verified frames from the SAME saved revision with a fresh approval of the
 retain their PNG sequence. Do not poll repeatedly while nothing changes. Give the user the job status \
 and output location; never describe a queued/running job as a completed export. Jobs remain in the Jobs \
 view after closing the chat. Previews of jobs show their saved revision, not later scene edits.
-- Poly Haven (CC0, no key) through search_polyhaven and import_polyhaven: scanned models, PBR \
-materials and HDRI skies. When the user wants a realistic prop, surface or environment light, search \
-it before building one from primitives; choose by the thumbnails, then place and scale what arrives.
+- Libraries, before building a realistic or stylised prop, material or sky from primitives: search_blenderkit \
+is BlenderKit, the largest (free without an account; a plan key unlocks more); search_polyhaven is Poly Haven \
+(CC0 scans, PBR materials, HDRIs); search_assets is the user's own Blender asset libraries (their kits, Online \
+Essentials, remote libraries); search_polypizza is Poly Pizza (low-poly stylised, CC0 or CC-BY: tell the \
+user it came from Poly Pizza with the link, and the attribution line for CC-BY). Choose by thumbnail, then \
+place and scale what arrives; say which library each asset came from.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
@@ -301,8 +304,9 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import files, inspection, job_tools, polyhaven, tools
-    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + polyhaven.SCHEMAS
+    from . import asset_libraries, blenderkit, files, inspection, job_tools, polyhaven, polypizza, tools
+    return (tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + polyhaven.SCHEMAS
+            + asset_libraries.SCHEMAS + polypizza.SCHEMAS + blenderkit.SCHEMAS)
 
 
 def _describe(call: llm.ToolCall) -> tuple[str, str]:
@@ -315,8 +319,12 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
-    from . import files, job_tools, polyhaven
-    return job_tools.describe(call.name, arguments) or files.describe(call.name, arguments) or polyhaven.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
+    from . import asset_libraries, blenderkit, files, job_tools, polyhaven, polypizza
+    for module in (job_tools, files, polyhaven, asset_libraries, polypizza, blenderkit):
+        described = module.describe(call.name, arguments)
+        if described:
+            return described
+    return str(arguments.get("summary") or call.name), str(arguments.get("code") or "")
 
 
 def _arguments(arguments: str) -> dict:
