@@ -767,6 +767,7 @@ HEADER_BUTTONS = (  # Right to left: id, glyph, tooltip.
     ("header.settings", "⚙", "Settings"),
     ("header.history", "↺", "History"),
     ("header.new", "+", "New chat"),
+    ("header.jobs", "▤", "Background jobs"),
 )
 
 
@@ -779,8 +780,8 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     f.prims.append({"t": "mark", "id": "header.mark", "x": pad, "y": (height - mark) // 2, "w": mark, "h": mark})
     title_x = pad + mark + f.px(8)
     f.text("header.title", title_x, y, "Loopcut", size, T.TEXT)
-    if view == "history":
-        f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  History", size,
+    if view in {"history", "jobs"} and f.width > f.px(370):
+        f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  " + view.title(), size,
                T.TEXT_MUTED)
     # Icon buttons at the right: the editor's own header is hidden, so close lives here too.
     hover, box, gap = f.ui.get("hover"), f.px(24), f.px(2)
@@ -789,10 +790,12 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
         bx, by = right - box, (height - box) // 2
         if id == "header.history":
             action, tip = (("history_close", None), "Back to chat") if view == "history" else (("history_open", None), tip)
+        elif id == "header.jobs":
+            action, tip = (("history_close", None), "Back to chat") if view == "jobs" else (("jobs_open", None), tip)
         else:
             action = {"header.close": ("close_panel", None), "header.settings": ("open_settings", None),
                       "header.new": ("new_chat", None)}[id]
-        active = hover == id or (id == "header.history" and view == "history")
+        active = hover == id or (id == "header.history" and view == "history") or (id == "header.jobs" and view == "jobs")
         if active:
             f.rect(f"{id}.bg", bx, by, box, box, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
         glyph_size = small if glyph in "⚙↺" else size  # The symbol glyphs come from a wider font.
@@ -867,6 +870,43 @@ def _update_banner(f: Frame, top: int) -> int:
     return height
 
 
+def _jobs(f: Frame, top, bottom):
+    pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    cursor = top + pad
+    error = f.ui.get("job_error")
+    if error:
+        cursor += f.paragraph("jobs.error", pad, cursor, f.width - 2 * pad, error, small, T.ERROR) + pad
+    rows = f.ui.get("jobs", [])
+    if not rows:
+        f.paragraph("jobs.empty", pad, cursor, f.width - 2 * pad,
+                    "No background jobs yet. Ask Loopcut to render or export a scene.", small, T.TEXT_MUTED)
+        return
+    row_height = f.px(118)
+    count = max(1, int((bottom - cursor - f.px(32)) // row_height))
+    page = min(f.ui.get("jobs_page", 0), (len(rows) - 1) // count)
+    for row in rows[page * count:(page + 1) * count]:
+        id, progress = row["id"], row.get("progress", {})
+        title = f"{row['state'].title()} · {progress.get('completed', 0)}/{len(row['frames'])} frames · {row['format']}"
+        f.text(f"job.{id}.title", pad, cursor, title, small, T.TEXT)
+        detail = f"{row['camera']} · {row['width']}×{row['height']} · {row['samples']} samples · {row['budget_seconds']}s/attempt"
+        f.text(f"job.{id}.detail", pad, cursor + f.px(22), _ellipsize(f, detail, small, f.width - pad * 2), small, T.TEXT_MUTED)
+        note = row.get("error") or f"Saved revision {row.get('scene_revision', '')[:12]} · {id[:8]}"
+        f.text(f"job.{id}.note", pad, cursor + f.px(42), _ellipsize(f, note, small, f.width - pad * 2), small, T.TEXT_FAINT)
+        x = pad
+        buttons = [("Cancel", "job_cancel")] if row["state"] in {"queued", "running", "cancelling"} else [("Resume", "job_resume")]
+        if progress.get("files"):
+            buttons.append(("Preview", "job_preview"))
+        buttons.append(("Output", "job_open"))
+        for label, action in buttons:
+            x += f.button(f"job.{id}.{action}", x, cursor + f.px(65), label, T.BUTTON_GHOST, T.TEXT,
+                          (action, id)) + f.px(6)
+        cursor += row_height
+    if page > 0:
+        f.button("jobs.previous", pad, cursor, "Previous", T.BUTTON_GHOST, T.TEXT, ("jobs_page", page - 1))
+    if (page + 1) * count < len(rows):
+        f.button("jobs.next", pad + f.px(100), cursor, "Next", T.BUTTON_GHOST, T.TEXT, ("jobs_page", page + 1))
+
+
 def build(session: dict, width: int, height: int, scale: float, measure, model: str = "",
           checkpoints: dict | None = None, ui: dict | None = None) -> dict:
     ui = ui or {}
@@ -876,7 +916,10 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     input_top = height - input_height(f, session)
     header_bottom = f.px(T.HEADER_HEIGHT)
     top = header_bottom + (f.px(T.BANNER_HEIGHT) if ui.get("update") else 0)
-    if view == "history":
+    if view == "jobs":
+        max_scroll = 0.0
+        _jobs(f, top, input_top)
+    elif view == "history":
         max_scroll = 0.0
         _history(f, session, ui, top, input_top)
     else:

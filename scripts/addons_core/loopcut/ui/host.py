@@ -296,6 +296,16 @@ def _do_action(session: dict, action) -> None:
         state.ui["view"] = "history"
     elif kind == "history_close":
         state.ui["view"] = "chat"
+    elif kind == "jobs_open":
+        from .. import job_tools
+        job_tools.refresh_ui()
+        state.ui["view"] = "jobs"
+        state.ui["jobs_page"] = 0
+    elif kind == "jobs_page":
+        state.ui["jobs_page"] = index
+    elif kind in {"job_cancel", "job_resume", "job_preview", "job_open"}:
+        from .. import job_tools
+        job_tools.ui_action(kind, index)
     elif kind == "open_conversation":
         _switch(session, lambda: conversations.load(index))
     elif kind == "new_chat":

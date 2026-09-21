@@ -158,6 +158,8 @@ def is_heavy(name: str, arguments: dict) -> bool:
     """A step that renders, bakes or simulates: the user approves it every time."""
     if name == "run_python":
         return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
+    if name in {"start_render_job", "resume_render_job"}:
+        return True
     return name == "see_render" and bool(arguments.get("render"))
 
 
@@ -863,10 +865,10 @@ _DISPATCH = {
 
 
 def execute(name: str, arguments_json: str) -> ToolResult:
-    from . import files
-    fn = _DISPATCH.get(name) or files.DISPATCH.get(name)
+    from . import files, job_tools
+    fn = _DISPATCH.get(name) or files.DISPATCH.get(name) or job_tools.DISPATCH.get(name)
     if fn is None:
-        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join([*_DISPATCH, *files.DISPATCH])}", ok=False)
+        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join([*_DISPATCH, *files.DISPATCH, *job_tools.DISPATCH])}", ok=False)
     try:
         arguments = json.loads(arguments_json) if arguments_json.strip() else {}
         if not isinstance(arguments, dict):

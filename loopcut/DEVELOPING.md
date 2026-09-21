@@ -34,7 +34,9 @@ Developers: copy `loopcut/.env.example` to `.env` next to the checkout and fill 
 
 Model-written code asks before it runs ("Always allow" on the card stops asking for that
 conversation; the preference or `LOOPCUT_AUTO_RUN=true` turns asking off). A step that runs longer
-than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped, so an endless loop cannot freeze Blender.
+than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped at the next Python trace event. This cannot interrupt
+a native render or bake. [Durable render jobs](RENDER_JOBS.md) run outside the editing process,
+with a separate supervisor enforcing cancellation and time limits.
 
 ## The Loopcut build
 
@@ -107,6 +109,8 @@ warning; signing needs an Apple Developer ID and a Windows code-signing certific
 | `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. |
 | `compare_with_reference` | The attached reference on the left and a capture on the right in one image, for the compare-adjust loop of copying a picture. |
 | `look_at_reference` | The attached reference at full resolution, or a region of it, to check a detail. |
+| `start_render_job` / `render_job_status` | Render a saved scene copy to a verified PNG sequence or MP4; progress persists in the Jobs view. |
+| `cancel_render_job` / `resume_render_job` | Stop a background job; resume only missing or invalid frames under another approved attempt budget. |
 
 Images can be attached to a message: drop image files on the panel or use "+ image" in the input
 box (png, jpg, webp, bmp, tif, tga; up to 6 per message). Each is decoded by Blender and stored as

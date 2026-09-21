@@ -64,6 +64,14 @@ def _initial_resume():
     return None
 
 
+def _poll_jobs():
+    from . import job_tools
+    from .ui import host
+    job_tools.refresh_ui()
+    host.tag_redraw_all()
+    return 1.0
+
+
 def _handlers() -> tuple:
     from . import files
     return ((bpy.app.handlers.load_post, _on_load_post), (bpy.app.handlers.save_post, _on_save_post),
@@ -74,9 +82,12 @@ def register() -> None:
     for handlers, fn in _handlers():
         handlers.append(fn)
     bpy.app.timers.register(_initial_resume, first_interval=0.0, persistent=True)
+    bpy.app.timers.register(_poll_jobs, first_interval=1.0, persistent=True)
 
 
 def unregister() -> None:
+    if bpy.app.timers.is_registered(_poll_jobs):
+        bpy.app.timers.unregister(_poll_jobs)
     if bpy.app.timers.is_registered(_initial_resume):  # Disabled before its first tick.
         bpy.app.timers.unregister(_initial_resume)
     conversations.save(state.session())

@@ -39,6 +39,13 @@ change and fix the differences you see; look_at_reference for a detail at full r
 - Files: list_files and read_file read the disk (an image file you then see); write_file and move_file \
 change it, with the user's approval; nothing deletes. see_render shows the user's last render, or with \
 render=true renders now: that, like any render or bake in run_python, waits for the user's OK every time.
+- For render/export deliverables use start_render_job: a saved scene copy renders outside the editing \
+process, with an explicit frame list, dimensions, samples and time budget. Approval covers this job \
+only. render_job_status reports progress and verified files; cancel_render_job stops it; resume_render_job \
+reuses verified frames from the SAME saved revision with a fresh approval of the same budget. MP4 jobs \
+retain their PNG sequence. Do not poll repeatedly while nothing changes. Give the user the job status \
+and output location; never describe a queued/running job as a completed export. Jobs remain in the Jobs \
+view after closing the chat. Previews of jobs show their saved revision, not later scene edits.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
@@ -262,8 +269,8 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import files, tools
-    return tools.SCHEMAS + files.SCHEMAS
+    from . import files, job_tools, tools
+    return tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS
 
 
 def _describe(call: llm.ToolCall) -> tuple[str, str]:
@@ -273,8 +280,8 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
         return call.name, call.arguments
     if not isinstance(arguments, dict):
         return call.name, call.arguments
-    from . import files
-    return files.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
+    from . import files, job_tools
+    return job_tools.describe(call.name, arguments) or files.describe(call.name, arguments) or (str(arguments.get("summary") or call.name), str(arguments.get("code") or ""))
 
 
 def _arguments(arguments: str) -> dict:

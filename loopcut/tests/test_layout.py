@@ -29,11 +29,23 @@ def hit(display, id):
 
 
 class HeaderTest(unittest.TestCase):
+    def test_jobs_view_survives_a_new_conversation_and_exposes_controls(self):
+        row = {"id": "job1", "state": "running", "frames": [1, 2, 3], "format": "MP4",
+               "camera": "Camera", "width": 640, "height": 480, "samples": 32, "budget_seconds": 60,
+               "scene_revision": "abc", "progress": {"completed": 1, "files": [{"file": "f.png"}]}}
+        display = build(state.new_session(), view="jobs", jobs=[row])
+        self.assertEqual(hit(display, "job.job1.job_cancel")["action"], ("job_cancel", "job1"))
+        self.assertEqual(hit(display, "job.job1.job_preview")["action"], ("job_preview", "job1"))
+        self.assertEqual(hit(display, "header.jobs")["action"], ("history_close", None))
+        row["state"] = "cancelled"
+        display = build(state.new_session(), view="jobs", jobs=[row])
+        self.assertEqual(hit(display, "job.job1.job_resume")["action"], ("job_resume", "job1"))
+
     def test_icon_buttons_with_tooltips_sit_at_the_right(self):
         display = build()
         buttons = [hit(display, id) for id, _, _ in layout.HEADER_BUTTONS]
-        self.assertEqual([b["action"][0] for b in buttons], ["close_panel", "open_settings", "history_open", "new_chat"])
-        self.assertEqual([b["tip"] for b in buttons], ["Close panel", "Settings", "History", "New chat"])
+        self.assertEqual([b["action"][0] for b in buttons], ["close_panel", "open_settings", "history_open", "new_chat", "jobs_open"])
+        self.assertEqual([b["tip"] for b in buttons], ["Close panel", "Settings", "History", "New chat", "Background jobs"])
         xs = [b["x"] for b in buttons]
         self.assertEqual(xs, sorted(xs, reverse=True), "close is rightmost, then settings, history, new")
         self.assertLess(xs[-1] + buttons[-1]["w"], 420)
