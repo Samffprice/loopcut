@@ -138,11 +138,96 @@ def pick_mention():
     key("TAB")
 
 
+def hit_center(id: str) -> tuple[int, int]:
+    panel = STATE["panel"]
+    display = host._displays[panel.as_pointer()]
+    hit = next(h for h in display["hits"] if h["id"] == id)
+    region = next(r for r in panel.regions if r.type == "WINDOW")
+    return region.x + int(hit["x"] + hit["w"] / 2), region.y + int(display["height"] - (hit["y"] + hit["h"] / 2))
+
+
+def move_to(id: str) -> None:
+    x, y = hit_center(id)
+    STATE["window"].event_simulate(type="MOUSEMOVE", value="NOTHING", x=x, y=y)
+
+
+def click(id: str) -> None:
+    x, y = hit_center(id)
+    STATE["window"].event_simulate(type="MOUSEMOVE", value="NOTHING", x=x, y=y)
+    STATE["window"].event_simulate(type="LEFTMOUSE", value="PRESS", x=x, y=y)
+    STATE["window"].event_simulate(type="LEFTMOUSE", value="RELEASE", x=x, y=y)
+
+
+def prims() -> dict:
+    return {p["id"]: p for p in host._displays[STATE["panel"].as_pointer()]["prims"]}
+
+
+@step
+def open_picker():
+    assert state.session()["input"] == "hoi @Camera ", repr(state.session()["input"])
+    assert state.ui["mentions"] == [], "the list closes after a pick"
+    click("input.add")
+
+
+@step
+def search_picker():
+    picker = state.ui["picker"]
+    assert picker is not None, "the + chip did not open the picker"
+    assert picker["rows"][0] == ("Image file…", "image") and ("Cube", "object") in picker["rows"], picker["rows"]
+    assert "picker.title" in prims(), "the picker is not on screen"
+    key("C", "c")
+    key("U", "u")
+
+
+@step
+def pick_from_picker():
+    picker = state.ui["picker"]
+    assert picker["query"] == "cu" and picker["rows"][0] == ("Cube", "object"), picker
+    key("RET")
+
+
+@step
+def hover_settings():
+    session = state.session()
+    assert session["input"] == "hoi @Camera @Cube ", repr(session["input"])
+    assert state.ui["picker"] is None, "the picker stays open after a pick"
+    move_to("header.settings")
+
+
+@step
+def hover_rings():
+    assert state.ui["hover"] == "header.settings", state.ui["hover"]
+    drawn = prims()
+    assert "header.settings.bg" in drawn and drawn["tooltip.l0"]["text"] == "Settings", drawn.get("tooltip.l0")
+    move_to("input.rings")
+
+
+@step
+def open_model_menu():
+    drawn = prims()
+    assert state.ui["hover"] == "input.rings" and drawn["tooltip.l0"]["text"].startswith("Context: "), drawn.get("tooltip.l0")
+    assert "input.ring.context" in drawn, "no context ring"
+    click("input.model")
+
+
+@step
+def close_model_menu():
+    assert state.ui["model_menu"], "the model button did not open its menu"
+    assert "models.bg" in prims() and "models.row0.name" in prims(), "the menu is not on screen"
+    key("ESC")
+
+
+@step
+def leave_panel():
+    assert not state.ui["model_menu"], "Esc did not close the model menu"
+    assert state.session()["focused"], "Esc on an open menu must not release focus"
+    view = next(a for a in STATE["window"].screen.areas if a.type == "VIEW_3D" and a != STATE["panel"])
+    STATE["window"].event_simulate(type="MOUSEMOVE", value="NOTHING", x=view.x + view.width // 2, y=view.y + view.height // 2)
+
+
 @step
 def escape():
-    session = state.session()
-    assert session["input"] == "hoi @Camera ", repr(session["input"])
-    assert state.ui["mentions"] == [], "the list closes after a pick"
+    assert state.ui["hover"] is None, f"hover should clear when the mouse leaves the panel, got {state.ui['hover']!r}"
     key("ESC")
 
 

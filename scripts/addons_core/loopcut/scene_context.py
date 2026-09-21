@@ -57,17 +57,23 @@ def all_names() -> list[tuple[str, str]]:
     scene = bpy.context.scene
     selected = {o.name for o in bpy.context.view_layer.objects.selected}
     objects = sorted(scene.objects, key=lambda o: (o.name not in selected, o.name.lower()))
+    from . import addons
     return ([(o.name, "object") for o in objects]
             + [(m.name, "material") for m in bpy.data.materials]
-            + [(c.name, "collection") for c in bpy.data.collections])
+            + [(c.name, "collection") for c in bpy.data.collections]
+            + [(a["name"], "add-on") for a in addons.enabled()])
 
 
 def _resolve(name: str):
     import bpy
+    from . import addons
     for kind, store in (("object", bpy.data.objects), ("material", bpy.data.materials),
                         ("collection", bpy.data.collections)):
         if name in store:
             return kind, store[name]
+    for entry in addons.enabled():
+        if entry["name"] == name or entry["module"] == name:
+            return "add-on", entry
     return None, None
 
 
@@ -80,6 +86,10 @@ def _describe_mention(name: str) -> str:
         body = {**tools.object_summary(found), **object_info.describe(found)}
     elif kind == "material":
         body = object_info.describe_material(found)
+    elif kind == "add-on":
+        body = {"module": found["module"], "description": found["description"],
+                "operators": found["operators"][:40], "note": "inspect_api describes each operator"}
+        return f"@{name} is the add-on {found['name']!r}: {json.dumps(body, separators=(',', ':'))}"
     else:
         body = {"objects": [o.name for o in found.objects][:60],
                 "children": [c.name for c in found.children]}

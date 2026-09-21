@@ -11,8 +11,10 @@ import uuid
 _session: dict | None = None
 restoring = False  # True while checkpoints.restore loads a file, so that load is not taken for the user's.
 # view: "chat" | "history"; history rows are loaded when the view opens. mentions: (name, kind)
-# completions for the @name being typed.
-ui = {"view": "chat", "history": [], "mentions": [],
+# completions for the @name being typed. picker: {"query", "rows", "active"} while the + menu is
+# open. hover: id of the hit under the mouse, for highlights and tooltips.
+ui = {"view": "chat", "history": [], "mentions": [], "picker": None, "model_menu": False,
+      "hover": None, "mouse": None,
       "account": None}  # Plan and window usage as the gateway last reported it; account.update_usage.
 hosts: set[int] = set()  # Pointers of the areas showing the panel. Same lifetime rules as the session.
 

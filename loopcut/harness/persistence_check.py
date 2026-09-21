@@ -131,8 +131,9 @@ def resumed_on_startup():
     assert len(session["items"]) == notes["items"] and meshes() >= {"A", "B"}
     assert [i.get("checkpoint") is not None for i in session["items"] if i["kind"] == "user"] == [True, True]
     wired = conversations.wire_messages(session["id"], session["messages"])
-    assert any(isinstance(m["content"], list) and m["content"][0]["image_url"]["url"].startswith("data:image/png")
-               for m in wired), "the stored capture did not come back for the API"
+    assert any(part.get("image_url", {}).get("url", "").startswith("data:image/png")
+               for m in wired if isinstance(m["content"], list) for part in m["content"]), \
+        "the stored capture did not come back for the API"
 
 
 @step("resume")

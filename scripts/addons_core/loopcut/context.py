@@ -44,6 +44,7 @@ SUMMARY = "loopcut_summary"   # On a message: a summary of everything before it.
 CAPTURE = "loopcut_capture"   # On a user message that carries a viewport capture; not a turn.
 CAPTURE_TEXT = "Viewport capture from capture_viewport:"  # Marks captures from before CAPTURE.
 ATTACHED = "loopcut_attached"  # On a user message whose images the user attached.
+STEER = "loopcut_steer"        # On a user message sent while the agent was working; agent._fold_notes.
 REFERENCE_CARD = "loopcut_reference_card"  # On an attached message once its images were described.
 STRIP = "loopcut_strip"  # On a capture message whose last image is a strip of earlier looks.
 KEEP_IMAGES = 3      # Captures sent per request: the newest step's, until the model has acted on them.

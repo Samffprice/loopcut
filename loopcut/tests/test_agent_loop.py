@@ -20,7 +20,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, conversations, llm, state  # noqa: E402
+from loopcut import agent, checkpoints, context, conversations, llm, state  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
 
 
@@ -170,6 +170,60 @@ class AgentLoopTest(unittest.TestCase):
         self.assertTrue(system.endswith("\n\nInstalled add-ons: Probe [probe] bpy.ops.probe.say_* (2)"), system[-120:])
         # The line is read on the main thread at the start of each turn, not stored with the conversation.
         self.assertNotIn("addons_line", conversations._PERSISTED)
+
+    def awaiting(self):
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "the approval card")
+
+    def test_a_note_sent_mid_turn_is_folded_in_before_the_next_request(self):
+        SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
+                           text_reply("Done, in red.")]
+        turn = self.start("add a cube")
+        self.awaiting()
+        self.assertTrue(agent.send("make it red"), "a message while busy is queued, not refused")
+        queued = self.session["items"][-1]
+        self.assertEqual((queued["kind"], queued["text"], queued.get("queued")), ("user", "make it red", True))
+        self.assertEqual(self.session["input"], "", "send() does not touch the input; the panel clears it")
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertNotIn("queued", queued, "folded in: the tag is gone")
+        sent = SCRIPT.requests[1]["messages"]
+        self.assertEqual((sent[-1]["role"], sent[-1]["content"]), ("user", "<steer>make it red</steer>"))
+        self.assertEqual(sent[-2]["role"], "tool", "the note comes after the step's results")
+        self.assertIn("<steer>", sent[0]["content"], "the prompt says what a steer message is")
+        self.assertEqual(len([m for m in self.session["messages"] if m.get(context.STEER)]), 1)
+        self.assertEqual(self.session["items"][-1]["text"], "Done, in red.")
+
+    def test_a_note_too_late_to_fold_in_starts_the_next_turn(self):
+        resent = []
+        agent._resend_on_main = resent.append
+        fold = agent._fold_notes
+        agent._fold_notes = lambda session, turn: None  # As if the note came during the final request.
+        try:
+            SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
+                               text_reply("Done.")]
+            turn = self.start("add a cube")
+            self.awaiting()
+            self.assertTrue(agent.send("and a sphere"))
+            item = self.session["items"][-1]
+            agent.decide(True)
+            turn.thread.join(5)
+        finally:
+            agent._fold_notes = fold
+        self.assertEqual(resent, ["and a sphere"])
+        self.assertNotIn(item, self.session["items"], "the queued item is replaced by the turn it starts")
+        self.assertFalse(self.session["busy"])
+
+    def test_a_note_left_over_after_a_stop_goes_back_to_the_input(self):
+        restored = []
+        agent._restore_input_on_main = restored.append
+        SCRIPT.replies.append(tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}))
+        turn = self.start("add a cube")
+        self.awaiting()
+        self.assertTrue(agent.send("wait"))
+        agent.stop()
+        turn.thread.join(5)
+        self.assertEqual(restored, ["wait"])
+        self.assertFalse(any(i.get("queued") for i in self.session["items"]))
 
     def test_tool_call_waits_for_approval_then_runs_and_continues(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),

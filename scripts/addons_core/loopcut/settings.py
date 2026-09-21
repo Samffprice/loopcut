@@ -92,8 +92,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", "Slowest")],
         default="medium", update=_changed)
     auto_run: bpy.props.BoolProperty(
-        name="Run code and file changes without asking", default=False, update=_changed,
-        description="Skip the Run / Reject step for code and file changes. Renders and bakes still ask. "
+        name="Run without asking", default=False, update=_changed,
+        description="Run code and file changes without the Run / Reject step. Renders and bakes still ask. "
                     "Every turn still gets a checkpoint you can restore")
     auto_look: bpy.props.BoolProperty(
         name="Look after every change", default=True, update=_changed,
@@ -101,17 +101,17 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
                     "One image per change; off, it only sees what it asks to see")
     max_steps: bpy.props.IntProperty(name="Steps per message", default=25, min=1, max=200, update=_changed)
     context_budget: bpy.props.IntProperty(
-        name="Context budget (tokens)", default=config.DEFAULT_CONTEXT_BUDGET,
+        name="Context budget", default=config.DEFAULT_CONTEXT_BUDGET,
         min=config.MIN_CONTEXT_BUDGET, max=config.MAX_CONTEXT_BUDGET, step=1000, update=_changed,
-        description="How much of the conversation each request may carry. Over this, old tool results "
+        description="Tokens each request may carry of the conversation. Over this, old tool results "
                     "are shortened and then the earlier conversation is summarized. Lower is cheaper; "
                     "higher remembers more")
     run_timeout: bpy.props.IntProperty(
         name="Stop code after (s)", default=60, min=1, max=3600, update=_changed,
         description="A step that runs longer is stopped, so an endless loop cannot freeze Blender")
     checkpoint_budget_mb: bpy.props.IntProperty(
-        name="Checkpoint storage (MB)", default=2048, min=1, max=1_000_000, update=_changed,
-        description="Per conversation. The oldest checkpoints expire first")
+        name="Checkpoints (MB)", default=2048, min=1, max=1_000_000, update=_changed,
+        description="Checkpoint storage per conversation. The oldest checkpoints expire first")
     dock_on_startup: bpy.props.BoolProperty(
         name="Open the panel at startup", default=True,
         description="Dock Loopcut at the right of the 3D viewport when Blender starts without it")
@@ -119,11 +119,16 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
-        column = layout.column()
+        layout.use_property_decorate = False
+
+        box = layout.box()
+        box.label(text="Connection", icon="WORLD")
+        column = box.column()
         column.prop(self, "provider")
         if self.provider == "LOOPCUT":
             account.draw(column.column(align=True))
-            column.prop(self, "tier")
+            column.separator()
+            column.row(align=True).prop(self, "tier", expand=True)
         else:
             if self.provider == "CUSTOM":
                 column.prop(self, "base_url")
@@ -136,18 +141,28 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
                 row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
         note = _BY_ID[self.provider][4]
         if note:
-            box = layout.box().column(align=True)
-            box.scale_y = 0.8
-            for line in wrap(note, 80):
-                box.label(text=line)
-        column = layout.column(heading="Agent")
-        column.prop(self, "reasoning_effort")
-        column.prop(self, "auto_run")
-        column.prop(self, "auto_look")
+            lines = wrap(note, 90)
+            info = box.column(align=True)
+            info.scale_y = 0.85
+            for n, line in enumerate(lines):
+                info.label(text=line, icon="INFO" if n == 0 else "BLANK1")
+
+        split = layout.split(factor=0.5)
+        agent = split.box()
+        agent.label(text="Agent", icon="PLAY")
+        agent.column().prop(self, "reasoning_effort")
+        flags = agent.column()
+        flags.use_property_split = False  # A checkbox reads best with its whole label beside it.
+        flags.prop(self, "auto_run")
+        flags.prop(self, "auto_look")
+        flags.prop(self, "dock_on_startup")
+        limits = split.box()
+        limits.label(text="Limits", icon="TIME")
+        column = limits.column()
         column.prop(self, "max_steps")
+        column.prop(self, "context_budget")
         column.prop(self, "run_timeout")
         column.prop(self, "checkpoint_budget_mb")
-        column.prop(self, "dock_on_startup")
 
 
 def wrap(text: str, width: int) -> list[str]:
@@ -233,6 +248,36 @@ def preferences():
     """None when Loopcut runs from a dev checkout without being enabled as an add-on."""
     addon = bpy.context.preferences.addons.get(PACKAGE)
     return addon.preferences if addon else None
+
+
+def model_options() -> list[tuple[str, str, str, bool]]:
+    """(id, label, note, current) for the panel's model button. On the Loopcut provider the
+    choice is the tier; elsewhere it is among the models "Fetch models" found, plus the current one."""
+    prefs = preferences()
+    if prefs is None:
+        try:
+            current = config.load().model
+        except config.ConfigError:
+            return []
+        return [(current, current, "from .env", True)]
+    if prefs.provider == "LOOPCUT":
+        return [(id, label, note, prefs.tier == id) for id, label, note in account.MODELS]
+    names = list(_models)
+    if prefs.model and prefs.model not in names:
+        names.insert(0, prefs.model)
+    return [(name, name, "", name == prefs.model) for name in names]
+
+
+def choose_model(model_id: str) -> None:
+    """The panel's model button picked one; see model_options."""
+    prefs = preferences()
+    if prefs is None or not model_id:
+        return
+    if prefs.provider == "LOOPCUT":
+        if model_id in {id for id, _, _ in account.MODELS}:
+            prefs.tier = model_id  # _tier_changed copies it to the model and reloads the config.
+    else:
+        prefs.model = model_id
 
 
 def set_tier(tier: str) -> None:

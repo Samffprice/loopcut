@@ -21,6 +21,18 @@ _FRAGMENT = """
 void main()
 {
   vec2 half_size = rect.zw * 0.5;
+  if (shape.z > 0.5) {
+    /* Ring: a track in border_color, filled clockwise from the top for shape.w of the way in color. */
+    float radius = min(half_size.x, half_size.y);
+    float band = abs(length(local) - (radius - shape.y * 0.5)) - shape.y * 0.5;
+    float coverage = 1.0 - smoothstep(-0.5, 0.5, band);
+    float angle = atan(local.x, local.y);
+    if (angle < 0.0) angle += 6.2831853;
+    float fill = shape.w >= 1.0 ? 1.0 : smoothstep(-0.5, 0.5, (shape.w * 6.2831853 - angle) * radius);
+    vec4 ring = mix(border_color, color, fill);
+    fragColor = vec4(ring.rgb, ring.a * coverage);
+    return;
+  }
   float r = min(shape.x, min(half_size.x, half_size.y));
   vec2 q = abs(local) - half_size + vec2(r);
   float dist = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
@@ -43,7 +55,7 @@ def _rect_shader():
         info.push_constant("VEC4", "rect")
         info.push_constant("VEC4", "color")
         info.push_constant("VEC4", "border_color")
-        info.push_constant("VEC4", "shape")  # x: corner radius, y: border width
+        info.push_constant("VEC4", "shape")  # x: corner radius, y: border or ring width, z: 1 for a ring, w: ring share
         info.vertex_in(0, "VEC2", "pos")
         interface = gpu.types.GPUStageInterfaceInfo("loopcut_rect_iface")
         interface.smooth("VEC2", "local")
@@ -115,6 +127,15 @@ def render(display: dict) -> None:
             shader.uniform_float("color", prim["color"])
             shader.uniform_float("border_color", prim["border_color"])
             shader.uniform_float("shape", (prim["radius"], prim["border"], 0.0, 0.0))
+            batch.draw(shader)
+        elif prim["t"] == "ring":
+            gpu.state.blend_set("ALPHA")
+            shader.bind()
+            shader.uniform_float("ModelViewProjectionMatrix", matrix)
+            shader.uniform_float("rect", (prim["x"], height - prim["y"] - prim["h"], prim["w"], prim["h"]))
+            shader.uniform_float("color", prim["color"])
+            shader.uniform_float("border_color", prim["track"])
+            shader.uniform_float("shape", (0.0, prim["thickness"], 1.0, prim["share"]))
             batch.draw(shader)
         elif prim["t"] == "mark":
             _draw_mark(prim, height)

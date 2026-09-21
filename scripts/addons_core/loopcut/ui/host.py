@@ -12,7 +12,7 @@ from pathlib import Path
 
 import bpy
 
-from .. import account, agent, checkpoints, config, conversations, scene_context, state
+from .. import account, agent, checkpoints, config, conversations, scene_context, settings, state
 from . import draw, layout, textedit
 
 NATIVE = hasattr(bpy.types, "SpaceLoopcut")
@@ -53,14 +53,20 @@ def config_changed() -> None:
 
 def _model_label() -> tuple[str, bool]:
     """(what to show in the input's footer, whether Loopcut still needs setting up)."""
+    return _config_cached()[:2]
+
+
+def _config_cached() -> tuple[str, bool, int]:
+    """(model label, whether Loopcut still needs setting up, context budget), reread every CONFIG_TTL."""
     cached = _runtime.get("model")
-    if cached is None or time.monotonic() - cached[2] > CONFIG_TTL:
+    if cached is None or time.monotonic() - cached[3] > CONFIG_TTL:
         try:
-            cached = (config.load().model, False, time.monotonic())
+            cfg = config.load()
+            cached = (cfg.model, False, cfg.context_budget, time.monotonic())
         except config.ConfigError:
-            cached = ("Set up Loopcut", True, time.monotonic())
+            cached = ("Set up Loopcut", True, config.DEFAULT_CONTEXT_BUDGET, time.monotonic())
         _runtime["model"] = cached
-    return cached[0], cached[1]
+    return cached[0], cached[1], cached[2]
 
 
 def _checkpoint_statuses(session: dict) -> dict:
@@ -98,11 +104,13 @@ def draw_area() -> None:
     if not is_host(area):
         return
     session = state.session()
-    model, needs_setup = _model_label()
+    model, needs_setup, budget = _config_cached()
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
+    options = settings.model_options() if state.ui.get("model_menu") else []
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
-                           {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection})
+                           {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
+                            "context_budget": budget, "model_options": options})
     session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
@@ -146,6 +154,72 @@ def _submit(session: dict) -> None:
     state.ui["mentions"] = []
 
 
+# ---------------------------------------------------------------- the + menu
+
+PICKER_ROWS = 8
+
+
+def _picker_names() -> list[tuple[str, str]]:
+    """Everything the + menu can add: an image file, then what @ completes."""
+    return [("Image file…", "image")] + scene_context.all_names()
+
+
+def _open_picker() -> None:
+    state.ui["picker"] = {"query": "", "rows": [], "active": 0}
+    state.ui["mentions"], state.ui["model_menu"] = [], False
+    _filter_picker()
+
+
+def _filter_picker() -> None:
+    picker = state.ui.get("picker")
+    if picker is None:
+        return
+    names = _picker_names()
+    query = picker["query"]
+    picker["rows"] = scene_context.candidates_from(names, query, PICKER_ROWS) if query else names[:PICKER_ROWS]
+    picker["active"] = min(picker.get("active", 0), max(0, len(picker["rows"]) - 1))
+
+
+def _close_popups() -> None:
+    state.ui["picker"], state.ui["model_menu"] = None, False
+
+
+def _pick_from_picker(session: dict, index: int) -> None:
+    picker = state.ui.get("picker") or {}
+    rows = picker.get("rows") or []
+    if not 0 <= index < len(rows):
+        return
+    name, kind = rows[index]
+    _close_popups()
+    if kind == "image":
+        bpy.ops.loopcut.attach_images("INVOKE_DEFAULT")
+        return
+    textedit.insert(session, scene_context.mention_text(name) + " ")
+    _update_mentions(session)
+
+
+def _picker_key(session: dict, event) -> bool:
+    """Keys while the + menu is open: they search it. True when the key was used."""
+    picker = state.ui["picker"]
+    kind = event.type
+    if kind == "ESC":
+        _close_popups()
+    elif kind in {"UP_ARROW", "DOWN_ARROW"}:
+        if picker["rows"]:
+            picker["active"] = (picker["active"] + (1 if kind == "DOWN_ARROW" else -1)) % len(picker["rows"])
+    elif kind in {"RET", "NUMPAD_ENTER", "TAB"}:
+        _pick_from_picker(session, picker["active"])
+    elif kind == "BACK_SPACE":
+        picker["query"] = picker["query"][:-1]
+        _filter_picker()
+    elif event.unicode and event.unicode.isprintable() and not (event.oskey or event.ctrl):
+        picker["query"] += event.unicode
+        _filter_picker()
+    else:
+        return False
+    return True
+
+
 def _open_settings() -> None:
     from .. import settings
     if settings.preferences() is None:
@@ -167,7 +241,21 @@ def _do_action(session: dict, action) -> None:
         conversations.save(session)
     elif kind == "mention_pick":
         _pick_mention(session, index)
+    elif kind == "picker_open":
+        _close_popups() if state.ui.get("picker") is not None else _open_picker()
+    elif kind == "picker_pick":
+        _pick_from_picker(session, index)
+    elif kind == "model_menu":
+        state.ui["model_menu"] = not state.ui.get("model_menu")
+        state.ui["picker"] = None
+    elif kind == "model_pick":
+        _close_popups()
+        settings.choose_model(index)
+        config_changed()
+    elif kind == "noop":
+        pass
     elif kind == "open_settings":
+        _close_popups()
         _open_settings()
     elif kind == "open_url":
         account.open_browser(session["items"][index]["url"])
@@ -425,7 +513,10 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         x, y, inside = _local(_window_region(area), event)
         if inside and display:
             action = layout.hit_test(display, x, y)
-            if action and action[0] != "focus":
+            kind = action[0] if action else None
+            if kind not in POPUP_ACTIONS and kind not in ("picker_open", "model_menu"):
+                _close_popups()  # A click anywhere else puts a menu away.
+            if action and kind != "focus":
                 _do_action(session, action)
         return inside
 
@@ -441,6 +532,11 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         kind, shift = event.type, event.shift
         command = event.oskey or event.ctrl       # Cmd on macOS, Ctrl elsewhere; both accepted.
         by_word = event.alt or (event.ctrl and sys.platform != "darwin")
+        if state.ui.get("picker") is not None and _picker_key(session, event):
+            return True
+        if state.ui.get("model_menu") and kind == "ESC":
+            _close_popups()
+            return True
         mentions = state.ui.get("mentions") or []
         if mentions and kind in {"UP_ARROW", "DOWN_ARROW"}:
             session["mention"] = (session.get("mention", 0) + (1 if kind == "DOWN_ARROW" else -1)) % len(mentions)
@@ -519,6 +615,35 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "mention_pick", "open_settings"}
+
+
+class LOOPCUT_OT_hover(bpy.types.Operator):
+    """Follows the mouse over the panel for hover highlights and tooltips"""
+    bl_idname = "loopcut.hover"
+    bl_label = "Loopcut Hover"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        # From the window keymap, so leaving the panel clears the highlight; cheap when neither applies.
+        return is_host(context.area) or bool(state.ui.get("hover"))
+
+    def invoke(self, context, event):
+        area = context.area
+        hovered = None
+        if is_host(area):
+            display = _displays.get(area.as_pointer())
+            x, y, inside = _local(_window_region(area), event)
+            hit = layout.hit_at(display, x, y) if inside and display else None
+            hovered = hit["id"] if hit else None
+            state.ui["mouse"] = (x, y)
+        if state.ui.get("hover") != hovered:
+            state.ui["hover"] = hovered
+            tag_redraw_all()
+        return {"PASS_THROUGH"}
+
+
 class LOOPCUT_OT_attach_images(bpy.types.Operator):
     """Attach images to your next message"""
     bl_idname = "loopcut.attach_images"
@@ -567,7 +692,8 @@ class LOOPCUT_FH_images(bpy.types.FileHandler):
         return context.area is not None and is_host(context.area)
 
 
-_CLASSES = (LOOPCUT_OT_open, LOOPCUT_OT_focus, LOOPCUT_OT_scroll, LOOPCUT_OT_interact, LOOPCUT_OT_attach_images,
+_CLASSES = (LOOPCUT_OT_open, LOOPCUT_OT_focus, LOOPCUT_OT_scroll, LOOPCUT_OT_interact, LOOPCUT_OT_hover,
+            LOOPCUT_OT_attach_images,
             LOOPCUT_FH_images)
 
 
@@ -586,7 +712,8 @@ def register() -> None:
         window_keymap = keyconfig.keymaps.new(name="Window", space_type="EMPTY")
         focus = window_keymap.keymap_items.new(LOOPCUT_OT_focus.bl_idname, "L", "PRESS", **(
             {"oskey": True} if COMMAND == "oskey" else {"ctrl": True, "alt": True}))
-        _runtime["keymap"] = [(keymap, items), (window_keymap, [focus])]
+        hover = window_keymap.keymap_items.new(LOOPCUT_OT_hover.bl_idname, "MOUSEMOVE", "ANY")
+        _runtime["keymap"] = [(keymap, items), (window_keymap, [focus, hover])]
 
 
 def unregister() -> None:

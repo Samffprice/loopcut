@@ -40,6 +40,9 @@ sensibly; real-world scale in meters unless told otherwise.
 prefixes. inspect_api describes their operators, modules and preferences \
 (bpy.context.preferences.addons[module].preferences) like the rest of the API. An operator that needs \
 another editor's context runs with run_python's `editor`.
+- A user message wrapped in <steer> arrived while you were working. Fold it into what you are doing \
+(it may change the goal, add a constraint or answer a question) and continue; do not start over or redo \
+finished work.
 - Keep replies short: what you did and anything the user must decide. No code dumps.
 - As the conversation grows, the code and results of older steps are cut to a line, and a \
 <conversation_summary> may stand for earlier messages. The scene is the source of truth: look again \
@@ -81,6 +84,7 @@ class Turn:
         self.config: config.Config | None = None  # Loaded on the main thread by send().
         self.scene_before: dict | None = None
         self.scene_after: dict | None = None
+        self.notes: list = []       # (text, chat item) sent while the turn runs; folded in at the next step.
 
 
 def _redraw() -> None:
@@ -135,6 +139,32 @@ def _system_prompt(session: dict) -> str:
 def _scene_snapshot() -> dict:
     from . import scene_diff
     return scene_diff.snapshot()
+
+
+def _resend_on_main(text: str) -> None:
+    """A note that arrived too late to be folded in starts the next turn by itself."""
+    from . import mainthread
+    mainthread.run_on_main(lambda: send(text))
+
+
+def _restore_input_on_main(text: str) -> None:
+    from . import mainthread
+    from .ui import textedit
+
+    def restore():
+        session = state.session()
+        if not session["input"]:
+            textedit.set_text(session, text)
+    mainthread.run_on_main(restore)
+
+
+def _fold_notes(session: dict, turn: Turn) -> None:
+    """What the user sent while the turn ran goes in before the next request, marked so the
+    model continues rather than starts over. The chat item drops its 'queued' tag."""
+    while turn.notes:
+        text, item = turn.notes.pop(0)
+        item.pop("queued", None)
+        session["messages"].append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
 
 
 def _project_roots() -> tuple:
@@ -384,6 +414,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             except llm.LLMError as ex:
                 print(f"Loopcut: could not describe the attached images: {ex}")
         for _ in range(cfg.max_steps):
+            _fold_notes(session, turn)
             prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set)
             if compacted:
                 items.append(state.item_notice(
@@ -515,10 +546,20 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 item["status"] = "rejected"
         session["busy"] = False
         session["turn"] = None
+        # Notes that arrived after the last fold: sent as the next message, or, after a stop, put
+        # back in the input box for the user to decide.
+        late = [(text, item) for text, item in turn.notes]
+        turn.notes.clear()
+        for _, item in late:
+            if item in items:
+                items.remove(item)
         try:
             conversations.save(session)
         except OSError as ex:
             items.append(state.item_error(f"Could not save this conversation: {ex}"))
+        if late:
+            joined = "\n".join(text for text, _ in late)
+            (_restore_input_on_main if turn.cancel.is_set() else _resend_on_main)(joined)
         _redraw()
 
 
@@ -526,7 +567,17 @@ def send(text: str) -> bool:
     session = state.session()
     text = text.strip()
     attachments = list(session["attachments"])
-    if not (text or attachments) or session["busy"]:
+    if session["busy"]:
+        # Mid-turn: the note is queued and folded in at the agent's next step; see _fold_notes.
+        turn = session.get("turn")
+        if not text or turn is None:
+            return False
+        item = state.item_user(text)
+        item["queued"] = True
+        session["items"].append(item)
+        turn.notes.append((text, item))
+        return True
+    if not (text or attachments):
         return False
     turn = Turn()
     try:
