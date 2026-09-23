@@ -261,9 +261,10 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         reject_width = f.button(f"item{n}.tool.reject", inner_x + run_width + f.px(8), cursor, "Reject  esc",
                                 T.BUTTON_GHOST, T.TEXT, ("reject", n))
         always_x = inner_x + run_width + reject_width + f.px(16)
-        # A render or bake asks every time: there is no "always" for it.
-        if not item.get("heavy") and always_x + f.measure("ui", small, "Always allow") + f.px(20) <= inner_x + inner_w:
-            f.button(f"item{n}.tool.always", always_x, cursor, "Always allow", T.BUTTON_GHOST, T.TEXT_MUTED,
+        # A render or bake has its own "always", apart from the one for ordinary steps.
+        always = "Always allow renders" if item.get("heavy") else "Always allow"
+        if always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
+            f.button(f"item{n}.tool.always", always_x, cursor, always, T.BUTTON_GHOST, T.TEXT_MUTED,
                      ("approve_always", n))
         cursor += f.px(24)
     cursor += f.px(7)

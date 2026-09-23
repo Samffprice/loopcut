@@ -5,7 +5,8 @@ Access rules, applied by the gate in agent.py through needs_approval:
 - Reads inside the project (the .blend's folder, the render output folder, Blender's temp folder)
   run unasked; reads elsewhere wait for the user, unless they said "Always allow".
 - Every write or move waits for the user, unless they said "Always allow".
-- A render (see_render with render=true) waits for the user every time; see tools.is_heavy.
+- A render (see_render with render=true) waits for the user unless they said "Always allow
+  renders"; see tools.is_heavy.
 - Hidden files and folders and Loopcut's own data are off limits altogether: they hold keys,
   tokens and conversations, and the model has no business there.
 - Nothing here deletes, and nothing overwrites unless asked to in so many words.
@@ -82,7 +83,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         "description": (
             "The user's last render (F12) as an image you see. With render=true, a new render through the "
             "scene camera: sized for you and capped in samples unless full=true. A render blocks Blender "
-            "and waits for the user's OK every time; prefer capture_viewport while building."),
+            "and waits for the user's OK; prefer capture_viewport while building."),
         "parameters": {"type": "object", "properties": {
             "render": {"type": "boolean", "description": "Render now instead of showing the last render"},
             "full": {"type": "boolean", "description": "The user's own resolution and samples; slow"},
@@ -149,7 +150,7 @@ def check(path: Path) -> Path:
 
 def needs_approval(name: str, arguments: dict, roots) -> bool:
     """Whether the user must approve this call (unless they chose "Always allow"). Renders are
-    handled separately by tools.is_heavy: they are never waived."""
+    handled separately by tools.is_heavy: "Always allow" does not waive them."""
     if name in WRITE_TOOLS:
         return True
     if name in READ_TOOLS:

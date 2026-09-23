@@ -649,7 +649,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertFalse(awaiting()[0].get("heavy"))
         self.assertTrue(agent.decide(True, always=True))
         self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "see_render", "the render's card")
-        self.assertTrue(awaiting()[0]["heavy"], "a render is marked heavy so the card offers no Always")
+        self.assertTrue(awaiting()[0]["heavy"], "a render is marked heavy so the card offers Always allow renders")
         self.assertEqual(awaiting()[0]["summary"], "Render the scene (preview)")
         agent.decide(True)
         self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "run_python", "the rendering code's card")
@@ -657,6 +657,28 @@ class AgentLoopTest(unittest.TestCase):
         agent.decide(False)
         turn.thread.join(5)
         self.assertEqual([n for n, _ in self.ran], ["run_python", "see_render"], "the rejected render never ran")
+
+    def test_always_allow_renders_stops_asking_for_renders_only(self):
+        SCRIPT.replies += [tool_reply("see_render", {"render": True}),
+                           tool_reply("see_render", {"render": True}),
+                           tool_reply("run_python", {"code": "a()", "summary": "a"}),
+                           tool_reply("run_python", {"code": "bpy.ops.render.render(write_still=True)", "summary": "render"}),
+                           text_reply("Done.")]
+        turn = self.start("render it twice")
+        awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
+        self.wait_for(awaiting, "the render's card")
+        self.assertTrue(awaiting()[0]["heavy"])
+        self.assertTrue(agent.decide(True, always=True))
+        self.wait_for(lambda: awaiting() and awaiting()[0]["summary"] == "a", "the ordinary step's card")
+        self.assertFalse(self.session["auto_run"], "allowing renders does not allow other steps")
+        self.assertEqual([n for n, _ in self.ran], ["see_render", "see_render"], "second render ran unasked")
+        agent.decide(True)
+        self.wait_for(lambda: awaiting() and awaiting()[0]["summary"] == "render", "the rendering code's card")
+        self.assertFalse(awaiting()[0]["heavy"], "code that renders still asks as code, so its Always is the plain one")
+        agent.decide(False)
+        turn.thread.join(5)
+        self.assertEqual([n for n, _ in self.ran], ["see_render", "see_render", "run_python"])
+        self.assertFalse(state.new_session()["auto_heavy"], "a new conversation asks again")
 
     def test_a_render_asks_even_with_auto_run_on(self):
         os.environ["LOOPCUT_AUTO_RUN"] = "true"

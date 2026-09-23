@@ -151,13 +151,13 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 CHANGES_SCENE = {"run_python", "import_polyhaven", "import_asset", "import_polypizza", "import_blenderkit"}
 NEEDS_APPROVAL = CHANGES_SCENE
 # Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
-# user every time, whatever they have allowed: "Always allow" and auto-run do not cover it.
+# user unless they said "Always allow renders": "Always allow" and auto-run do not cover it.
 HEAVY_CODE = re.compile(r"ops\.(?:render\.(?:render|opengl)|object\.bake|cycles\.bake|ptcache\.bake|"
                         r"fluid\.bake|rigidbody\.bake|object\.(?:voxel|quadriflow)_remesh)")
 
 
 def is_heavy(name: str, arguments: dict) -> bool:
-    """A step that renders, bakes or simulates: the user approves it every time."""
+    """A step that renders, bakes or simulates: it asks even when other steps run unasked."""
     if name == "run_python":
         return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
     if name in {"start_render_job", "resume_render_job", "inspect_scene"}:

@@ -6,7 +6,8 @@ The editing process only waits for the copy-save, not for rendering. `render_job
 The Jobs button in the panel header shows progress, errors, Preview, Output, Cancel and Resume.
 Jobs continue after the panel, conversation, or launching Blender process closes.
 
-Each attempt requires approval for the saved settings and an explicit wall-clock budget. Resuming
+Each attempt requires approval (unless the user chose "Always allow renders" in that conversation)
+for the saved settings and an explicit wall-clock budget. Resuming
 uses the original budget again. It never includes newer edits to the live scene. A job's compressed
 `.blend`, SHA-256 revision, engine, camera, frame list, dimensions, samples, FPS, source path, external
 asset hashes and output location live in `<data>/jobs/<id>/spec.json`. They do not expire with chat

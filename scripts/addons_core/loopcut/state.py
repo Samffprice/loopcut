@@ -39,6 +39,7 @@ def new_session() -> dict:
         "title": "",
         "created": time.time(),
         "auto_run": False,               # "Always allow" for this conversation; never saved.
+        "auto_heavy": False,             # "Always allow renders" (and bakes) likewise.
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},

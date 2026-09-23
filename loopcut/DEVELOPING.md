@@ -33,7 +33,9 @@ Developers: copy `loopcut/.env.example` to `.env` next to the checkout and fill 
 `.env`. Lookup order per setting: environment, preferences, `.env`.
 
 Model-written code asks before it runs ("Always allow" on the card stops asking for that
-conversation; the preference or `LOOPCUT_AUTO_RUN=true` turns asking off). A step that runs longer
+conversation; the preference or `LOOPCUT_AUTO_RUN=true` turns asking off). Renders and bakes
+ask even then; "Always allow renders" on a render's card stops that for the conversation, though
+code that renders still needs the plain "Always allow" too. A step that runs longer
 than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped at the next Python trace event. This cannot interrupt
 a native render or bake. [Durable render jobs](RENDER_JOBS.md) run outside the editing process,
 with a separate supervisor enforcing cancellation and time limits.

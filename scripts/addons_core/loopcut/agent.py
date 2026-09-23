@@ -44,7 +44,8 @@ match the viewpoint with the camera, build from the card, then compare_with_refe
 change and fix the differences you see; look_at_reference for a detail at full resolution.
 - Files: list_files and read_file read the disk (an image file you then see); write_file and move_file \
 change it, with the user's approval; nothing deletes. see_render shows the user's last render, or with \
-render=true renders now: that, like any render or bake in run_python, waits for the user's OK every time.
+render=true renders now: that, like any render or bake in run_python, waits for the user's OK \
+unless they allowed renders.
 - For render/export deliverables use start_render_job: a saved scene copy renders outside the editing \
 process, with an explicit frame list, dimensions, samples and time budget. Approval covers this job \
 only. render_job_status reports progress and verified files; cancel_render_job stops it; resume_render_job \
@@ -171,8 +172,8 @@ def _fresh_images(images: list) -> list:
 
 def _approval(name: str, arguments: str, roots) -> str:
     """"" when the call runs unasked; "gate" when the user must approve it unless they said
-    "Always allow" or auto-run is on; "heavy" when they must approve it every time: a render,
-    a bake, a simulation, which can hold Blender for minutes."""
+    "Always allow" or auto-run is on; "heavy" for a render, a bake, a simulation, which can hold
+    Blender for minutes: it asks unless they said "Always allow renders"; see _asks."""
     from . import files, tools
     parsed = _arguments(arguments)
     if tools.is_heavy(name, parsed):
@@ -180,6 +181,16 @@ def _approval(name: str, arguments: str, roots) -> str:
     if name in tools.NEEDS_APPROVAL or files.needs_approval(name, parsed, roots):
         return "gate"
     return ""
+
+
+def _asks(approval: str, name: str, session: dict, cfg) -> bool:
+    """Whether the step waits for the user. "Always allow renders" waives only the render itself:
+    code that renders is still code, so it also needs "Always allow" or auto-run."""
+    from . import tools
+    allowed = cfg.auto_run or session["auto_run"]
+    if approval == "heavy":
+        return not session["auto_heavy"] or (name in tools.NEEDS_APPROVAL and not allowed)
+    return bool(approval) and not allowed
 
 
 def _changes_scene(name: str) -> bool:
@@ -547,9 +558,11 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 card = state.item_tool(call.name, summary, code)
                 items.append(card)
                 approval = _approval(call.name, call.arguments, turn.roots)
-                if approval == "heavy" or (approval and not (cfg.auto_run or session["auto_run"])):
+                if _asks(approval, call.name, session, cfg):
                     turn.decided.clear()
-                    card["status"], card["heavy"] = "awaiting", approval == "heavy"
+                    # heavy: asking because it renders, so the card's "always" allows renders.
+                    card["status"] = "awaiting"
+                    card["heavy"] = approval == "heavy" and not session["auto_heavy"]
                     _redraw()
                     if not _wait_for_approval(turn):
                         card["status"] = "rejected"
@@ -739,13 +752,15 @@ def resume() -> bool:
 
 
 def decide(approved: bool, always: bool = False) -> bool:
-    """Answer the pending approval card, if there is one. `always` stops asking in this conversation."""
+    """Answer the pending approval card, if there is one. `always` stops asking in this
+    conversation: for renders when the card is a render's, otherwise for everything else."""
     session = state.session()
     turn = session["turn"]
-    if turn is None or not any(i.get("status") == "awaiting" for i in session["items"]):
+    card = next((i for i in session["items"] if i.get("status") == "awaiting"), None)
+    if turn is None or card is None:
         return False
     if approved and always:
-        session["auto_run"] = True
+        session["auto_heavy" if card.get("heavy") else "auto_run"] = True
     turn.approved = approved
     turn.decided.set()
     return True
