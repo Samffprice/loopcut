@@ -181,6 +181,7 @@ def stream_chat(
             usage = chunk.get("usage")
             if isinstance(usage, dict):
                 completion.usage = {"input": int(usage.get("prompt_tokens") or 0),
+                                    "cached": int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
                                     "output": int(usage.get("completion_tokens") or 0)}
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}

@@ -694,7 +694,7 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies += [sse({"choices": [{"delta": {"content": "Hi."}}]}, usage)] * 2
         self.start("hi").thread.join(5)
         self.start("again").thread.join(5)
-        self.assertEqual(self.session["usage"], {"input": 240, "output": 16, "context": 120})
+        self.assertEqual(self.session["usage"], {"input": 240, "cached": 0, "output": 16, "context": 120})
         self.assertEqual(SCRIPT.requests[0]["stream_options"], {"include_usage": True})
 
     def test_overloaded_api_is_retried_and_the_user_never_sees_it(self):

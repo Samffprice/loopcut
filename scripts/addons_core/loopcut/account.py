@@ -27,7 +27,7 @@ BASE_URL = f"{SERVICE_URL}/v1"
 WATCH_EVERY = 4.0          # Seconds between looks at /v1/me while the user upgrades in the browser.
 WATCH_FOR = 15 * 60.0      # How long to keep looking.
 _watch_generation = 0
-MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))
+MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))  # Until /v1/models answers.
 
 _state = {
     "status": "idle",   # idle | starting | waiting | error
@@ -35,6 +35,8 @@ _state = {
     "url": "",
     "error": "",
     "account": None,    # /v1/me payload once known
+    "models": None,     # /v1/models rows once known: what the picker lists, with plan and usage notes
+    "default_model": "fast",
     "fetched_at": 0.0,
 }
 _cancel = threading.Event()
@@ -197,9 +199,47 @@ def _set_account(payload: dict | None) -> None:
 def _refresh_account(key: str) -> None:
     try:
         _set_account(_get("/v1/me", key))
+        _set_models(_get("/v1/models", key))
     except AccountError as ex:
         _state["error"] = str(ex)
     _redraw()
+
+
+def _set_models(payload: dict) -> None:
+    """The catalogue as the service lists it; see loopcut-web's /v1/models."""
+    rows = [r for r in payload.get("data") or [] if isinstance(r, dict) and r.get("id")]
+    if rows:
+        _state["models"] = rows
+        _state["default_model"] = str(payload.get("default") or next((r["id"] for r in rows if r.get("default")), "fast"))
+
+
+def models() -> list[dict]:
+    """(id, label, note, available, default) per model the service offers, in its order. The
+    note says what a step costs against the default ("2.4x usage") and which plan unlocks it."""
+    rows = _state["models"]
+    if not rows:
+        return [{"id": id, "label": label, "note": note, "available": True, "default": id == "fast"} for id, label, note in MODELS]
+    out = []
+    for r in rows:
+        parts = [str(r.get("blurb") or "")]
+        multiplier = r.get("usage_multiplier")
+        if isinstance(multiplier, (int, float)) and not r.get("default"):
+            parts.append(f"{multiplier:g}x usage")
+        unlock = r.get("unlock_plan") or {}
+        if not r.get("available", True):
+            parts.append(f"{unlock.get('name') or 'a higher'} plan")
+        out.append({"id": str(r["id"]), "label": str(r.get("display_name") or r["id"]),
+                    "note": "  ·  ".join(p for p in parts if p), "available": bool(r.get("available", True)),
+                    "default": bool(r.get("default"))})
+    return out
+
+
+def default_model() -> str:
+    return _state["default_model"]
+
+
+def model_label(model_id: str) -> str:
+    return next((m["label"] for m in models() if m["id"] == model_id), model_id)
 
 
 def update_usage(info: dict) -> None:
@@ -260,7 +300,7 @@ def sign_out() -> None:
     from . import settings
     credentials.store(BASE_URL, "")
     _set_account(None)
-    _state.update(error="", status="idle")
+    _state.update(error="", status="idle", models=None, default_model="fast")
     settings.config_changed()
 
 

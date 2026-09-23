@@ -525,8 +525,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             )
             reply["streaming"] = False
             if completion.usage:
-                for key in ("input", "output"):
-                    session["usage"][key] += completion.usage[key]
+                for key in ("input", "cached", "output"):
+                    session["usage"][key] += completion.usage.get(key, 0)
                 session["usage"]["context"] = completion.usage["input"]
                 context.calibrate(session, estimated, completion.usage["input"])
             if completion.account:

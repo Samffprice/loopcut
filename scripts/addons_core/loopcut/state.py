@@ -41,7 +41,7 @@ def new_session() -> dict:
         "auto_run": False,               # "Always allow" for this conversation; never saved.
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
-        "usage": {"input": 0, "output": 0, "context": 0},
+        "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},
         "token_ratio": 0.0,              # context.calibrate: reported / estimated tokens. Never saved.
         "mention": 0,                    # Highlighted row of the @-mention list.
     }

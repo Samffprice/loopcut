@@ -741,7 +741,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     button_h = f.px(22)
     button_y = card_y + card_h - card_pad - button_h
     text_y = button_y + (button_h - f.line_height(small)) // 2
-    label, caret = model_button_label(model), "▾"
+    label, caret = f.ui.get("model_label") or model_button_label(model), "▾"
     label_w = round(f.measure("ui", small, label))
     button_w = label_w + round(f.measure("ui", small, caret)) + f.px(22)
     open_menu = bool(f.ui.get("model_menu"))

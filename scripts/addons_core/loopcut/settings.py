@@ -104,9 +104,9 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],
         default="LOOPCUT", update=_provider_changed)
-    tier: bpy.props.EnumProperty(
-        name="Model", items=account.MODELS, default="fast", update=_tier_changed,
-        description="Fast answers quickly; Pro thinks longer and uses more of your allowance")
+    tier: bpy.props.StringProperty(
+        name="Model", default="fast", update=_tier_changed,
+        description="Which of the models your Loopcut plan offers answers; the menu says what each costs against the default")
     base_url: bpy.props.StringProperty(
         name="Base URL", default=PROVIDERS[0][2], update=_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
@@ -168,7 +168,9 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         if self.provider == "LOOPCUT":
             account.draw(column.column(align=True))
             column.separator()
-            column.row(align=True).prop(self, "tier", expand=True)
+            row = column.row(align=True)
+            row.label(text="Model")
+            row.menu("LOOPCUT_MT_tiers", text=account.model_label(self.tier), icon="DOWNARROW_HLT")
         else:
             if self.provider == "CUSTOM":
                 column.prop(self, "base_url")
@@ -303,6 +305,28 @@ class LOOPCUT_MT_models(bpy.types.Menu):
             self.layout.operator("loopcut.pick_model", text=name).model = name
 
 
+class LOOPCUT_OT_pick_tier(bpy.types.Operator):
+    bl_idname = "loopcut.pick_tier"
+    bl_label = "Use Model"
+    bl_options = {"INTERNAL"}
+
+    tier: bpy.props.StringProperty()
+
+    def execute(self, context):
+        set_tier(self.tier)
+        return {"FINISHED"}
+
+
+class LOOPCUT_MT_tiers(bpy.types.Menu):
+    """The models the Loopcut service offers, as /v1/models lists them."""
+    bl_label = "Model"
+
+    def draw(self, context):
+        for m in account.models():
+            text = m["label"] + (f"   —   {m['note']}" if m["note"] else "")
+            self.layout.operator("loopcut.pick_tier", text=text).tier = m["id"]
+
+
 def provider_label(provider: str) -> str:
     return _BY_ID[provider][1]
 
@@ -332,7 +356,7 @@ def model_options() -> list[tuple[str, str, str, bool]]:
             return []
         return [(current, current, "from .env", True)]
     if prefs.provider == "LOOPCUT":
-        return [(id, label, note, prefs.tier == id) for id, label, note in account.MODELS]
+        return [(m["id"], m["label"], m["note"], prefs.tier == m["id"]) for m in account.models()]
     names = list(_models)
     if prefs.model and prefs.model not in names:
         names.insert(0, prefs.model)
@@ -345,14 +369,22 @@ def choose_model(model_id: str) -> None:
     if prefs is None or not model_id:
         return
     if prefs.provider == "LOOPCUT":
-        if model_id in {id for id, _, _ in account.MODELS}:
+        if model_id in {m["id"] for m in account.models()}:
             prefs.tier = model_id  # _tier_changed copies it to the model and reloads the config.
     else:
         prefs.model = model_id
 
 
+def model_label(model_id: str) -> str:
+    """What the panel's model button shows for the configured model."""
+    prefs = preferences()
+    if prefs is not None and prefs.provider == "LOOPCUT":
+        return account.model_label(model_id)
+    return model_id
+
+
 def set_tier(tier: str) -> None:
-    """Pick Fast or Pro on the Loopcut provider, as the model menu would."""
+    """Pick a model of the Loopcut service by alias, as the model menu would."""
     prefs = preferences()
     if prefs is not None and prefs.provider == "LOOPCUT":
         prefs.tier = tier  # _tier_changed copies it to the model and reloads the config.
@@ -406,6 +438,7 @@ class LOOPCUT_OT_blenderkit_get_key(bpy.types.Operator):
 
 
 _CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_pick_model, LOOPCUT_MT_models,
+            LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key)
 
 

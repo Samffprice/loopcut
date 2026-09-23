@@ -110,7 +110,8 @@ def draw_area() -> None:
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
-                            "context_budget": budget, "model_options": options, "update": update.banner()})
+                            "context_budget": budget, "model_options": options, "model_label": settings.model_label(model),
+                            "update": update.banner()})
     session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
@@ -263,7 +264,7 @@ def _do_action(session: dict, action) -> None:
     elif kind == "limit_upgrade":
         _start_upgrade(session, session["items"][index])
     elif kind == "limit_fast":
-        settings.set_tier("fast")
+        settings.set_tier(account.default_model())
         agent.resume()
     elif kind == "resume":
         agent.resume()
