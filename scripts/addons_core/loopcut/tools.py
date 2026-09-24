@@ -17,8 +17,6 @@ from . import scratch
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
-STRIP_HEIGHT = 160   # A frame of the progress strip: enough to see what moved, a fraction of a capture's pixels.
-STRIP_GAP = 6
 NAMES_LIMIT = 400    # Names get_scene_info lists when rows do not fit; past this, narrow the question.
 MAX_SELECTED_ROWS = 40  # Rows for the selection when only names fit.
 DEFAULT_RUN_TIMEOUT = 60.0
@@ -791,26 +789,6 @@ def images_alike(a: Path, b: Path) -> bool:
         return False
     changed = (np.abs(first[..., :3] - second[..., :3]) > ALIKE_CHANNEL).any(axis=-1)
     return float(changed.mean()) < ALIKE_FRACTION
-
-
-def progress_strip(paths: list) -> "Path | None":
-    """The captures at `paths` side by side, oldest first, each STRIP_HEIGHT tall: the model's
-    earlier looks as one small image. None when none of the files is there any more."""
-    import numpy as np
-    frames = [_pixels(path, height=STRIP_HEIGHT) for path in paths if Path(path).is_file()]
-    if not frames:
-        return None
-    width = sum(frame.shape[1] for frame in frames) + STRIP_GAP * (len(frames) - 1)
-    canvas = np.zeros((STRIP_HEIGHT, width, 4), dtype=np.float32)
-    canvas[..., :3], canvas[..., 3] = 0.15, 1.0  # A dark gap: the frames read as separate pictures.
-    x = 0
-    for frame in frames:
-        canvas[:, x:x + frame.shape[1]] = frame
-        x += frame.shape[1] + STRIP_GAP
-    out = scratch.folder() / "strip.png"
-    out.parent.mkdir(exist_ok=True)
-    _save_pixels(canvas, out)
-    return out
 
 
 def look_at_reference(name: str, region: list | None = None) -> ToolResult:

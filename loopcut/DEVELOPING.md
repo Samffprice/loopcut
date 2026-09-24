@@ -149,6 +149,14 @@ Keep and Undo all (which restores that turn's checkpoint).
 | `Blender -b --factory-startup --python loopcut/harness/evals/selfcheck.py` | ~5s | Every eval check fails on the untouched scene and passes on its reference solution. No model. |
 | `python3 loopcut/harness/evals/run.py [tasks] [--tag t] [--label "what changed"]` | ~6 min, costs tokens | 22 real agent turns, checked by reading the scene; `../out/evals/<time>/summary.md` has pass rate, time, steps, failed calls and what was won or lost against the previous run. |
 
+Claude Code as the model: `python3 loopcut/harness/cc_bridge.py serve` serves `/chat/completions` on
+127.0.0.1:8765, and `loopcut/scripts/cc_session.sh` starts the dev Blender pointed at it. Every
+request waits on disk under `../out/cc_bridge/<time>/` until a Claude Code session answers it. Each
+request goes to a fresh subagent that follows `loopcut/harness/cc_bridge_model.md` and sees only the
+request. Everything but the model runs for real. `cc_bridge.py report` writes `transcript.md` (every
+request, reply, result and image, plus the model's private notes) and `summary.json`. Token counts
+there are the add-on's own estimate.
+
 When a run goes badly, read the task's transcript in `../out/evals/<time>/<task>.md` before blaming
 the model: it shows exactly what the tools told it. The two regressions found this way so far were
 both tools lying (an enum listed as `['DEFAULT']`; two look-alike objects overlapping in a capture).
@@ -206,36 +214,37 @@ Harness scripts default `LOOPCUT_DATA_DIR` to a temp folder so they never touch 
 
 ## Context
 
-Every request carries the conversation, so a long session pays for its history again on every
-step; the cost of a conversation grows with the square of its length unless something is cut.
-`context.py` keeps each request within `LOOPCUT_CONTEXT_BUDGET` tokens (preference "Context
-budget", default 24000), in order:
+Every request carries the conversation, and the provider caches the part of a request that matches
+the previous one: appending is cheap, editing anything already sent re-bills everything after the
+edit. `context.py` keeps each request within `LOOPCUT_CONTEXT_BUDGET` tokens (preference "Context
+budget", default 40000, the system prompt and tool schemas included) by keeping the history
+append-only while the model works and shrinking it in batches:
 
-1. Elision, on every request. The code of all but the newest two `run_python` calls is cut to
-   a line, and all but the newest four tool results are cut to a headline (first line or the
-   exception, plus the first scene change) and a note to call the tool again. Both edits land a
-   few messages from the end and are never undone, so the prefix of a request stays stable and
-   provider prompt caches keep hitting. At request time, runs of finished steps are folded into
-   one "Earlier steps" message, one line each. Captures are limited to three per message by the
-   agent loop, counting `run_python` steps that asked for one.
-2. Compaction. If that is not enough, the model summarizes everything before the current turn
-   (or before a later point, if the current turn alone is too big) into one
-   `<conversation_summary>` message, and the chat shows a "Summarized N earlier messages" notice.
-   The summary is stored on the first message it does not cover, so checkpoint restores that cut
-   the conversation cut or keep it correctly.
-3. Images: a capture is sent with the request right after it and dropped once the model has
-   acted on it, since that step also changed what it showed. Attached references are pinned:
-   sent with every request, at 768 px, until unpinned; they sit early in the prefix, so the
-   provider cache pays for them. On the gateway one image costs as much as ten tool results on
-   every request it rides in. Looks at an unchanged scene are refused after three in a turn,
-   and any look after eight. A 960 px capture cost about 1700 tokens on the Loopcut gateway, ten times a
-   typical tool result, so captures are taken at 640 px.
+1. Step records. A step (an assistant message with tool calls, its results, the captures after
+   it) can be sent as its record: what the model said at that step, word for word, then per call
+   whether it worked (or its exception), what the code printed (400 characters) and the full
+   "Scene changes" (15 lines). Code bodies and long outputs are left out. The model's own sentences
+   are the part that says why: a run on 2026-09-23 lost them and the model undid its own fixes twice.
+   The system prompt asks the model to open every tool-calling reply with what it sees and why.
+   A folded step is only marked (`loopcut_folded`); its stored messages are never edited.
+2. When the user sends a message, every step of the earlier turns is folded: one cache break per turn.
+3. Mid-turn, only past 75% of the budget, the turn's oldest steps are folded at once, down to 50%,
+   leaving the newest three whole.
+4. Compaction, the last resort, when records alone exceed the budget: the model summarizes everything
+   before a cut into one `<conversation_summary>` message, and the chat shows a "Summarized N
+   earlier messages" notice. The summary is stored on the first message it does not cover, so
+   checkpoint restores that cut the conversation cut or keep it correctly.
+5. Images: the captures the model has not acted on yet, the newest capture of the conversation,
+   and pinned references (768 px, until unpinned) are sent; a dropped capture is remembered in the
+   record by what it showed. The automatic look is taken once per reply, after all of its calls,
+   and only if the model did not look after its last change. Looks at an unchanged scene are
+   refused after three in a turn and nudged after eight. Captures are 640 px (about 800 tokens).
 
-Sizes are estimated from characters (3.4 per token, 1700 per image, both measured against the
-gateway's logs) and corrected with the token count the API reports for each request; the footer
-shows that count ("12.3k context") next to the conversation's total. The
-stored conversation keeps every message in place, so nothing above changes what the chat shows or
-where a checkpoint cuts.
+Sizes are estimated from characters (3.4 per token, 800 per image) plus the measured size of the
+system prompt and tool schemas (about 7k tokens, `context.fixed_tokens`), and the chars-per-token
+ratio is corrected from the token count the API reports; the footer shows that count next to the
+conversation's total. `harness/cc_bridge.py` records every request exactly as sent, which is the
+way to check what the model actually saw.
 
 ## UI architecture
 

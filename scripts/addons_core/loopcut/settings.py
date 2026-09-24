@@ -129,9 +129,9 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     context_budget: bpy.props.IntProperty(
         name="Context budget", default=config.DEFAULT_CONTEXT_BUDGET,
         min=config.MIN_CONTEXT_BUDGET, max=config.MAX_CONTEXT_BUDGET, step=1000, update=_changed,
-        description="Tokens each request may carry of the conversation. Over this, old tool results "
-                    "are shortened and then the earlier conversation is summarized. Lower is cheaper; "
-                    "higher remembers more")
+        description="Tokens each request may carry, prompt included. Earlier turns are always sent as "
+                    "short step records; over this, the current turn's older steps are too, and then the "
+                    "earlier conversation is summarized. Lower is cheaper; higher remembers more")
     run_timeout: bpy.props.IntProperty(
         name="Stop code after (s)", default=60, min=1, max=3600, update=_changed,
         description="A step that runs longer is stopped, so an endless loop cannot freeze Blender")

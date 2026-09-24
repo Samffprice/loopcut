@@ -24,10 +24,11 @@ def account_url() -> str:
     return f"{SERVICE_URL}/account"
 
 
-# Tokens per request before the earlier conversation is summarized (context.py). With finished
-# steps folded, a request is typically 5-8k, so this holds a few turns whole.
-DEFAULT_CONTEXT_BUDGET = 24_000
-MIN_CONTEXT_BUDGET, MAX_CONTEXT_BUDGET = 8_000, 2_000_000
+# Tokens per request, the system prompt and tool schemas (about 7k) included, before the current
+# turn's older steps are folded early and then the earlier conversation is summarized (context.py).
+# A 25-step turn sent whole is about 30k, so at this size a turn is almost never cut while it runs.
+DEFAULT_CONTEXT_BUDGET = 40_000
+MIN_CONTEXT_BUDGET, MAX_CONTEXT_BUDGET = 16_000, 2_000_000
 
 
 class ConfigError(RuntimeError):

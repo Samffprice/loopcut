@@ -15,7 +15,7 @@ _PACKAGE = __package__
 _ROOT = Path(__file__).parent
 # Dependency order: a module comes after everything it imports.
 # state (the session) and settings (registered preferences) are left alone on purpose.
-_MODULES = ("config", "credentials", "llm", "scene_diff", "object_info", "api_docs", "tools", "scene_context",
+_MODULES = ("config", "credentials", "llm", "context", "scene_diff", "object_info", "api_docs", "tools", "scene_context",
             "checkpoints", "conversations", "agent", "ui.theme", "ui.textedit", "ui.layout", "ui.draw", "ui.host")
 _INTERVAL = 0.4
 _mtimes: dict[str, float] = {}

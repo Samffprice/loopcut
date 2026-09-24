@@ -19,9 +19,17 @@ def cube(**overrides) -> dict:
     return entry
 
 
+def material(**overrides) -> dict:
+    entry = {"node Principled BSDF": "BSDF_PRINCIPLED", "Principled BSDF.Base Color": (0.8, 0.8, 0.8, 1.0),
+             "Principled BSDF.Roughness": 0.5, "node Material Output": "OUTPUT_MATERIAL",
+             "links": ("Principled BSDF.BSDF -> Material Output.Surface",), "settings.surface_render_method": "DITHERED"}
+    entry.update(overrides)
+    return entry
+
+
 def scene(objects=None, **overrides) -> dict:
     shot = {"too_many": False, "objects": objects if objects is not None else {"Cube": cube()},
-            "materials": {"Material": {"nodes": 2, "links": 1, "Base Color": (0.8, 0.8, 0.8, 1.0)}},
+            "materials": {"Material": material()},
             "collections": {"Collection": ("Cube",)},
             "scene": {"frame_start": 1, "frame_end": 250, "render.fps": 24}, "mode": "OBJECT"}
     shot["object_count"] = len(shot["objects"])
@@ -67,13 +75,50 @@ class SceneDiffTest(unittest.TestCase):
 
     def test_material_and_collection_changes(self):
         after = scene()
-        after["materials"] = {"Material": {"nodes": 2, "links": 1, "Base Color": (0, 0, 1, 1.0)},
-                              "Red": {"nodes": 2, "links": 1}}
+        after["materials"] = {"Material": material(**{"Principled BSDF.Base Color": (0, 0, 1, 1.0)}), "Red": material()}
         after["collections"] = {"Collection": (), "Props": ("Cube",)}
         changes = scene_diff.diff(scene(), after)
         self.assertEqual(changes["added"], ["material Red", "collection Props"])
-        self.assertIn("material Material: Base Color (0.8, 0.8, 0.8, 1.0) -> (0, 0, 1, 1.0)", changes["changed"])
+        self.assertIn("material Material: Principled BSDF.Base Color (0.8, 0.8, 0.8, 1.0) -> (0, 0, 1, 1.0)",
+                      changes["changed"])
         self.assertIn("collection Collection: -Cube", changes["changed"])
+
+    def test_node_edits_the_model_makes_are_all_visible(self):
+        """Color ramps, volume density and render-method settings once went unreported, so the
+        model re-rendered to find out whether its edit had landed."""
+        before = scene()
+        before["materials"]["Material"]["node Color Ramp"] = "VALTORGB"
+        before["materials"]["Material"]["Color Ramp.ramp"] = ("LINEAR", (0.0, (0, 0, 0, 1)), (1.0, (1, 1, 1, 1)))
+        after = copy.deepcopy(before)
+        after["materials"]["Material"].update({
+            "Color Ramp.ramp": ("LINEAR", (0.0, (0, 0, 0, 1)), (0.006, (1, 1, 1, 1))),
+            "settings.surface_render_method": "BLENDED",
+            "node Principled Volume": "PRINCIPLED_VOLUME", "Principled Volume.Density": 0.6,
+            "links": ("Principled BSDF.BSDF -> Material Output.Surface",
+                      "Principled Volume.Volume -> Material Output.Volume")})
+        (line,) = scene_diff.diff(before, after)["changed"]
+        self.assertIn("+node Principled Volume (PRINCIPLED_VOLUME)", line)
+        self.assertIn("+link Principled Volume.Volume -> Material Output.Volume", line)
+        self.assertIn("Color Ramp.ramp", line)
+        self.assertIn("settings.surface_render_method 'DITHERED' -> 'BLENDED'", line)
+        self.assertNotIn("Principled Volume.Density", line)  # Part of the new node, not a change of its own.
+
+    def test_world_and_render_engine_settings(self):
+        before = scene(worlds={"World": {"node Background": "BACKGROUND", "Background.Strength": 1.0}})
+        before["scene"]["eevee.use_volumetric_shadows"] = False
+        after = copy.deepcopy(before)
+        after["worlds"]["World"]["Background.Strength"] = 0.2
+        after["scene"]["eevee.use_volumetric_shadows"] = True
+        changes = scene_diff.diff(before, after)
+        self.assertIn("world World: Background.Strength 1.0 -> 0.2", changes["changed"])
+        self.assertIn("scene eevee.use_volumetric_shadows False -> True", changes["other"])
+
+    def test_hiding_from_the_render_is_a_change_of_its_own(self):
+        after = scene({"Cube": cube(renders=False, hidden_from_rays=("camera",))})
+        before = scene({"Cube": cube(renders=True, hidden_from_rays=())})
+        (line,) = scene_diff.diff(before, after)["changed"]
+        self.assertIn("renders True -> False", line)
+        self.assertIn("hidden_from_rays () -> ('camera',)", line)
 
     def test_scene_settings_and_mode(self):
         after = scene(mode="EDIT_MESH")

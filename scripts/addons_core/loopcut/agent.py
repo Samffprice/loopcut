@@ -30,10 +30,11 @@ It renders a copy with a bounded budget while the editor stays responsive; stale
 Use it to check all requested cameras and meaningful animation phases. Its metadata reports the \
 engine, quality limits, saved revision and signal measurements. A nearly black image can be a scene \
 problem; it is not proof that materials or lights need rebuilding. Inspect the cause first.
-- After every run_python step that changes the scene you get a capture of the result (three_quarter, or \
-the last angle you asked for) with object names drawn on and, below it, a strip of your earlier looks \
-oldest to newest: your progress. When that capture would look the same as your last one you get a note \
-instead of the image. Ask for capture_viewport or compare_with_reference only for another angle, a \
+- Tool calls in one reply run in order, each after the previous one finished: a look placed after a \
+run_python sees its result.
+- After a reply whose steps changed the scene you get one capture of the result (three_quarter, or the \
+last angle you asked for) with object names drawn on, unless you looked yourself after the last change in \
+that reply. When it would look the same as your last one you get a note instead of the image. Ask for capture_viewport or compare_with_reference only for another angle, a \
 focus, a sheet of four views, a rendered look at lighting, or a comparison; the same look at an \
 unchanged scene is refused after 3 times. Never move the user's \
 viewport or shading. Fix what is actually wrong in the picture, then finish.
@@ -77,9 +78,12 @@ output, inspect ImageFormatSettings: IMAGE and VIDEO media types expose differen
 - Before finishing a multi-part job, check each requested deliverable against the scene: camera framing, \
 animation endpoints and middle, preservation constraints, output settings and actual output files. \
 Distinguish a configured scene, a preview, and a completed render or export; say which you verified.
-- As the conversation grows, the code and results of older steps are cut to a line, and a \
-<conversation_summary> may stand for earlier messages. The scene is the source of truth: look again \
-rather than trust memory, and write each step so it stands on its own."""
+- Start every reply that calls tools with a sentence or two: what you see now and why this step. Older \
+steps are later shown as records: that note, whether each call worked, what it printed and what it \
+changed; not their code. So say there what you learned, above all what did not work and why, or you may \
+try it again. Name the objects, materials and nodes you create so later steps can find them. A \
+<conversation_summary> may stand for earlier messages. The scene is the source of truth for exact \
+values: read it again rather than trust memory."""
 
 _POLL_SECONDS = 0.1
 # Looks at the scene cost an image each. A look after a change is what the loop is for, and the
@@ -88,7 +92,6 @@ _POLL_SECONDS = 0.1
 MAX_IDLE_CAPTURES = 3
 SOFT_LOOKS = 8
 DEFAULT_ANGLE = "three_quarter"
-STRIP_LOOKS = 4  # Earlier looks shown in the progress strip under a new capture.
 LOW_ALLOWANCE = 0.8  # Share of the week's allowance used at which the conversation gets a heads-up, once.
 CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene"}
 
@@ -286,11 +289,6 @@ def _limit_item(ex: llm.LLMError) -> dict:
                             str(details.get("resets_at") or ""), upgrade)
 
 
-def _build_strip_on_main(paths: list) -> "Path | None":
-    from . import mainthread, tools
-    return mainthread.run_on_main(lambda: tools.progress_strip(paths)).result()
-
-
 def _alike_on_main(a, b) -> bool:
     from . import mainthread, tools
     return mainthread.run_on_main(lambda: tools.images_alike(a, b)).result()
@@ -367,18 +365,13 @@ def _image_what(text: str) -> str:
     return what.rstrip(".")
 
 
-def _earlier_looks(messages: list) -> list[str]:
-    """References to the newest STRIP_LOOKS captures, oldest first: the frames of the next strip.
-    A capture message's first image is the capture; a strip it carries is not a look."""
-    refs = []
+def _last_look(messages: list) -> str | None:
+    """The newest capture's image reference, if there is one."""
     for message in reversed(messages):
-        if context.is_capture(message):
-            images = context._image_refs(message)
-            if images:
-                refs.append(images[0])
-            if len(refs) == STRIP_LOOKS:
-                break
-    return refs[::-1]
+        images = context._image_refs(message) if context.is_capture(message) else []
+        if images:
+            return images[0]
+    return None
 
 
 def _without_capture(arguments: str) -> str:
@@ -396,22 +389,13 @@ def _wait_for_approval(turn: Turn) -> bool:
     return turn.approved
 
 
-def _image_message(reference: str, what: str, strip: str | None = None) -> dict:
-    """A capture as a message: references to files in the conversation's folder, expanded when a
-    request is sent. `what` it shows is text, so it outlives the image. With a strip, the message
-    carries the earlier looks too, as one small image."""
-    message = {"role": "user", context.CAPTURE: True, "content": [
+def _image_message(reference: str, what: str) -> dict:
+    """A capture as a message: a reference to a file in the conversation's folder, expanded when a
+    request is sent. `what` it shows is text, so it outlives the image."""
+    return {"role": "user", context.CAPTURE: True, "content": [
         {"type": "text", "text": f"{context.CAPTURE_LABEL}{what or 'the scene'} (after the step above)."},
         {"type": "image_url", "image_url": {"url": reference}},
     ]}
-    if strip:
-        message[context.STRIP] = True
-        message["content"] += [
-            {"type": "text", "text": "Your earlier looks, oldest on the left to newest on the right: "
-                                     "compare them with the capture above to see your progress."},
-            {"type": "image_url", "image_url": {"url": strip}},
-        ]
-    return message
 
 
 def _scene_changed(result) -> bool:
@@ -467,38 +451,36 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
     return names
 
 
-def _auto_look(session: dict, turn: Turn, run_tool, result, alike) -> None:
-    """The look the agent takes after a step that changed the scene, unless the step took one:
-    what the model would ask for next anyway, without the request that asking costs. It is
-    not a look the model asked for, so it is not counted. A failure is not the step's failure.
-    A look that shows the same picture as the previous capture is a note, not an image: the
-    capture is free, the image in every later request is not."""
+def _auto_look(session: dict, turn: Turn, run_tool, alike) -> tuple[str, "Path | None"]:
+    """The look the agent takes once a reply's steps changed the scene, unless the model looked
+    itself after the last change: what it would ask for next anyway, without the request that
+    asking costs. Taken after the whole reply, so a look the model placed after its change is
+    never doubled by this one. Not counted as a look the model asked for; a failure is not the
+    step's failure. A look that shows the same picture as the previous capture is a note, not an
+    image: the capture is free, the image in every later request is not.
+    Returns (text for the step's result, image path or None)."""
     from . import tools
     try:
         shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle}))
     except llm.Cancelled:
-        return  # The mutation already ran; keep its result before honoring Stop.
+        return "", None  # The mutation already ran; keep its result before honoring Stop.
     if not (shot.ok and shot.image_path):
-        result.text += f"\n\nAutomatic preview unavailable: {shot.text}"
-        return
+        return f"\n\nAutomatic preview unavailable: {shot.text}", None
     turn.changed = False
-    previous = _earlier_looks(session["messages"])[-1:]
+    previous = _last_look(session["messages"])
     try:
-        same = bool(previous) and alike(conversations.image_path(session["id"], previous[0]), shot.image_path)
+        same = previous is not None and alike(conversations.image_path(session["id"], previous), shot.image_path)
     except Exception as ex:  # Comparing is a saving, never a reason to lose the look.
         print(f"Loopcut: could not compare the capture with the previous one: {ex!r}")
         same = False
     if same:
-        result.text += SAME_LOOK_NOTE.format(angle=turn.angle, width=tools.CAPTURE_WIDTH)
-        return
-    result.text += f"\n\n{shot.text}"
-    result.image_path = shot.image_path
+        return SAME_LOOK_NOTE.format(angle=turn.angle, width=tools.CAPTURE_WIDTH), None
+    return f"\n\n{shot.text}", shot.image_path
 
 
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
-         ensure_checkpoint=_ensure_checkpoint_on_main, build_strip=None, alike=None) -> None:
+         ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     items, messages = session["items"], session["messages"]
-    build_strip = build_strip or _build_strip_on_main
     alike = alike or _alike_on_main
     if run_tool is _run_tool_on_main:
         run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
@@ -515,11 +497,13 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             if turn.cancel.is_set():
                 raise llm.Cancelled()
             _fold_notes(session, turn)
-            prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set)
+            system, schemas = _system_prompt(session), _tool_schemas()
+            fixed = context.fixed_tokens(system, schemas)
+            prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed)
             if compacted:
                 items.append(state.item_notice(
                     f"Summarized {compacted} earlier messages so requests stay small."))
-            estimated = context.estimate_tokens(prepared)
+            estimated = context.estimate_tokens(prepared, fixed)
             reply = state.item_assistant()
             items.append(reply)
 
@@ -529,9 +513,9 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
 
             completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
-                messages=[{"role": "system", "content": _system_prompt(session)},
+                messages=[{"role": "system", "content": system},
                           *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session))],
-                tools=_tool_schemas(), reasoning_effort=cfg.reasoning_effort,
+                tools=schemas, reasoning_effort=cfg.reasoning_effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
             )
             reply["streaming"] = False
@@ -551,6 +535,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 return
 
             images = []
+            changed_by = None  # (card, tool message) of the reply's last step that changed the scene.
             for call in completion.tool_calls:
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
@@ -597,16 +582,16 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 if note:
                     result.text += note
                 asked_look = call.name in CAPTURE_TOOLS or (call.name == "run_python" and _wants_capture(arguments))
-                if asked_look:
-                    result.text += _look_note(turn)
-                    turn.changed = False
                 if _scene_changed(result):
                     turn.changed, turn.idle_captures = True, 0
-                    if cfg.auto_look and not asked_look and not refusal and not turn.cancel.is_set():
-                        _auto_look(session, turn, run_tool, result, alike)
+                if asked_look:  # After the change: run_python's own capture is taken after its code ran.
+                    result.text += _look_note(turn)
+                    turn.changed = False
                 card["status"] = "done" if result.ok else "failed"
                 card["output"] = result.text
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})
+                if _scene_changed(result) and not asked_look and not refusal:
+                    changed_by = (card, messages[-1])
                 if result.image_path:
                     # Stored now: every capture is written to the same file, so a second capture in
                     # this batch would otherwise replace the first before it is read.
@@ -615,19 +600,16 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 if getattr(result, "scene_before", None) is not None:
                     turn.scene_before = turn.scene_before or result.scene_before
                     turn.scene_after = result.scene_after
+            # One automatic look per reply, after all of it, unless the model looked after its last change.
+            if changed_by and turn.changed and cfg.auto_look and not turn.cancel.is_set():
+                card, message = changed_by
+                text, path = _auto_look(session, turn, run_tool, alike)
+                card["output"] += text
+                message["content"] += text
+                if path:
+                    images.append((conversations.store_image(session, path), _image_what(text), None, card, message))
             # Tool messages must directly follow the assistant message, so images go after them all.
-            # The newest carries the strip of earlier looks, built before this step's are among them.
-            images = _fresh_images(images)
-            strip = None
-            earlier = _earlier_looks(messages) if images else []
-            if earlier:
-                try:
-                    path = build_strip([conversations.image_path(session["id"], ref) for ref in earlier])
-                    strip = conversations.store_image(session, path) if path else None
-                except Exception as ex:  # A strip is a bonus; a step never fails for want of one.
-                    print(f"Loopcut: could not build the progress strip: {ex!r}")
-            messages.extend(_image_message(reference, what, strip if n == len(images) - 1 else None)
-                            for n, (reference, what) in enumerate(images))
+            messages.extend(_image_message(reference, what) for reference, what in _fresh_images(images))
             conversations.save(session)  # The history is consistent here: every call has its result.
             _redraw()
         turn.outcome = "step_limit"

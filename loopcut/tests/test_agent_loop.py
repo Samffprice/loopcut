@@ -44,6 +44,14 @@ def tool_reply(name: str, arguments: dict) -> bytes:
     )
 
 
+def multi_tool_reply(*calls: tuple) -> bytes:
+    """Several tool calls in one reply, as parallel tool calls arrive."""
+    return sse(*({"choices": [{"delta": {"tool_calls": [{"index": i, "id": f"call_{i + 1}", "type": "function",
+                                                        "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+                 for i, (name, args) in enumerate(calls)),
+               {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+
+
 class Script:
     def __init__(self):
         self.replies: list = []
@@ -100,7 +108,6 @@ class AgentLoopTest(unittest.TestCase):
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
         agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
         agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
-        agent._build_strip_on_main = lambda paths: None  # Needs Blender's main thread; tests pass their own.
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
         agent._changes_scene = lambda name: name == "run_python"
@@ -267,7 +274,9 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("Still here."))
         self.start("and now?").thread.join(5)
         roles = [m["role"] for m in SCRIPT.requests[-1]["messages"]]
-        self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
+        # The stopped turn's step is sent as its record: one assistant message, no dangling call.
+        self.assertEqual(roles, ["system", "user", "assistant", "user"])
+        self.assertIn('run_python "x": not run: Cancelled before this ran.', SCRIPT.requests[-1]["messages"][2]["content"])
 
     def test_stop_during_a_batch_does_not_execute_remaining_calls(self):
         def run_tool(name, arguments):
@@ -360,34 +369,48 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(turn.outcome, "cancelled")
         self.assertEqual(next(i for i in self.session["items"] if i["kind"] == "tool")["status"], "done")
 
-    def test_a_long_history_is_summarized_before_the_next_request(self):
-        from loopcut import context
-        os.environ["LOOPCUT_CONTEXT_BUDGET"] = "8000"
+    def test_a_huge_step_result_is_folded_not_summarized_at_the_next_turn(self):
+        os.environ["LOOPCUT_CONTEXT_BUDGET"] = "16000"
         self.addCleanup(os.environ.pop, "LOOPCUT_CONTEXT_BUDGET")
-        self.run_tool = lambda name, arguments: types.SimpleNamespace(text="x" * 60_000, ok=True, image_path=None)
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(
+            text="x" * 60_000 + "\n\nScene changes: none. (If you expected a change, the code did not do what you think.)",
+            ok=True, image_path=None)
         SCRIPT.replies += [tool_reply("run_python", {"code": "big()", "summary": "Big"}), text_reply("Done.")]
         turn = self.start("first")
         self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
         agent.decide(True)
         turn.thread.join(5)
-        self.assertEqual(len(SCRIPT.requests), 2)
-
-        SCRIPT.replies += [text_reply("Turn 1 added a big thing."), text_reply("Sure.")]
+        SCRIPT.replies.append(text_reply("Sure."))
         self.start("second").thread.join(5)
-        self.assertEqual(len(SCRIPT.requests), 4)
-        summary_request = SCRIPT.requests[2]
+        self.assertEqual(len(SCRIPT.requests), 3, "no summarizing call: the record is small")
+        sent = json.dumps(SCRIPT.requests[-1]["messages"][1:])  # Past the system prompt.
+        self.assertIn("run_python \\\"Big\\\": ok, printed:", sent)
+        self.assertLess(len(sent), 1500)
+
+    def test_a_long_history_is_summarized_before_the_next_request(self):
+        from loopcut import context
+        os.environ["LOOPCUT_CONTEXT_BUDGET"] = "16000"
+        self.addCleanup(os.environ.pop, "LOOPCUT_CONTEXT_BUDGET")
+        SCRIPT.replies.append(text_reply("Read it."))
+        self.start("first: " + "x" * 60_000).thread.join(5)  # A pasted document: a message is never folded.
+        self.assertEqual(len(SCRIPT.requests), 1)
+
+        SCRIPT.replies += [text_reply("Turn 1 was a long paste."), text_reply("Sure.")]
+        self.start("second").thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 3)
+        summary_request = SCRIPT.requests[1]
         self.assertEqual(summary_request["messages"][0]["content"], context.SUMMARY_PROMPT)
-        self.assertIn("TOOL RESULT: xxxx", summary_request["messages"][1]["content"])
+        self.assertIn("USER: first: xxxx", summary_request["messages"][1]["content"])
         self.assertNotIn("tools", summary_request)
-        sent = SCRIPT.requests[3]["messages"]
+        sent = SCRIPT.requests[2]["messages"]
         self.assertEqual([m["role"] for m in sent], ["system", "user", "user"])
-        self.assertIn("Turn 1 added a big thing.", sent[1]["content"])
+        self.assertIn("Turn 1 was a long paste.", sent[1]["content"])
         self.assertTrue(sent[2]["content"].endswith("second"))
         self.assertFalse(any(k.startswith("loopcut_") for m in sent for k in m))
-        self.assertEqual(len(self.session["messages"]), 6, "the stored conversation is whole")
-        self.assertEqual(self.session["messages"][4][context.SUMMARY], "Turn 1 added a big thing.")
+        self.assertEqual(len(self.session["messages"]), 4, "the stored conversation is whole")
+        self.assertEqual(self.session["messages"][2][context.SUMMARY], "Turn 1 was a long paste.")
         self.assertEqual([i["kind"] for i in self.session["items"]][-3:], ["user", "notice", "assistant"])
-        self.assertIn("Summarized 4 earlier messages", self.session["items"][-2]["text"])
+        self.assertIn("Summarized 2 earlier messages", self.session["items"][-2]["text"])
 
     def test_looks_are_capped_when_nothing_changed_and_free_after_a_change(self):
         from loopcut import conversations
@@ -420,7 +443,6 @@ class AgentLoopTest(unittest.TestCase):
         self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
         self.session["auto_run"] = True
         shot = Path(self.data_dir.name) / "viewport.png"
-        strips: list[list] = []
         empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
                  "scene": {}, "mode": "OBJECT"}
 
@@ -433,12 +455,6 @@ class AgentLoopTest(unittest.TestCase):
             return types.SimpleNamespace(text="OK\n\nScene changes: +Cube", ok=True, image_path=None,
                                          scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
 
-        def build_strip(paths):
-            strips.append(paths)
-            strip = Path(self.data_dir.name) / "strip.png"
-            strip.write_bytes(b"\x89PNG strip %d" % len(strips))
-            return strip
-
         self.run_tool = run_tool
         step = lambda: tool_reply("run_python", {"code": "add()", "summary": "Add"})
         SCRIPT.replies += [tool_reply("capture_viewport", {"angle": "camera"}), step(), step(), text_reply("Done.")]
@@ -447,7 +463,7 @@ class AgentLoopTest(unittest.TestCase):
         session["items"].append(state.item_user("build it"))
         session["messages"].append({"role": "user", "content": "build it"})
         session["busy"], session["turn"] = True, turn
-        agent._run(session, turn, run_tool, self.ensure_checkpoint, build_strip)
+        agent._run(session, turn, run_tool, self.ensure_checkpoint)
         self.assertEqual([(n, json.loads(a)) for n, a in self.ran],
                          [("capture_viewport", {"angle": "camera"}), ("run_python", {"code": "add()", "summary": "Add"}),
                           ("capture_viewport", {"angle": "camera"}), ("run_python", {"code": "add()", "summary": "Add"}),
@@ -458,13 +474,55 @@ class AgentLoopTest(unittest.TestCase):
         captures = [m for m in session["messages"] if context.is_capture(m)]
         self.assertEqual(len(captures), 3)
         self.assertTrue(captures[1]["content"][0]["text"].startswith(context.CAPTURE_LABEL + "the view through Camera"))
-        self.assertEqual([len(p) for p in strips], [1, 2], "each strip holds the looks before it")
-        self.assertTrue(all(context.STRIP in m for m in captures[1:]) and context.STRIP not in captures[0])
         self.assertEqual(turn.captures, 1, "automatic looks are not counted against the model")
         sent = SCRIPT.requests[-1]["messages"]
         images = [p for m in sent if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image_url"]
-        self.assertEqual(len(images), 2, "the newest capture and its strip; earlier looks folded")
+        self.assertEqual(len(images), 1, "the newest capture; earlier looks are remembered by what they showed")
         self.assertTrue(any("- looked: the view through Camera" in (m.get("content") or "") for m in sent))
+
+    def _looking_tools(self):
+        shot = Path(self.data_dir.name) / "viewport.png"
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+
+        def run_tool(name, arguments):
+            self.ran.append(name)
+            if name in ("capture_viewport", "inspect_scene"):
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached: the view through Camera.", ok=True, image_path=shot)
+            if name == "run_python":
+                return types.SimpleNamespace(text="OK\n\nScene changes: +Cube", ok=True, image_path=None,
+                                             scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
+            return types.SimpleNamespace(text="read", ok=True, image_path=None)
+        return run_tool
+
+    def _run_batch(self, *calls):
+        from unittest.mock import patch
+        self.session["auto_run"] = True
+        SCRIPT.replies += [multi_tool_reply(*calls), text_reply("Done.")]
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("go"))
+        self.session["messages"].append({"role": "user", "content": "go"})
+        self.session["busy"], self.session["turn"] = True, turn
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "true"}):
+            agent._run(self.session, turn, self._looking_tools(), self.ensure_checkpoint, lambda a, b: False)
+
+    def test_a_look_the_model_placed_after_its_change_is_not_doubled(self):
+        """A reply of run_python then capture_viewport once got an automatic look between the two:
+        two images of the same scene in every lighting step."""
+        self._run_batch(("run_python", {"code": "add()", "summary": "Add"}), ("capture_viewport", {"angle": "camera"}))
+        self.assertEqual(self.ran, ["run_python", "capture_viewport"])
+
+    def test_the_automatic_look_comes_after_the_whole_reply(self):
+        self._run_batch(("run_python", {"code": "add()", "summary": "Add"}), ("get_scene_info", {}))
+        self.assertEqual(self.ran, ["run_python", "get_scene_info", "capture_viewport"])
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertIn("Image attached", results[0], "the look belongs to the step that changed the scene")
+        self.assertEqual(results[1], "read")
+
+    def test_a_change_after_the_models_look_still_gets_a_look(self):
+        self._run_batch(("capture_viewport", {}), ("run_python", {"code": "add()", "summary": "Add"}))
+        self.assertEqual(self.ran, ["capture_viewport", "run_python", "capture_viewport"])
 
     def test_an_automatic_look_that_shows_nothing_new_is_a_note_not_an_image(self):
         from loopcut import context
@@ -495,7 +553,7 @@ class AgentLoopTest(unittest.TestCase):
         session["items"].append(state.item_user("tweak it"))
         session["messages"].append({"role": "user", "content": "tweak it"})
         session["busy"], session["turn"] = True, turn
-        agent._run(session, turn, run_tool, self.ensure_checkpoint, lambda paths: None, alike)
+        agent._run(session, turn, run_tool, self.ensure_checkpoint, alike)
         self.assertEqual([n for n, _ in self.ran], ["run_python", "capture_viewport"] * 3, "the capture is still taken: it is free")
         captures = [m for m in session["messages"] if context.is_capture(m)]
         self.assertEqual(len(captures), 2, "the repeated look is not stored as an image")

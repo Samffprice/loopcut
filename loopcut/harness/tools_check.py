@@ -179,16 +179,6 @@ def check():
         after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
                  space.overlay.show_overlays, "Render Result" in bpy.data.images)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
-        # The progress strip: earlier looks side by side, each STRIP_HEIGHT tall, one small image.
-        frames = [out / "capture_camera.png", out / "capture_distinct.png", out / "capture_check.png"]
-        strip = tools.progress_strip(frames)
-        strip_image = bpy.data.images.load(str(strip))
-        strip_size = tuple(strip_image.size)
-        bpy.data.images.remove(strip_image)
-        assert strip_size[1] == tools.STRIP_HEIGHT and strip_size[0] > 3 * tools.STRIP_HEIGHT, strip_size
-        assert tools.progress_strip([out / "nope.png"]) is None
-        shutil.copy(strip, out / "strip_check.png")
-
         # Reference images: a side-by-side comparison and a full-resolution crop, nothing left in bpy.data.
         from loopcut import conversations, state
         session = state.session()
