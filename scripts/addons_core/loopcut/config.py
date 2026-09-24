@@ -45,6 +45,7 @@ class Config:
     auto_look: bool  # Capture the viewport after every step that changes the scene; see agent._auto_look.
     max_steps: int
     context_budget: int  # Tokens one request may carry before old tool results are cut; see context.py.
+    keep_context: bool = False  # Never rewrite what a turn already sent (context.py, keep mode); per model.
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -158,4 +159,6 @@ def load() -> Config:
         auto_look=_as_bool(get("LOOPCUT_AUTO_LOOK", "true"), "LOOPCUT_AUTO_LOOK"),
         max_steps=int(max_steps),
         context_budget=int(context_budget),
+        # For a direct provider; on the Loopcut service the model's catalogue entry decides (agent.py).
+        keep_context=_as_bool(get("LOOPCUT_KEEP_CONTEXT", "false"), "LOOPCUT_KEEP_CONTEXT"),
     )

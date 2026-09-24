@@ -1,5 +1,6 @@
 """The agent loop: stream a reply, run the tools it asks for, feed results back, repeat."""
 
+import dataclasses
 import json
 import threading
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -258,6 +259,19 @@ def _project_roots() -> tuple:
     return files.project_roots()
 
 
+def _keeps_context(cfg: config.Config) -> bool:
+    from . import account
+    return account.keeps_context(cfg.base_url, cfg.model)
+
+
+def _turn_config() -> config.Config:
+    """config.load(), with keep mode switched on when the Loopcut service lists the model with it."""
+    cfg = config.load()
+    if not cfg.keep_context and _keeps_context(cfg):
+        cfg = dataclasses.replace(cfg, keep_context=True)
+    return cfg
+
+
 def _update_account(info: dict) -> None:
     from . import account
     account.update_usage(info)
@@ -514,7 +528,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
                 messages=[{"role": "system", "content": system},
-                          *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session))],
+                          *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session),
+                                                       cfg.keep_context)],
                 tools=schemas, reasoning_effort=cfg.reasoning_effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
             )
@@ -678,7 +693,7 @@ def send(text: str) -> bool:
         return False
     turn = Turn()
     try:
-        turn.config = config.load()
+        turn.config = _turn_config()
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
         return False
@@ -724,7 +739,7 @@ def resume() -> bool:
         return False
     turn = Turn()
     try:
-        turn.config = config.load()
+        turn.config = _turn_config()
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
         return False

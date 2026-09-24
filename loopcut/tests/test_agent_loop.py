@@ -108,6 +108,7 @@ class AgentLoopTest(unittest.TestCase):
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
         agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
         agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
+        agent._keeps_context = lambda cfg: False  # account.py needs bpy.
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
         agent._changes_scene = lambda name: name == "run_python"

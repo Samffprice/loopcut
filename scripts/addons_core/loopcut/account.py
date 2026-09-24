@@ -238,6 +238,13 @@ def default_model() -> str:
     return _state["default_model"]
 
 
+def keeps_context(base_url: str, model_id: str) -> bool:
+    """Whether the service lists this model with keep_context: its upstream's cache rewards only
+    requests that extend the previous one whole, so context.py must not rewrite a turn."""
+    return base_url.rstrip("/") == BASE_URL and any(
+        r.get("id") == model_id and r.get("keep_context") is True for r in _state["models"])
+
+
 def model_label(model_id: str) -> str:
     return next((m["label"] for m in models() if m["id"] == model_id), model_id)
 

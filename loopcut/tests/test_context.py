@@ -41,7 +41,11 @@ def turn(number: int, steps: int, chars: int) -> list[dict]:
 
 
 class Config:
-    base_url, api_key, model, context_budget = "http://127.0.0.1:1", "k", "m", 40_000
+    base_url, api_key, model, context_budget, keep_context = "http://127.0.0.1:1", "k", "m", 40_000, False
+
+
+class KeepConfig(Config):
+    keep_context = True
 
 
 def records(sent: list) -> list[str]:
@@ -173,6 +177,52 @@ class FoldTest(unittest.TestCase):
 def capture(ref: str) -> dict:
     return {"role": "user", cx.CAPTURE: True, "content": [
         {"type": "text", "text": cx.CAPTURE_TEXT}, {"type": "image_url", "image_url": {"url": ref}}]}
+
+
+class KeepModeTest(unittest.TestCase):
+    """Keep mode, for caches that reuse only a request extended whole (Xiaomi's MiMo)."""
+
+    def test_each_request_of_a_turn_extends_the_one_before_it(self):
+        messages = [{"role": "user", "content": "go"}]
+        session, sent = {"messages": messages}, []
+        for n in range(6):
+            messages += step(1, n, 200) + [capture(f"img:{n}")]
+            request, _ = cx.prepare(session, KeepConfig, lambda: False)
+            wired = cv.wire_messages("c", request, keep=True)
+            self.assertEqual(wired[:len(sent)], sent, f"request {n} rewrote what an earlier one sent")
+            sent = wired
+        images = [p for m in sent if isinstance(m["content"], list) for p in m["content"] if p["type"] == "image_url"]
+        self.assertEqual(len(images), 6, "every capture keeps its image in place")
+
+    def test_steps_fold_only_past_the_budget_itself_and_take_their_captures_along(self):
+        messages = [{"role": "user", "content": "go"}]
+        session, n = {"messages": messages}, 0
+
+        def grow_past(share: float) -> None:
+            nonlocal n
+            while cx.estimate_tokens(cx.view(messages, keep=True)) <= KeepConfig.context_budget * share:
+                messages.extend(step(1, n, 1000) + [capture(f"img:{n}")])
+                n += 1
+
+        grow_past(cx.FOLD_AT)
+        sent, _ = cx.prepare(session, KeepConfig, lambda: False)
+        self.assertEqual(records(sent), [], "past FOLD_AT but within the budget: nothing folds")
+        grow_past(1.0)
+        sent, _ = cx.prepare(session, KeepConfig, lambda: False)
+        self.assertLessEqual(cx.estimate_tokens(sent), KeepConfig.context_budget * cx.FOLD_TO)
+        live = [k for k, i in enumerate(cx.steps(messages)) if not messages[i].get(cx.FOLDED)]
+        self.assertGreaterEqual(len(live), cx.LIVE_STEPS)
+        self.assertEqual(live, list(range(live[0], n)), "oldest first, in one batch")
+        self.assertEqual(cx.kept_images(messages, keep=True), {f"img:{k}" for k in live},
+                         "a folded step's captures fold with it; the rest stay")
+        again, _ = cx.prepare(session, KeepConfig, lambda: False)
+        self.assertEqual(again, sent, "stable: the next request has the same prefix")
+
+    def test_earlier_turns_still_fold_when_the_user_writes(self):
+        session = {"messages": turn(1, 3, 100) + turn(2, 3, 100)}
+        sent, _ = cx.prepare(session, KeepConfig, lambda: False)
+        self.assertEqual(len(records(sent)), 1, "one cache break per turn, as in the default mode")
+        self.assertEqual(sent[3:], session["messages"][8:])
 
 
 class CompactionTest(unittest.TestCase):

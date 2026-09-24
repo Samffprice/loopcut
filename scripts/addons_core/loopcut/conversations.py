@@ -214,10 +214,10 @@ def image_path(conversation_id: str, reference: str) -> Path:
     return _folder(conversation_id) / "images" / name
 
 
-def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset()) -> list:
+def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset(), keep: bool = False) -> list:
     """Messages as the API wants them: stored image references become data URIs, and only the
     images context.kept_images names are sent; the conversation on disk keeps them all."""
-    kept = context.kept_messages(messages, unpinned)
+    kept = context.kept_messages(messages, unpinned, keep)
     wired = []
     for message in messages:
         content = message.get("content")

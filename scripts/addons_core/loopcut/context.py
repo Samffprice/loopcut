@@ -22,6 +22,13 @@ moments, in batches:
 5. Images: kept_messages() keeps the captures the model has not acted on yet, the newest capture
    of all (the model is never without a picture of the scene), and the images the user attached,
    which are references and stay until unpinned. A dropped capture is remembered by what it showed.
+6. Keep mode (cfg.keep_context: the gateway's models table sets it per model, LOOPCUT_KEEP_CONTEXT
+   for other providers) is for caches that reward only a request that extends an earlier one whole.
+   Xiaomi's MiMo reuses anything else in 4096-token blocks (measured 2026-09-24), so the capture
+   swapped for a look line each step cost it ~4k fresh tokens a request. In keep mode nothing a turn
+   has sent changes: every capture keeps its image where it is, and steps fold only when a request
+   would pass the budget itself, then all at once down to FOLD_TO. Earlier turns still fold when
+   the user sends a message. Longer requests with more images, about 94% of them cache.
 
 The budget is counted as the provider counts it: the system prompt and tool schemas are part of
 every request (agent passes their size as `fixed`), and calibrate() corrects only the tokenizer's
@@ -112,7 +119,7 @@ def unpinned_refs(session: dict) -> frozenset:
     return frozenset(r["ref"] for r in session.get("references") or [] if not r.get("pinned", True))
 
 
-def kept_messages(messages: list, unpinned: frozenset = frozenset()) -> set[int]:
+def kept_messages(messages: list, unpinned: frozenset = frozenset(), keep: bool = False) -> set[int]:
     """ids of the messages whose images are still sent: the captures the model has not yet
     acted on (the trailing run of capture messages, at most KEEP_IMAGES), the newest capture
     of the conversation whatever came after it, and the images the user attached and has not
@@ -120,18 +127,28 @@ def kept_messages(messages: list, unpinned: frozenset = frozenset()) -> set[int]
     once; after that the newest stays as the model's picture of the scene until a newer look
     replaces it, so the model is never without one. A reference is what the work is measured
     against and stays until the user says otherwise. Messages, not references: two identical
-    captures share a file, and the older one must still drop."""
+    captures share a file, and the older one must still drop. In keep mode every capture of the
+    turn stays unless its step is folded: dropping one would change a request already sent."""
     batch: list[dict] = []  # A step's captures come right after its results, consecutively.
+    in_folded = False       # Keep mode: the captures being read belong to a folded step.
     for message in messages[turn_start(messages) + 1:]:
-        batch = batch + [message] if is_capture(message) else []
+        if not keep:
+            batch = batch + [message] if is_capture(message) else []
+        elif message.get("role") == "assistant" and message.get("tool_calls"):
+            in_folded = bool(message.get(FOLDED))
+            if in_folded:
+                batch = []  # Steps fold oldest first: everything before this one is being rewritten anyway.
+        elif is_capture(message) and not in_folded:
+            batch.append(message)
     latest = [m for m in reversed(messages) if is_capture(m)][:1]
     attached = [m for m in messages if m.get(ATTACHED) and any(ref not in unpinned for ref in _image_refs(m))]
-    return {id(m) for m in batch[-KEEP_IMAGES:] + latest} | {id(m) for m in attached[-KEEP_ATTACHED:]}
+    captures = batch if keep else batch[-KEEP_IMAGES:]
+    return {id(m) for m in captures + latest} | {id(m) for m in attached[-KEEP_ATTACHED:]}
 
 
-def kept_images(messages: list, unpinned: frozenset = frozenset()) -> set[str]:
+def kept_images(messages: list, unpinned: frozenset = frozenset(), keep: bool = False) -> set[str]:
     """The image references still sent; see kept_messages."""
-    kept = kept_messages(messages, unpinned)
+    kept = kept_messages(messages, unpinned, keep)
     return {ref for m in messages if id(m) in kept for ref in _image_refs(m) if ref not in unpinned}
 
 
@@ -198,11 +215,11 @@ def _summary_message(summary: str) -> dict:
             "The block above stands for earlier messages of this conversation. It continues below."}
 
 
-def view(messages: list, upto: int | None = None, unpinned: frozenset = frozenset()) -> list[dict]:
+def view(messages: list, upto: int | None = None, unpinned: frozenset = frozenset(), keep: bool = False) -> list[dict]:
     """What is sent for messages[:upto]: the latest summary, then the messages after it with
     folded steps as records. Stored messages are returned as themselves, never copied or edited."""
     start, summary = window(messages)
-    tail = fold(messages[start:upto], kept_messages(messages, unpinned))
+    tail = fold(messages[start:upto], kept_messages(messages, unpinned, keep))
     return ([_summary_message(summary)] if summary else []) + tail
 
 
@@ -347,18 +364,19 @@ def fold_steps(messages: list, indexes: list[int]) -> int:
 
 
 def fold_for_budget(messages: list, budget: int, ratio: float = 1.0, unpinned: frozenset = frozenset(),
-                    fixed: int = FIXED_TOKENS) -> int:
+                    fixed: int = FIXED_TOKENS, keep: bool = False) -> int:
     """Earlier turns are always sent as records. In the current turn, once a request would exceed
-    FOLD_AT of the budget, its oldest steps are folded, oldest first, until the request is under
-    FOLD_TO, leaving the newest LIVE_STEPS whole. Returns how many steps were folded now."""
+    FOLD_AT of the budget (in keep mode, the whole budget), its oldest steps are folded, oldest
+    first, until the request is under FOLD_TO, leaving the newest LIVE_STEPS whole. Returns how
+    many steps were folded now."""
     start, _ = window(messages)
     current = turn_start(messages)
     folded = fold_steps(messages, steps(messages, start, current))
 
     def over(share: float) -> bool:
-        return estimate_tokens(view(messages, unpinned=unpinned), fixed) * ratio > budget * share
+        return estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed) * ratio > budget * share
 
-    if not over(FOLD_AT):
+    if not over(1.0 if keep else FOLD_AT):
         return folded
     for index in steps(messages, max(start, current))[:-LIVE_STEPS or None]:
         folded += fold_steps(messages, [index])
@@ -370,12 +388,12 @@ def fold_for_budget(messages: list, budget: int, ratio: float = 1.0, unpinned: f
 # ------------------------------------------------------------------ compaction
 
 def compaction_cut(messages: list, budget: int, ratio: float = 1.0, unpinned: frozenset = frozenset(),
-                   fixed: int = FIXED_TOKENS) -> int | None:
+                   fixed: int = FIXED_TOKENS, keep: bool = False) -> int | None:
     """Where to cut so that what follows fits COMPACT_TO of the budget: the earliest turn start
     that does, else the earliest message a request may start with (a user or assistant message;
     a tool result cannot come first). None when nothing can be summarized or nothing fits."""
     start, _ = window(messages)
-    kept = kept_messages(messages, unpinned)
+    kept = kept_messages(messages, unpinned, keep)
 
     def fits(index: int) -> bool:
         return (estimate_tokens(fold(messages[index:], kept), fixed) + SUMMARY_TOKENS) * ratio <= budget * COMPACT_TO
@@ -420,14 +438,14 @@ def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summ
     messages a new summary now stands for (0 when none was made). Marks steps folded and may
     put a summary on a message; never changes the number, order or content of messages."""
     messages, unpinned = session["messages"], unpinned_refs(session)
-    budget, ratio = cfg.context_budget, session.get("token_ratio") or 1.0
+    budget, ratio, keep = cfg.context_budget, session.get("token_ratio") or 1.0, cfg.keep_context
     compacted = 0
-    fold_for_budget(messages, budget, ratio, unpinned, fixed)
-    if estimate_tokens(view(messages, unpinned=unpinned), fixed) * ratio > budget:
-        cut = compaction_cut(messages, budget, ratio, unpinned, fixed)
+    fold_for_budget(messages, budget, ratio, unpinned, fixed, keep)
+    if estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed) * ratio > budget:
+        cut = compaction_cut(messages, budget, ratio, unpinned, fixed, keep)
         if cut is not None:
             try:
-                summary = summarize(cfg, view(messages, cut, unpinned), is_cancelled)
+                summary = summarize(cfg, view(messages, cut, unpinned, keep), is_cancelled)
             except llm.LLMError as ex:
                 print(f"Loopcut: could not summarize the conversation, sending it as is: {ex}")
                 summary = ""
@@ -435,4 +453,4 @@ def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summ
                 start, _ = window(messages)
                 messages[cut][SUMMARY] = summary
                 compacted = cut - start
-    return view(messages, unpinned=unpinned), compacted
+    return view(messages, unpinned=unpinned, keep=keep), compacted
