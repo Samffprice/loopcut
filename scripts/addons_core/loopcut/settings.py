@@ -323,7 +323,8 @@ class LOOPCUT_MT_tiers(bpy.types.Menu):
 
     def draw(self, context):
         for m in account.models():
-            text = m["label"] + (f"   —   {m['note']}" if m["note"] else "")
+            about = "  ·  ".join(p for p in (m["blurb"], m["note"]) if p)
+            text = m["label"] + (f"   —   {about}" if about else "")
             self.layout.operator("loopcut.pick_tier", text=text).tier = m["id"]
 
 

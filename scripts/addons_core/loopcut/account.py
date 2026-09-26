@@ -214,14 +214,16 @@ def _set_models(payload: dict) -> None:
 
 
 def models() -> list[dict]:
-    """(id, label, note, available, default) per model the service offers, in its order. The
-    note says what a step costs against the default ("2.4x usage") and which plan unlocks it."""
+    """(id, label, blurb, note, available, default) per model the service offers, in its order.
+    The blurb says what the model is good at; the note, short enough for the panel's model menu,
+    what a step costs against the default ("2.4x usage") and which plan unlocks it."""
     rows = _state["models"]
     if not rows:
-        return [{"id": id, "label": label, "note": note, "available": True, "default": id == "fast"} for id, label, note in MODELS]
+        return [{"id": id, "label": label, "blurb": blurb, "note": "", "available": True, "default": id == "fast"}
+                for id, label, blurb in MODELS]
     out = []
     for r in rows:
-        parts = [str(r.get("blurb") or "")]
+        parts = []
         multiplier = r.get("usage_multiplier")
         if isinstance(multiplier, (int, float)) and not r.get("default"):
             parts.append(f"{multiplier:g}x usage")
@@ -229,7 +231,8 @@ def models() -> list[dict]:
         if not r.get("available", True):
             parts.append(f"{unlock.get('name') or 'a higher'} plan")
         out.append({"id": str(r["id"]), "label": str(r.get("display_name") or r["id"]),
-                    "note": "  ·  ".join(p for p in parts if p), "available": bool(r.get("available", True)),
+                    "blurb": str(r.get("blurb") or ""), "note": "  ·  ".join(parts),
+                    "available": bool(r.get("available", True)),
                     "default": bool(r.get("default"))})
     return out
 

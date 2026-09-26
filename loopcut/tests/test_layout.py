@@ -69,12 +69,13 @@ class FooterTest(unittest.TestCase):
         self.assertEqual(label["text"], "Fast")
 
     def test_model_menu_lists_options_with_the_current_one_ticked(self):
-        options = [("fast", "Fast", "Quick answers", True), ("pro", "Pro", "Thinks longer", False)]
+        options = [("fast", "Fast", "", True), ("pro", "Pro", "0.5x usage", False),
+                   ("opus", "Opus", "24x usage  ·  Max plan", False)]
         display = build(model_menu=True, model_options=options)
         names = [p["text"] for p in display["prims"] if p["id"].startswith("models.row") and p["id"].endswith(".name")]
-        self.assertEqual(names, ["✓  Fast", "     Pro", "Settings…"])
+        self.assertEqual(names, ["✓  Fast", "     Pro", "     Opus", "Settings…"], "no name cut short by its note")
         self.assertEqual(hit(display, "models.row1")["action"], ("model_pick", "pro"))
-        self.assertEqual(hit(display, "models.row2")["action"], ("open_settings", None))
+        self.assertEqual(hit(display, "models.row3")["action"], ("open_settings", None))
 
     def test_context_ring_fills_with_the_request_and_the_session_ring_drains(self):
         session = state.new_session()
