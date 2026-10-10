@@ -121,33 +121,38 @@ def rank(query: str, items, text_of, name_of=None, weight_of=None, limit: int = 
     return [item for *_, item in scored[:limit]]
 
 
-def sheet(paths: list, name: str = "sheet.png") -> Path | None:
-    """Thumbnails as one image, numbered by position; None entries are blank tiles."""
+def sheet(paths: list, name: str = "sheet.png", cell: tuple = (TILE, TILE), columns: int = SHEET_COLUMNS,
+          folder: Path | None = None) -> Path | None:
+    """Images as one, in rows of `columns` cells of cell (width, height) px, each scaled to the cell's
+    height and cut to its width; None entries are blank cells. Search thumbnails (numbered by
+    position in the text beside them) and a wave's contact sheet (waves.contact_sheet). Written to
+    folder, else the scratch folder. Main thread."""
     import numpy as np
+    width_of, height_of = cell
     tiles = []
     for path in paths:
         try:
-            tiles.append(_pixels(path, TILE) if path else None)
+            tiles.append(_pixels(path, height_of) if path else None)
         except Exception as ex:  # A preview Blender cannot read is a blank tile, not a failed search.
             print(f"Loopcut: could not read thumbnail {path}: {ex}")
             tiles.append(None)
     if not any(t is not None for t in tiles):
         return None
-    rows = (len(tiles) + SHEET_COLUMNS - 1) // SHEET_COLUMNS
-    width = SHEET_COLUMNS * TILE + (SHEET_COLUMNS - 1) * SHEET_GAP
-    height = rows * TILE + (rows - 1) * SHEET_GAP
+    rows = (len(tiles) + columns - 1) // columns
+    width = columns * width_of + (columns - 1) * SHEET_GAP
+    height = rows * height_of + (rows - 1) * SHEET_GAP
     canvas = np.zeros((height, width, 4), dtype=np.float32)
     canvas[..., :3], canvas[..., 3] = 0.15, 1.0
     for index, tile in enumerate(tiles):
         if tile is None:
             continue
-        row, column = divmod(index, SHEET_COLUMNS)
-        tile = tile[:TILE, :TILE]
-        y0 = height - (row + 1) * TILE - row * SHEET_GAP  # Pixel rows run bottom-up in Blender images.
-        x0 = column * (TILE + SHEET_GAP)
+        row, column = divmod(index, columns)
+        tile = tile[:height_of, :width_of]
+        y0 = height - (row + 1) * height_of - row * SHEET_GAP  # Pixel rows run bottom-up in Blender images.
+        x0 = column * (width_of + SHEET_GAP)
         canvas[y0:y0 + tile.shape[0], x0:x0 + tile.shape[1]] = tile
-    out = scratch.folder() / name
-    out.parent.mkdir(exist_ok=True)
+    out = (Path(folder) if folder else scratch.folder()) / name
+    out.parent.mkdir(parents=True, exist_ok=True)
     _save_pixels(canvas, out)
     return out
 

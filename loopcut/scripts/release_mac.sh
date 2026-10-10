@@ -8,6 +8,8 @@
 # scripts/addons_core/loopcut/__init__.py first): installed apps compare it with the release to
 # know when to update. Once both installers are on the release, publish_release.sh publishes it.
 set -eu
+# Python build helpers must not add caches to the source/install trees.
+export PYTHONDONTWRITEBYTECODE=1
 repo="$(cd "$(dirname "$0")/../.." && pwd)"   # The repository. Builds, tools/, out/ and .env sit next to it.
 work="$(dirname "$repo")"
 version="${1:?usage: loopcut/scripts/release_mac.sh v0.1.0 [--upload]}"
@@ -22,16 +24,18 @@ cmake -S "$repo" -B "$build" -G Ninja \
   -DWITH_ASSERT_ABORT=OFF -DWITH_ASSERT_RELEASE=OFF \
   -DCPACK_OVERRIDE_PACKAGENAME="loopcut-$version"
 ninja -C "$build" install
-"$build/bin/Loopcut.app/Contents/MacOS/Loopcut" -b --factory-startup --python-expr \
-  "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 rm -f "$build"/loopcut-*.dmg
 (cd "$build" && cpack -G DragNDrop)
+# Blender's isolated Python ignores PYTHONDONTWRITEBYTECODE. Smoke-test after
+# packaging so any runtime caches it creates are outside the released image.
+"$build/bin/Loopcut.app/Contents/MacOS/Loopcut" -b --factory-startup --python-expr \
+  "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 dmg="$(ls "$build"/loopcut-"$version"-*.dmg)"
 echo "Built $dmg"
 
 if [ "${2:-}" = "--upload" ]; then
   cd "$repo"  # gh finds the GitHub repository from the checkout it runs in.
-  gh release view "$version" >/dev/null 2>&1 ||
-    gh release create "$version" --draft --generate-notes --title "Loopcut $version"
-  gh release upload "$version" "$dmg" --clobber
+  gh release view "$version" --repo Samffprice/loopcut >/dev/null 2>&1 ||
+    gh release create "$version" --repo Samffprice/loopcut --draft --generate-notes --title "Loopcut $version"
+  gh release upload "$version" "$dmg" --clobber --repo Samffprice/loopcut
 fi

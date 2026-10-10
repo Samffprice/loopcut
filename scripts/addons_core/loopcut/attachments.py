@@ -15,8 +15,8 @@ from . import conversations
 
 EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".tga")
 MAX_PER_MESSAGE = 6
-MAX_SIDE = 1568            # The stored copy; look_at_reference reads details from it.
-SEND_SIDE = 768            # The copy in every request: a pinned reference must stay cheap.
+MAX_SIDE = 2048            # The stored copy; workspace requests and look_at_reference read details from it.
+SEND_SIDE = 768            # The cheap loop's copy; workspace requests use MAX_SIDE instead.
 MAX_FILE_BYTES = 100_000_000
 
 
@@ -76,5 +76,6 @@ def add(session: dict, paths: list[str]) -> list[str]:
             continue
         full, small = stored
         if all(a["ref"] != small for a in session["attachments"]):
-            session["attachments"].append({"ref": small, "full": full, "name": source.name})
+            # source: the original file, which the workspace copies (workspace.py) while it is still there.
+            session["attachments"].append({"ref": small, "full": full, "name": source.name, "source": str(source)})
     return problems

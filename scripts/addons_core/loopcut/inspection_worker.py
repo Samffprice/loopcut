@@ -12,6 +12,7 @@ from mathutils import Vector
 from bpy_extras.object_utils import world_to_camera_view
 
 import jobs
+import view_layers
 from job_worker import configure, image_record
 
 
@@ -77,9 +78,11 @@ def make_sheet(spec, output: Path, records):
                     pixels = np.asarray(source)
                     np.asarray(dest)[y + footer:y + footer + height, x:x + width] = pixels
                     rgb = pixels[..., :3].astype(np.float32) / 255
-                    record["signal"] = {"mean_rgb": [round(float(v), 4) for v in rgb.mean(axis=(0, 1))],
+                    mean = [round(float(v), 4) for v in rgb.mean(axis=(0, 1))]
+                    record["signal"] = {"mean_rgb": mean,
                                         "fraction_above_002": round(float(np.mean(rgb.max(axis=2) > .02)), 4),
-                                        "near_black": bool(np.quantile(rgb.max(axis=2), .95) < .02)}
+                                        "near_black": bool(np.quantile(rgb.max(axis=2), .95) < .02),
+                                        **jobs.color_signal(mean, float(np.mean(pixels[..., :3].max(axis=2) >= 255)))}
             finally:
                 tile.free()
             with blf.bind_imbuf(0, sheet):
@@ -134,8 +137,39 @@ def render_inspection(path: Path, spec: dict, scene) -> None:
         shading.light, shading.color_type = "STUDIO", "MATERIAL"
         shading.show_shadows, shading.show_cavity = True, True
         shading.background_type, shading.background_color = "WORLD", (.06, .06, .06)
+    # The layer the user's Blender chose (inspection.inspect_scene): rendered alone, its use on in this
+    # copy, unless the shot is the compositor's mix of several; framing and labels read it too.
+    layer = scene.view_layers.get(spec.get("view_layer") or "") or bpy.context.view_layer
+    asked = bool(spec.get("view_layer_asked"))
+    single = not (spec["purpose"] == "final_lighting" and view_layers.composited(scene, asked))
+    if single:
+        layer.use = True
+    if spec["purpose"] != "final_lighting":   # Its own light and colours: the layer's overrides would win.
+        layer.world_override = layer.material_override = None
+    with view_layers.evaluating(layer):
+        records = _render_views(path, spec, scene, output, layer.name if single else "")
+    context = view_layers.described(scene, layer, asked or single)
+    sheet, size = make_sheet(spec, output, records)
+    metadata = {"scene_revision": spec["scene_revision"], "purpose": spec["purpose"],
+                "engine": spec["engine"], "source_engine": spec["source_engine"], "samples": spec["samples"],
+                "quality": "bounded inspection, not production render", "size": size, **context,
+                "view_transform": scene.view_settings.view_transform, "look": scene.view_settings.look,
+                "exposure": scene.view_settings.exposure, "gamma": scene.view_settings.gamma,
+                "elapsed_seconds": round(time.monotonic() - started, 3), "sheet_bytes": sheet.stat().st_size,
+                "sheet_sha256": jobs.digest(sheet), "views": records}
+    jobs.atomic_json(output / "inspection.json", metadata)
+    progress = jobs.read_json(path / "progress.json")
+    progress.update(phase="verified", verified_complete=True, elapsed_seconds=metadata["elapsed_seconds"])
+    jobs.atomic_json(path / "progress.json", progress)
+    jobs.atomic_json(output / "manifest.json", {"job": spec, "result": metadata})
+
+
+def _render_views(path: Path, spec: dict, scene, output: Path, layer: str) -> list:
+    """Every camera at every frame, rendered (layer: that view layer alone; "" every one that renders)
+    and measured; the records, progress written as they come."""
     targets = [scene.objects[name] for name in spec["focus"]] if spec["focus"] else [
-        obj for obj in scene.objects if obj.type in {"MESH", "CURVE", "FONT", "SURFACE", "META", "VOLUME"} and not obj.hide_render]
+        obj for obj in scene.objects if obj.type in {"MESH", "CURVE", "FONT", "SURFACE", "META", "VOLUME"}
+        and not obj.hide_render and view_layers.includes(bpy.context.view_layer, obj)]
     generated = None
     if not spec["cameras"]:
         generated = bpy.data.objects.new("Inspection view", bpy.data.cameras.new("Inspection view"))
@@ -166,7 +200,7 @@ def render_inspection(path: Path, spec: dict, scene) -> None:
             bpy.context.view_layer.update()
             target = output / f"view_{camera_index:02d}_{frame:07d}.png"
             scene.render.filepath = str(target)
-            bpy.ops.render.render(write_still=True, scene=scene.name)
+            bpy.ops.render.render(write_still=True, scene=scene.name, **({"layer": layer} if layer else {}))
             record = image_record(target, spec["width"], spec["height"])
             record.update(camera=camera.name, frame=frame, scene_revision=spec["scene_revision"],
                           focus=projections(scene, camera, targets[:12]) if spec["focus"] else [],
@@ -174,15 +208,4 @@ def render_inspection(path: Path, spec: dict, scene) -> None:
             records.append(record)
             progress["completed"] = len(records)
             jobs.atomic_json(path / "progress.json", progress)
-    sheet, size = make_sheet(spec, output, records)
-    metadata = {"scene_revision": spec["scene_revision"], "purpose": spec["purpose"],
-                "engine": spec["engine"], "source_engine": spec["source_engine"], "samples": spec["samples"],
-                "quality": "bounded inspection, not production render", "size": size,
-                "view_transform": scene.view_settings.view_transform, "look": scene.view_settings.look,
-                "exposure": scene.view_settings.exposure, "gamma": scene.view_settings.gamma,
-                "elapsed_seconds": round(time.monotonic() - started, 3), "sheet_bytes": sheet.stat().st_size,
-                "sheet_sha256": jobs.digest(sheet), "views": records}
-    jobs.atomic_json(output / "inspection.json", metadata)
-    progress.update(phase="verified", verified_complete=True, elapsed_seconds=metadata["elapsed_seconds"])
-    jobs.atomic_json(path / "progress.json", progress)
-    jobs.atomic_json(output / "manifest.json", {"job": spec, "result": metadata})
+    return records

@@ -28,7 +28,7 @@
   <a href="https://github.com/Samffprice/loopcut/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Samffprice/loopcut/total?style=flat-square&color=df8b37"></a>
   <img alt="Blender 5.2" src="https://img.shields.io/badge/Blender-5.2-4a95a3?style=flat-square">
   <img alt="macOS and Windows" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-2a2a2e?style=flat-square">
-  <a href="COPYING"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2a2a2e?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2a2a2e?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -123,8 +123,24 @@ The [developer guide](loopcut/DEVELOPING.md) covers the layout, the dev loop, th
 
 Issues and pull requests are welcome. The fast loop is `loopcut/scripts/dev.sh` (Blender stays open, saving a file reloads the panel) and `python3 -m unittest discover -s loopcut/tests` runs without Blender. The Blender-free tests run on every push.
 
+## Bundled add-ons
+
+Loopcut includes unmodified, optional System extensions, disabled until needed:
+[UniV](https://extensions.blender.org/add-ons/univ/) by Oxicid (GPL-3.0-or-later);
+[LoopTools](https://extensions.blender.org/add-ons/looptools/) by Bart Crouch and Vladimir Spivak,
+maintained by the community (GPL-2.0-or-later);
+[Node Arrange](https://extensions.blender.org/add-ons/node-arrange/) maintained by Leonardo Pike-Excell
+(GPL-3.0-or-later, with NetworkX under BSD-3-Clause);
+[MPFB](https://extensions.blender.org/add-ons/mpfb/) maintained by Joel Palmius and the MakeHuman
+community (code GPL-3.0-or-later; included assets CC0 1.0; additional asset packs are not bundled);
+and [Bool Tool](https://extensions.blender.org/add-ons/bool-tool/) maintained by Nika Kutsniashvili,
+with its upstream contributors (GPL-3.0-or-later). Full credits and pinned versions are in
+[bundled.json](release/extensions/bundled.json), with [licence texts](release/extensions/licenses/)
+and the shipped Python sources in [the System repository](release/extensions/system/).
+These packages contain no compiled components; Node Arrange's bundled NetworkX wheel is pure Python.
+
 ## License and name
 
-The code is Blender's and ours together, under the GNU General Public License v3 or later, like Blender ([COPYING](COPYING), [doc/license/](doc/license/)). That includes the add-on: it is written against Blender's Python API and ships inside the app. The hosted model service is separate work in its own repository.
+The code is Blender's and ours together, under the GNU General Public License v3 or later, like Blender ([LICENSE](LICENSE) has the full text; [COPYING](COPYING), [doc/license/](doc/license/)). That includes the add-on: it is written against Blender's Python API and ships inside the app. The hosted model service is separate work in its own repository.
 
 The license covers the code, not the name. "Loopcut" and the Loopcut mark ([release/loopcut/](release/loopcut/)) identify this product, and the GPL grants no right to use them; a fork of this repository needs its own name and icons, exactly as this one does not use Blender's. Blender is a trademark of the Blender Foundation. Loopcut is based on Blender and is not affiliated with or endorsed by the Blender Foundation.

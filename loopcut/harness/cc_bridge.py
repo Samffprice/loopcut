@@ -14,11 +14,20 @@ Blender side: scripts/cc_session.sh. The model side's instructions: harness/cc_b
 
 A run folder (out/cc_bridge/<time>/) holds events.jsonl (every event, timestamped) and one folder
 per request: request.json (the body, images swapped for files), images/, prompt.md (what the model
-reads), meta.json, reply.json (with the model's private notes, which are never streamed).
+reads), delta.md (only the messages after the previous request's), meta.json, reply.json (with the
+model's notes for developers, which are never streamed).
+
+Eval runs (harness/evals/run.py --cc-orchestrator, or --cc-single for Claude as the single loop)
+start one bridge per task in a folder of their own, and one Claude Code subagent per task drives it
+(harness/cc_orchestrator_model.md or harness/cc_single_model.md, as <out>/cc_tasks.json says):
+
+    python3 cc_bridge.py serve --port P --run-dir D   # no current.txt: several bridges at once
+    python3 cc_bridge.py wait --run D --timeout 540   # REQUEST <folder>, IDLE, or DONE once D/done exists
 """
 
 import argparse
 import base64
+import hashlib
 import json
 import re
 import sys
@@ -28,9 +37,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import prompt_assembly
+from prompt_proxy import request_meta, send_error
+
 WORKSPACE = Path(__file__).resolve().parents[3]
 ROOT = WORKSPACE / "out" / "cc_bridge"
 CURRENT = ROOT / "current.txt"
+DONE = "done"            # Touched in a run folder by run.py when the task's Blender has exited.
 KEEPALIVE_SECONDS = 15   # The add-on's read timeout is 120 s (llm.stream_chat); comment lines keep it fed.
 POLL_SECONDS = 0.5
 STREAM_PIECE = 48        # Characters per streamed text chunk, so the panel streams as it does live.
@@ -55,6 +68,11 @@ def current_run() -> Path:
     if not CURRENT.exists():
         sys.exit("No bridge run yet: start `cc_bridge.py serve` first.")
     return Path(CURRENT.read_text().strip())
+
+
+def run_of(args) -> Path:
+    """The run folder a command names with --run, else the newest `serve` without --run-dir."""
+    return Path(args.run).resolve() if getattr(args, "run", None) else current_run()
 
 
 def write_json(path: Path, value) -> None:
@@ -131,7 +149,13 @@ def render_prompt(number: int, body: dict) -> str:
     else:
         out += ["## Tools", "", "None offered: answer in text only.", ""]
     out += ["## Conversation", ""]
-    for i, message in enumerate(messages):
+    return "\n".join(out + render_messages(messages, 0))
+
+
+def render_messages(messages: list, start: int) -> list[str]:
+    """Messages [start:] as prompt.md lays them out, the system prompt left out."""
+    out = []
+    for i, message in enumerate(messages[start:], start):
         if message.get("role") == "system":
             continue
         head = f"### [{i}] {message.get('role')}"
@@ -150,17 +174,92 @@ def render_prompt(number: int, body: dict) -> str:
                     out += [part.get("text", ""), ""]
         for call in message.get("tool_calls") or []:
             out += [_call_block(call), ""]
-    return "\n".join(out)
+    return out
+
+
+# ------------------------------------------------------------------ delta.md
+
+def fingerprints(body: dict) -> dict:
+    """Per-message hashes and the tool list's, taken before images are swapped for files, so an
+    image that changed changes its message's hash."""
+    def digest(value) -> str:
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return {"messages": [digest(m) for m in body.get("messages") or []], "tools": digest(body.get("tools") or [])}
+
+
+def delta_kind(previous: dict | None, current: dict, has_tools: bool) -> tuple[str, str]:
+    """How this request relates to the previous step request: "first", "side" (a summary or a
+    reference card: its own short conversation, no tools), "append" (the previous request's messages
+    are an unchanged prefix) or "changed" (context.prepare folded or summarised earlier messages, or
+    the tools changed). Returns the kind and the reason in words."""
+    if not has_tools:
+        return "side", "a side request with its own short conversation and no tools (a summary or a reference description)"
+    if previous is None:
+        return "first", "the first request of this conversation"
+    number, old, new = previous["number"], previous["messages"], current["messages"]
+    if previous["tools"] != current["tools"]:
+        return "changed", f"the tool list differs from request {number:04d}"
+    if len(new) < len(old):
+        return "changed", f"the conversation shrank from {len(old)} to {len(new)} messages since request {number:04d} (folded or summarised)"
+    differs = next((i for i, (a, b) in enumerate(zip(old, new)) if a != b), None)
+    if differs is not None:
+        return "changed", f"message [{differs}] differs from request {number:04d} (earlier messages were folded or summarised)"
+    return "append", f"messages [0]-[{len(old) - 1}] are unchanged from request {number:04d}"
+
+
+def render_delta(number: int, body: dict, kind: str, reason: str, previous: dict | None) -> str:
+    """delta.md: only what is new since the previous step request, or a heading that says to read
+    prompt.md in full because the delta would not show everything the model now sees."""
+    messages = body.get("messages") or []
+    if kind == "first":
+        return f"# FIRST REQUEST — read prompt.md\n\nRequest {number:04d} is {reason}.\n"
+    if kind in ("side", "changed"):
+        tail = (" Answer in content only and follow its last message; the main conversation continues at "
+                "the next request." if kind == "side" else " Answer from what it shows now: anything it no "
+                "longer shows is gone for the model too.")
+        return f"# HISTORY CHANGED — read prompt.md\n\nRequest {number:04d}: {reason}.{tail}\n"
+    start = len(previous["messages"])
+    new = messages[start:]
+    images = sum(1 for m in new if isinstance(m.get("content"), list)
+                 for p in m["content"] if p.get("type") == "image_url")
+    out = [f"# Loopcut model request {number:04d} · delta since request {previous['number']:04d}", "",
+           f"reasoning_effort: {body.get('reasoning_effort')} · messages: {len(messages)} · "
+           f"{reason.replace('messages', 'Messages', 1)}; system prompt and tools unchanged. "
+           + (f"New: [{start}]-[{len(messages) - 1}], {images} image(s)." if new else
+              "Nothing is new: the add-on sent the same conversation again (a retry after an error or a stop)."), ""]
+    return "\n".join(out + render_messages(messages, start))
 
 
 # ------------------------------------------------------------------ server
 
 class Bridge:
-    def __init__(self, run: Path):
+    def __init__(self, run: Path, source=None, prompts=None, skills=None):
         self.run = run
+        self.source = source
+        self.prompts, self.skills = prompts, skills
+        self.source_lock = threading.Lock()
         self.count = 0
         self.last_streamed: float | None = None
         self.count_lock = threading.Lock()
+        self.chain: dict | None = None   # The previous step request's number and fingerprints, for delta.md.
+
+    def prompt_source(self):
+        # Old, plain requests must work even on machines without hosted source files.
+        with self.source_lock:
+            if self.source is None:
+                self.source = prompt_assembly.load(self.prompts, self.skills)
+            return self.source
+
+    def delta(self, number: int, body: dict) -> tuple[str, str, dict | None]:
+        """This request's delta kind and reason, and the step request it is measured against.
+        Side requests do not move the chain: the next step is measured against the step before."""
+        current = {"number": number, **fingerprints(body)}
+        with self.count_lock:
+            previous = self.chain
+            kind, reason = delta_kind(previous, current, bool(body.get("tools")))
+            if kind != "side":
+                self.chain = current
+        return kind, reason, previous
 
     def next_folder(self) -> tuple[int, Path]:
         with self.count_lock:
@@ -207,17 +306,50 @@ def make_handler(bridge: Bridge):
                 self.send_error(404)
                 return
             received = now()
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            prompt_id = self.headers.get('x-loopcut-prompt') or None  # Absent or empty: pass-through.
+            version = None
+            if prompt_id is not None:
+                try:
+                    if prompt_id not in prompt_assembly.PROMPT_IDS:
+                        raise prompt_assembly.AssemblyError('unknown_prompt', 'Unknown prompt id.')
+                    source = bridge.prompt_source()
+                    version = prompt_assembly.version(source)
+                except prompt_assembly.AssemblyError as ex:
+                    send_error(self, 400, ex, version)
+                    return
+                except (OSError, ValueError, KeyError) as ex:
+                    print(f'cc_bridge: cannot load hosted prompts: {ex}', file=sys.stderr, flush=True)
+                    send_error(self, 500, prompt_assembly.AssemblyError('server_error', 'Hosted prompts unavailable.'))
+                    return
+            try:
+                length = int(self.headers.get('Content-Length', ''))
+                if length < 0 or self.headers.get('Transfer-Encoding'):
+                    raise ValueError('Unsupported request framing')
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError('Expected an object')
+                if prompt_id is not None:
+                    body['messages'] = prompt_assembly.assemble(body.get('messages'), prompt_id, source)
+            except prompt_assembly.AssemblyError as ex:
+                send_error(self, 400, ex, version)
+                return
+            except (ValueError, UnicodeError):
+                send_error(self, 400, prompt_assembly.AssemblyError('invalid_request_error', 'Invalid request body.'), version)
+                return
             number, folder = bridge.next_folder()
+            delta, reason, previous = bridge.delta(number, body)  # Before images become files.
             images = extract_images(body, folder)
             tokens = estimate_tokens(body)
             kind = "step" if body.get("tools") else "text_only"  # Summaries and reference cards send no tools.
             meta = {"number": number, "kind": kind, "received": received, "messages": len(body.get("messages") or []),
                     "images": images, "estimated_tokens": tokens, "request_bytes": int(self.headers["Content-Length"]),
-                    "since_last_reply": round(received - bridge.last_streamed, 3) if bridge.last_streamed else None}
+                    "since_last_reply": round(received - bridge.last_streamed, 3) if bridge.last_streamed else None,
+                    "delta": delta}
+            meta.update({key: value for key, value in request_meta(self.headers).items() if value is not None})
             write_json(folder / "request.json", body)
             (folder / "prompt.md").write_text(render_prompt(number, body), encoding="utf-8")
-            write_json(folder / "meta.json", meta)
+            (folder / "delta.md").write_text(render_delta(number, body, delta, reason, previous), encoding="utf-8")
+            write_json(folder / "meta.json", meta)  # Last: wait treats a folder with meta.json as ready.
             log(bridge.run, "request", number=number, kind=kind, messages=meta["messages"], images=images,
                 estimated_tokens=tokens, since_last_reply=meta["since_last_reply"])
 
@@ -225,6 +357,8 @@ def make_handler(bridge: Bridge):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
+            if version:
+                self.send_header('x-loopcut-prompt-version', version)
             self.end_headers()
             self.close_connection = True
 
@@ -258,10 +392,15 @@ def make_handler(bridge: Bridge):
 
 
 def serve(args) -> None:
-    run = ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
-    run.mkdir(parents=True)
-    CURRENT.write_text(str(run))
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(Bridge(run)))
+    if args.run_dir:  # One bridge per eval task; wait/submit/report name the folder, so no current.txt.
+        run = Path(args.run_dir).resolve()
+        run.mkdir(parents=True, exist_ok=True)
+    else:
+        run = ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
+        run.mkdir(parents=True)
+        CURRENT.write_text(str(run))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(Bridge(
+        run, prompts=getattr(args, 'prompts', None), skills=getattr(args, 'skills', None))))
     log(run, "serve", port=args.port)
     print(f"Bridge on http://127.0.0.1:{args.port}/v1, run folder {run}", flush=True)
     server.serve_forever()
@@ -275,9 +414,15 @@ def pending(run: Path) -> list[Path]:
 
 
 def wait(args) -> None:
-    run, deadline = current_run(), time.time() + args.timeout
-    while time.time() < deadline:
-        found = pending(run)
+    """Prints REQUEST <folder> (claimed for the caller), DONE once the run's Blender has exited
+    (run.py touches <run>/done), or IDLE when nothing came within the timeout: in an orchestrated
+    eval, a worker wave is running inside Blender (delegate blocks) or the task is still queued."""
+    run, deadline = run_of(args), time.time() + args.timeout
+    while True:
+        if (run / DONE).exists():  # Before any pending request: nothing will read its reply now.
+            print("DONE")
+            return
+        found = pending(run) if run.is_dir() else []
         if found:
             folder = found[0]
             (folder / "claimed").write_text(str(now()))
@@ -287,10 +432,12 @@ def wait(args) -> None:
             last_user = next((m for m in reversed(body["messages"]) if m["role"] == "user"), {})
             content = last_user.get("content")
             text = content if isinstance(content, str) else " ".join(p.get("text", "") for p in content or [] if p.get("type") == "text")
-            print(f"REQUEST {folder}\nkind={meta['kind']} messages={meta['messages']} images={meta['images']} "
-                  f"~{meta['estimated_tokens']} tokens, last role={body['messages'][-1]['role']}\n"
+            print(f"REQUEST {folder}\nkind={meta['kind']} delta={meta.get('delta')} messages={meta['messages']} "
+                  f"images={meta['images']} ~{meta['estimated_tokens']} tokens, last role={body['messages'][-1]['role']}\n"
                   f"newest user text: {text[:300]!r}")
             return
+        if time.time() >= deadline:
+            break
         time.sleep(POLL_SECONDS)
     print("IDLE")
 
@@ -329,6 +476,8 @@ def submit(args) -> None:
     run = folder.parent
     if (folder / "reply.json").exists():
         sys.exit("Already answered.")
+    if (run / DONE).exists():
+        sys.exit("The task's Blender has exited; nothing will read a reply. Do not retry: run wait, which prints DONE.")
     if (folder / "cancelled").exists():
         sys.exit("The user stopped this request in Blender; nothing will read a reply. Do not retry.")
     try:
@@ -350,7 +499,7 @@ def submit(args) -> None:
 
 
 def note(args) -> None:
-    run = current_run()
+    run = run_of(args)
     log(run, "note", text=args.text)
     print(f"Noted in {run.name}.")
 
@@ -358,7 +507,7 @@ def note(args) -> None:
 # ------------------------------------------------------------------ report
 
 def report(args) -> None:
-    run = Path(args.run) if args.run else current_run()
+    run = run_of(args)
     events = [json.loads(line) for line in (run / "events.jsonl").read_text().splitlines() if line]
     folders = sorted(p for p in run.iterdir() if p.is_dir() and (p / "meta.json").exists())
     lines = [f"# Claude Code bridge run {run.name}", ""]
@@ -453,8 +602,12 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("serve")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--run-dir", help="use this run folder and leave current.txt alone (one bridge per eval task)")
+    p.add_argument('--prompts', type=Path, help='hosted prompts directory (default LOOPCUT_PROMPTS_DIR)')
+    p.add_argument('--skills', type=Path, help='server skills directory (default LOOPCUT_SERVER_SKILLS_DIR)')
     p.set_defaults(func=serve)
     p = commands.add_parser("wait")
+    p.add_argument("--run", help="the run folder (serve --run-dir); default: the current run")
     p.add_argument("--timeout", type=float, default=3000)
     p.set_defaults(func=wait)
     p = commands.add_parser("submit")
@@ -463,6 +616,7 @@ def main() -> None:
     p.set_defaults(func=submit)
     p = commands.add_parser("note")
     p.add_argument("text")
+    p.add_argument("--run", help="the run folder; default: the current run")
     p.set_defaults(func=note)
     p = commands.add_parser("report")
     p.add_argument("run", nargs="?")

@@ -1,5 +1,6 @@
 """Exercise the real tools inside Blender:  Blender --factory-startup --python harness/tools_check.py"""
 import json
+import math
 import os
 import shutil
 import sys
@@ -42,6 +43,35 @@ def check():
         block = scene_context.for_message("hi")
         assert "other objects: " in block and "Camera (CAMERA)" in block and "Light (LIGHT)" in block, block
         assert "Sphere" in bpy.data.objects
+
+        # Camera lens/sensor fit/shift/aim, light colour/energy/spot size and keyed channels
+        # survive a fold because they are read fresh from the scene on every message, not carried
+        # in conversation history. Set them, read the block, then put the scene back.
+        camera, light = bpy.data.objects["Camera"], bpy.data.objects["Light"]
+        cam_before = (camera.data.lens, camera.data.sensor_fit, camera.data.shift_x, camera.data.shift_y)
+        camera.data.lens, camera.data.sensor_fit = 35.0, "VERTICAL"
+        camera.data.shift_x, camera.data.shift_y = 0.02, -0.01
+        track = camera.constraints.new("TRACK_TO")
+        track.target = bpy.data.objects["Cube"]
+        light_before = (light.data.type, tuple(light.data.color), light.data.energy)
+        light.data.type = "SPOT"
+        light.data.color, light.data.energy, light.data.spot_size = (1.0, 0.0, 0.0), 500.0, math.radians(45)
+        probe = bpy.data.objects.new("KeyProbe", None)
+        bpy.context.scene.collection.objects.link(probe)
+        for frame in (1, 12, 24):
+            probe.location = (frame * 0.1, 0, 0)
+            probe.keyframe_insert("location", frame=frame)
+        try:
+            facts = scene_context.for_message("hi")
+            assert "cameras:\n  Camera: lens 35mm, sensor_fit VERTICAL, shift 0.02/-0.01, tracks Cube" in facts, facts
+            assert "lights:\n  Light: SPOT, color #ff0000, energy 500, spot size 45.0°" in facts, facts
+            assert "KeyProbe: location keys 1, 12, 24" in facts, facts
+        finally:
+            camera.constraints.remove(track)
+            camera.data.lens, camera.data.sensor_fit, camera.data.shift_x, camera.data.shift_y = cam_before
+            light.data.type, light.data.color, light.data.energy = light_before
+            bpy.data.objects.remove(probe, do_unlink=True)
+        assert "animated (keyed channels" not in scene_context.for_message("hi"), "the probe object is gone"
 
         # After a default transform_apply the origin reads 0,0,0 but the geometry has not moved.
         tools.execute("run_python", json.dumps({"summary": "Apply", "code": "bpy.ops.object.transform_apply()"}))
@@ -179,6 +209,37 @@ def check():
         after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
                  space.overlay.show_overlays, "Render Result" in bpy.data.images)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
+        # Workbench has no MATERIAL shading enum. Both framed and camera captures must still
+        # show the studio-lit materials, then restore the user's engine and viewport settings.
+        scene = bpy.context.scene
+        engine, shading_type, overlays = scene.render.engine, space.shading.type, space.overlay.show_overlays
+        try:
+            scene.render.engine = "BLENDER_WORKBENCH"
+            space.shading.type = "SOLID"
+            for angle, show_overlays in (("three_quarter", True), ("camera", False)):
+                space.overlay.show_overlays = show_overlays
+                before = (scene.render.engine, space.shading.type, space.overlay.show_overlays,
+                          space.shading.color_type, space.shading.light,
+                          space.shading.use_scene_lights, space.shading.use_scene_world,
+                          space.shading.use_scene_lights_render, space.shading.use_scene_world_render)
+                workbench = tools.execute("capture_viewport", json.dumps({"angle": angle}))  # Default style.
+                assert workbench.ok and workbench.image_path and workbench.image_path.is_file(), workbench.text
+                assert workbench.image_path.stat().st_size > 5_000, workbench.text
+                pixels = tools._pixels(workbench.image_path)
+                height, width = pixels.shape[:2]
+                # Inspect the image centre: labels around the edges cannot rescue a blank draw.
+                centre = pixels[height // 4:3 * height // 4, width // 4:3 * width // 4, :3]
+                assert float(centre.mean()) > 0.01 and float(centre.std(axis=(0, 1)).max()) > 0.02, (
+                    angle, "Workbench capture is blank")
+                shutil.copy(workbench.image_path, out / f"capture_workbench_{angle}.png")
+                after = (scene.render.engine, space.shading.type, space.overlay.show_overlays,
+                         space.shading.color_type, space.shading.light,
+                         space.shading.use_scene_lights, space.shading.use_scene_world,
+                         space.shading.use_scene_lights_render, space.shading.use_scene_world_render)
+                assert before == after, f"Workbench capture must restore state: {before} -> {after}"
+        finally:
+            scene.render.engine = engine
+            space.shading.type, space.overlay.show_overlays = shading_type, overlays
         # Reference images: a side-by-side comparison and a full-resolution crop, nothing left in bpy.data.
         from loopcut import conversations, state
         session = state.session()
@@ -227,16 +288,16 @@ def check():
         nothing = tools.execute("see_render", "{}")
         assert not nothing.ok and "render=true" in nothing.text, nothing.text
         scene = bpy.context.scene
-        engine, scene.render.engine = scene.render.engine, "BLENDER_WORKBENCH"  # Fast; put back before capturing.
+        scene.render.engine = "BLENDER_WORKBENCH"  # Fast preview; subsequent captures must also work.
         before = (scene.render.filepath, scene.render.resolution_percentage, scene.render.image_settings.file_format)
         rendered = tools.execute("see_render", json.dumps({"render": True}))
         assert rendered.ok and rendered.text.startswith("Image attached: a preview render through Camera with BLENDER_WORKBENCH"), rendered.text
         assert rendered.image_path.stat().st_size > 5_000, rendered.image_path
         assert (scene.render.filepath, scene.render.resolution_percentage, scene.render.image_settings.file_format) == before
         shutil.copy(rendered.image_path, out / "render_check.png")
-        scene.render.engine = engine  # Workbench has no material shading, which the capture needs.
         again = tools.execute("capture_viewport", "{}")  # Goes through Render Result too; must not pass for a render.
         assert again.ok and again.image_path.is_file(), again.text
+        assert scene.render.engine == "BLENDER_WORKBENCH", scene.render.engine
         last = tools.execute("see_render", "{}")
         assert last.ok and last.text.startswith("Image attached: the last render, finished at "), last.text
         assert set(bpy.data.images.keys()) - images_before <= {"Render Result"}, "file tools left an image datablock behind"
@@ -250,6 +311,15 @@ def check():
         assert scene.render.image_settings.media_type == "VIDEO"
         assert scene.render.image_settings.file_format == "FFMPEG"
         assert scene.render.ffmpeg.format == "MPEG4" and scene.render.ffmpeg.codec == "H264"
+        # The merged tools are offered and dispatched; render_job and search_assets route by action and source.
+        from loopcut import agent
+        offered = [schema["function"]["name"] for schema in agent._tool_schemas()]
+        assert {"search_assets", "import_asset", "render_job"} <= set(offered), offered
+        assert all("Unknown tool" not in tools.execute(name, "{}").text for name in ("search_assets", "render_job"))
+        listed = tools.execute("render_job", json.dumps({"action": "status"}))
+        assert listed.ok and isinstance(json.loads(listed.text), list), listed.text
+        untyped = tools.execute("search_assets", json.dumps({"source": "polyhaven", "query": "oak"}))
+        assert not untyped.ok and untyped.text == "source polyhaven needs type", untyped.text
         print(f"TOOLS OK: capture at {shot.image_path} ({shot.image_path.stat().st_size} bytes)")
         code = 0
     except Exception:

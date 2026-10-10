@@ -1,5 +1,6 @@
 """Conversation persistence that needs no Blender."""
 
+import base64
 import json
 import os
 import sys
@@ -61,6 +62,25 @@ class ConversationsTest(unittest.TestCase):
         self.assertFalse(loaded["items"][1]["streaming"])
         self.assertEqual(loaded["items"][2]["status"], "rejected")
         self.assertEqual(loaded["messages"][-1]["tool_call_id"], "c1")
+
+    def test_a_conversation_from_before_the_tools_were_merged_restores(self):
+        session = self.session("/work/desk.blend", "a chair")
+        card = state.item_tool("import_polyhaven", "Import Poly Haven asset chair_01 (1k)", "")
+        card["status"] = "done"
+        session["items"] += [state.item_assistant(), card]
+        old = {"id": "c1", "type": "function",
+               "function": {"name": "import_polyhaven", "arguments": json.dumps({"asset_id": "chair_01"})}}
+        session["messages"] += [{"role": "assistant", "content": None, "tool_calls": [old]},
+                                {"role": "tool", "tool_call_id": "c1", "content": "Imported"}]
+        cv.save(session)
+        loaded = cv.load(session["id"])
+        self.assertEqual(loaded["items"][-1], card, "the card shows what ran then")
+        function = loaded["messages"][1]["tool_calls"][0]["function"]
+        self.assertEqual((function["name"], json.loads(function["arguments"])),
+                         ("import_asset", {"source": "polyhaven", "id": "chair_01"}))
+        display = layout.build(loaded, 420, 700, 1.0, lambda f, s, t: len(t) * s * 0.5, "m", {}, {})
+        texts = [p["text"] for p in display["prims"] if p["t"] == "text"]
+        self.assertIn("import_polyhaven", texts)
 
     def test_close_open_tool_calls_answers_only_the_unanswered_in_place(self):
         messages = [
@@ -156,6 +176,32 @@ class ConversationsTest(unittest.TestCase):
         self.assertEqual([m["content"][1]["type"] for m in wired[1:]], ["text"] * 3 + ["image_url"] * cv.KEEP_IMAGES)
         self.assertTrue(all(cv.ATTACHED not in m for m in wired))
         self.assertIn(cv.ATTACHED, session["messages"][-cv.KEEP_IMAGES - 4], "stored form untouched")
+
+    def test_full_reference_mapping_preserves_detail_pinning_and_missing_full_copy(self):
+        session = self.session("/work/desk.blend", "look")
+        picture = Path(self.tmp.name) / "picture.png"
+        picture.write_bytes(b"small")
+        small = cv.store_image(session, picture)
+        picture.write_bytes(b"full")
+        full = cv.store_image(session, picture)
+        message = {"role": "user", cv.ATTACHED: True, "content": [
+            {"type": "text", "text": "copy this"},
+            {"type": "image_url", "image_url": {"url": small, "detail": "low"}}]}
+        session["messages"].append(message)
+        mapping = {small: full}
+        wired = cv.wire_messages(session["id"], session["messages"], full_refs=mapping)
+        image = wired[-1]["content"][1]["image_url"]
+        self.assertEqual(base64.b64decode(image["url"].split(",", 1)[1]), b"full")
+        self.assertEqual(image["detail"], "low")
+        self.assertEqual(message["content"][1]["image_url"], {"url": small, "detail": "low"})
+        capture = {**message, cv.ATTACHED: False, cx.CAPTURE: True}
+        wired_capture = cv.wire_messages(session["id"], [capture], full_refs=mapping)
+        self.assertEqual(base64.b64decode(wired_capture[0]["content"][1]["image_url"]["url"].split(",", 1)[1]), b"small")
+        unpinned = cv.wire_messages(session["id"], session["messages"], frozenset({small}), full_refs=mapping)
+        self.assertEqual(unpinned[-1]["content"][1]["type"], "text")
+        cv.image_path(session["id"], full).unlink()
+        wired = cv.wire_messages(session["id"], session["messages"], full_refs=mapping)
+        self.assertEqual(base64.b64decode(wired[-1]["content"][1]["image_url"]["url"].split(",", 1)[1]), b"small")
 
     def test_a_draft_with_attachments_survives_and_a_forged_one_is_refused(self):
         session = self.session("/work/desk.blend", "hello")

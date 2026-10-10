@@ -1,7 +1,8 @@
-"""Poly Haven (CC0 models, PBR textures, HDRIs) as two tools: search and import.
+"""Poly Haven (CC0 models, PBR textures, HDRIs): search and import, source polyhaven of assets.py's tools.
 
 Why: the agent builds everything procedurally, and a procedural bottle or brick wall looks cheap
-next to a scanned one. A library asset is one call and, being CC0, needs no key and no credit.
+next to a scanned one. CC0 assets need no key or asset attribution; search results carry the
+API's required service credit, "Powered by Poly Haven".
 The API (https://api.polyhaven.com) and CDN are public; downloads are verified against the md5
 the API publishes and kept in a cache under Loopcut's data folder so a second import is free.
 
@@ -37,36 +38,6 @@ THUMB_SIDE = 256          # What the CDN serves for thumbnails; the sheet scales
 TEXTURE_ROLES = {"Diffuse": "base_color", "Rough": "roughness", "Metal": "metallic",
                  "nor_gl": "normal", "Displacement": "displacement"}
 COLOR_ROLES = {"base_color"}
-
-SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
-    {"type": "function", "function": {
-        "name": "search_polyhaven",
-        "description": (
-            "Search Poly Haven, a CC0 library of scanned models (furniture, props, plants, food, "
-            "tools), PBR textures (wood, brick, fabric, ground) and HDRI skies for lighting. Returns "
-            "the best matches with a sheet of their thumbnails in the same order. Prefer a library "
-            "asset to building a realistic prop, surface or sky yourself; then import_polyhaven."),
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Words to match: 'wooden chair', 'brick wall', 'sunset'"},
-            "type": {"type": "string", "enum": list(TYPES)},
-            "limit": {"type": "integer", "description": f"Default {DEFAULT_LIMIT}, max {MAX_LIMIT}"},
-        }, "required": ["query", "type"]},
-    }},
-    {"type": "function", "function": {
-        "name": "import_polyhaven",
-        "description": (
-            "Download and import a Poly Haven asset by id. A model arrives as a collection at the "
-            "origin, in meters: move and scale it after (the result gives its bounds). A texture "
-            "becomes a material, applied to `apply_to` objects if given. An HDRI becomes the scene "
-            "world. Files are cached; 1k suits previews, 2k final renders."),
-        "parameters": {"type": "object", "properties": {
-            "asset_id": {"type": "string", "description": "The id from search_polyhaven"},
-            "resolution": {"type": "string", "enum": list(RESOLUTIONS), "description": "Default 1k"},
-            "apply_to": {"type": "array", "items": {"type": "string"},
-                         "description": "Textures only: objects to give the material"},
-        }, "required": ["asset_id"]},
-    }},
-]
 
 _lists: dict[str, tuple[float, dict]] = {}  # type -> (fetched, assets), per process.
 
@@ -197,14 +168,21 @@ def search_polyhaven(query: str, type: str, limit: int = DEFAULT_LIMIT) -> ToolR
     image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png")
     text = f"{len(found)} Poly Haven {type} for {query!r}, numbered as on the sheet (left to right, top to bottom):\n" \
            + "\n".join(lines)
+    text += "\nPowered by Poly Haven"
     if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_polyhaven(asset_id)."
+        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=polyhaven, id)."
     return ToolResult(_clip(text), image_path=image)
 
 
 def import_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] | None = None) -> ToolResult:
+    return load_polyhaven(fetch_polyhaven(asset_id, resolution, apply_to), apply_to)
+
+
+def fetch_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] | None = None) -> dict:
+    """import_polyhaven's network half (a worker's parent runs it): the asset's files into the cache.
+    What load_polyhaven needs, JSON-able; apply_to is checked there, against the scene it lands in."""
     if not valid_slug(asset_id):
-        raise ToolError("asset_id is the id from search_polyhaven: letters, digits, _ and - only.")
+        raise ToolError("id is the id search_assets gave: letters, digits, _ and - only.")
     resolution = resolution or "1k"
     if resolution not in RESOLUTIONS:
         raise ToolError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
@@ -217,24 +195,66 @@ def import_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] 
         raise ToolError(f"Poly Haven has no asset {asset_id!r}. Search first and use the id it gives.")
     files = get_json(f"{API}/files/{urllib.parse.quote(asset_id, safe='')}")
     folder = cache_root() / asset_id / resolution
+    fetched = {"id": asset_id, "kind": kind, "resolution": resolution,
+               "info": {"authors": info.get("authors") or {}, "dimensions": info.get("dimensions")}}
     if kind == "hdris":
-        return _import_hdri(asset_id, info, files, resolution, folder)
-    if kind == "textures":
-        return _import_texture(asset_id, info, files, resolution, folder, apply_to or [])
-    return _import_model(asset_id, info, files, resolution, folder)
+        record = (files.get("hdri") or {}).get(resolution, {}).get("hdr")
+        if not record:
+            raise ToolError(f"{asset_id} has no {resolution} HDR; available: {available(files)}")
+        fetched["hdr"] = str(_file(record, folder / f"{asset_id}_{resolution}.hdr"))
+    elif kind == "textures":
+        picked = pick_texture_maps(files, resolution)
+        if not picked:
+            raise ToolError(f"{asset_id} has no {resolution} maps; available: {available(files)}")
+        fetched["maps"] = {role: str(_file(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name))
+                           for role, record in picked.items()}
+    else:
+        blend = _fetch_model(files, "blend", resolution, folder)
+        if blend is None:
+            raise ToolError(f"{asset_id} has no {resolution} .blend; available: {available(files)}")
+        fetched["blend"] = str(blend)
+        if not _opens(blend):  # A .blend from a newer Blender, or a broken file: glTF is worse but works.
+            gltf = _fetch_model(files, "gltf", resolution, folder)
+            fetched["gltf"] = str(gltf) if gltf else None
+    return fetched
+
+
+def load_polyhaven(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
+    """import_polyhaven's scene half (a worker's child runs it): files already on disk, no network."""
+    asset_id, info, resolution = fetched["id"], fetched.get("info") or {}, fetched["resolution"]
+    if fetched["kind"] == "hdris":
+        return _import_hdri(asset_id, info, resolution, Path(fetched["hdr"]))
+    if fetched["kind"] == "textures":
+        return _import_texture(asset_id, info, resolution, {r: Path(p) for r, p in fetched["maps"].items()},
+                               apply_to or [])
+    return _import_model(asset_id, info, resolution, Path(fetched["blend"]) if fetched.get("blend") else None,
+                         Path(fetched["gltf"]) if fetched.get("gltf") else None)
+
+
+def _opens(path: Path) -> bool:
+    """Whether this Blender can read the .blend's contents (not what it would append)."""
+    try:
+        with bpy.data.libraries.load(str(path), link=False) as (data_from, _data_to):
+            _ = list(data_from.collections)
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _tag(datablocks, asset_id: str, info: dict) -> None:
     authors = ", ".join(info.get("authors", {}))
     for block in datablocks:
         try:
-            block["polyhaven"] = asset_id
-            block["polyhaven_authors"] = authors
+            provider = info.get("provider", "polyhaven")
+            block[provider] = asset_id
+            block[provider + "_authors"] = authors
         except Exception:
             pass
 
 
 def _credit(asset_id: str, info: dict) -> str:
+    if info.get("credit"):
+        return info["credit"]
     return f"CC0, by {', '.join(info.get('authors', {})) or 'Poly Haven'} ({SITE}{asset_id})"
 
 
@@ -245,11 +265,7 @@ def _set_colorspace(image, is_color: bool) -> None:
         pass  # A custom OCIO config without these names: Blender's loader default stands.
 
 
-def _import_hdri(asset_id, info, files, resolution, folder) -> ToolResult:
-    record = (files.get("hdri") or {}).get(resolution, {}).get("hdr")
-    if not record:
-        raise ToolError(f"{asset_id} has no {resolution} HDR; available: {available(files)}")
-    path = _file(record, folder / f"{asset_id}_{resolution}.hdr")
+def _import_hdri(asset_id, info, resolution, path: Path) -> ToolResult:
     previous = bpy.context.scene.world.name if bpy.context.scene.world else None
     world = asset_common.hdri_world(asset_id, path)
     _tag([world], asset_id, info)
@@ -315,16 +331,12 @@ def _build_material(asset_id: str, maps: dict, info: dict) -> tuple:
     return material, wired
 
 
-def _import_texture(asset_id, info, files, resolution, folder, apply_to: list[str]) -> ToolResult:
-    picked = pick_texture_maps(files, resolution)
-    if not picked:
-        raise ToolError(f"{asset_id} has no {resolution} maps; available: {available(files)}")
+def _import_texture(asset_id, info, resolution, paths: dict, apply_to: list[str]) -> ToolResult:
     missing = [name for name in apply_to if name not in bpy.data.objects]
     if missing:
         raise ToolError(f"No such object(s) to apply to: {', '.join(missing)}")
     maps = {}
-    for role, record in picked.items():
-        path = _file(record, folder / Path(urllib.parse.urlparse(record["url"]).path).name)
+    for role, path in paths.items():
         image = bpy.data.images.load(str(path), check_existing=True)
         _set_colorspace(image, role in COLOR_ROLES)
         image.pack()
@@ -362,20 +374,21 @@ def _fetch_model(files: dict, fmt: str, resolution: str, folder: Path) -> Path |
     return main
 
 
-def _import_model(asset_id, info, files, resolution, folder) -> ToolResult:
+def _import_model(asset_id, info, resolution, blend: Path | None, gltf: Path | None) -> ToolResult:
     before = {obj.name for obj in bpy.data.objects}
     note = ""
-    blend = _fetch_model(files, "blend", resolution, folder)
     if blend is None:
-        raise ToolError(f"{asset_id} has no {resolution} .blend; available: {available(files)}")
-    try:
-        _append_blend(blend, asset_id)
-    except Exception as ex:  # A .blend from a newer Blender, or a broken download: glTF is worse but works.
-        gltf = _fetch_model(files, "gltf", resolution, folder)
         if gltf is None:
-            raise ToolError(f"Could not open {asset_id}'s .blend ({ex}) and it publishes no glTF") from ex
+            raise ToolError(f"No model file was fetched for {asset_id}")
         bpy.ops.import_scene.gltf(filepath=str(gltf))
-        note = f" Imported from glTF because the .blend could not be opened ({ex}); materials are a conversion."
+    else:
+        try:
+            _append_blend(blend, asset_id)
+        except Exception as ex:  # A .blend from a newer Blender, or a broken download: glTF is worse but works.
+            if gltf is None:
+                raise ToolError(f"Could not open {asset_id}'s .blend ({ex}) and no glTF was fetched") from ex
+            bpy.ops.import_scene.gltf(filepath=str(gltf))
+            note = f" Imported from glTF because the .blend could not be opened ({ex}); materials are a conversion."
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
     if not imported:
         raise ToolError(f"{asset_id} downloaded but nothing arrived in the scene")
@@ -416,6 +429,3 @@ def _append_blend(path: Path, asset_id: str) -> None:
         for obj in data_to.objects:
             if obj is not None:
                 bpy.context.scene.collection.objects.link(obj)
-
-
-DISPATCH = {"search_polyhaven": search_polyhaven, "import_polyhaven": import_polyhaven}

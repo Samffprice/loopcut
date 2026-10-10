@@ -1,0 +1,8 @@
+{
+    "type": "boolean",
+    "name": "receive_shadows",
+    "description": "If the material receives shadows. This has no effect in exports",
+    "label": "Receive shadows",
+    "default": true,
+    "aliases": ["receiveShadows", "MhMsReceiveShadows"]
+}

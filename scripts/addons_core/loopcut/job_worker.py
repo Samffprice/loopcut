@@ -59,7 +59,7 @@ def configure(scene, spec: dict) -> None:
                 node.mute = True
 
 
-def encode_movie(spec: dict, output: Path, frames: list[dict]) -> dict:
+def encode_movie(spec: dict, output: Path, frames: list[dict], scratch: Path) -> dict:
     if not bpy.app.ffmpeg.supported:
         raise jobs.JobError("This Blender build cannot encode MP4 (FFmpeg is unavailable). PNG frames are retained.")
     scene = bpy.data.scenes.new("Loopcut encode")
@@ -101,7 +101,7 @@ def encode_movie(spec: dict, output: Path, frames: list[dict]) -> dict:
     editor.strips.new_movie("Verify encoded movie", str(temporary), channel=1, frame_start=1)
     r.image_settings.media_type = "IMAGE"
     r.image_settings.file_format, r.image_settings.color_mode, r.image_settings.color_depth = "PNG", "RGBA", "8"
-    probe = output / "movie-decode-check.png"
+    probe = scratch / "movie-decode-check.png"  # The job's own folder: nothing of the job's among the renders.
     checked = sorted({1, (len(frames) + 1) // 2, len(frames)})
     for frame in checked:
         scene.frame_set(frame)
@@ -125,8 +125,7 @@ def render_job(path: Path) -> None:
     if jobs.digest(snapshot) != spec["scene_revision"]:
         raise jobs.JobError("The saved scene changed; create a new job instead of resuming this one.")
     output = Path(spec["output"])
-    if jobs.read_json(output / "loopcut-job.json").get("id") != spec["id"]:
-        raise jobs.JobError("Output folder no longer belongs to this job.")
+    jobs.check_output(path, spec)
     for asset in spec.get("assets", []):
         if jobs.digest(Path(asset["path"])) != asset["sha256"]:
             raise jobs.JobError("An external scene asset changed; create a new job for the new revision.")
@@ -185,13 +184,13 @@ def render_job(path: Path) -> None:
     if spec["format"] == "MP4":
         progress["phase"] = "encoding"
         report()
-        progress["movie"] = encode_movie(spec, output, completed)
+        progress["movie"] = encode_movie(spec, output, completed, path)
     for asset in spec.get("assets", []):
         if jobs.digest(Path(asset["path"])) != asset["sha256"]:
             raise jobs.JobError("An external asset changed during rendering; the job is not verified.")
     progress.update(phase="verified", verified_complete=True)
     report()
-    jobs.atomic_json(output / "manifest.json", {"job": spec, "result": progress})
+    jobs.atomic_json(path / "manifest.json", {"job": spec, "result": progress})  # Beside spec.json, not the renders.
 
 
 if __name__ == "__main__":

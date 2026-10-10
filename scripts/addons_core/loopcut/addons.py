@@ -3,14 +3,14 @@
 inspect_api already describes whatever an add-on registers: its operators land in bpy.ops, its
 panels, properties and preferences in bpy.types. What the model cannot do is look up something it
 does not know exists, so each request names the user-installed add-ons with their operator
-prefixes. Blender's own bundled add-ons are left out: the model knows those, and they are always
-there.
+prefixes. Core add-ons are left out. Optional System bundles are listed after installed add-ons.
 
 Main thread only, except `line` which is pure.
 """
 
 import os
 import sys
+from collections.abc import Sequence
 
 MAX_LISTED = 12       # More than this and the line stops being cheap; the rest is a count.
 MAX_OP_GROUPS = 3     # Operator prefixes shown per add-on, largest groups first.
@@ -97,10 +97,8 @@ def _op_groups(idnames: list[str]) -> str:
     return ", ".join(parts)
 
 
-def line(entries: list[dict]) -> str:
-    """One line for the system prompt, or "" when nothing is installed."""
-    if not entries:
-        return ""
+def line(entries: list[dict], bundled: Sequence[dict] = ()) -> str:
+    """Pure formatting, installed first; both sections share the MAX_LISTED entry budget."""
     parts = []
     for entry in entries[:MAX_LISTED]:
         text = f"{entry['name']} [{entry['module']}]"
@@ -115,4 +113,13 @@ def line(entries: list[dict]) -> str:
         parts.append(text)
     if len(entries) > MAX_LISTED:
         parts.append(f"+{len(entries) - MAX_LISTED} more")
-    return "Installed add-ons: " + "; ".join(parts)
+    sections = ["Installed add-ons: " + "; ".join(parts)] if parts else []
+    off = [p for p in bundled if p["present"] and not p["enabled"]]
+    budget = max(0, MAX_LISTED - len(entries))
+    if off:
+        from .bundled_addons import hint
+        shown = [hint(p) for p in off[:budget]]
+        if len(off) > budget:
+            shown.append(f"+{len(off) - budget} more bundled")
+        sections.append("Bundled, off until inspect_api names one: " + "; ".join(shown))
+    return "; ".join(sections)

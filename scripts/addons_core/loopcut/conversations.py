@@ -24,14 +24,20 @@ from . import checkpoints, context, state
 IMAGE_SCHEME = "loopcut-image:"
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
-_ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes", "limit"}
+_ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes", "limit", "wave", "merge"}
 # Which images are still sent is context.kept_images; an image costs about ten tool results.
 KEEP_IMAGES, KEEP_ATTACHED = context.KEEP_IMAGES, context.KEEP_ATTACHED
 PRIVATE_PREFIX, ATTACHED = context.PRIVATE_PREFIX, context.ATTACHED
 _ROLES = {"user", "assistant", "tool"}
-_USAGE = ("input", "output", "context")
-_PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage")
+# Every key of state.new_session()'s usage: a resumed conversation's turns add to each of them, so one
+# missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
+_USAGE = ("input", "cached", "output", "context")
+_PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
+              "mode", "codex_thread")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
+# Conversations kept somewhere other than root(): a worker's transcript and captures live in its
+# job folder (waves.py). Keyed by conversation id; set before the first save.
+FOLDERS: dict[str, Path] = {}
 
 
 class ConversationError(Exception):
@@ -45,7 +51,7 @@ def root() -> Path:
 def _folder(conversation_id: str) -> Path:
     if not _ID.match(conversation_id):
         raise ConversationError(f"Bad conversation id {conversation_id!r}")
-    return root() / conversation_id
+    return FOLDERS.get(conversation_id) or root() / conversation_id
 
 
 def project_key(filepath: str) -> str:
@@ -69,7 +75,7 @@ def save(session: dict) -> None:
         if not session["title"]:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
-        body = {key: session[key] for key in _PERSISTED}
+        body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED}
         meta = {"id": session["id"], "projects": session["projects"], "title": session["title"],
                 "created": session["created"], "updated": time.time(),
                 "turns": sum(1 for i in session["items"] if i["kind"] == "user")}
@@ -101,14 +107,20 @@ def _validate(body) -> dict:
         required = ("name", "summary", "code", "status", "output") if item["kind"] == "tool" else ("text",)
         if any(not isinstance(item.get(key), str) for key in required):
             raise ConversationError(f"malformed {item['kind']} item")
-        lines = item.get("lines", []) if item["kind"] == "changes" else item.get("images", [])
+        lines = item.get("lines", []) if item["kind"] in ("changes", "merge") else item.get("images", [])
         if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
             raise ConversationError(f"malformed {item['kind']} item")
+        rows = item.get("rows", [])
+        if item["kind"] == "wave" and (not isinstance(rows, list) or any(
+                not isinstance(r, dict) or any(not isinstance(r.get(k), str) for k in ("id", "status")) for r in rows)):
+            raise ConversationError("malformed wave item")
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in _ROLES:
             raise ConversationError(f"unknown message: {str(message)[:80]}")
         if any(k.startswith(PRIVATE_PREFIX) and not isinstance(v, (str, int, bool)) for k, v in message.items()):
             raise ConversationError(f"malformed message marker: {str(message)[:80]}")
+    if not isinstance(body.get("codex_thread", ""), str):
+        raise ConversationError("malformed codex_thread")
     usage = body.get("usage", {})
     if not isinstance(usage, dict) or any(not isinstance(usage.get(k, 0), int) for k in _USAGE):
         raise ConversationError("malformed usage")
@@ -132,9 +144,34 @@ def load(conversation_id: str) -> dict:
             item["streaming"] = False
         if item.get("status") in ("awaiting", "running"):
             item["status"] = "rejected"
+        for row in item.get("rows", []) if item["kind"] == "wave" else ():
+            if row["status"] in state.WAVE_RUNNING:
+                row["status"] = "stopped"
+    session["turn_number"] = sum(1 for i in session["items"] if i["kind"] == "user")
     close_open_tool_calls(session["messages"], "Blender was closed before this ran.")
+    rename_merged_tools(session["messages"])
     session["cursor"] = len(session["input"])
     return session
+
+
+def rename_merged_tools(messages: list) -> None:
+    """Calls to tools since merged into one (tools.RENAMED), respelled as the current tool, so the
+    model is shown only tools it is offered. The chat's cards keep the name and label they had."""
+    from . import tools
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") not in tools.RENAMED:
+                continue
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(arguments, dict):
+                continue
+            name, current = tools.current_call(function["name"], arguments)
+            if (name, current) != (function["name"], arguments):
+                function["name"], function["arguments"] = name, json.dumps(current)
 
 
 def close_open_tool_calls(messages: list, reason: str) -> None:
@@ -214,9 +251,11 @@ def image_path(conversation_id: str, reference: str) -> Path:
     return _folder(conversation_id) / "images" / name
 
 
-def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset(), keep: bool = False) -> list:
+def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset(), keep: bool = False,
+                  *, full_refs: dict | None = None) -> list:
     """Messages as the API wants them: stored image references become data URIs, and only the
-    images context.kept_images names are sent; the conversation on disk keeps them all."""
+    images context.kept_images names are sent; the conversation on disk keeps them all. Workspace
+    full_refs substitutes the larger attached copies on the wire, retaining the stored refs for pinning."""
     kept = context.kept_messages(messages, unpinned, keep)
     wired = []
     for message in messages:
@@ -229,9 +268,13 @@ def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = fr
                     part = {"type": "text", "text": "[an earlier image, no longer attached]"}
                 elif url.startswith(IMAGE_SCHEME):
                     path = image_path(conversation_id, url)
+                    if full_refs and message.get(ATTACHED) and url in full_refs:
+                        full = image_path(conversation_id, full_refs[url])
+                        if full.is_file():
+                            path = full
                     if path.is_file():
                         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-                        part = {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+                        part = {**part, "image_url": {**part["image_url"], "url": f"data:image/png;base64,{encoded}"}}
                     else:
                         part = {"type": "text", "text": "[image no longer available]"}
                 parts.append(part)

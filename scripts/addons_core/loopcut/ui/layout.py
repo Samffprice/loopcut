@@ -8,7 +8,7 @@ background.
 
 import re
 
-from .. import state
+from .. import config, state
 from . import theme as T
 
 _FENCE = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
@@ -223,6 +223,11 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
     return cursor - y
 
 
+# On a step that installs packages or runs downloaded code (agent._approval "install"): why it asks
+# although auto-run is on, and why it has no "Always allow".
+INSTALL_NOTE = "This installs software from the internet. Loopcut asks every time."
+
+
 def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     status = item["status"]
@@ -246,6 +251,13 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
            item["name"], small, T.TEXT_FAINT)
     cursor += row
 
+    # Provider credit must remain visible beside the search summary when its card is collapsed.
+    if "Powered by Poly Haven" in item.get("output", "") and item["name"] in {
+            "search_assets", "loopcut_cloud__asset_search", "loopcut_cloud.asset_search"}:
+        cursor += f.paragraph(f"item{n}.tool.credit", inner_x, cursor, inner_w,
+                              "Powered by Poly Haven", small, T.TEXT_MUTED)
+    if item.get("cost"):
+        cursor += f.paragraph(f"item{n}.tool.cost", inner_x, cursor, inner_w, item["cost"], small, T.TEXT)
     if expanded and item["code"]:
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
@@ -254,6 +266,16 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
                               f.px(T.FONT_SIZE_CODE), T.ERROR if status == "failed" else T.TEXT_MUTED, "mono")
+    if expanded and (item.get("cloud_error") or {}).get("message"):
+        cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
+                              item["cloud_error"]["message"], small, T.ERROR)
+    if not config.BETA and expanded and (item.get("cloud_error") or {}).get("upgrade"):
+        f.button(f"item{n}.tool.upgrade", inner_x, cursor, "Add credits / upgrade", T.BUTTON, T.BUTTON_TEXT,
+                 ("cloud_upgrade", n))
+        cursor += f.px(28)
+    if awaiting and item.get("install"):
+        cursor += f.px(6)
+        cursor += f.paragraph(f"item{n}.tool.install", inner_x, cursor, inner_w, INSTALL_NOTE, small, T.TEXT)
     if awaiting:
         cursor += f.px(8)
         run_width = f.button(f"item{n}.tool.run", inner_x, cursor, "Run  ⏎", T.BUTTON, T.BUTTON_TEXT,
@@ -263,7 +285,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         always_x = inner_x + run_width + reject_width + f.px(16)
         # A render or bake has its own "always", apart from the one for ordinary steps.
         always = "Always allow renders" if item.get("heavy") else "Always allow"
-        if always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
+        if not item.get("paid_approval") and not item.get("install") and always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
             f.button(f"item{n}.tool.always", always_x, cursor, always, T.BUTTON_GHOST, T.TEXT_MUTED,
                      ("approve_always", n))
         cursor += f.px(24)
@@ -289,6 +311,7 @@ def _item_error(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 
 def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
+    item = state.notice_for_display(item)
     pad, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     cursor = y + pad
@@ -302,6 +325,11 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(8)
         f.button(f"item{n}.notice.action", x + pad, cursor, item["action_label"], T.BUTTON_GHOST, T.TEXT,
                  ("open_url", n))
+        cursor += f.px(24)
+    elif item.get("modifiers") and item["action_label"]:
+        cursor += f.px(8)
+        f.button(f"item{n}.notice.action", x + pad, cursor, item["action_label"], T.BUTTON_GHOST, T.TEXT,
+                 ("guard_show", n))
         cursor += f.px(24)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.notice.card", "x": x, "y": y, "w": width, "h": height,
@@ -320,6 +348,9 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
     status, upgrade = item.get("status", ""), item.get("upgrade")
+    if config.BETA:
+        status, upgrade = "", None  # Saved pre-beta cards cannot offer a purchase either.
+        item = state.item_limit(item["text"], item["reason"], item["plan"], item["resets_at"], None)
     if status == "done":
         title, body, color = "Upgraded", item["text"], T.OK
     elif status == "waiting":
@@ -327,6 +358,8 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
         body = "Finish in the browser. Loopcut picks this conversation up by itself once the plan is active."
     else:
         title, color = _LIMIT_TITLES.get(item["reason"], "Allowance used"), T.WARN
+        if config.BETA and item["reason"] == "model_not_in_plan":
+            title = "Model unavailable"
         body = item["text"] + (f"\n{upgrade['note']}" if upgrade and upgrade.get("note") else "")
     f.text(f"item{n}.limit.title", inner_x, cursor, title, size, color)
     cursor += f.line_height(size) + f.px(4)
@@ -392,8 +425,221 @@ def _item_changes(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
+# A worker row's status: glyph, color, and whether the row can still be cancelled on its own.
+# Merging is one main-thread call that completes or rolls back, so it has no Cancel.
+WORKER_STATUS = {
+    "queued": ("●", T.TEXT_FAINT, True),
+    "starting": ("●", T.ACCENT, True),
+    "working": ("●", T.ACCENT, True),
+    "checking": ("●", T.ACCENT, True),
+    "merging": ("●", T.ACCENT, False),
+    "done": ("✓", T.OK, False),
+    "partial": ("✓", T.WARN, False),     # Built, but some of its checks fail, or a budget stopped it.
+    "failed": ("✕", T.ERROR, False),
+    "cancelled": ("–", T.TEXT_FAINT, False),
+    "stopped": ("–", T.TEXT_FAINT, False),  # A row that was running when the conversation was saved.
+    "question": ("?", T.WARN, False),
+}
+
+
+def _worker_status(row: dict) -> str:
+    """The row's status word; a worker whose result is in the scene says merged (the orchestrator has
+    it while the others still run)."""
+    status = row.get("status", "")
+    if not row.get("merged"):
+        return status
+    return "merged" if status == "done" else f"{status} · merged"
+
+
+def _worker_detail(row: dict) -> str:
+    """The row's second line: role, steps taken, checks passed (also for older saved rows with a cap)."""
+    steps = row.get("steps") or 0
+    parts = [row.get("role", "")]
+    if steps or row.get("status") not in ("queued", "starting"):
+        parts.append(f"{steps} steps")
+    if row.get("checks"):
+        parts.append(f"checks {row['checks']}")
+    return " · ".join(p for p in parts if p)
+
+
+def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """One delegate call's workers, a row each: what it builds, where it is, its steps and checks.
+    A running row can be cancelled by itself; the other workers carry on."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    f.text(f"item{n}.wave.title", inner_x, cursor, _ellipsize(f, item["text"], size, inner_w), size, T.TEXT)
+    cursor += f.line_height(size) + f.px(4)
+    row_height, small_height = f.line_height(size), f.line_height(small)
+    for k, row in enumerate(item.get("rows", [])):
+        cursor += f.px(6) if k else 0
+        id, status = f"item{n}.wave.row{k}", row.get("status", "")
+        glyph, color, cancellable = WORKER_STATUS.get(status, ("●", T.TEXT_FAINT, False))
+        name_x = inner_x + f.px(18)
+        status = _worker_status(row)
+        status_width = round(f.measure("ui", small, status))
+        f.text(f"{id}.glyph", inner_x, cursor, glyph, size, color)
+        f.text(f"{id}.name", name_x, cursor,
+               _ellipsize(f, row.get("deliverable") or row.get("id", ""), size,
+                          inner_x + inner_w - name_x - status_width - f.px(10)), size, T.TEXT)
+        f.text(f"{id}.status", inner_x + inner_w - status_width, cursor + (row_height - small_height) // 2,
+               status, small, color)
+        cursor += row_height
+        right = inner_x + inner_w
+        if cancellable and f.session.get("busy"):
+            label = "Cancel"
+            label_width = round(f.measure("ui", small, label))
+            right -= label_width
+            f.text(f"{id}.cancel", right, cursor, label, small, T.TEXT_MUTED)
+            f.hit(f"{id}.cancel", right - f.px(4), cursor - f.px(2), label_width + f.px(8), small_height + f.px(4),
+                  ("worker_cancel", (item["wave"], row["id"])), "Stop this worker; the others carry on")
+            right -= f.px(10)
+        f.text(f"{id}.detail", name_x, cursor, _ellipsize(f, _worker_detail(row), small, right - name_x), small,
+               T.TEXT_MUTED)
+        cursor += small_height
+        if row.get("note"):
+            cursor += f.paragraph(f"{id}.note", name_x, cursor, inner_x + inner_w - name_x, row["note"], small,
+                                  T.TEXT_FAINT)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.wave.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
+
+
+_MERGE_COLORS = {**_CHANGE_COLORS, "!": T.WARN}  # "!" marks a conflict or a quarantined datablock.
+
+
+def _item_merge(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """A wave's results merged into the live scene: what came in, what was replaced, what was held
+    back and what conflicted. Held-back datablocks wait in a hidden collection until accepted; the
+    wave's checkpoint is the way back to the scene before the merge."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    cursor += f.paragraph(f"item{n}.merge.title", inner_x, cursor, inner_w, item["text"], size, T.TEXT) + f.px(4)
+
+    lines, expanded = item.get("lines", []), item.get("expanded", False)
+    shown = lines if expanded or len(lines) <= CHANGES_PREVIEW_LINES else lines[:CHANGES_PREVIEW_LINES - 1]
+    code = f.px(T.FONT_SIZE_CODE)
+    for k, line in enumerate(shown):
+        signed = line[:2] in ("+ ", "- ", "~ ", "! ")
+        if signed:
+            f.text(f"item{n}.merge.sign{k}", inner_x, cursor, line[:1], code, _MERGE_COLORS[line[:1]], "mono")
+        cursor += f.paragraph(f"item{n}.merge.l{k}", inner_x + f.px(14), cursor, inner_w - f.px(14),
+                              line[2:] if signed else line, code,
+                              T.TEXT if signed and line[:1] in "+-!" else T.TEXT_MUTED, "mono")
+    if len(shown) < len(lines) or expanded and len(lines) > CHANGES_PREVIEW_LINES:
+        label = "Show less" if expanded else f"Show {len(lines) - len(shown)} more"
+        f.text(f"item{n}.merge.more", inner_x + f.px(14), cursor + f.px(2), label, small, T.ACCENT)
+        f.hit(f"item{n}.merge.more", inner_x, cursor, inner_w, f.line_height(small) + f.px(4), ("toggle", n))
+        cursor += f.line_height(small) + f.px(4)
+
+    quarantined = item.get("quarantined", [])
+    if quarantined and item.get("resolved") == "accepted":
+        cursor += f.px(4)
+        cursor += f.paragraph(f"item{n}.merge.accepted", inner_x, cursor, inner_w,
+                              "Held-back items accepted into the scene.", small, T.TEXT_FAINT)
+    restorable = item.get("checkpoint") and f.checkpoints.get(item["checkpoint"], "ok") == "ok"
+    accept = quarantined and not item.get("resolved")
+    if (accept or restorable) and not f.session.get("busy"):
+        cursor += f.px(8)
+        bx = inner_x
+        if accept:
+            bx += f.button(f"item{n}.merge.accept", bx, cursor, f"Accept {len(quarantined)} held back", T.BUTTON,
+                           T.BUTTON_TEXT, ("accept_quarantine", n)) + f.px(8)
+        if restorable:
+            f.button(f"item{n}.merge.restore", bx, cursor, "Restore before merge", T.BUTTON_GHOST, T.TEXT,
+                     ("restore", item["checkpoint"]))
+        cursor += f.px(24)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.merge.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1,
+                          "border_color": T.WARN if accept else T.CARD_BORDER})
+    return height
+
+
 _ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant,
-                "tool": _item_tool, "error": _item_error, "limit": _item_limit}
+                "tool": _item_tool, "error": _item_error, "limit": _item_limit, "wave": _item_wave,
+                "merge": _item_merge}
+
+
+EXAMPLE_REQUESTS = (
+    "Make the selected object brushed metal.",
+    "Add a floor and soft studio lighting.",
+    "Explain the modifiers on the selected object.",
+)
+
+
+def _setup_routes(f: Frame, x, cursor, width) -> int:
+    """All three routes stay reachable after a failed first message or browser sign-in."""
+    small = f.px(T.FONT_SIZE_SMALL)
+    statuses = f.ui.get("sign_in") or {}
+    loopcut, chatgpt = statuses.get("loopcut", {}), statuses.get("chatgpt", {})
+    if loopcut.get("status") in {"starting", "waiting"}:
+        text = (f"Approve code {loopcut.get('user_code', '')} in your browser."
+                if loopcut["status"] == "waiting" else "Contacting Loopcut…")
+        cursor += f.paragraph("chat.signin.waiting", x, cursor, width, text, small, T.TEXT_MUTED) + f.px(6)
+        if loopcut.get("url"):
+            used = f.button("chat.signin.copy", x, cursor, "Copy Link", T.BUTTON_GHOST, T.TEXT,
+                            ("sign_in_copy", "loopcut"))
+        else:
+            used = 0
+        f.button("chat.signin.cancel", x + used + f.px(6), cursor, "Cancel", T.BUTTON_GHOST, T.TEXT,
+                 ("sign_in_cancel", "loopcut"))
+        cursor += f.px(30)
+    elif chatgpt.get("status") == "waiting":
+        cursor += f.paragraph("chat.signin.waiting", x, cursor, width, "Finish signing in with ChatGPT in your browser.",
+                              small, T.TEXT_MUTED) + f.px(6)
+        used = (f.button("chat.signin.copy", x, cursor, "Copy Link", T.BUTTON_GHOST, T.TEXT,
+                         ("sign_in_copy", "chatgpt")) if chatgpt.get("url") else 0)
+        f.button("chat.signin.cancel", x + used + f.px(6), cursor, "Cancel", T.BUTTON_GHOST, T.TEXT,
+                 ("sign_in_cancel", "chatgpt"))
+        cursor += f.px(30)
+    else:
+        labels = (("loopcut", "Sign in to Loopcut"), ("chatgpt", "Sign in with ChatGPT"))
+        button_w = max(round(f.measure("ui", small, label)) for _, label in labels) + f.px(20)
+        stacked = 2 * button_w + f.px(8) > width
+        button_w = min(button_w, width)
+        for n, (route, label) in enumerate(labels):
+            left, y = (x, cursor + n * f.px(30)) if stacked else (x + n * (button_w + f.px(8)), cursor)
+            id = "chat.signin." + route
+            f.rect(id, left, y, button_w, f.px(24), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+            f.text(id + ".label", left + f.px(10), y + f.px(3),
+                   _ellipsize(f, label, small, button_w - f.px(20)), small, T.TEXT)
+            f.hit(id, left, y, button_w, f.px(24), ("sign_in", route), tip=label)
+        cursor += f.px(60 if stacked else 30)
+        for route, status in (("loopcut", loopcut), ("chatgpt", chatgpt)):
+            if status.get("error"):
+                cursor += f.paragraph("chat.signin." + route + ".error", x, cursor, width,
+                                      status["error"], small, T.ERROR) + f.px(4)
+        if chatgpt.get("error"):
+            f.button("chat.signin.another", x, cursor, "Use another ChatGPT account", T.BUTTON_GHOST, T.TEXT_MUTED,
+                     ("sign_in_new", None))
+            cursor += f.px(30)
+    if loopcut.get("url") or chatgpt.get("url"):
+        cursor += f.paragraph("chat.signin.browser", x, cursor, width,
+                              "Browser did not open? Copy Link and paste it into your browser.", small, T.TEXT_FAINT)
+    label = "or use your own key"
+    f.text("chat.setup.label", x, cursor + f.px(3), label, small, T.TEXT_MUTED)
+    f.hit("chat.setup", x, cursor, width, f.px(24), ("own_key", None),
+          tip="Preferences: choose a model provider, enter its API key and model name. Cloud tool keys are separate.")
+    return cursor + f.px(30)
+
+
+def _first_run(f: Frame, x, cursor, width) -> int:
+    small = f.px(T.FONT_SIZE_SMALL)
+    cursor += f.paragraph("chat.hints.scope", x, cursor, width,
+                          "Loopcut can inspect and edit this scene; it can't see other apps. "
+                          "Code asks for approval by default.", small, T.TEXT_FAINT) + f.px(8)
+    for n, request in enumerate(EXAMPLE_REQUESTS):
+        id = f"chat.hint{n}"
+        height = len(wrap(request, "ui", small, width - f.px(16), f.measure)) * f.line_height(small) + f.px(8)
+        f.rect(id + ".bg", x, cursor, width, height, T.BUTTON_GHOST if f.ui.get("hover") == id else T.NONE,
+               f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+        f.paragraph(id + ".label", x + f.px(8), cursor + f.px(4), width - f.px(16), request, small, T.TEXT_MUTED)
+        f.hit(id, x, cursor, width, height, ("example_request", n), tip="Fill the input; review it before sending")
+        cursor += height + f.px(4)
+    return cursor
 
 
 def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
@@ -405,25 +651,19 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
 
     for n, item in enumerate(items):
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
+    cursor = _cloud_jobs(f, cursor)
     last = items[-1] if items else None
     if session["busy"] and not (last and (last.get("streaming") or last.get("status") == "awaiting")):
         cursor += thinking(f, "chat.working", x, cursor, f.px(T.FONT_SIZE), "Working") + gap
 
-    if not items:
-        size = f.px(T.FONT_SIZE)
-        middle = (top + bottom) // 2
-        needs_setup = bool(f.ui.get("needs_setup"))
-        second = "Add an API key to get started." if needs_setup else "Ask for anything in your scene."
-        for n, (line, color) in enumerate((("Loopcut", T.TEXT), (second, T.TEXT_MUTED))):
-            line_width = f.measure("ui", size, line)
-            f.text(f"chat.empty{n}", round((f.width - line_width) / 2), middle + (n - 1) * f.line_height(size),
-                   line, size, color)
-        if needs_setup:
-            label = "Open settings"
-            button_width = round(f.measure("ui", f.px(T.FONT_SIZE_SMALL), label)) + 2 * f.px(10)
-            f.button("chat.setup", round((f.width - button_width) / 2), middle + f.line_height(size) + f.px(10),
-                     label, T.BUTTON, T.BUTTON_TEXT, ("open_settings", None))
-        return 0.0
+    empty = not items and not f.ui.get("cloud_jobs") and not session["busy"]
+    if empty:
+        cursor += f.paragraph("chat.empty0", x, cursor, width, "Ask for anything in your scene.",
+                              f.px(T.FONT_SIZE), T.TEXT_MUTED) + gap
+    if f.ui.get("needs_setup") and not session["busy"]:
+        cursor = _setup_routes(f, x, cursor, width)
+    if empty and not f.ui.get("hints_dismissed"):
+        cursor = _first_run(f, x, cursor, width)
 
     content, view = cursor - gap + 2 * pad, bottom - top
     max_scroll = max(0.0, content - view)
@@ -532,7 +772,158 @@ def input_height(f: Frame, session: dict) -> int:
     measuring = Frame(f.width, f.height, f.scale, f.measure)  # Chips wrap, so their height is laid out to be known.
     chips = _chip_rows(measuring, "measure", 0, 0, inner_w, session)
     chips += f.px(6) if chips else 0
-    return visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad + _context_row_height(f) + chips
+    return (visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad
+            + _context_row_height(f) + chips + _cloud_height(f) + (f.px(22) if f.ui.get("credits") else 0))
+
+
+_INTEREST_SIGN_IN = 'Sign in to Loopcut to hear when it launches'
+
+
+def _cloud_rows(f):
+    """Pack buttons by category in manifest order; uncategorised entries keep their own group."""
+    if not f.ui.get('coming_soon_expanded', True):
+        return []
+    width, size = f.width - 2 * f.px(T.PAD + 6), f.px(T.FONT_SIZE_SMALL)
+    groups = {}
+    for item in f.ui.get('coming_soon') or []:
+        category = item.get('category')
+        groups.setdefault(category if isinstance(category, str) else '', []).append(item)
+    rows = []
+    suffixes = {'ready': '', 'thanks': ' · Thank you', 'sending': '…', 'retry': ' · Retry'}
+    for category, items in groups.items():
+        if category:
+            rows.append({'category': category, 'height': f.line_height(size)})
+        row, used = [], 0
+        for item in items:
+            notify = item.get('notify_sign_in', item['state'] == 'sign_in')
+            suffix = suffixes.get(item['state'], '')
+            title = ' · '.join(filter(None, (item['title'], item.get('data_label'))))
+            # Successful and retry responses keep the same button geometry.
+            button_width = min(width, round(max(f.measure('ui', size, title + response)
+                               for response in suffixes.values())) + f.px(16))
+            if notify:
+                button_width = width
+            title_width = button_width - f.px(16) - f.measure('ui', size, suffix)
+            label = _ellipsize(f, title, size, title_width) + suffix
+            if row and used + button_width > width:
+                rows.append({'items': row, 'group': category, 'height': f.px(25)})
+                row, used = [], 0
+            row.append((item, label, button_width))
+            used += button_width + f.px(6)
+            if notify:
+                # A single quiet reminder below the clicked button, wrapping only at narrow widths.
+                note_width = width - f.px(66)
+                lines = wrap(_INTEREST_SIGN_IN, 'ui', size, note_width, f.measure)
+                note_height = max(f.px(22), len(lines) * f.line_height(size))
+                rows.append({'items': row, 'group': category, 'note': lines, 'height': f.px(30) + note_height})
+                row, used = [], 0
+        if row:
+            rows.append({'items': row, 'group': category, 'height': f.px(25)})
+    return rows
+
+
+def _cloud_page(f):
+    """Keep the composer and collapse control reachable even after many signed-out clicks."""
+    rows = _cloud_rows(f)
+    if not rows:
+        return rows, None, None
+    without_extras = Frame(f.width, f.height, f.scale, f.measure, ui={**f.ui, 'coming_soon': []})
+    header = T.HEADER_HEIGHT + (T.BANNER_HEIGHT if f.ui.get('update') else 0)
+    capacity = max(f.px(100), f.height - input_height(without_extras, f.session) - f.px(header + 34))
+    if sum(row['height'] for row in rows) <= capacity:
+        return rows, None, None
+    start = min(max(0, f.ui.get('coming_soon_start', 0)), len(rows) - 1)
+    # Repeat a category when a page begins in the middle of its group.
+    visible = []
+    if rows[start].get('group'):
+        visible.append({'category': rows[start]['group'], 'height': f.line_height(f.px(T.FONT_SIZE_SMALL))})
+    used = sum(row['height'] for row in visible)
+    end = start
+    while end < len(rows):
+        needed = rows[end]['height']
+        if 'category' in rows[end] and end + 1 < len(rows):
+            needed += rows[end + 1]['height']
+        if end > start and used + needed > capacity:
+            break
+        visible.append(rows[end])
+        used += rows[end]['height']
+        end += 1
+    previous, used = start, 0
+    while previous > 0 and used + rows[previous - 1]['height'] <= capacity:
+        previous -= 1
+        used += rows[previous]['height']
+    return visible, previous if start else None, end if end < len(rows) else None
+
+
+def _cloud_box_height(f, rows):
+    return (f.px(34) + sum(row['height'] for row in rows)) if f.ui.get('coming_soon') else 0
+
+
+def _cloud_height(f):
+    return _cloud_box_height(f, _cloud_page(f)[0]) + (f.px(24) if
+            f.ui.get('cloud_message') or f.ui.get('cloud_message_reserved') else 0)
+
+
+def _cloud_buttons(f, top):
+    x, size, y = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL), top
+    if f.ui.get('cloud_message'):
+        message = f.ui['cloud_message']
+        f.text('cloud.message', x, y, _ellipsize(f, message, size, f.width - 2 * x - f.px(28)), size, T.TEXT_MUTED)
+        right = f.width - x - f.px(24)
+        f.text('cloud.dismiss.label', right + f.px(6), y, '×', size, T.TEXT_FAINT)
+        f.hit('cloud.dismiss', right, y, f.px(24), f.px(22), ('cloud_dismiss', message), tip=message + '\nDismiss')
+    if f.ui.get('cloud_message') or f.ui.get('cloud_message_reserved'):
+        y += f.px(24)
+    if not f.ui.get('coming_soon'):
+        return
+    rows, previous, following = _cloud_page(f)
+    width = f.width - 2 * x
+    expanded = f.ui.get('coming_soon_expanded', True)
+    heading = 'Optional extras · Coming soon'
+    f.rect('cloud.box', x, y, width, _cloud_box_height(f, rows), T.CARD, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+    f.text('cloud.caret', x + f.px(4), y + f.px(5), '▾' if expanded else '▸', size, T.TEXT_MUTED)
+    f.text('cloud.heading', x + f.px(18), y + f.px(5),
+           _ellipsize(f, heading, size, width - f.px(72 if previous is not None or following is not None else 24)),
+           size, T.TEXT_MUTED)
+    f.hit('cloud.toggle', x, y, width, f.px(28), ('cloud_toggle', None), tip=heading)
+    for name, target, offset, glyph in (('previous', previous, 48, '‹'), ('next', following, 24, '›')):
+        if target is not None:
+            left = x + width - f.px(offset)
+            f.text('cloud.' + name + '.label', left + f.px(6), y + f.px(5), glyph, size, T.TEXT_MUTED)
+            f.hit('cloud.' + name, left, y, f.px(24), f.px(28), ('cloud_page', target),
+                  tip='Previous extras' if name == 'previous' else 'More extras')
+    y += f.px(28)
+    x += f.px(6)
+    for n, row in enumerate(rows):
+        if 'category' in row:
+            f.text('cloud.category.' + str(n), x, y, _ellipsize(f, row['category'], size, width - f.px(12)),
+                   size, T.TEXT_FAINT)
+        left = x
+        for item, label, button_width in row.get('items', []):
+            action = ('noop', None) if item['state'] in ('thanks', 'sending') else ('cloud_interest', item['name'])
+            id = 'cloud.' + item['name']
+            f.rect(id, left, y, button_width, f.px(22), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
+            f.text(id + '.label', left + f.px(8), y + f.px(3), label, size, T.TEXT_MUTED)
+            tip = item['title'] + ': ' + {'thanks': 'Thank you for telling us.', 'sending': 'Sending your interest…',
+                  'retry': 'Could not send. Click to try again.'}.get(item['state'], COMING_SOON_TIP if config.BETA
+                                                                       else 'Tell us you want this.')
+            if not config.BETA:  # The beta runs none of these: no data class or credits line to explain.
+                tip = ' · '.join(filter(None, (tip, item.get('data_label'), item.get('reason'))))
+            f.hit(id, left, y, button_width, f.px(22), action, tip=tip)
+            if 'note' in row:
+                note_y = y + f.px(26)
+                for line, (_, text) in enumerate(row['note']):
+                    f.text(id + '.note.' + str(line), left, note_y + line * f.line_height(size),
+                           text.rstrip(), size, T.TEXT_MUTED)
+                sign_x = left + button_width - f.px(60)
+                f.rect(id + '.signin', sign_x, note_y, f.px(60), f.px(22), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
+                f.text(id + '.signin.label', sign_x + f.px(6), note_y + f.px(3), 'Sign in', size, T.TEXT_MUTED)
+                f.hit(id + '.signin', sign_x, note_y, f.px(60), f.px(22), ('sign_in', 'loopcut'), tip=_INTEREST_SIGN_IN)
+            left += button_width + f.px(6)
+        y += row['height']
+
+
+COMING_SOON_TIP = "Coming soon. Click to tell us you'd use it."
 
 
 def _context_row(f: Frame, x: int, y: int, width: int) -> None:
@@ -671,6 +1062,24 @@ def _model_menu(f: Frame, x: int, bottom: int, width: int) -> None:
     _list_popup(f, "models", x, bottom, min(width, f.px(280)), rows, -1)
 
 
+def _service_settings(f, x, bottom, width):
+    if not f.ui.get("service_settings"):
+        return
+    policy = f.ui.get("service_policy") or {}
+    rows = [(("✓  " if policy.get(key) else "     ") + label,
+             "Account default" if f.ui.get("service_signed_in") else "Local preference", ("service_toggle", key))
+            for key, label in (("no_generation", "No generation"), ("private_mode", "Private mode"))]
+    for value, label in (("inherit", "Inherit"), ("on", "On"), ("off", "Off")):
+        checked = "✓  " if f.ui.get("project_override", "inherit") == value else "     "
+        rows.append((checked + "Project no generation: " + label,
+                     "Account restrictions still apply" if value == "off" else "Saved in this .blend",
+                     ("project_generation", value)))
+    if not f.ui.get("service_signed_in"):
+        rows.append(("Sign in to Loopcut", "", ("sign_in", "loopcut")))
+    rows.append(("All settings…", "", ("open_settings", None)))
+    _list_popup(f, "service.settings", x, bottom, min(width, f.px(320)), rows, -1)
+
+
 def model_button_label(model: str) -> str:
     return {"fast": "Fast", "pro": "Pro"}.get(model, model)
 
@@ -700,7 +1109,8 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     hover = f.ui.get("hover")
 
     f.rect("input.zone", 0, top, f.width, f.height - top, T.BG)
-    card_y, card_h = top + pad, f.height - top - 2 * pad
+    cloud_height = _cloud_height(f)
+    card_y, card_h = top + pad, f.height - top - 2 * pad - cloud_height
     f.rect("input.card", x, card_y, width, card_h, T.INPUT_BG, f.px(T.RADIUS), 1,
            T.ACCENT if focused else T.INPUT_BORDER)
     f.hit("input.card", x, card_y, width, card_h, ("focus", None))
@@ -755,12 +1165,18 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))
     f.text("input.hint", hint_x, text_y, hint, small, T.TEXT_FAINT)
     _rings(f, session, hint_x - f.px(16), button_y, button_h)
+    if f.ui.get("credits"):
+        credit_y = button_y - f.px(22)
+        f.text("input.credits", inner_x, credit_y, _ellipsize(f, f.ui["credits"], small, inner_w), small, T.TEXT_MUTED)
+        f.hit("input.credits", inner_x, credit_y, inner_w, f.px(20), ("open_account", None), tip=f.ui["credits"])
 
     if f.ui.get("picker") is not None:
         _picker(f, x, card_y, width)
     elif focused:
         _mention_list(f, session, x, card_y, width)
     _model_menu(f, inner_x, button_y - f.px(2), width)
+    _service_settings(f, inner_x, button_y - f.px(2), width)
+    _cloud_buttons(f, card_y + card_h + f.px(6))
 
 
 HEADER_BUTTONS = (  # Right to left: id, glyph, tooltip.
@@ -781,6 +1197,9 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     f.prims.append({"t": "mark", "id": "header.mark", "x": pad, "y": (height - mark) // 2, "w": mark, "h": mark})
     title_x = pad + mark + f.px(8)
     f.text("header.title", title_x, y, "Loopcut", size, T.TEXT)
+    title_w = round(f.measure("ui", size, "Loopcut"))
+    version = config.version_label()
+    f.hit("header.title", title_x, 0, title_w, height, ("noop", None), tip=f"Loopcut {version}")
     if view in {"history", "jobs"} and f.width > f.px(370):
         f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  " + view.title(), size,
                T.TEXT_MUTED)
@@ -794,7 +1213,7 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
         elif id == "header.jobs":
             action, tip = (("history_close", None), "Back to chat") if view == "jobs" else (("jobs_open", None), tip)
         else:
-            action = {"header.close": ("close_panel", None), "header.settings": ("open_settings", None),
+            action = {"header.close": ("close_panel", None), "header.settings": ("service_settings", None),
                       "header.new": ("new_chat", None)}[id]
         active = hover == id or (id == "header.history" and view == "history") or (id == "header.jobs" and view == "jobs")
         if active:
@@ -805,6 +1224,9 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
                T.TEXT if active else T.TEXT_MUTED)
         f.hit(id, bx, 0, box, height, action, tip=tip)
         right = bx - gap
+    version_x = title_x + title_w + f.px(8)
+    if view == "chat" and version_x + f.measure("ui", small, version) <= right:
+        f.text("header.version", version_x, (height - f.line_height(small)) // 2, version, small, T.TEXT_MUTED)
     return height
 
 
@@ -871,14 +1293,37 @@ def _update_banner(f: Frame, top: int) -> int:
     return height
 
 
+def _cloud_jobs(f: Frame, cursor):
+    pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    for row in f.ui.get("cloud_jobs", []):
+        id = row["id"]
+        right = f.width - pad
+        if row["cancelable"]:
+            cancel_w = round(f.measure("ui", small, "Cancel")) + f.px(20)
+            f.button(f"cloud.{id}.cancel", right - cancel_w, cursor, "Cancel", T.BUTTON_GHOST, T.TEXT,
+                     ("cloud_job_cancel", id))
+            right -= cancel_w + f.px(8)
+        pct = f"{row['pct']}%"
+        pct_w = round(f.measure("ui", small, pct))
+        f.text(f"cloud.{id}.pct", right - pct_w, cursor + f.px(3), pct, small, T.TEXT_MUTED)
+        title_w = right - pct_w - f.px(8) - pad
+        f.text(f"cloud.{id}.title", pad, cursor + f.px(3), _ellipsize(f, row['title'], small, title_w), small, T.TEXT)
+        cursor += f.px(26)
+        cursor += f.paragraph(f"cloud.{id}.progress", pad, cursor, f.width - pad * 2, row["message"], small, T.TEXT_MUTED)
+        cursor += pad
+    return cursor
+
+
 def _jobs(f: Frame, top, bottom):
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
-    cursor = top + pad
+    cursor = _cloud_jobs(f, top + pad)
     error = f.ui.get("job_error")
     if error:
         cursor += f.paragraph("jobs.error", pad, cursor, f.width - 2 * pad, error, small, T.ERROR) + pad
     rows = f.ui.get("jobs", [])
     if not rows:
+        if f.ui.get("cloud_jobs"):
+            return
         f.paragraph("jobs.empty", pad, cursor, f.width - 2 * pad,
                     "No background jobs yet. Ask Loopcut to render or export a scene.", small, T.TEXT_MUTED)
         return

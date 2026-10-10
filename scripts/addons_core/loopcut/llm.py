@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import urlparse
 
 
 class LLMError(RuntimeError):
@@ -44,6 +45,8 @@ class Completion:
     finish_reason: str | None = None
     usage: dict | None = None  # {"input": tokens, "output": tokens} when the API reports it.
     account: dict | None = None  # Plan and window usage from Loopcut's gateway headers; see account_from_headers.
+    timed_out: bool = False  # call_max_seconds cut the stream short; finish_reason is set to "length" too.
+    prompt_version: str | None = None
 
     def as_message(self) -> dict:
         message = {"role": "assistant", "content": self.text or None}
@@ -103,12 +106,17 @@ def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
 
 def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], bool]):
     """Open the stream, retrying failures that are likely to pass. Nothing has been streamed to
-    the user yet at this point, so a retry is invisible apart from the wait."""
+    the user yet at this point, so a retry is invisible apart from the wait. A read or connect
+    timeout at this stage (getting the status line and headers) is a socket.timeout/TimeoutError
+    that urlopen itself wraps as URLError, so it is already covered by the clause below."""
     for attempt in range(len(RETRY_DELAYS) + 1):
         last = attempt == len(RETRY_DELAYS)
         try:
             return urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as ex:
+            if request.get_header("X-loopcut-prompt"):
+                from . import cloud
+                cloud.note_prompt_version(ex.headers.get("x-loopcut-prompt-version"))
             with ex:
                 body = ex.read()
                 retry_after = ex.headers.get("Retry-After", "")
@@ -119,12 +127,110 @@ def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], boo
             delay = RETRY_DELAYS[attempt]
             if retry_after.replace(".", "", 1).isdigit():
                 delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)
+            print(f"Loopcut: retrying the request after HTTP {ex.code} ({attempt + 1}/{len(RETRY_DELAYS)}, "
+                  f"waiting {delay:g}s)")
         except urllib.error.URLError as ex:
             if last:
                 raise LLMError(f"Could not reach {base_url}: {ex.reason}") from ex
             delay = RETRY_DELAYS[attempt]
+            print(f"Loopcut: retrying the request after {ex.reason!r} ({attempt + 1}/{len(RETRY_DELAYS)}, "
+                  f"waiting {delay:g}s)")
         _wait(delay, is_cancelled)
     raise AssertionError("unreachable")
+
+
+class _ReadInterrupted(Exception):
+    """A read timeout or connection reset while a stream's body was being read (after urlopen
+    already returned the status line and headers): urlopen wraps neither as URLError, since they
+    happen later, outside its own call. streamed: whether a content or tool-call delta had already
+    reached on_text this attempt, so the caller may have applied something from it."""
+
+    def __init__(self, streamed: bool):
+        super().__init__(streamed)
+        self.streamed = streamed
+
+
+_READ_ERRORS = (TimeoutError, ConnectionResetError)  # socket.timeout is TimeoutError since Python 3.10.
+
+
+def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
+         deadline: float | None = None) -> Completion:
+    """One stream, start to finish, into a Completion. Raises _ReadInterrupted(streamed) for a read
+    timeout or connection reset (see _READ_ERRORS); everything else (a malformed chunk, an error
+    object in the stream, Cancelled) is unrelated to the connection and is not retryable here.
+
+    deadline: a time.monotonic() past which the stream is cut short like a normal finish, not an
+    error -- finish_reason is set to "length" (and timed_out=True) so a caller that already retries
+    a capped reply (agent._request) treats this the same way, with whatever text and tool calls had
+    already arrived. Checked once per line, so a keepalive comment (cc_bridge's, say) is as good an
+    opportunity to notice as a content delta: stream_chat leaves deadline None for a base URL on
+    127.0.0.1, so this never fires for the Claude Code bridge."""
+    completion = Completion(account=account_from_headers(response.headers),
+                            prompt_version=response.headers.get("x-loopcut-prompt-version"))
+    calls: dict[int, ToolCall] = {}
+    streamed = False
+    try:
+        with response:
+            for raw in response:
+                if is_cancelled():
+                    raise Cancelled()
+                if deadline is not None and time.monotonic() > deadline:
+                    completion.finish_reason, completion.timed_out = "length", True
+                    break
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError as ex:
+                    raise LLMError(f"Malformed stream chunk: {data[:200]}") from ex
+                if chunk.get("error"):
+                    raise LLMError(_error_detail(data.encode("utf-8")))
+                usage = chunk.get("usage")
+                if isinstance(usage, dict):
+                    completion.usage = {"input": int(usage.get("prompt_tokens") or 0),
+                                        "cached": int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+                                        "output": int(usage.get("completion_tokens") or 0)}
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    text = delta.get("content")
+                    if text:
+                        completion.text += text
+                        streamed = True
+                        on_text(text)
+                    for part in delta.get("tool_calls") or []:
+                        streamed = True
+                        call = calls.setdefault(part.get("index", 0), ToolCall())
+                        call.id = part.get("id") or call.id
+                        function = part.get("function") or {}
+                        call.name = function.get("name") or call.name
+                        call.arguments += function.get("arguments") or ""
+                    if choice.get("finish_reason"):
+                        completion.finish_reason = choice["finish_reason"]
+    except _READ_ERRORS as ex:
+        raise _ReadInterrupted(streamed) from ex
+    completion.tool_calls = [calls[i] for i in sorted(calls)]
+    return completion
+
+
+def correlation_headers(conversation_id: str, role: str) -> dict:
+    """x-loopcut-conversation / x-loopcut-role for Loopcut's own gateway: which of a turn's
+    simultaneous streams (orchestrator, worker, router, summary, single) a request is, for its
+    usage row. These headers go only to the gateway (see stream_chat)."""
+    return {"x-loopcut-conversation": conversation_id, "x-loopcut-role": role}
+
+
+def _is_loopback(base_url: str) -> bool:
+    """Whether base_url is Loopcut's own Claude Code bridge (harness/cc_bridge.py, always
+    127.0.0.1): its replies can legitimately take several minutes, so call_max_seconds never
+    applies to it."""
+    try:
+        return urlparse(base_url).hostname == "127.0.0.1"
+    except ValueError:
+        return False
 
 
 def stream_chat(
@@ -138,7 +244,47 @@ def stream_chat(
     on_text: Callable[[str], None],
     is_cancelled: Callable[[], bool],
     timeout: float = 120.0,
+    max_tokens: int | None = None,
+    call_max_seconds: float | None = None,
+    headers: dict | None = None,
+    prompt_id: str | None = None,
+    on_retry: Callable[[], None] | None = None,
 ) -> Completion:
+    """`headers` adds to (never replaces) Authorization/Content-Type/Accept -- for Loopcut's own
+    gateway, the caller passes correlation_headers()'s x-loopcut-conversation / x-loopcut-role so a
+    usage row can be told apart from another conversation's on the same account (see the web repo's
+    gateway/correlation.ts). All x-loopcut-* headers go only to the gateway. prompt_id selects
+    its single, orchestrator, worker or router prompt; absent means pass-through.
+
+    max_tokens caps the reply the way every OpenAI-compatible provider expects, in the request body
+    (not a header); the caller decides the number (config.Config.max_output_tokens) so a runaway
+    reasoning call cannot run unbounded.
+
+    call_max_seconds bounds the whole call's wall clock, start to finish (not the 120s+ per-read
+    timeout= above, which stays as it is): a stream still running past it is cut short and reported
+    as if it had hit max_tokens (finish_reason "length", Completion.timed_out=True) rather than as an
+    error, so a caller that already retries a capped reply treats both the same way. Ignored --
+    always uninterrupted -- when base_url is 127.0.0.1 (_is_loopback): the Claude Code bridge.
+
+    A read timeout or connection reset (a z.ai/provider hiccup mid-stream, not an HTTP error) is
+    retried like a 429/5xx: same capped backoff, a fresh request each time, as long as nothing of
+    this attempt's reply reached on_text yet. Once something has (the agent loop may already have
+    shown it), a blind retry would double it up, so that is retried exactly once, from scratch, and
+    only when on_retry is given: it is the caller saying it can undo what on_text already did (drop
+    the partial reply card's text) before the retried request's own deltas start arriving. Without
+    on_retry, or after that one retry also breaks, the error surfaces as it did before this existed.
+
+    The ChatGPT plan provider (base URL chatgpt_auth.CHATGPT_PLAN_BASE_URL) is not chat completions:
+    chatgpt_responses.stream speaks the Responses API with the signed-in account's token instead,
+    and returns the same Completion. It reads correlation headers locally and never sends them
+    over the wire. api_key and max_tokens do not apply there."""
+    if prompt_id is not None and prompt_id not in ("single", "orchestrator", "worker", "router"):
+        raise ValueError(f"Unknown Loopcut prompt_id: {prompt_id!r}")
+    if base_url.startswith("chatgpt-plan"):
+        from . import chatgpt_responses
+        return chatgpt_responses.stream(
+            model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort, on_text=on_text,
+            is_cancelled=is_cancelled, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry)
     body = {
         "model": model,
         "messages": messages,
@@ -148,55 +294,53 @@ def stream_chat(
     }
     if tools:  # An empty list is rejected by some providers.
         body["tools"] = tools
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    from . import config
+    service = config.on_service(base_url)
+    request_headers = {name: value for name, value in (headers or {}).items()
+                       if name.lower() != "x-loopcut-prompt"
+                       and (service or not name.lower().startswith("x-loopcut-"))}
+    if service and prompt_id is not None:
+        from . import cloud
+        request_headers["x-loopcut-prompt"] = prompt_id
+    request_headers.update({
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    })
     request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
+        headers=request_headers,
         method="POST",
     )
-    response = _open(request, base_url, timeout, is_cancelled)
-
-    completion = Completion(account=account_from_headers(response.headers))
-    calls: dict[int, ToolCall] = {}
-    with response:
-        for raw in response:
-            if is_cancelled():
-                raise Cancelled()
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data:"):
+    deadline = (time.monotonic() + call_max_seconds
+                if call_max_seconds and not _is_loopback(base_url) else None)
+    # Two separate, small budgets: before any content this attempt, the same capped backoff as a
+    # connect failure (bounded by RETRY_DELAYS); once content has streamed, exactly one further
+    # retry, regardless of how much of the first budget that used.
+    before_content = 0
+    retried_partial = False
+    while True:
+        response = _open(request, base_url, timeout, is_cancelled)
+        if service and prompt_id is not None:
+            cloud.note_prompt_version(response.headers.get("x-loopcut-prompt-version"))
+        try:
+            return _read(response, on_text, is_cancelled, deadline)
+        except _ReadInterrupted as ex:
+            cause = ex.__cause__
+            if ex.streamed:
+                if retried_partial or on_retry is None:
+                    raise LLMError(f"Connection lost while streaming the reply: {cause!r}") from cause
+                retried_partial = True
+                print(f"Loopcut: retrying once from scratch after the stream broke mid-reply ({cause!r})")
+                on_retry()
                 continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-            except ValueError as ex:
-                raise LLMError(f"Malformed stream chunk: {data[:200]}") from ex
-            if chunk.get("error"):
-                raise LLMError(_error_detail(data.encode("utf-8")))
-            usage = chunk.get("usage")
-            if isinstance(usage, dict):
-                completion.usage = {"input": int(usage.get("prompt_tokens") or 0),
-                                    "cached": int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
-                                    "output": int(usage.get("completion_tokens") or 0)}
-            for choice in chunk.get("choices") or []:
-                delta = choice.get("delta") or {}
-                text = delta.get("content")
-                if text:
-                    completion.text += text
-                    on_text(text)
-                for part in delta.get("tool_calls") or []:
-                    call = calls.setdefault(part.get("index", 0), ToolCall())
-                    call.id = part.get("id") or call.id
-                    function = part.get("function") or {}
-                    call.name = function.get("name") or call.name
-                    call.arguments += function.get("arguments") or ""
-                if choice.get("finish_reason"):
-                    completion.finish_reason = choice["finish_reason"]
-
-    completion.tool_calls = [calls[i] for i in sorted(calls)]
-    return completion
+            if before_content == len(RETRY_DELAYS):
+                raise LLMError(f"Connection lost before any reply arrived: {cause!r}") from cause
+            delay = RETRY_DELAYS[before_content]
+            print(f"Loopcut: retrying the request after {cause!r} ({before_content + 1}/{len(RETRY_DELAYS)}, "
+                  f"waiting {delay:g}s)")
+            before_content += 1
+            _wait(delay, is_cancelled)

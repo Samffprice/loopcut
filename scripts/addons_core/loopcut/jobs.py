@@ -96,6 +96,23 @@ def verify_png(path: Path, width: int, height: int) -> None:
             raise JobError("Incomplete PNG pixels.")
 
 
+TOO_BRIGHT = 0.05  # Share of an image's pixels with a channel at 255 past which it is flagged too bright.
+
+
+def color_signal(mean_rgb, clipped: float) -> dict:
+    """What an inspection image's exposure and colour read as, from its mean display colour (0..1)
+    and the share of pixels with a channel at 255: that share, the too_bright flag, and the mean's
+    luminance (Rec. 709 weights), hue in degrees (None when it is grey) and saturation, so "a dark
+    studio" or "icy blue" is judged from numbers."""
+    import colorsys
+    r, g, b = (min(max(float(c), 0.0), 1.0) for c in mean_rgb)
+    hue, saturation, _ = colorsys.rgb_to_hsv(r, g, b)
+    return {"clipped": round(clipped, 4), "too_bright": clipped > TOO_BRIGHT,
+            "mean_luminance": round(0.2126 * r + 0.7152 * g + 0.0722 * b, 4),
+            "mean_hue": round(hue * 360.0) % 360 if saturation >= 0.02 else None,
+            "mean_saturation": round(saturation, 3)}
+
+
 def reap() -> None:
     _children[:] = [child for child in _children if child.poll() is None]
 
@@ -137,6 +154,47 @@ def validate_spec(spec: dict) -> None:
         raise JobError("Unsupported existing-file policy.")
 
 
+def identity(path: Path) -> list:
+    """What names a folder while it exists: its device and inode. A job records its output folder's,
+    so a later attempt writes only into that folder, not one made again under its name, and no
+    marker file of the job's sits among the user's renders."""
+    stat = path.stat()
+    return [stat.st_dev, stat.st_ino]
+
+
+def ensure_empty(path: Path) -> None:
+    """Raise unless path is missing or an empty folder (hidden names such as .DS_Store aside): a
+    job never writes where other files are."""
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise JobError(f"{path} is a file, not a folder.")
+    names = sorted(entry.name for entry in path.iterdir() if not entry.name.startswith("."))
+    if names:
+        raise JobError(f"{path} is not empty ({', '.join(names[:3])}{', ...' if len(names) > 3 else ''}): a render "
+                       "job never writes into a folder with files in it. Name a new folder, or empty this one first.")
+
+
+def check_output(path: Path, spec: dict) -> None:
+    """Raise unless the job at path still owns its output folder: the same folder it made or claimed
+    (not one made again by that name), and no job started later has claimed it since."""
+    try:
+        same = identity(Path(spec["output"])) == spec.get("output_identity")
+    except OSError:
+        same = False
+    if not same:
+        raise JobError("Output folder no longer belongs to this job.")
+    for other in path.parent.iterdir():
+        if other == path or not _ID.fullmatch(other.name) or not (other / "spec.json").exists():
+            continue
+        try:
+            record = read_json(other / "spec.json")
+        except (OSError, ValueError, JobError):
+            continue
+        if record.get("output") == spec["output"] and record.get("created", 0) > spec.get("created", 0):
+            raise JobError(f"Output folder now belongs to job {other.name}, started later.")
+
+
 def folder(root: Path, job_id: str) -> Path:
     if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
         raise JobError("Invalid job id.")
@@ -151,22 +209,29 @@ def spec_at(path: Path) -> dict:
     return spec
 
 
-def status(path: Path) -> dict:
-    spec = spec_at(path)
-    current = read_json(path / "status.json")
-    if current.get("state") not in ACTIVE | TERMINAL:
+def current(path: Path) -> dict:
+    """status.json as readers see it: one small file, cheap enough to poll (progress.json grows a
+    record per frame)."""
+    record = read_json(path / "status.json")
+    if record.get("state") not in ACTIVE | TERMINAL:
         raise JobError("Invalid job status.")
-    if current["state"] in ACTIVE:
+    if record["state"] in ACTIVE:
         heartbeat = path / "lease" / "heartbeat"
-        stamp = heartbeat.stat().st_mtime if heartbeat.exists() else current["updated"]
+        stamp = heartbeat.stat().st_mtime if heartbeat.exists() else record["updated"]
         if time.time() - stamp > HEARTBEAT_TIMEOUT:
             # Report loss, but never release an uncertain lease or start a second writer.
-            current = {**current, "state": "interrupted", "error": "Worker heartbeat was lost. "
-                       "Resume is allowed once its supervisor has exited."}
+            record = {**record, "state": "interrupted", "error": "Worker heartbeat was lost. "
+                      "Resume is allowed once its supervisor has exited."}
         elif (path / "cancel").exists():
-            current = {**current, "state": "cancelling"}
+            record = {**record, "state": "cancelling"}
+    return record
+
+
+def status(path: Path) -> dict:
+    spec = spec_at(path)
+    state = current(path)
     progress = read_json(path / "progress.json") if (path / "progress.json").exists() else {}
-    return {**spec, **current, "progress": progress}
+    return {**spec, **state, "progress": progress}
 
 
 def list_jobs(root: Path) -> list[dict]:

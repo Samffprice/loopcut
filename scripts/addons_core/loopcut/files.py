@@ -14,18 +14,20 @@ Access rules, applied by the gate in agent.py through needs_approval:
 needs_approval and the path checks are pure; the tools run on Blender's main thread.
 """
 
+import contextlib
 import fnmatch
 import os
 import shutil
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
-from . import scratch
+from . import cost_guard, scratch
 from .tools import MAX_OUTPUT_CHARS, ToolError, ToolResult, _clip
 
 READ_TOOLS = {"list_files", "read_file"}
-WRITE_TOOLS = {"write_file", "move_file"}
+WRITE_TOOLS = {"write_file", "move_file", "export_glb"}  # export_glb: the orchestrator's (glb.py).
 MAX_ENTRIES = 200            # A folder listing past this says so and asks for a pattern.
 MAX_TEXT_BYTES = 2_000_000   # A text file past this is read in line ranges.
 IMAGE_SIDE = 768             # The copy the model sees; a viewport capture is 640.
@@ -95,12 +97,11 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # ---------------------------------------------------------------- paths and the gate
 
 def project_roots() -> tuple[Path, ...]:
-    """Where reads run unasked: the .blend's folder, the render output folder, Blender's temp folder.
-    Main thread: reads bpy."""
+    """Where reads run unasked: where relative paths land (relative_base; always first, which
+    needs_approval relies on), the .blend's folder when that is not it (workspace mode), the render
+    output folder, Blender's temp folder. Main thread: reads bpy."""
     import bpy
-    roots = []
-    if bpy.data.filepath:
-        roots.append(Path(bpy.data.filepath).resolve().parent)
+    roots = [relative_base()[0], blend_base()[0]]
     scene = bpy.context.scene
     if scene is not None and scene.render.filepath:
         out = Path(bpy.path.abspath(scene.render.filepath))
@@ -110,20 +111,93 @@ def project_roots() -> tuple[Path, ...]:
     return tuple(dict.fromkeys(roots))
 
 
-def resolve(raw: str) -> Path:
-    """An absolute path from what the model wrote: // is the .blend's folder, ~ the user's home."""
+def relative_base() -> tuple[Path, str]:
+    """(folder, note): where a relative path the model writes lands: the workspace in workspace mode
+    (workspace.py: the shell's working directory too), else blend_base. Main thread."""
+    from . import workspace
+    ws = workspace.current()
+    if ws is not None:
+        return ws, ""
+    return blend_base()
+
+
+def blend_base() -> tuple[Path, str]:
+    """(folder, note): what Blender's // means, and outside workspace mode where a relative path the
+    model writes lands; when that is not the .blend's folder, a sentence saying where it is instead.
+    Main thread: reads bpy.
+
+    Never Blender's working directory: that is wherever Blender was started from, and during evals
+    it is the harness folder in the git checkout (render_job put product_reveal_final/ there,
+    2026-09-27). Saved: the .blend's folder, what Blender's // means. Unsaved: the render output
+    folder when it is an absolute path (Blender's default is /tmp/), else a Loopcut folder in the
+    system temp folder; not Blender's own temp folder, which is deleted when Blender quits."""
+    import bpy
+    if bpy.data.filepath:
+        return Path(bpy.data.filepath).resolve().parent, ""
+    scene = bpy.context.scene
+    out = scene.render.filepath if scene is not None else ""
+    if out and not out.startswith("//") and Path(os.path.expanduser(out)).is_absolute():
+        folder, what = Path(os.path.expanduser(out)), "the render output folder"
+        if not (out.endswith(("/", "\\")) or folder.is_dir()):
+            folder = folder.parent  # A file name prefix such as /tmp/shot_.
+    else:
+        folder, what = Path(tempfile.gettempdir()) / "Loopcut", "a Loopcut folder in the system temp folder"
+        with contextlib.suppress(OSError):
+            folder.mkdir(exist_ok=True)
+    folder = folder.resolve()
+    return folder, (f"This scene is not saved to a .blend yet, so relative paths are under {what}, {folder}. "
+                    "Save the file first, or give an absolute path, to put output somewhere else.")
+
+
+def is_relative(raw: str) -> bool:
+    """Whether resolve() puts this path under relative_base: // and bare relative paths."""
+    text = str(raw or "").strip()
+    return text.startswith("//") or not Path(os.path.expanduser(text)).is_absolute()
+
+
+def relative_note(*raws: str) -> str:
+    """"" or a line for a tool's result saying where relative paths went, when the scene is unsaved
+    and one of these paths was relative. Main thread."""
+    note = relative_base()[1] if any(is_relative(raw) for raw in raws) else ""
+    return f"\n{note}" if note else ""
+
+
+def resolve(raw: str, base: Path | None = None) -> Path:
+    """An absolute path from what the model wrote: ~ is the user's home; // (Blender's "next to the
+    .blend") and a bare relative path are under base, by default relative_base(). base lets the
+    approval gate resolve off the main thread, from the roots it was given."""
     text = str(raw or "").strip()
     if not text:
         raise ToolError("path must not be empty")
-    if text.startswith("//"):
+    blend_relative = text.startswith("//")
+    if blend_relative:
+        text = text[2:]
+    path = Path(os.path.expanduser(text))
+    if not path.is_absolute():
+        if base is None:
+            base = blend_base()[0] if blend_relative else relative_base()[0]
+        path = base / path
+    return path.resolve()
+
+
+def _temp_roots() -> tuple[Path, ...]:
+    """The system's and Blender's temp folders: Blender's own, the Loopcut folder for unsaved scenes
+    and the images Loopcut shows the model are there. Where they are is a setting, not a hidden file."""
+    roots = [tempfile.gettempdir()]
+    with contextlib.suppress(ImportError, AttributeError):
         import bpy
-        if not bpy.data.filepath:
-            raise ToolError("// is the .blend's folder, but this scene has not been saved to a file yet.")
-        text = bpy.path.abspath(text)
-    return Path(os.path.expanduser(text)).resolve()
+        roots.append(bpy.app.tempdir)
+    return tuple(Path(root).resolve() for root in roots if root)
 
 
 def is_hidden(path: Path) -> bool:
+    """A name starting with '.', counted below a temp folder the path is in, not in the temp folder's
+    own path: TMPDIR under a dot folder (the eval harness's .<task>-xxxx) made Blender's temp folder
+    hidden, and with it every inspect_scene and every read of its files (2026-09-27)."""
+    for root in sorted(_temp_roots(), key=lambda root: len(root.parts), reverse=True):
+        if path == root or root in path.parents:
+            path = path.relative_to(root)
+            break
     return any(part.startswith(".") and part not in (".", "..") for part in path.parts)
 
 
@@ -140,7 +214,14 @@ def _forbidden_roots() -> tuple[Path, ...]:
 
 
 def check(path: Path) -> Path:
-    """Raise for a path the model may never touch, whatever the user allows."""
+    """Raise for a path the model may never touch, whatever the user allows. A workspace (workspace.py)
+    is the model's own, though it lives in Loopcut's data: inside one, only its hidden names count."""
+    from . import workspace
+    root = workspace.inside(path)
+    if root is not None:
+        if any(part.startswith(".") for part in path.relative_to(root).parts):
+            raise ToolError(f"{path} is hidden (a name starting with '.'): hidden files and folders are off limits.")
+        return path
     if is_hidden(path):
         raise ToolError(f"{path} is hidden (a name starting with '.'): hidden files and folders are off limits.")
     if inside(path, _forbidden_roots()):
@@ -154,8 +235,10 @@ def needs_approval(name: str, arguments: dict, roots) -> bool:
     if name in WRITE_TOOLS:
         return True
     if name in READ_TOOLS:
-        try:
-            return not inside(resolve(str(arguments.get("path", ""))), roots)
+        if not roots:
+            return True
+        try:  # Off the main thread: relative paths resolve under roots[0], relative_base when it was taken.
+            return not inside(resolve(str(arguments.get("path", "")), base=roots[0]), roots)
         except ToolError:
             return True  # Unresolvable now; the tool will explain, after the user has seen the call.
     return False
@@ -214,7 +297,7 @@ def list_files(path: str, pattern: str = "") -> ToolResult:
         lines.append(f"{entry.name}/  {when}" if entry.is_dir() else f"{entry.name}  {_human(stat.st_size)}  {when}")
     if len(shown) > MAX_ENTRIES:
         lines.append(f"... {len(shown) - MAX_ENTRIES} more; narrow with a pattern.")
-    return ToolResult("\n".join(lines))
+    return ToolResult("\n".join(lines) + relative_note(path))
 
 
 def _read_text(path: Path, lines) -> str:
@@ -258,7 +341,8 @@ def _read_image(path: Path) -> ToolResult:
 def read_file(path: str, lines: list | None = None) -> ToolResult:
     target = check(resolve(path))
     if not target.is_file():
-        raise ToolError(f"{target} is a folder; use list_files." if target.is_dir() else f"{target} does not exist.")
+        raise ToolError(f"{target} is a folder; use list_files." if target.is_dir()
+                        else f"{target} does not exist.{relative_note(path)}")
     if target.suffix.lower() in IMAGE_EXTENSIONS:
         return _read_image(target)
     return ToolResult(_read_text(target, lines))
@@ -270,14 +354,17 @@ def write_file(path: str, content: str, overwrite: bool = False) -> ToolResult:
         raise ToolError(f"{target} is a folder.")
     if target.exists() and not overwrite:
         raise ToolError(f"{target} already exists; pass overwrite=true to replace it, or choose another name.")
+    from . import workspace
+    if not target.parent.is_dir() and workspace.inside(target) is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)  # In the workspace, as a shell's tools would.
     if not target.parent.is_dir():
-        raise ToolError(f"The folder {target.parent} does not exist.")
+        raise ToolError(f"The folder {target.parent} does not exist.{relative_note(path)}")
     try:
         data = str(content).encode("utf-8")
         target.write_bytes(data)
     except OSError as ex:
         raise ToolError(f"Cannot write {target}: {ex.strerror or ex}") from ex
-    return ToolResult(f"Wrote {_human(len(data))} to {target}.")
+    return ToolResult(f"Wrote {_human(len(data))} to {target}.{relative_note(path)}")
 
 
 def move_file(source: str, destination: str, copy: bool = False) -> ToolResult:
@@ -300,7 +387,7 @@ def move_file(source: str, destination: str, copy: bool = False) -> ToolResult:
             shutil.move(str(origin), str(target))
     except OSError as ex:
         raise ToolError(f"Cannot {'copy' if copy else 'move'} {origin}: {ex.strerror or ex}") from ex
-    return ToolResult(f"{'Copied' if copy else 'Moved'} {origin} to {target}.")
+    return ToolResult(f"{'Copied' if copy else 'Moved'} {origin} to {target}.{relative_note(source, destination)}")
 
 
 def _render_now(scene, out: Path, full: bool) -> str:
@@ -384,6 +471,9 @@ def see_render(render: bool = False, full: bool = False) -> ToolResult:
     folder.mkdir(exist_ok=True)
     out, shown = folder / "render.png", folder / "render_small.png"
     if render:
+        refusal = cost_guard.render_refusal()  # Render levels are only ever evaluated by a render.
+        if refusal:
+            raise ToolError(refusal)
         what = _render_now(scene, out, bool(full))
     else:
         what, out = _last_render(), LAST_RENDER

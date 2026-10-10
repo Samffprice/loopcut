@@ -17,7 +17,7 @@ frames the focus objects (or renderable scene geometry). Focus labels sit beside
 bounds do not prove visibility through occluders. Each tile labels its camera, frame, purpose,
 engine, dimensions, samples and saved scene revision. The accompanying metadata contains those
 settings, focus bounds, image hashes, camera matrices, timing and pixel-signal measurements.
-Nearly black output is reported as evidence, not automatically treated as a material failure.
+Nearly black output is reported as evidence, not automatically treated as a material failure. Each view's signal also has the share of pixels with a channel at 255 (`clipped`; `too_bright` past 5%) and the mean colour's luminance, hue and saturation (`jobs.color_signal`), so a dark studio or an icy blue is judged from numbers.
 
 The tool starts a [durable job](RENDER_JOBS.md), then the agent waits outside Blender's main thread.
 The editor remains responsive. The job supervisor enforces the whole inspection budget and handles

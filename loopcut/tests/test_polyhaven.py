@@ -15,7 +15,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, polyhaven, tools  # noqa: E402
+from loopcut import agent, assets, polyhaven, tools  # noqa: E402
 
 ASSETS = {
     "wooden_table_02": {"name": "Wooden Table 02", "type": 2, "tags": ["wooden", "worn"],
@@ -95,13 +95,13 @@ class SafetyTest(unittest.TestCase):
                 self.assertIsNone(polyhaven.safe_include(root, bad), bad)
 
     def test_bad_arguments_are_errors_the_model_can_read(self):
-        result = tools.execute("import_polyhaven", json.dumps({"asset_id": "../x"}))
+        result = tools.execute("import_asset", json.dumps({"source": "polyhaven", "id": "../x"}))
         self.assertFalse(result.ok)
         self.assertIn("letters, digits", result.text)
-        result = tools.execute("import_polyhaven", json.dumps({"asset_id": "ok", "resolution": "16k"}))
+        result = tools.execute("import_asset", json.dumps({"source": "polyhaven", "id": "ok", "resolution": "16k"}))
         self.assertFalse(result.ok)
         self.assertIn("1k, 2k, 4k", result.text)
-        result = tools.execute("search_polyhaven", json.dumps({"query": "x", "type": "sounds"}))
+        result = tools.execute("search_assets", json.dumps({"source": "polyhaven", "query": "x", "type": "sounds"}))
         self.assertFalse(result.ok)
         self.assertIn("hdris, textures, models", result.text)
 
@@ -109,18 +109,17 @@ class SafetyTest(unittest.TestCase):
 class WiringTest(unittest.TestCase):
     def test_tools_are_offered_dispatched_gated_and_labelled(self):
         # agent._tool_schemas is stubbed by another test module; the dispatch table is the contract here.
-        names = [schema["function"]["name"] for schema in polyhaven.SCHEMAS]
-        self.assertEqual(set(names), set(polyhaven.DISPATCH))
-        self.assertIn("search_polyhaven", names)
-        self.assertIn("import_polyhaven", names)
-        self.assertIn("import_polyhaven", tools.CHANGES_SCENE, "an import takes a checkpoint and asks first")
-        self.assertNotIn("search_polyhaven", tools.CHANGES_SCENE)
-        self.assertEqual(polyhaven.describe("search_polyhaven", {"query": "oak", "type": "models"}),
+        names = [schema["function"]["name"] for schema in assets.SCHEMAS]
+        self.assertEqual(set(names), set(assets.DISPATCH))
+        self.assertIn("polyhaven", assets.SCHEMAS[0]["function"]["parameters"]["properties"]["source"]["enum"])
+        self.assertIn("import_asset", tools.CHANGES_SCENE, "an import takes a checkpoint and asks first")
+        self.assertNotIn("search_assets", tools.CHANGES_SCENE)
+        self.assertEqual(assets.describe("search_assets", {"source": "polyhaven", "query": "oak", "type": "model"}),
                          ("Search Poly Haven models: oak", ""))
-        self.assertEqual(polyhaven.describe("import_polyhaven", {"asset_id": "oak_01"})[0],
+        self.assertEqual(assets.describe("import_asset", {"source": "polyhaven", "id": "oak_01"})[0],
                          "Import Poly Haven asset oak_01 (1k)")
         self.assertIsNone(polyhaven.describe("run_python", {}))
-        self.assertIn("search_polyhaven", agent.SYSTEM_PROMPT)
+        self.assertIn("polyhaven is Poly Haven", agent.SYSTEM_PROMPT)
 
     def test_thumbnail_url_asks_the_cdn_for_the_sheet_size(self):
         record = {"thumbnail_url": "https://cdn.polyhaven.com/asset_img/thumbs/ArmChair_01.png?width=256&height=256&v=abbc4732"}

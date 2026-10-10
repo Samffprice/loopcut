@@ -10,27 +10,83 @@ is not reachable from Blender's Python without shipping native wheels per platfo
 
 import json
 import os
+import tempfile
+import threading
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 FILE_NAME = "credentials.json"
+VENDOR_KEY_NAMES = ("OPENAI_API_KEY", "FAL_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY")
+_WRITE_LOCK = threading.Lock()
 
 
 def folder() -> Path:
     override = os.environ.get("LOOPCUT_CONFIG_DIR")
     if override:
         return Path(override)
+    if threading.current_thread() is not threading.main_thread():
+        from . import mainthread
+        return mainthread.run_on_main(folder).result(timeout=30)
     import bpy
     return Path(bpy.utils.user_resource("CONFIG", path="loopcut", create=True))
 
 
+def _read(*, target=None, strict=False) -> dict:
+    try:
+        data = json.loads(((target or folder()) / FILE_NAME).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        if strict:
+            raise OSError("Could not read credentials; existing file was left unchanged") from None
+        return {}
+    if strict and (not isinstance(data, dict) or any(
+            section in data and (not isinstance(data[section], dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in data[section].items()))
+            for section in ("api_keys", "vendor_keys"))):
+        raise OSError("Invalid credentials file; existing file was left unchanged")
+    return data if isinstance(data, dict) else {}
+
+
+@contextmanager
+def _transaction():
+    """Lock the whole update, including across Blender processes sharing this config.
+
+    The lock file is permanent: unlinking it would let waiters lock different inodes.
+    Resolve Blender's config directory before locking so the UI never waits on itself.
+    """
+    target = folder()
+    target.mkdir(parents=True, exist_ok=True)
+    with _WRITE_LOCK:
+        path = target / (FILE_NAME + ".lock")
+        if path.is_symlink():
+            raise OSError("Symlink in credentials lock path")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield target
+            finally:
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _keys(data: dict, section: str) -> dict[str, str]:
+    keys = data.get(section)
+    return {k: v for k, v in keys.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(keys, dict) else {}
+
+
 def load() -> dict[str, str]:
     """{base_url: api_key}. A missing or damaged file is no credentials, never a crash."""
-    try:
-        data = json.loads((folder() / FILE_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    keys = data.get("api_keys") if isinstance(data, dict) else None
-    return {k: v for k, v in keys.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(keys, dict) else {}
+    return _keys(_read(), "api_keys")
 
 
 def api_key(base_url: str) -> str:
@@ -39,17 +95,94 @@ def api_key(base_url: str) -> str:
 
 def store(base_url: str, key: str) -> None:
     """Keys are per endpoint, so switching provider never sends one provider's key to another."""
-    keys = load()
-    base_url = base_url.rstrip("/")
-    if key:
-        keys[base_url] = key
-    else:
-        keys.pop(base_url, None)
-    target = folder()
+    with _transaction() as target:
+        data = _read(target=target, strict=True)
+        keys = _keys(data, "api_keys")
+        base_url = base_url.rstrip("/")
+        if key:
+            keys[base_url] = key
+        else:
+            keys.pop(base_url, None)
+        data["api_keys"] = keys
+        _write(data, target=target)
+
+
+def _write(data: dict, *, target=None, filename=FILE_NAME) -> None:
+    target = target or folder()
     target.mkdir(parents=True, exist_ok=True)
-    path, temporary = target / FILE_NAME, target / (FILE_NAME + ".tmp")
+    path = target / filename
     # Created with the final permissions, so the key is never on disk world-readable.
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump({"api_keys": keys}, handle, indent=1)
-    os.replace(temporary, path)
+    descriptor, temporary = tempfile.mkstemp(prefix=filename + ".", suffix=".tmp", dir=target)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def interest_install_id() -> str | None:
+    """Random identity used only by signed-out interest events, never by background workers.
+
+    Share the config transaction lock so concurrent interactive processes reuse one ID.
+    A damaged record can be replaced; a write failure is handled by the click's retry state.
+    """
+    import bpy
+    if getattr(bpy.app, "background", True):  # Workers, and anything that cannot say it is interactive.
+        return None
+    with _transaction() as target:
+        try:
+            with (target / "install.json").open("rb") as handle:
+                raw = handle.read(4097)
+            if len(raw) > 4096:
+                raise ValueError("Install record is too large")
+            record = json.loads(raw)
+            value = record.get("install_id") if isinstance(record, dict) else None
+            if isinstance(value, str):
+                parsed = uuid.UUID(value)
+                if str(parsed) == value and parsed.version == 4:
+                    return value
+        except (OSError, ValueError, RecursionError):
+            pass  # No account data lives here; a corrupt/unreadable ID is safe to replace.
+        value = str(uuid.uuid4())
+        _write({"install_id": value}, target=target, filename="install.json")
+        return value
+
+
+def _vendor_name(name: str) -> None:
+    if name not in VENDOR_KEY_NAMES:
+        raise ValueError("Unknown BYOK vendor key name")
+
+
+def vendor_key(name: str) -> str:
+    """Lookup order: process environment, then vendor_keys in credentials.json. No .env lookup."""
+    _vendor_name(name)
+    return os.environ.get(name, "").strip() or _keys(_read(), "vendor_keys").get(name, "").strip()
+
+
+def set_vendor_key(name: str, key: str) -> None:
+    """Save a vendor key without changing the endpoint keys used by existing integrations."""
+    _vendor_name(name)
+    with _transaction() as target:
+        data = _read(target=target, strict=True)
+        keys = _keys(data, "vendor_keys")
+        key = key.strip()
+        if key:
+            keys[name] = key
+        else:
+            keys.pop(name, None)
+        data["vendor_keys"] = keys
+        _write(data, target=target)
+
+
+def clear_vendor_key(name: str) -> None:
+    """Clear the saved key; an environment variable still takes precedence."""
+    set_vendor_key(name, "")
+
+
+def vendor_keys_set() -> dict[str, bool]:
+    """Only presence flags, including environment keys; safe for UI and catalog consumers."""
+    return {name: bool(vendor_key(name)) for name in VENDOR_KEY_NAMES}

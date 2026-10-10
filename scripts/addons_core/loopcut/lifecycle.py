@@ -59,6 +59,13 @@ def _dock_at_startup() -> None:
 
 def _initial_resume():
     # From a timer: bpy.data is not readable while an add-on is still registering.
+    # Saved System add-ons must have finished loading before repairing incidental prefs saves.
+    from . import bundled_addons
+    try:
+        bundled_addons.startup_cleanup()
+    except (bundled_addons.BundledAddonError, OSError, ValueError):
+        import traceback
+        traceback.print_exc()  # Keep the journal, and leave the panel usable for recovery.
     resume_for_open_file()
     _dock_at_startup()
     return None

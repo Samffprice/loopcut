@@ -1,6 +1,7 @@
 """The agent's tools. Every function here runs on Blender's main thread."""
 
 import contextlib
+import inspect
 import io
 import json
 import math
@@ -10,6 +11,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import bpy
 
@@ -35,14 +37,19 @@ class ToolResult:
     scene_before: dict | None = None
     scene_after: dict | None = None
     pending_job: Path | None = None  # Inspections wait on the agent thread, never in the UI pump.
+    # The rest of a call that waits (render_job status with wait): agent._run_tool_on_main calls it
+    # on the agent thread as then(is_cancelled, on_main) and returns what it returns.
+    then: Callable | None = None
     evidence_token: dict | None = None  # Rechecked if later tools in the same batch change the scene.
+    guard_notes: list | None = None  # cost_guard.take: modifiers it switched off, shown in the panel too.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "run_python",
         "description": (
-            "Run Python in the live Blender session; `bpy` is imported and bpy.ops have a 3D viewport "
+            "Run Python in the live Blender session, a new namespace each call (`bpy` imported; reuse code via a "
+            "Text block); bpy.ops have a 3D viewport "
             "context (or another editor's, see `editor`). Prefer the data API over bpy.ops. Returns print "
             "output, any traceback, and `Scene changes`: what really changed, measured from the scene. "
             "One undo step per call."),
@@ -63,7 +70,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "by collection. Then one row per matching object (type, location, bounds, materials, modifiers, "
             "mesh size; zero rotation, unit scale, visible and unselected are left out) when they fit, else "
             "names by collection: then narrow with name_contains, type or collection, or ask detail=rows. "
-            "`bounds` is the world-space box the geometry occupies: judge placement and contact from it. "
+            "`bounds` is the world-space box the geometry occupies: use it for layout; check_contact "
+            "measures contact. "
             "`location` is only the origin, relative to a parent, and can sit far from the geometry. "
             "get_object_info has the full setup of an object."),
         "parameters": {"type": "object", "properties": {
@@ -80,12 +88,14 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "get_object_info",
         "description": (
-            "Full setup of up to 5 objects: modifier settings, material node trees (nodes, values, "
-            "links), geometry-nodes inputs, constraints, animation, children, custom properties. Read "
-            "before changing an existing setup."),
+            "Full setup of up to 5 objects: modifier settings, material node trees, geometry-nodes "
+            "inputs, constraints, animation, custom properties. Read before changing an existing setup."),
         "parameters": {"type": "object", "properties": {
             "names": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5,
-                      "description": "Object names"},
+                      "description": "Object names; \"world\" for the scene's world"},
+            "detail": {"type": "string", "enum": ["full", "transform"],
+                       "description": "transform: only transform, bounds, mesh counts, modifiers, parent/children, "
+                                      "slot names"},
         }, "required": ["names"]},
     }},
     {"type": "function", "function": {
@@ -94,7 +104,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "The Python API of THIS Blender, installed add-ons included: property names, enum values, "
             "defaults, operator arguments, node sockets. Use before an API you are not sure of, and after any AttributeError, "
             "TypeError or 'enum not found'. `path` like bpy.types.BevelModifier, Object.modifiers, "
-            "bpy.ops.mesh.bevel, ShaderNodeTexNoise, bmesh.ops.bevel; or `search` words: 'action fcurves'."),
+            "bpy.ops.mesh.bevel, ShaderNodeTexNoise, bmesh.ops.bevel; or `search` words: 'action fcurves'. "
+            "Naming a bundled add-on turns it on."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Dotted path to describe"},
             "search": {"type": "string", "description": "Words to find in names and descriptions"},
@@ -146,21 +157,123 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 
 # Tools that can change the scene. A checkpoint is taken before the first one in a turn, and they
 # need the user's go-ahead unless auto-run is on.
-CHANGES_SCENE = {"run_python", "import_polyhaven", "import_asset", "import_polypizza", "import_blenderkit"}
+# apply_build brings a workspace build into it (workspace.py, the single agent in workspace mode).
+# delegate starts workers whose results merge into the scene (orchestrator.py); accept_quarantine
+# moves what a merge kept aside into it; uv_unwrap writes UV maps (uv_tools.py); bake_paint_masks
+# makes images and stylize_material rebuilds a material (paint_tools.py, offered to workers only).
+CHANGES_SCENE = {"run_python", "import_asset", "frame_camera", "delegate", "accept_quarantine", "uv_unwrap",
+                 "bake_paint_masks", "stylize_material", "apply_build"}
 NEEDS_APPROVAL = CHANGES_SCENE
+# Tools since merged into one with a `source` or an `action`: old name -> (current name, the
+# arguments the old name implied, the old name of its `id` argument). Saved conversations still
+# hold calls to the old names: conversations.load rewrites them and agent._describe labels them.
+# They are never dispatched.
+RENAMED = {
+    "search_polyhaven": ("search_assets", {"source": "polyhaven"}, ""),
+    "import_polyhaven": ("import_asset", {"source": "polyhaven"}, "asset_id"),
+    "search_blenderkit": ("search_assets", {"source": "blenderkit"}, ""),
+    "import_blenderkit": ("import_asset", {"source": "blenderkit"}, "asset_id"),
+    "search_polypizza": ("search_assets", {"source": "polypizza"}, ""),
+    "import_polypizza": ("import_asset", {"source": "polypizza"}, "model_id"),
+    "search_assets": ("search_assets", {"source": "library"}, ""),  # The Blender libraries' own, before `source`.
+    "import_asset": ("import_asset", {"source": "library"}, "ref"),
+    "start_render_job": ("render_job", {"action": "start"}, ""),
+    "render_job_status": ("render_job", {"action": "status"}, ""),
+    "cancel_render_job": ("render_job", {"action": "cancel"}, ""),
+    "resume_render_job": ("render_job", {"action": "resume"}, ""),
+}
+# Tools whose result depends only on their arguments and the scene, so the same call with nothing
+# changed in between says the same again; see repeats.py. Not the viewport looks, which agent.py
+# caps on its own (_capture_refusal), nor files and jobs, which change without the scene changing.
+# search_assets is every library's search: the source is an argument, so part of the call's key.
+# UV and pixel edits are not in scene_diff, but they come from run_python or uv_unwrap, and any call
+# to a scene-changing tool starts the reads over (agent.run_loop).
+SAME_WHILE_UNCHANGED = {"get_scene_info", "get_object_info", "inspect_api", "look_at_reference", "search_assets",
+                        "check_contact", "inspect_uv", "inspect_texture"}
 # Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
 # user unless they said "Always allow renders": "Always allow" and auto-run do not cover it.
-HEAVY_CODE = re.compile(r"ops\.(?:render\.(?:render|opengl)|object\.bake|cycles\.bake|ptcache\.bake|"
+# Not render.render: the cost guard refuses it in the code whatever the user allows
+# (cost_guard.IN_PROCESS_RENDERS), so asking to allow it would only lead to that refusal.
+HEAVY_CODE = re.compile(r"ops\.(?:render\.opengl|object\.bake|cycles\.bake|ptcache\.bake|"
                         r"fluid\.bake|rigidbody\.bake|object\.(?:voxel|quadriflow)_remesh)")
+
+
+# Code that installs packages or downloads code and runs it asks every time, whatever the user allowed:
+# neither auto-run nor "Always allow" covers it, since it puts third-party code on their machine. In the
+# v0.2.0 RC smoke test the workspace agent, auto-run on, ran `python3 -m pip install --target ./verify_deps
+# imageio-ffmpeg` to read back the frames of the MP4 it had rendered (C29). Read from run_python's code,
+# the shell's command and the scripts run_blender or the command runs (workspace.installs); a pattern
+# list for what agents write, not a sandbox. agent._approval calls such a step "install".
+INSTALLS = tuple(re.compile(pattern, re.MULTILINE) for pattern in (
+    r"\bpip[\d.]*\b.*\binstall\b",                     # pip install, python -m pip --quiet install, uv pip install
+    r"\bpip[\d.]*\W{0,12}install\b",                   # [sys.executable, "-m", "pip",\n "install", ...]
+    r"\bpip\.main\b|\bpip\._internal\b|^\s*(?:from|import)\s+pip\b",
+    r"\bensurepip\b|\bget-pip\b|\beasy_install\b",
+    r"\b(?:pipx|uv|conda|mamba|micromamba|poetry|npm|pnpm|yarn|bun|gem|cargo|brew|apt-get|apt)"
+    r"\s+(?:-\S+\s+)*(?:install|add)\b",
+    r"\bnpm\s+i\b|\b(?:pipx|uv)\s+(?:-\S+\s+)*run\b|\buv\s+tool\s+(?:install|run)\b|\b(?:npx|uvx|bunx)\s+\S",
+    r"\bextensions\.package_install\b|\bpreferences\.addon_install\b",   # Blender extensions and add-ons.
+    # curl … | sh (or python3, python3 -): what is fetched runs. Not `| python3 -m json.tool`, which only reads.
+    r"\b(?:curl|wget)\b[^\n]*\|\s*(?:sudo\s+)?(?:(?:ba|z|da|k)?sh(?:\s+-s\b[^\n|;&]*)?|python[\d.]*(?:\s+-)?"
+    r"|perl|ruby|node)\s*(?:$|[;&|)])",
+    r"\b(?:ba|z|da|k)?sh\s+<\(\s*(?:curl|wget)\b|\b(?:eval|(?:ba|z|da|k)?sh\s+-c)\s+[\"']?\$\(\s*(?:curl|wget)\b",
+    r"\b(?:curl|wget)\b[^\n]*\.(?:sh|py|pkg|whl|run|command|dmg|exe|msi)\b",  # fetching a script or installer
+))
+# Python that fetches and then runs what it fetched: both halves anywhere in the code.
+_FETCHES = re.compile(r"\burlopen\b|\burlretrieve\b|\brequests\.get\b|\bhttpx\.get\b|\bhttp\.client\b")
+_RUNS_FETCHED = re.compile(r"\bexec\s*\(|\beval\s*\(|\brunpy\.|\bimportlib\.")
+
+
+def installs_code(text: str) -> bool:
+    """Whether code or a command installs packages or downloads code and runs it."""
+    return (any(pattern.search(text) for pattern in INSTALLS)
+            or bool(_FETCHES.search(text) and _RUNS_FETCHED.search(text)))
+
+
+def installs(name: str, arguments: dict) -> bool:
+    """A step whose own text installs or fetches-and-runs code: it asks even when other steps run unasked."""
+    field = {"run_python": "code", "shell": "command"}.get(name)
+    return bool(field) and installs_code(str(arguments.get(field, "")))
+
+
+def only_reads(name: str, arguments: dict) -> bool:
+    """A call to a scene-changing tool that only measures: frame_camera with report_only. It takes
+    no checkpoint, needs no go-ahead, and counts as a read (SAME_WHILE_UNCHANGED)."""
+    return name == "frame_camera" and str(arguments.get("report_only")).lower() == "true"
 
 
 def is_heavy(name: str, arguments: dict) -> bool:
     """A step that renders, bakes or simulates: it asks even when other steps run unasked."""
     if name == "run_python":
         return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
-    if name in {"start_render_job", "resume_render_job", "inspect_scene"}:
+    if name == "render_job":
+        return arguments.get("action") in ("start", "resume")  # Not a set: the model may send a list.
+    if name in ("inspect_scene", "bake_paint_masks"):
         return True
     return name == "see_render" and bool(arguments.get("render"))
+
+
+# The workspace's tools (workspace.py): what they act on are files and processes, which change without
+# the scene changing, so the same call later in a reply (run_blender after an edit_file) runs again.
+WORKSPACE_TOOLS = {"shell", "run_blender", "edit_file", "view_image", "apply_build", "snapshot_scene"}
+
+
+def changes_over_time(name: str, arguments: dict) -> bool:
+    """A call whose result moves on by itself while nothing else changes: a render job's status as
+    the job renders, and the workspace's tools. The same call again is never refused or noted as a
+    repeat, even in one reply; polling a running job without `wait` gets its own note (repeats.POLLS)."""
+    return name == "render_job" and arguments.get("action") == "status" or name in WORKSPACE_TOOLS
+
+
+def current_call(name: str, arguments: dict) -> tuple[str, dict]:
+    """A call as the current tools spell it: an old name becomes its merged tool (see RENAMED)."""
+    if name not in RENAMED or {"source", "action"} & set(arguments):
+        return name, arguments
+    current, implied, id_name = RENAMED[name]
+    arguments = dict(arguments)
+    if id_name in arguments:
+        arguments["id"] = arguments.pop(id_name)
+    return current, {**implied, **arguments}
 
 
 def _view3d_override() -> dict:
@@ -199,6 +312,10 @@ def _editor_context(editor: str):
     kind; else the viewport is switched to that editor for the step and switched back, which
     keeps its view and shading. Nothing redraws in between, so the user sees no change."""
     editor = _editor_name(editor) if editor and editor.strip() else "VIEW_3D"
+    if getattr(bpy.app, "background", False):
+        with _background_context(editor):
+            yield
+        return
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
@@ -227,6 +344,26 @@ def _editor_context(editor: str):
                 yield
         finally:
             area.type, area.ui_type = saved_type, saved_ui
+
+
+@contextlib.contextmanager
+def _background_context(editor: str):
+    """bpy.context in background Blender (a worker's child Blender, the headless checks). The file's
+    first window and its screen, which undo_push polls for; also that screen's 3D viewport for the
+    default editor, so view3d operators work as they do for the user. No editor is ever switched:
+    nothing draws, and there is no UI to restore. With no window at all, no override."""
+    windows = bpy.context.window_manager.windows
+    if not windows:
+        yield
+        return
+    window = windows[0]
+    override = {"window": window, "screen": window.screen}
+    area = next((a for a in window.screen.areas if a.type == "VIEW_3D"), None) if editor == "VIEW_3D" else None
+    region = next((r for r in area.regions if r.type == "WINDOW"), None) if area else None
+    if region:
+        override.update(area=area, region=region)
+    with bpy.context.temp_override(**override):
+        yield
 
 
 def _clip(text: str) -> str:
@@ -261,17 +398,22 @@ class _Deadline:
 def _model_traceback(ex: BaseException) -> str:
     """Only the frames in the model's own code: our wrapper's frames and Blender's paths are
     noise it pays for on every later step."""
+    from . import api_docs
     frames = [f for f in traceback.extract_tb(ex.__traceback__) if f.filename == "<loopcut>"]
-    return "".join(["Traceback (most recent call last):\n", *traceback.format_list(frames),
+    text = "".join(["Traceback (most recent call last):\n", *traceback.format_list(frames),
                     *traceback.format_exception_only(type(ex), ex)])
+    note = api_docs.error_note(ex)  # An Action note for action.fcurves, how to write // for an exporter.
+    return text + (f"NOTE: {note}\n" if note else "")
 
 
 def run_python(code: str, summary: str = "", capture: str = "", editor: str = "") -> ToolResult:
     # Running model-written code is the product; the approval gate lives in agent.py.
-    from . import config, scene_diff
+    from . import config, contact, cost_guard, live_file, op_notes, scene_diff, shape_key_guard
     stdout = io.StringIO()
-    ok = True
+    ok, raised = True, False
     deadline = _Deadline(config.run_timeout())
+    shape_key_guard.install()
+    cost_guard.begin()
     before = scene_diff.snapshot()
     with _editor_context(editor):
         bpy.ops.ed.undo_push(message=f"Before Loopcut: {summary or 'run_python'}"[:60])
@@ -279,21 +421,36 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
         try:
             compiled = compile(code, "<loopcut>", "exec")
             sys.settrace(deadline)
-            with contextlib.redirect_stdout(stdout):
+            # The deadline cannot stop one long native call, such as evaluating subdivision level 6;
+            # the cost guard checks before each bpy.ops call evaluates the scene.
+            # live_file: a save elsewhere is a copy, so the user's open file and their next save stay theirs.
+            with (contextlib.redirect_stdout(stdout), cost_guard.watching_ops(), op_notes.watching_ops(),
+                  live_file.watching_ops()):
                 exec(compiled, {"bpy": bpy, "__name__": "__loopcut__"})
         except _RunTimeout:
             ok = False
             stdout.write(f"\nStopped: the code ran for more than {deadline.seconds:g} s, which usually means a "
                          f"loop that never ends. Whatever it changed before that is listed below.")
         except Exception as ex:
-            ok = False
+            ok, raised = False, True
             stdout.write("\n" + _model_traceback(ex))
         finally:
             sys.settrace(previous_trace)
-    after = scene_diff.snapshot()
+            shape_key_guard.check()
+            notices = shape_key_guard.take() + op_notes.take() + live_file.take()
+    after = scene_diff.snapshot(guard=cost_guard.check)  # The guard runs before it evaluates.
+    guarded, notes = cost_guard.take()
     output = _clip(stdout.getvalue().strip()) or "OK (no output)"
-    changes = scene_diff.for_model(scene_diff.diff(before, after))
-    result = ToolResult(f"{output}\n\n{changes}", ok=ok, scene_before=before, scene_after=after)
+    if notices:
+        output += "\n\n" + "\n".join(notices)
+    diff = scene_diff.diff(before, after)
+    diff["other"] += contact.recheck()  # Pairs check_contact was asked to watch: a change of status.
+    changes = scene_diff.for_model(diff)
+    if raised and not scene_diff.is_empty(diff):
+        # A paint that landed before a later line failed read as lost (eval 20260930-154037 W0022).
+        changes = "The code made these changes before the error; they stay in the scene.\n" + changes
+    result = ToolResult(f"{output}\n\n{guarded}{changes}", ok=ok, scene_before=before, scene_after=after,
+                        guard_notes=notes)
     if capture:
         # One request instead of two: the step and the look at what it did.
         try:
@@ -319,6 +476,7 @@ def _world_bounds(obj) -> dict | None:
 
 
 def object_summary(obj) -> dict:
+    from . import view_layers
     entry = {
         "name": obj.name,
         "type": obj.type,
@@ -328,7 +486,17 @@ def object_summary(obj) -> dict:
         "visible": obj.visible_get(),
         "selected": obj.select_get(),
     }
+    # One the active view layer excludes is not evaluated there: its bounds are read in a layer that
+    # includes it (evaluating flushes them back), or said to be unavailable, never stale numbers.
+    included = entry["visible"] or view_layers.includes(view_layers.active(), obj)
+    layer = None if included else view_layers.home(obj)
+    if layer is not None:
+        with view_layers.evaluating(layer):
+            bpy.context.evaluated_depsgraph_get()
+        entry["evaluated_in"] = layer.name
     bounds = _world_bounds(obj)
+    if bounds and not included and layer is None:
+        bounds = "unavailable: excluded from every view layer"
     if bounds:
         entry["bounds"] = bounds
     if obj.parent:
@@ -380,7 +548,7 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
     missing, and the narrower question that would fit is named."""
     if detail not in ("", "rows", "names"):
         raise ToolError('detail must be "rows" or "names"')
-    from . import capabilities
+    from . import capabilities, view_layers
     scene = bpy.context.scene
     active = bpy.context.view_layer.objects.active
     wanted = collection.lower()
@@ -416,6 +584,9 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
         "collections": {c.name: len(c.objects) for c in bpy.data.collections if c.objects},
         "matching": len(chosen),
     }
+    layers = view_layers.overview(scene)
+    if layers:
+        info["view_layers"] = layers
     head = json.dumps(info, separators=(",", ":"))[:-1]
     room = MAX_OUTPUT_CHARS - len(head) - 400  # For the note and the envelope.
     rows = [json.dumps(object_row(o), separators=(",", ":")) for o in chosen]
@@ -450,20 +621,43 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
     return ToolResult(_clip(body))
 
 
-def get_object_info(names: list[str]) -> ToolResult:
+def get_object_info(names: list[str], detail: str = "full") -> ToolResult:
+    """detail full: object_summary and object_info.describe per object; transform: object_summary
+    and object_info.brief. Past MAX_OUTPUT_CHARS, whole sections are left out and named, never a
+    value cut in half (object_info.fit)."""
     from . import object_info
+    if detail not in ("full", "transform"):
+        raise ToolError("detail is full or transform.")
     if not names or len(names) > 5:
         raise ToolError("Pass 1 to 5 object names.")
-    missing = [name for name in names if name not in bpy.data.objects]
+    scene_world = bpy.context.scene.world
+
+    def world(name):  # "world" is the scene's; a world's own name, that one. Objects come first.
+        if name in bpy.data.objects:
+            return None
+        return scene_world if name.strip().lower() == "world" and scene_world else bpy.data.worlds.get(name)
+    missing = [name for name in names if name not in bpy.data.objects and world(name) is None]
     if missing:
         close = [o.name for o in bpy.data.objects if any(m.lower() in o.name.lower() for m in missing)][:10]
         raise ToolError(f"No such object(s): {', '.join(missing)}."
                         + (f" Similar names: {', '.join(close)}." if close else ""))
     described = []
     for name in names:
+        if world(name) is not None:
+            described.append(object_info.describe_world(world(name), world(name) == scene_world))
+            continue
         obj = bpy.data.objects[name]
-        described.append({**object_summary(obj), **object_info.describe(obj)})
-    return ToolResult(_clip(json.dumps(described, separators=(",", ":"), default=str)))
+        if detail == "transform":
+            summary = {k: v for k, v in object_summary(obj).items() if k not in ("materials", "mesh")}
+            described.append({**summary, **object_info.brief(obj)})
+        else:
+            described.append({**object_summary(obj), **object_info.describe(obj)})
+    text, left_out = object_info.fit(described, MAX_OUTPUT_CHARS - 300)
+    if left_out:
+        text += (f"\nLeft out to fit {MAX_OUTPUT_CHARS:,} characters, largest first, each named in its "
+                 f"\"omitted\": {'ask for fewer objects, or ' if len(names) > 1 else ''}read the rest in run_python; "
+                 f"detail=transform lists the layout only.")
+    return ToolResult(text)
 
 
 def inspect_api(path: str = "", search: str = "") -> ToolResult:
@@ -663,6 +857,12 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolRe
                     scene.render.engine = "BLENDER_EEVEE"
                     shading.use_scene_lights_render = shading.use_scene_world_render = True
                 else:
+                    # rna_space.cc:rna_3DViewShading_type_itemf (1555-1565) offers MATERIAL
+                    # for every engine except Workbench; no engine capability flag is checked.
+                    # Use EEVEE temporarily to preserve the requested studio-lit materials,
+                    # rather than Solid's viewport colours. The finally restores the engine.
+                    if scene.render.engine == "BLENDER_WORKBENCH":
+                        scene.render.engine = "BLENDER_EEVEE"
                     shading.use_scene_lights = shading.use_scene_world = False
                 shading.type = "RENDERED" if style == "rendered" else "MATERIAL"
             space.overlay.show_overlays = False
@@ -718,12 +918,17 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolRe
             what += f"; EEVEE lighting preview (final scene engine: {saved_engine}), not a final render"
         elif style == "material":
             what += "; studio lighting, not the scene's lights or world"
+    # Provenance: how the image was drawn, so no one mistakes a viewport draw for a render.
+    drawn = {"material": "Material Preview", "distinct": "Solid, a random colour per object",
+             "rendered": "Rendered (EEVEE)"}[style] if angle != "user" else "as the user has it"
+    what += (f". Drawn: the viewport, {drawn}, {scene.view_settings.view_transform} view, "
+             f"{pixels.shape[1]}x{pixels.shape[0]} px")
     return ToolResult(f"Image attached: {what}.{order}", image_path=path)
 
 
 # ------------------------------------------------------------------ reference images
 
-CROP_MAX_SIDE = 1024   # A crop is a look at a detail; a whole reference at full size is up to 1568.
+CROP_MAX_SIDE = 1024   # A crop is a look at a detail; a whole stored reference is up to 2048.
 COMPARE_GAP = 8        # Pixels between the two halves of a comparison.
 
 
@@ -791,24 +996,29 @@ def images_alike(a: Path, b: Path) -> bool:
     return float(changed.mean()) < ALIKE_FRACTION
 
 
+def crop(pixels, region: list | None):
+    """(pixels, what they show): region [x0, y0, x1, y1], fractions from the top-left, of rows kept
+    bottom-up as Blender keeps them; the whole image for None."""
+    if region is None:
+        return pixels, "the whole image"
+    height, width = pixels.shape[:2]
+    try:
+        x0, y0, x1, y1 = (float(v) for v in region)
+    except (TypeError, ValueError) as ex:
+        raise ToolError("region must be four numbers [x0, y0, x1, y1] between 0 and 1") from ex
+    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+        raise ToolError("region must be [x0, y0, x1, y1] with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
+    top_down = pixels[::-1]
+    rows, cols = slice(round(y0 * height), max(round(y0 * height) + 8, round(y1 * height))), \
+        slice(round(x0 * width), max(round(x0 * width) + 8, round(x1 * width)))
+    return top_down[rows, cols][::-1], f"region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} from the top-left"
+
+
 def look_at_reference(name: str, region: list | None = None) -> ToolResult:
     found, path = _reference(name)
     pixels = _pixels(path)
     height, width = pixels.shape[:2]
-    if region is not None:
-        try:
-            x0, y0, x1, y1 = (float(v) for v in region)
-        except (TypeError, ValueError) as ex:
-            raise ToolError("region must be four numbers [x0, y0, x1, y1] between 0 and 1") from ex
-        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
-            raise ToolError("region must be [x0, y0, x1, y1] with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
-        top_down = pixels[::-1]
-        rows, cols = slice(round(y0 * height), max(round(y0 * height) + 8, round(y1 * height))), \
-            slice(round(x0 * width), max(round(x0 * width) + 8, round(x1 * width)))
-        pixels = top_down[rows, cols][::-1]
-        what = f"region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} from the top-left"
-    else:
-        what = "the whole image"
+    pixels, what = crop(pixels, region)
     out = scratch.folder() / "reference.png"
     out.parent.mkdir(exist_ok=True)
     shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
@@ -844,10 +1054,34 @@ _DISPATCH = {
 }
 
 
+def forward(fn, arguments: dict, what: str) -> ToolResult:
+    """Call fn, the implementation behind a merged tool's `what` (a source, an action), with the
+    arguments that tool was given, naming in any complaint the parameters the model sees."""
+    parameters = inspect.signature(fn).parameters
+    extra = [key for key in arguments if key not in parameters]
+    if extra:
+        raise ToolError(f"{what} does not take {', '.join(extra)}")
+    missing = [key for key, p in parameters.items() if p.default is p.empty and key not in arguments]
+    if missing:
+        raise ToolError(f"{what} needs {', '.join(missing)}")
+    return fn(**arguments)
+
+
 def execute(name: str, arguments_json: str) -> ToolResult:
-    from . import asset_libraries, blenderkit, files, inspection, job_tools, polyhaven, polypizza
-    tables = (_DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, polyhaven.DISPATCH,
-              asset_libraries.DISPATCH, polypizza.DISPATCH, blenderkit.DISPATCH)
+    from . import cloud
+    if cloud.is_tool(name):
+        try:
+            arguments = json.loads(arguments_json) if arguments_json.strip() else {}
+        except ValueError:
+            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
+        if not isinstance(arguments, dict):
+            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
+        return cloud.execute(name, arguments)
+    from . import (assets, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
+                   uv_tools, workspace)
+    tables = (_DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, assets.DISPATCH,
+              camera.DISPATCH, orchestrator.DISPATCH, uv_tools.DISPATCH, texture_tools.DISPATCH, paint_tools.DISPATCH,
+              workspace.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
         return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)
@@ -858,8 +1092,14 @@ def execute(name: str, arguments_json: str) -> ToolResult:
     except ValueError as ex:
         return ToolResult(f"Invalid tool arguments: {ex}", ok=False)
     try:
-        return fn(**arguments)
+        inspect.signature(fn).bind(**arguments)
     except TypeError as ex:
         return ToolResult(f"Bad arguments for {name}: {ex}", ok=False)
+    try:
+        return fn(**arguments)
+    except TypeError as ex:
+        # From inside the tool, not the model's arguments: reported as "Bad arguments", it sent the
+        # model looking for other arguments (get_object_info on a Blender 5 modifier, 2026-09-19).
+        return ToolResult(f"{name} failed inside the tool, not because of your arguments: TypeError: {ex}", ok=False)
     except ToolError as ex:
         return ToolResult(str(ex), ok=False)

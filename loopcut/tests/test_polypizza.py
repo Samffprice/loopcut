@@ -15,7 +15,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import credentials, polypizza, tools  # noqa: E402
+from loopcut import assets, credentials, polypizza, tools  # noqa: E402
 
 MODEL = {"ID": "abc123", "Title": "Low Poly Tree", "Tri Count": 420, "Licence": "CC-BY", "Category": "Nature",
          "Creator": {"Username": "quaternius"}, "Attribution": "Low Poly Tree by quaternius [CC-BY] via Poly Pizza",
@@ -49,7 +49,7 @@ class PolyPizzaTest(unittest.TestCase):
 
     def test_key_comes_from_env_then_credentials_and_its_absence_is_explained(self):
         self.assertEqual(polypizza.api_key(), "")
-        result = tools.execute("search_polypizza", json.dumps({"query": "tree"}))
+        result = tools.execute("search_assets", json.dumps({"source": "polypizza", "query": "tree"}))
         self.assertFalse(result.ok)
         self.assertIn("poly.pizza", result.text)
         self.assertIn("preferences", result.text)
@@ -62,9 +62,10 @@ class PolyPizzaTest(unittest.TestCase):
             del os.environ[polypizza.ENV_KEY]
 
     def test_labels_gate_and_bad_id(self):
-        self.assertIn("import_polypizza", tools.CHANGES_SCENE)
-        self.assertEqual(polypizza.describe("import_polypizza", {"model_id": "abc"}), ("Import Poly Pizza model abc", ""))
-        result = tools.execute("import_polypizza", json.dumps({"model_id": "../x"}))
+        self.assertIn("import_asset", tools.CHANGES_SCENE)
+        self.assertEqual(assets.describe("import_asset", {"source": "polypizza", "id": "abc"}),
+                         ("Import Poly Pizza model abc", ""))
+        result = tools.execute("import_asset", json.dumps({"source": "polypizza", "id": "../x"}))
         self.assertFalse(result.ok)
         self.assertIn("letters, digits", result.text)
 

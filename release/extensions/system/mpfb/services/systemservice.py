@@ -1,0 +1,163 @@
+"""Various functionality for system and directories"""
+
+import os, sys, subprocess, bpy, addon_utils, re
+from .logservice import LogService
+_LOG = LogService.get_logger("services.systemservice")
+
+LOWEST_FUNCTIONAL_BLENDER_VERSION: tuple[int, int, int] = (4, 2, 0)
+
+
+class SystemService:
+    """Utility functions for various system tasks."""
+
+    def __init__(self) -> None:
+        """You should not instance SystemService. Use its static methods instead."""
+        raise RuntimeError("You should not instance SystemService. Use its static methods instead.")
+
+    @staticmethod
+    def deduce_platform() -> str:
+        """Deduces the current system platform (ie the operating system)."""
+        if sys.platform.startswith('linux'):
+            return "LINUX"
+
+        if sys.platform.startswith('win32'):
+            return "WINDOWS"
+
+        if sys.platform.startswith('cygwin'):
+            return "WINDOWS"
+
+        if sys.platform.startswith('darwin'):
+            return "MACOS"
+
+        # Default to windows, since that's the most likely platform
+        return "WINDOWS"
+
+    @staticmethod
+    def open_file_browser(path: str) -> None:
+        """Open a file browser window for the specified path."""
+        platform = SystemService.deduce_platform()
+        if platform == "LINUX":
+            subprocess.call(["xdg-open", path])
+            return
+        if platform == "WINDOWS":
+            os.startfile(path)  # pylint: disable=E1101
+            return
+        if platform == "MACOS":
+            subprocess.call(["open", path])
+            return
+        raise NotImplementedError("Opening a file browser is not supported for platform " + platform)
+
+    @staticmethod
+    def check_for_obj_importer() -> bool:
+        """Check if the Blender OBJ importer is installed."""
+        _LOG.warn("Doing superfluous check for Blender OBJ importer")
+        return True
+
+    @staticmethod
+    def check_for_lipsync() -> bool:
+        """Check if the Lip Sync addon is enabled. This method will both check for the addon per se,
+        and for the specific operators which are commonly used."""
+        lip_sync_name = None
+        for addon_name in bpy.context.preferences.addons.keys():
+            if "iocgpoly_lip_sync" in addon_name:
+                lip_sync_name = addon_name
+                break
+
+        if lip_sync_name is None:
+            _LOG.warn("Lip sync addon does not exist in addon keys")
+            return False
+
+        (loaded_default, loaded_state) = addon_utils.check(lip_sync_name)  # pylint: disable=W0612
+        if not loaded_state:
+            _LOG.warn("Lip sync is not enabled")
+            return False
+
+        return True
+
+    @staticmethod
+    def check_for_rigify() -> bool:
+        """Check if the Blender Rigify addon is enabled. This method will both check for the addon per se,
+        and for the specific operators which are commonly used."""
+        (loaded_default, loaded_state) = addon_utils.check('rigify')  # pylint: disable=W0612
+        if not loaded_state:
+            _LOG.warn("Rigify is not enabled")
+            return False
+        if not hasattr(bpy.ops.pose, "rigify_generate"):
+            _LOG.warn("Rigify generate operator is not available, despite rigify being enabled!?")
+            return False
+        if not hasattr(bpy.ops.pose, "rigify_upgrade_face"):
+            _LOG.warn("Rigify face upgrade operator is not available, despite rigify being enabled!?")
+            return False
+        if not hasattr(bpy.ops.armature, "rigify_collection_set_ui_row"):
+            _LOG.warn("Rigify collection set UI row operator is not available, despite rigify being enabled!?")
+            return False
+        if not hasattr(bpy.ops.armature, "rigify_collection_set_ui_row"):
+            _LOG.warn("Rigify collection set UI column operator is not available, despite rigify being enabled!?")
+            return False
+        _LOG.debug("Rigify seems to be installed, enabled and working as expected.")
+        return True
+
+    @staticmethod
+    def check_for_bvh() -> bool:
+        """Check if the Blender BVH importer addon is enabled, by verifying that its
+        import operator type is registered. Note that hasattr(bpy.ops.import_anim, "bvh")
+        cannot be used here: bpy.ops constructs an operator wrapper for any name without
+        consulting the registry, so it returns True even when the addon is disabled. The
+        operator type IMPORT_ANIM_OT_bvh, derived from the bl_idname import_anim.bvh, is
+        only present in bpy.types while the addon is actually enabled."""
+        if not hasattr(bpy.types, "IMPORT_ANIM_OT_bvh"):
+            _LOG.warn("BVH importer addon (io_anim_bvh) is not enabled")
+            return False
+        return True
+
+    @staticmethod
+    def normalize_path_separators(path_string: str) -> str:
+        """Replace all escaped backslashes with forward slashes."""
+        if not path_string:
+            return ""
+        return re.sub(r"\\+", "/", str(path_string))
+
+    @staticmethod
+    def string_contains_path_segment(full_path: str, path_segment: str, case_insensitive: bool = True) -> bool:
+        """Check if the full path contains the path segment."""
+        if not full_path or not path_segment:
+            return False
+        full = SystemService.normalize_path_separators(full_path)
+        path_segment = str(path_segment)
+        if case_insensitive:
+            full = full.lower()
+            path_segment = path_segment.lower()
+        segments = full.split("/")
+        for segment in segments:
+            if segment == path_segment:
+                return True
+        return False
+
+    # Method for finding if the currently running blender version is at least the specified version
+    @staticmethod
+    def is_blender_version_at_least(version: tuple[int, int, int] = LOWEST_FUNCTIONAL_BLENDER_VERSION) -> bool:
+        """Check if the currently running blender version is at least the specified version.
+
+        Args:
+            version (list): The version to check against.
+        """
+        if not version:
+            return False
+        if len(version) != 3:
+            _LOG.error("Version need to be specified as a three item list, the provided value was", version)
+            return False
+
+        if bpy.app.version[0] > version[0]:
+            return True
+        if bpy.app.version[0] < version[0]:
+            return False
+
+        if bpy.app.version[1] > version[1]:
+            return True
+        if bpy.app.version[1] < version[1]:
+            return False
+
+        if bpy.app.version[2] >= version[2]:
+            return True
+
+        return False

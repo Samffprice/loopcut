@@ -27,6 +27,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import config
+
 REPO = "Samffprice/loopcut"
 # "off" disables the updater, e.g. for harness runs. http on 127.0.0.1 is for trying a local manifest.
 MANIFEST_URL = os.environ.get("LOOPCUT_UPDATE_URL", f"https://github.com/{REPO}/releases/latest/download/update.json")
@@ -237,7 +239,7 @@ def banner_for(state: dict, installable: bool) -> dict | None:
     release, status = state["release"], state["status"]
     if release is None or state["dismissed"] or status in ("idle", "checking", "current"):
         return None
-    version = release["label"]
+    version = config.version_label(release["version"])
     if status == "downloading":
         return {"text": f"Downloading Loopcut {version}… {int(state['progress'] * 100)}%", "button": None,
                 "dismiss": False, "progress": state["progress"]}
@@ -258,11 +260,11 @@ def banner_for(state: dict, installable: bool) -> dict | None:
 def status_line(state: dict, current: tuple) -> str:
     """One line for the preferences page."""
     status, release = state["status"], state["release"]
-    version = release["label"] if release else ""
+    version = config.version_label(release["version"]) if release else ""
     if status == "checking":
         return "Checking for updates…"
     if status == "current":
-        return f"Loopcut {label(current)} is up to date."
+        return f"Loopcut {config.version_label(current)} is up to date."
     if status == "available":
         return f"Loopcut {version} is available."
     if status == "downloading":
@@ -275,7 +277,7 @@ def status_line(state: dict, current: tuple) -> str:
         return f"Update failed: {state['error']}"
     if state["error"]:
         return f"Could not check for updates: {state['error']}"
-    return f"Loopcut {label(current)}"
+    return f"Loopcut {config.version_label(current)}"
 
 
 # ---- Network and files, on worker threads ------------------------------------------------------

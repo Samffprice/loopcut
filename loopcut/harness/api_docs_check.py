@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checkout  # noqa: E402
 checkout.use()
 import bpy  # noqa: E402,F401
-from loopcut import api_docs  # noqa: E402
+from loopcut import api_docs, op_notes  # noqa: E402
 
 CASES = [
     # (kwargs, substrings that must all appear)
@@ -18,6 +18,7 @@ CASES = [
     ({"path": "BevelModifier.limit_method"}, ["enum [", "'ANGLE'"]),
     ({"path": "bpy.types.Object.modifiers"}, ["ObjectModifiers", "new(name, type)", "items are bpy.types.Modifier"]),
     ({"path": "bpy.ops.mesh.primitive_cube_add"}, ["size: float", "location", "poll"]),
+    ({"path": "bpy.ops.uv.pack_islands"}, ["NOTE:", op_notes.NOTES["uv.pack_islands"][0][1]]),
     ({"path": "bpy.ops.mesh"}, ["primitive_cube_add", "subdivide"]),
     ({"path": "ShaderNodeTexChecker"}, ["inputs:", "'Scale'", "'Color1'", "outputs:", "'Color'"]),
     ({"path": "GeometryNodeDistributePointsOnFaces"}, ["'Density'", "'Points'", "distribute_method"]),
@@ -28,22 +29,67 @@ CASES = [
     ({"path": "bpy.types.NodeTreeInterface.new_socket"}, ["'NodeSocketGeometry'", "'NodeSocketFloat'"]),
     ({"path": "bpy.types.GeometryNodeTree"}, ["NOTE:", "tree.interface.new_socket"]),
     ({"path": "bpy.types.Action"}, ["NOTE:", "channelbag(slot)"]),
+    ({"path": "bpy.types.ActionSlot"}, ["NOTE:", "channelbag(slot)", "slot.identifier"]),
+    ({"path": "bpy.types.ActionKeyframeStrip"}, ["NOTE:", "channelbag(slot)"]),
     ({"path": "bpy.context.scene.cycles.samples"}, ["samples", "int"]),
     ({"path": "bpy.types.Scene.cycles"}, ["CyclesRenderSettings", "samples"]),
+    ({"path": "Mesh.from_pydata"}, ["(defined in Python)", "from_pydata(vertices, edges, faces, shade_flat=True)",
+                                    "# Make a mesh from"]),
+    ({"path": "bpy.types.Mesh"}, ["defined in Python:", "  from_pydata(vertices, edges, faces", "edge_keys (read-only)"]),
+    ({"path": "bpy.data.objects"}, ["BlendDataObjects"]),
+    ({"path": "bpy.types.CyclesRenderSettings"}, ["reach it as Scene.cycles", "samples"]),
+    ({"path": "CyclesRenderSettings.samples"}, ["reach it as Scene.cycles", "samples: int"]),
+    ({"path": "CyclesLightSettings"}, ["Light.cycles", "bpy.types.CyclesLightSettings"]),
     ({"path": "RenderSettings.engine"}, ["CYCLES", "BLENDER_EEVEE", "BLENDER_WORKBENCH"]),
     ({"path": "ImageFormatSettings.file_format"}, ["NOTE:", "media_type", "VIDEO"]),
     ({"search": "bevel modifier"}, ["bpy.types.BevelModifier"]),
     ({"search": "shade smooth"}, ["bpy.ops.object.shade_smooth"]),
+    ({"search": "fcurves action layers animation"}, ["Nothing matches every word", "ActionChannelbag.fcurves"]),
 ]
 ERRORS = [
     ({"path": "bpy.types.NoSuchThing"}, "No type"),
     ({"path": "GeometryNodeMeshIcosahedron"}, "GeometryNodeMeshIcoSphere"),
     ({"path": "bpy.types.ShaderNodeBsdfPrincipledd"}, "ShaderNodeBsdfPrincipled"),
     ({"path": "bpy.types.Object.nope"}, "has no property or function"),
+    ({"path": "bpy.types.Mesh.nope"}, "from_pydata"),
     ({"path": "bpy.ops.mesh.nope"}, "No operator"),
+    ({"path": "bpy.types.Action.fcurves"}, "channelbag(slot)"),
     ({}, "exactly one"),
     ({"path": "a", "search": "b"}, "exactly one"),
 ]
+
+
+def mp4_frames_are_readable() -> None:
+    """NOTES['ImageFormatSettings']: an MP4's frames read back as a movie strip rendered to stills (C29: the agent
+    pip-installed imageio-ffmpeg to do this)."""
+    import tempfile
+    folder = Path(tempfile.mkdtemp(prefix="loopcut-mp4-note-"))
+    source = bpy.data.scenes.new("NoteMovieSource")
+    source.render.engine = "BLENDER_WORKBENCH"
+    source.render.resolution_x, source.render.resolution_y, source.render.resolution_percentage = 64, 48, 100
+    source.frame_start, source.frame_end = 1, 3
+    source.render.image_settings.media_type = "VIDEO"
+    source.render.image_settings.file_format = "FFMPEG"
+    source.render.ffmpeg.format, source.render.ffmpeg.codec = "MPEG4", "H264"
+    source.render.filepath = str(folder / "shot.mp4")
+    camera = bpy.data.objects.new("NoteCamera", bpy.data.cameras.new("NoteCamera"))
+    source.collection.objects.link(camera)
+    source.camera = camera
+    bpy.ops.render.render(animation=True, scene=source.name)
+    movie = next(folder.glob("shot*.mp4"))
+    scene = bpy.data.scenes.new("NoteMovieCheck")
+    strip = scene.sequence_editor_create().strips.new_movie("shot", str(movie), channel=1, frame_start=1)
+    assert strip.frame_final_duration == 3, strip.frame_final_duration
+    scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = 64, 48, 100
+    scene.render.image_settings.media_type = "IMAGE"
+    scene.render.image_settings.file_format = "PNG"
+    scene.frame_set(2)
+    scene.render.filepath = str(folder / "frame_0002.png")
+    bpy.ops.render.render(write_still=True, scene=scene.name)
+    still = bpy.data.images.load(str(folder / "frame_0002.png"))
+    assert tuple(still.size) == (64, 48), tuple(still.size)
+    for block, data in ((still, bpy.data.images), (scene, bpy.data.scenes), (source, bpy.data.scenes)):
+        data.remove(block)
 
 
 def notes_are_true() -> int:
@@ -63,6 +109,20 @@ def notes_are_true() -> int:
         assert not hasattr(action, "fcurves"), "NOTES['Action'] says action.fcurves is gone"
         bag = action.layers[0].strips[0].channelbag(cube.animation_data.action_slot)
         assert len(list(bag.fcurves)) == 3
+        slot = cube.animation_data.action_slot
+        assert not hasattr(slot, "name") and (slot.identifier, slot.name_display) == ("OBCube", "Cube"), \
+            "NOTES['Action'] says how a slot is named"
+        try:  # run_python's error for the old spelling carries the note.
+            exec(compile("action.fcurves", "<loopcut>", "exec"), {"action": action})
+            raise AssertionError("action.fcurves did not raise")
+        except AttributeError as ex:
+            from loopcut import tools
+            assert "NOTE: Actions are layered" in tools._model_traceback(ex), tools._model_traceback(ex)
+        try:  # The glTF exporter does not expand //, so the error names the fix.
+            bpy.ops.export_scene.gltf(filepath="//loopcut_note_check.glb", export_format="GLB")
+            raise AssertionError("a glTF export to // worked: BLEND_RELATIVE may be out of date")
+        except RuntimeError as ex:
+            assert api_docs.error_note(ex) == api_docs.BLEND_RELATIVE, str(ex)[-300:]
         render = bpy.context.scene.render
         assert bpy.app.ffmpeg.supported
         saved = render.image_settings.media_type, render.image_settings.file_format
@@ -74,6 +134,7 @@ def notes_are_true() -> int:
         render.image_settings.file_format = "PNG"
         assert not render.is_movie_format
         render.image_settings.media_type, render.image_settings.file_format = saved
+        mp4_frames_are_readable()
         print("ok   the code in NOTES runs on this Blender")
         return 0
     except Exception:
@@ -105,7 +166,7 @@ def addons_are_seen() -> int:
         assert "Node Wrangler" not in line and "loopcut" not in line.split(":", 1)[1].lower().replace("loopcut probe", "").replace("loopcut_probe", ""), line
         addon_utils.disable("loopcut_probe_addon", default_set=True)
         assert "Loopcut Probe" not in addons.line(addons.enabled()), "a disabled add-on stays listed"
-        assert "Nothing in bpy.types" in api_docs.inspect_api(search="probe say"), "the index kept a disabled add-on"
+        assert "bpy.ops.probe" not in api_docs.inspect_api(search="probe say"), "the index kept a disabled add-on"
         print("ok   an add-on enabled mid-session is searchable, described, and named to the model")
         return 0
     except Exception:

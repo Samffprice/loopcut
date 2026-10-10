@@ -1,0 +1,1060 @@
+"""Runtime tools and skills, independent of a release of the add-on.
+
+Network work stays on worker threads. Blender-facing preparation returns ToolResult.then,
+so the existing agent gate, cards and main-thread pump also own remote tool calls. A cache
+is scoped to the service and credential identity; signing out cannot reuse account access.
+"""
+
+import hashlib
+import importlib
+import itertools
+import json
+import math
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+import uuid
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote
+
+from . import cloud_account, cloud_http, config, prompt_index
+from .byok import catalog
+
+NAMESPACE = "loopcut_cloud"
+PREFIX = NAMESPACE + "__"
+REFRESH_SECONDS = 600
+MAX_SKILLS = 128
+MAX_SKILL_BYTES = 256 * 1024
+UPDATE_MESSAGE = "Update Loopcut to use cloud tools"
+_APPLY = {"add_image_reference", "import_model", "import_material", "add_audio_strip",
+          "load_frames", "attach_report", "none", "apply_shape_keys"}
+_runtime = None
+_snapshot_at = 0
+# Deferred application only. cloud_jobs owns status, downloads and cancellation by server ID.
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+
+def tool_name(name):
+    for prefix in (PREFIX, NAMESPACE + "."):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return None
+
+
+def is_tool(name):
+    return tool_name(name) is not None
+
+
+def _descriptor(value):
+    """Validate executable fields; optional display metadata such as category cannot reject a tool."""
+    if not isinstance(value, dict):
+        return False
+    schema, files = value.get("input_schema"), value.get("file_inputs", [])
+    cost, approval = value.get("cost") or {}, value.get("approval") or {}
+    bundle, byok = value.get("bundle_input"), value.get("byok")
+    if bundle is not None and (not isinstance(bundle, dict) or type(bundle.get("required")) is not bool
+                               or not isinstance(bundle.get("description"), str)):
+        return False
+    if byok is not None and not isinstance(byok, dict):
+        return False
+    if (not isinstance(cost, dict) or not isinstance(approval, dict)
+            or type(cost.get("quote_required")) is not bool
+            or type(cost.get("credits_estimate")) is not int):
+        return False
+    amounts = [cost.get("credits_estimate", 0), approval.get("confirm_over_credits", 50)]
+    if any(type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0 for amount in amounts):
+        return False
+    return (isinstance(value.get("name"), str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,43}", value["name"]) is not None
+            and value["name"] != "job_status" and value.get("namespace") == NAMESPACE
+            and type(value.get("version")) is int and value["version"] > 0
+            and value.get("kind") in ("gen", "assist")
+            and type(value.get("available")) is bool
+            and value.get("status") in ("live", "beta", "coming_soon")
+            and value.get("latency") in ("seconds", "minutes", "long")
+            and isinstance(value.get('apply'), str) and value["apply"] in _APPLY
+            and isinstance(value.get("description"), str) and isinstance(value.get("title"), str)
+            and isinstance(value.get("backends"), list)
+            and isinstance(schema, dict) and schema.get("type") == "object"
+            and isinstance(schema.get("properties", {}), dict)
+            and isinstance(schema.get("required", []), list)
+            and all(isinstance(field, str) for field in schema.get("required", []))
+            and isinstance(files, list) and all(isinstance(f, dict)
+                and isinstance(f.get("field"), str) and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", f["field"])
+                and type(f.get('max_mb')) in (int, float) and math.isfinite(f['max_mb']) and f['max_mb'] >= 0
+                and isinstance(f.get('accept'), list) and f['accept']
+                and all(isinstance(mime, str) and mime for mime in f['accept'])
+                and isinstance(f.get("required"), bool) for f in files))
+
+
+def _manifest(value):
+    if (not isinstance(value, dict) or not isinstance(value.get("flags"), dict)
+            or any(type(value["flags"].get(k)) is not bool for k in ("services", "premium_skills"))
+            or not isinstance(value.get("tools"), list) or not isinstance(value.get("skills"), list)
+            or (value.get("account") is not None and not isinstance(value["account"], dict))):
+        raise cloud_http.CloudError("Invalid tool manifest from Loopcut", "invalid_response")
+    account = value.get("account") or {}
+    if (not isinstance(account.get("credits", {}), dict) or not isinstance(account.get("settings", {}), dict)
+            or any(type(v) is not bool for k, v in account.get("settings", {}).items()
+                   if k in ("no_generation", "private_mode"))):
+        raise cloud_http.CloudError("Invalid account settings in Loopcut manifest", "invalid_response")
+    try:
+        prompt_index.validate(value)
+    except prompt_index.IndexError as ex:
+        raise cloud_http.CloudError(str(ex), "invalid_response") from ex
+    return deepcopy(value)
+
+
+def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, policy=None, supported=True):
+    """Return executable descriptors with a backend, using key-presence snapshots only."""
+    keys_set, preferred, policy = keys_set or {}, preferred or {}, policy or {}
+    if not supported:
+        return []
+    account = manifest.get("account") or {}
+    settings = account.get("settings") or {}
+    no_generation = settings.get("no_generation", False) or policy.get("no_generation", False)
+    private_mode = ((settings.get("private_mode", True) or policy.get('private_mode', False))
+                    if signed_in else policy.get("private_mode", True))
+    local = {d["name"]: d for d in catalog.descriptors(no_generation=no_generation,
+                                                      private_mode=private_mode, keys_set=keys_set)}
+    merged = dict(local)
+    remote = {d["name"]: d for d in manifest.get("tools", []) if _descriptor(d)}
+    for name, descriptor in merged.items():
+        if name not in remote:
+            descriptor["backends"] = ["byok"]
+    merged.update(remote)
+    balance = (account.get("credits") or {}).get("balance", 0)
+    funded = signed_in and type(balance) in (int, float) and balance > 0
+    result = []
+    for name, descriptor in merged.items():
+        if descriptor.get("status") not in ("live", "beta") or (no_generation and descriptor["kind"] == "gen"):
+            continue
+        if descriptor.get('apply') in {'import_material', 'apply_shape_keys'}:
+            continue  # These handlers are not implemented; do not offer a paid call we cannot apply.
+        if private_mode and (descriptor.get("byok") or {}).get("data_class") in ("C", "D"):
+            continue
+        byok = local.get(name)
+        has_key = bool(byok and byok["available"] and "byok" in descriptor.get("backends", []))
+        route = descriptor
+        free = (descriptor.get("cost") or {}).get("credits_estimate") == 0 and not descriptor["cost"].get("quote_required")
+        selection = catalog.choose_backend(route, signed_in_with_credits=funded or (signed_in and free),
+                    preferred_backend=preferred.get(name), has_key=has_key)
+        backend = selection["backend"]
+        if backend == "managed" and (not descriptor.get("available") or not manifest.get("flags", {}).get("services")):
+            # An off switch for managed services need not take away the user's local vendor route.
+            backend = catalog.choose_backend(route, signed_in_with_credits=False,
+                        preferred_backend=preferred.get(name), has_key=has_key)["backend"]
+        if backend is None:
+            continue
+        # The BYOK adapters implement the local input contract, which can differ from managed.
+        chosen = deepcopy(byok if backend == "byok" else descriptor)
+        chosen.update(description=descriptor["description"], title=descriptor["title"], backend=backend,
+                      available=True, status=descriptor["status"])
+        result.append(chosen)
+    return result
+
+
+def schema(descriptor):
+    parameters = deepcopy(descriptor["input_schema"])
+    properties = parameters.setdefault("properties", {})
+    required = parameters.setdefault("required", [])
+    for field in descriptor.get("file_inputs", []):
+        name = field["field"]
+        properties[name] = {"type": "string", "description":
+            "Scene reference: an object name to export, an image datablock name, or a capture/render file path. "
+            "The client resolves and uploads this file. Accepted types: " + ", ".join(field.get("accept", []))}
+        if field["required"] and name not in required:
+            required.append(name)
+    if descriptor.get("backend") == "managed":
+        properties["idempotency_key"] = {"type": "string", "minLength": 1, "maxLength": 200,
+            "description": "Reuse only when retrying a failed submission with the same inputs."}
+        if (descriptor.get("cost") or {}).get("quote_required"):
+            properties["quote_id"] = {"type": "string", "minLength": 1,
+                "description": "Optional quote from a previous call with the same inputs. The client obtains a quote and asks for approval before submission."}
+        bundle = descriptor.get("bundle_input")
+        if bundle:
+            properties["bundle"] = {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of an already uploaded, self-contained bundle manifest. " + bundle["description"]}
+            if bundle["required"] and "bundle" not in required:
+                required.append("bundle")
+    return {"type": "function", "function": {"name": PREFIX + descriptor["name"],
+            "description": descriptor["description"], "parameters": parameters}}
+
+
+JOB_SCHEMA = {"type": "function", "function": {"name": PREFIX + "job_status",
+    "description": "Check a long cloud job's progress and apply its finished outputs to the scene. Call again if running.",
+    "parameters": {"type": "object", "properties": {"job_id": {"type": "string"},
+                   "cancel": {"type": "boolean", "description": "Cancel this job."}}, "required": ["job_id"]}}}
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".cloud-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, allow_nan=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _skill_bytes(document, regex_quotes=None):
+    """Rebuild the contract's LF/unquoted format. Never trust a digest without matching bytes.
+
+    Parsed-only responses cannot preserve arbitrary spacing or key order. We can verify the
+    canonical format and the mock's quoted regex variants; any other representation fails
+    closed. Contract 0.2 responses with text bypass this legacy reconstruction.
+    """
+    fields, body = document.get("front_matter"), document.get("body")
+    if not isinstance(fields, dict) or not isinstance(body, str):
+        raise ValueError("Invalid skill document")
+    lines = []
+    for key, value in fields.items():
+        rendered = "[" + ", ".join(value) + "]" if isinstance(value, list) else str(value)
+        wrapper = (regex_quotes or {}).get(key, "")
+        rendered = wrapper + rendered + wrapper
+        lines.append(f"{key}: {rendered}")
+    return ("---\n" + "\n".join(lines) + "\n---\n" + body).encode("utf-8")
+
+
+def _verified_skill(document, entry):
+    from .skills import loader
+    if not isinstance(document, dict):
+        raise ValueError('Invalid skill document')
+    if "text" in document:
+        if not isinstance(document["text"], str):
+            raise ValueError("Invalid raw skill text")
+        canonical = document["text"].encode("utf-8")
+        matches = hashlib.sha256(canonical).hexdigest() == entry["sha256"]
+    else:
+        canonical = _skill_bytes(document)
+        fields = [k for k in document["front_matter"] if k in ("words", "leads")]
+        candidates = (dict(zip(fields, wrappers)) for wrappers in itertools.product(("", "'", '"'), repeat=len(fields)))
+        matches = any(hashlib.sha256(_skill_bytes(document, wrappers)).hexdigest() == entry["sha256"] for wrappers in candidates)
+    if len(canonical) > MAX_SKILL_BYTES or document.get("sha256") != entry["sha256"] or not matches:
+        raise ValueError("Skill hash does not match the manifest")
+    skill = loader.parse_skill(canonical.decode("utf-8"), "server skill")
+    if skill.id != entry["id"] or skill.version != entry["version"]:
+        raise ValueError("Skill identity does not match the manifest")
+    return {"front_matter": dict(skill.front_matter), "body": skill.body, "sha256": entry["sha256"]}
+
+
+def _empty_manifest():
+    return {"account": None, "flags": {"services": False, "premium_skills": False}, "tools": [], "skills": []}
+
+
+# Contract 0.6 (proposal 010): optional ToolDescriptor.display {title, summary, category} for buttons only;
+# the top-level title and description stay model-facing. Category ids become short group labels.
+CATEGORY_LABELS = {"render": "Render", "images": "Images", "3d_models": "3D models", "audio": "Audio",
+                   "characters": "Characters", "assets": "Assets"}
+
+
+def _display(descriptor, key):
+    display = descriptor.get("display")
+    value = display.get(key) if isinstance(display, dict) else None
+    return " ".join(value.split())[:120] if isinstance(value, str) else ""
+
+
+def _category_label(value):
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    value = " ".join(value.split())[:40]
+    return CATEGORY_LABELS.get(value, value.replace("_", " ").capitalize())
+
+
+class Runtime:
+    """Injectable manifest/cache owner. refresh() is synchronous and must run off the UI thread."""
+    def __init__(self, client, cache_dir, *, signed_in=False, keys_set=None, preferred=None, policy=None):
+        self.client, self.cache_dir, self.signed_in = client, Path(cache_dir), signed_in
+        self.keys_set, self.preferred, self.policy = keys_set or {}, preferred or {}, policy or {}
+        self.manifest = _empty_manifest()
+        self.etag, self.message, self.supported = "", "", True
+        self.refreshed_at = 0
+        self.prompts_stale = False
+        self.prompt_updates = 0
+        self.skills = []
+        self.interests = {}
+        self.dismissed_message = ""
+        self.quotes = {}  # Session-only amounts for the approval card, never vendor input.
+        self.quote_requests = {}
+        self.lock, self.refresh_lock = threading.RLock(), threading.Lock()
+        self.load_cache()
+
+    def load_cache(self):
+        try:
+            with (self.cache_dir / "manifest.json").open("rb") as handle:
+                raw = handle.read(cloud_http.MAX_RESPONSE + 1)
+            if len(raw) > cloud_http.MAX_RESPONSE:
+                raise ValueError("Cloud catalog cache is too large")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("Cloud catalog cache must be an object")
+            self.manifest = _manifest(payload["manifest"])
+            etag = payload.get("etag", "")
+            if not isinstance(etag, str) or any(ord(c) < 32 or ord(c) == 127 for c in etag):
+                raise ValueError("Invalid cached ETag")
+            self.etag = etag
+            self.supported = payload.get("supported", True) is True
+            self.message = "" if self.supported else UPDATE_MESSAGE
+            dismissed = payload.get("dismissed_message", "")
+            if not isinstance(dismissed, str):
+                raise ValueError("Invalid dismissed cloud message")
+            self.dismissed_message = dismissed
+            interests = payload.get("interests", {})
+            if not isinstance(interests, dict):
+                raise ValueError("Invalid cached interests")
+            self.interests = {name: "thanks" for name, state in interests.items() if state == "thanks"}
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, KeyError, cloud_http.CloudError) as ex:
+            print(f"Loopcut: could not read the cloud catalog cache: {ex}")
+        self._load_skills(fetch=False)
+
+    def descriptors(self):
+        with self.lock:
+            return merge_tools(self.manifest, signed_in=self.signed_in, keys_set=self.keys_set,
+                               preferred=self.preferred, policy={**self.policy, "no_generation": self.no_generation(),
+                               "private_mode": self.private_mode()}, supported=self.supported)
+
+    def no_generation(self):
+        with self.lock:
+            settings = (self.manifest.get("account") or {}).get("settings") or {}
+            return (settings.get("no_generation", False) or self.policy.get("no_generation", False)
+                    or getattr(self, "account_pending", {}).get("no_generation", False))
+
+    def private_mode(self):
+        with self.lock:
+            settings = (self.manifest.get("account") or {}).get("settings") or {}
+            return ((settings.get("private_mode", True) if self.signed_in else self.policy.get("private_mode", True))
+                    or getattr(self, "account_pending", {}).get("private_mode", False))
+
+    def _save(self):
+        try:
+            _write_json(self.cache_dir / "manifest.json", {"manifest": safe_value(self.manifest, (self.client.api_key,)), "etag": self.etag,
+                                                          "supported": self.supported, "interests": self.interests,
+                                                          "dismissed_message": self.dismissed_message})
+        except OSError as ex:
+            print(f"Loopcut: could not save the cloud catalog cache: {ex}")
+
+    def refresh(self, *, wait=False):
+        if not self.refresh_lock.acquire(blocking=wait):
+            return False
+        try:
+            with self.lock:
+                if wait and not self.prompts_stale:
+                    return True  # A concurrent index user already refreshed while we waited.
+                prompt_updates = self.prompt_updates
+                headers = {"If-None-Match": self.etag} if self.etag else {}
+            response = self.client.request_response("GET", "/v1/manifest", headers=headers, auth=self.signed_in)
+            with self.lock:
+                if response.status != 304:
+                    self.manifest = _manifest(safe_value(response.data, (self.client.api_key,)))
+                    self.etag = next((v for k, v in response.headers.items() if k.lower() == "etag"), "")
+                self.supported, self.message = True, ""
+                self.prompts_stale = self.prompt_updates != prompt_updates
+                self.refreshed_at = time.monotonic()
+                self._save()
+            self._load_skills(fetch=True)
+            return True
+        except cloud_http.CloudError as ex:
+            if ex.status == 404:
+                # An older deployment has no catalog. Discard cached beta capabilities too;
+                # unlike a transient outage, this server cannot expand hosted prompt ids.
+                with self.lock:
+                    self.manifest, self.skills = _empty_manifest(), []
+                    self.etag, self.message, self.supported = "", "", True
+                    self.prompts_stale = False
+                    self.refreshed_at = time.monotonic()
+                    self._save()
+            self.handle_error(ex)
+            return False
+        finally:
+            self.refresh_lock.release()
+
+    def handle_error(self, error):
+        if error.code == "contract_unsupported":
+            with self.lock:
+                self.supported, self.message, self.skills = False, UPDATE_MESSAGE, []
+                self._save()
+        elif error.code == "tool_disabled":
+            self.refreshed_at = 0
+            self.refresh_async()
+        elif (error.code == "quote_required" and isinstance(error.extra.get("quote_id"), str)
+              and type(error.extra.get("credits")) is int):
+            with self.lock:
+                self.quotes[error.extra["quote_id"]] = deepcopy(error.extra)
+                if len(self.quotes) > 32:
+                    oldest = next(iter(self.quotes))
+                    del self.quotes[oldest]
+                    self.quote_requests.pop(oldest, None)
+
+    def refresh_async(self):
+        def refresh():
+            self.refresh()
+            from . import mainthread
+            mainthread.request_redraw()
+        threading.Thread(target=refresh, name="loopcut-manifest", daemon=True).start()
+
+    def _load_skills(self, *, fetch):
+        with self.lock:
+            enabled = self.supported and self.signed_in and self.manifest["flags"]["premium_skills"]
+            entries = deepcopy(self.manifest["skills"][:MAX_SKILLS]) if enabled else []
+            paid = (self.manifest.get("account") or {}).get("plan") in ("pro", "max")
+            self.skills = []
+        found = []
+        retained = set()
+        for entry in entries:
+            if (not isinstance(entry, dict) or not set(entry.get("roles") or ()).intersection(("single", "workspace"))
+                    or (entry.get("tier") == "paid" and not paid)):
+                continue
+            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+                    or not re.fullmatch(r"[a-z0-9_-]+(?:/[a-z0-9_-]+)*", entry["id"])
+                    or type(entry.get("version")) is not int or entry["version"] < 1
+                    or not isinstance(entry.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+                continue
+            path = self.cache_dir / "skills" / (entry["sha256"] + ".json")
+            retained.add(path.name)
+            try:
+                with path.open("rb") as handle:
+                    raw = handle.read(MAX_SKILL_BYTES * 2 + 1)
+                if len(raw) > MAX_SKILL_BYTES * 2:
+                    raise ValueError("Skill cache is too large")
+                document = json.loads(raw)
+                skill = _verified_skill(document, entry)
+            except (OSError, ValueError, TypeError, KeyError):
+                if not fetch:
+                    continue
+                try:
+                    document = self.client.request("GET", f"/v1/skills/{quote(entry['id'], safe='/')}?version={entry['version']}")
+                    skill = _verified_skill(document, entry)
+                    _write_json(path, document)
+                except (cloud_http.CloudError, OSError, ValueError, TypeError, KeyError) as ex:
+                    if isinstance(ex, cloud_http.CloudError) and ex.code == "plan_required":
+                        continue
+                    print(f"Loopcut: skipping unverifiable server skill {entry['id']}")
+                    continue
+            found.append(skill)
+        for path in (self.cache_dir / "skills").glob("*.json"):
+            if path.name not in retained:
+                try:
+                    path.unlink()
+                except OSError:
+                    print("Loopcut: could not remove an obsolete skill cache")
+        with self.lock:
+            if self.supported and self.manifest["flags"]["premium_skills"]:
+                self.skills = found
+
+    def server_skills(self):
+        with self.lock:
+            return deepcopy(self.skills) if self.supported and self.manifest["flags"]["premium_skills"] else []
+
+    def coming_soon(self):
+        with self.lock:
+            return [{"name": d["name"], "title": _display(d, "title") or d["title"],
+                     "summary": _display(d, "summary"), "state": self.interests.get(d["name"], "ready"),
+                     "category": _category_label(_display(d, "category") or d.get("category")),
+                     "notify_sign_in": not self.signed_in and self.interests.get(d["name"], "ready") != "ready",
+                     "data_label": cloud_account.data_label(d), "reason": cloud_account.refusal(d, self.policy)}
+                    for d in self.manifest["tools"] if _descriptor(d) and d["status"] == "coming_soon"]
+
+    def interest(self, name):
+        """One in-flight/successful event per tool per runtime; failed sends can be retried."""
+        with self.lock:
+            if name not in {d["name"] for d in self.coming_soon()} or self.interests.get(name) in ("sending", "thanks"):
+                return False
+            self.interests[name] = "sending"
+        try:
+            # Contract 0.6: install_id (random, per install) and app_version on both paths; the bearer, when
+            # signed in, still identifies the user. Required only without Authorization.
+            from . import credentials
+            payload = {"type": "interest", "tool": name, "source": "coming_soon_button",
+                       "app_version": config.app_version()}
+            install_id = credentials.interest_install_id()
+            if install_id is not None:
+                payload["install_id"] = install_id
+            elif not self.signed_in:
+                with self.lock:
+                    self.interests[name] = "retry"
+                return False
+            try:
+                self.client.request("POST", "/v1/events", payload, auth=self.signed_in)
+            except cloud_http.CloudError as ex:
+                if ex.status not in (400, 422):
+                    raise
+                # A server on contract 0.5 rejects the 0.6 fields: send its body once (anonymous still needs the id).
+                older = {k: payload[k] for k in ("type", "tool", "source")}
+                if not self.signed_in:
+                    older["install_id"] = payload["install_id"]
+                self.client.request("POST", "/v1/events", older, auth=self.signed_in)
+        except (cloud_http.CloudError, OSError) as ex:
+            anonymous_refused = (not self.signed_in and isinstance(ex, cloud_http.CloudError)
+                                 and (ex.status in (400, 401, 404, 422, 429) or ex.code == "sign_in_required"))
+            with self.lock:
+                self.interests[name] = ("notify" if anonymous_refused else "sign_in" if isinstance(ex, cloud_http.CloudError)
+                                        and (ex.status == 401 or ex.code == "sign_in_required") else "retry")
+            if isinstance(ex, cloud_http.CloudError) and not anonymous_refused:
+                self.handle_error(ex)
+            return False
+        with self.lock:
+            self.interests[name] = "thanks"
+            self._save()
+        return True
+
+
+def _snapshot():
+    """Main thread only: preferences, credential directories and account identity may use bpy."""
+    global _runtime
+    from . import checkpoints, credentials
+    key = credentials.api_key(config.SERVICE_BASE_URL)
+    identity = hashlib.sha256((config.SERVICE_URL + "\n" + key).encode()).hexdigest()
+    directory = checkpoints.data_root() / "cloud" / identity
+    if _runtime is None or _runtime.cache_dir != directory:
+        _runtime = Runtime(cloud_http.Client(api_key=key, client_headers=cloud_http.contract_headers()),
+                           directory, signed_in=bool(key))
+        _runtime.live = True
+    settings = (_runtime.manifest.get("account") or {}).get("settings") or {}
+    with _runtime.lock:
+        _runtime.policy = config.service_policy(no_generation_default=settings.get("no_generation", False))
+        _runtime.keys_set = credentials.vendor_keys_set()
+        _runtime.preferred = config.service_backends()
+    return _runtime
+
+
+def sync_settings():
+    """Main-thread callers update project policy even when the panel is closed."""
+    if _runtime is not None and getattr(_runtime, "live", False):
+        _snapshot()
+
+
+def refresh_async():
+    runtime = _snapshot()
+    runtime.refresh_async()
+
+
+def panel_seen():
+    global _snapshot_at
+    now = time.monotonic()
+    if _runtime is None or now - _snapshot_at >= 1:
+        _snapshot_at = now
+        try:
+            _snapshot()
+        except config.ConfigError as ex:
+            if _runtime is not None and _runtime.supported:
+                _runtime.message = str(ex)
+            return
+    runtime = _runtime
+    if time.monotonic() - runtime.refreshed_at >= REFRESH_SECONDS:
+        runtime.refreshed_at = time.monotonic()  # Throttle offline retries and repeated draws.
+        runtime.refresh_async()
+
+
+def _timer():
+    import bpy
+    from .ui import host
+    if any(host.is_host(area) for window in bpy.context.window_manager.windows for area in window.screen.areas):
+        panel_seen()
+    return 10.0
+
+
+def register():
+    import bpy
+    from . import account
+    if refresh_async not in account.on_signed_in:
+        account.on_signed_in.append(refresh_async)
+    refresh_async()
+    if not bpy.app.timers.is_registered(_timer):
+        bpy.app.timers.register(_timer, first_interval=10, persistent=True)
+
+
+def unregister():
+    import bpy
+    from . import account
+    if refresh_async in account.on_signed_in:
+        account.on_signed_in.remove(refresh_async)
+    if bpy.app.timers.is_registered(_timer):
+        bpy.app.timers.unregister(_timer)
+    from . import cloud_jobs
+    cloud_jobs.cancel_all()
+
+
+def tool_schemas():
+    descriptors = _runtime.descriptors() if _runtime else []
+    schemas = [schema(d) for d in descriptors]
+    with _jobs_lock:
+        pending = any(row["result"] is None for row in _jobs.values())
+    if any(d["latency"] == "long" for d in descriptors) or pending:
+        schemas.append(deepcopy(JOB_SCHEMA))
+    return schemas
+
+
+def skill_options():
+    if _runtime is None:
+        return {}
+    return {"server_skills": _runtime.server_skills(),
+            "available_tools": [NAMESPACE + "." + tool_name(s["function"]["name"]) for s in tool_schemas()],
+            "no_generation": _runtime.no_generation()}
+
+
+def prompt_index_available():
+    """Cached capability for main-thread loop selection; never refresh over the network."""
+    index = prompt_index.override()
+    if index is not None:
+        return index.get('prompts') is not None
+    runtime = _runtime
+    if runtime is None:
+        return False
+    with runtime.lock:
+        return runtime.manifest.get('prompts') is not None
+
+
+def hosted_index(*, required=False):
+    """The injection index, refreshing stale metadata best-effort. Never fetch worker text."""
+    index = prompt_index.override()
+    runtime = _runtime
+    if index is None and runtime is not None:
+        while True:
+            with runtime.lock:
+                if not runtime.prompts_stale:
+                    index = {"prompts": deepcopy(runtime.manifest.get("prompts")),
+                             "skills": deepcopy(runtime.manifest["skills"])}
+                    break
+            if not runtime.refresh(wait=True):
+                with runtime.lock:
+                    index = {"prompts": deepcopy(runtime.manifest.get("prompts")),
+                             "skills": deepcopy(runtime.manifest["skills"])}
+                if index['prompts'] is not None:
+                    # Ids are permanent; the server still expands the currently live text.
+                    print('Loopcut: could not refresh the service prompt index; using the cached index')
+                break
+    if index is None or index.get('prompts') is None:
+        if required:
+            raise prompt_index.IndexError('No Loopcut prompt index for hosted requests or workers. Refresh the signed-in manifest '
+                                          'or set LOOPCUT_PROMPT_INDEX for a service stand-in.')
+        return None
+    return index
+
+
+def note_prompt_version(version):
+    """A deployment changed injection bytes. The next index user refreshes synchronously."""
+    runtime = _runtime
+    if not version or os.environ.get('LOOPCUT_PROMPT_INDEX') or runtime is None:
+        return
+    with runtime.lock:
+        if version != (runtime.manifest.get('prompts') or {}).get('version'):
+            runtime.prompt_updates += 1
+            runtime.prompts_stale = True
+            runtime.refreshed_at = 0
+
+
+def worker_skill_options():
+    index = hosted_index(required=True)
+    return {'skill_index': index['skills'],
+            'available_tools': [NAMESPACE + '.' + tool_name(s['function']['name']) for s in tool_schemas()],
+            'no_generation': _runtime.no_generation() if _runtime else False}
+
+
+def coming_soon():
+    return _runtime.coming_soon() if _runtime else []
+
+
+def ui_message():
+    if _runtime:
+        with _runtime.lock:
+            return _runtime.message if _runtime.message != _runtime.dismissed_message else ""
+    return ""
+
+
+def dismiss_ui_message(message):
+    if _runtime:
+        with _runtime.lock:
+            if message and message == _runtime.message:
+                _runtime.dismissed_message = message
+                _runtime._save()
+
+
+def record_interest(name):
+    if _runtime:
+        runtime = _runtime
+        def send():
+            runtime.interest(name)
+            from . import mainthread
+            mainthread.request_redraw()
+        threading.Thread(target=send, name="loopcut-interest", daemon=True).start()
+
+
+def approval(name, arguments=None, roots=(), *, files_only=False):
+    bare = tool_name(name)
+    if _runtime:
+        descriptor = next((d for d in _runtime.descriptors() if d["name"] == bare), None)
+        if descriptor:
+            from . import files
+            for field in descriptor.get("file_inputs", []):
+                reference = (arguments or {}).get(field["field"])
+                if isinstance(reference, str):
+                    if files.needs_approval("read_file", {"path": reference}, roots):
+                        return True
+            if files_only:
+                return False
+            return cloud_account.approval_details(descriptor)["required"]
+    return False
+
+
+def changes_scene(name):
+    return is_tool(name)  # job_status may apply finished outputs; checkpoint before either call.
+
+
+def describe(name, arguments):
+    if not is_tool(name):
+        return None
+    bare = tool_name(name)
+    descriptor = next((d for d in (_runtime.descriptors() if _runtime else []) if d["name"] == bare), None)
+    if bare == "job_status":
+        return f"Cloud job {arguments.get('job_id', '')}", ""
+    title = descriptor["title"] if descriptor else bare
+    quote = None
+    if descriptor and descriptor["backend"] == "managed" and isinstance(arguments.get("quote_id"), str):
+        with _runtime.lock:
+            quote = _runtime.quotes.get(arguments["quote_id"])
+    route = cloud_account.approval_details(descriptor, quote)["text"] if descriptor else "cloud"
+    return f"{title} ({route})", ""
+
+
+def error_text(error):
+    # Preserve contract extras for retries, quotes, refunds and policy explanations.
+    extra = {k: v for k, v in error.extra.items() if k not in {"job", "upgrade"}}
+    return safe_value(_error_message(error) + ("\n" + json.dumps({"error": {"code": error.code,
+        "type": error.error_type, **extra}}, ensure_ascii=False) if extra else ""))
+
+
+def safe_value(value, secrets=()):
+    """Keep credentials and URL query capabilities out of cards, history and scene metadata."""
+    if isinstance(value, str):
+        for secret in secrets:
+            if isinstance(secret, str) and secret:
+                value = value.replace(secret, "[redacted]")
+        value = re.sub(r'https?://[^\s<>"\x27]+',
+                       lambda m: m[0].split("?", 1)[0] + "?[redacted]" if "?" in m[0] else m[0], value)
+        return re.sub(r'\b(?:lc_|sk[-_]|AIza)[A-Za-z0-9_-]+', '[redacted]', value)
+    if isinstance(value, dict):
+        return {safe_value(k, secrets): safe_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [safe_value(v, secrets) for v in value]
+    return value
+
+
+def _error_message(error):
+    account_error = cloud_account.report_error(error)
+    if account_error:
+        return account_error
+    code, extra = error.code, error.extra
+    if code == "quote_required":
+        return f"quote_required: {extra.get('credits', '?')} credits. Ask the user to approve this quote, then repeat the same inputs with quote_id."
+    if code == "vendor_failed":
+        return "vendor_failed: the vendor failed; credits refunded." if extra.get("refunded") else "vendor_failed: the vendor failed. Try again later."
+    if code in ("rate_limited", "concurrency_limit"):
+        return f"{code}: retry after {extra.get('retry_after', '?')} seconds."
+    if code == "contract_unsupported":
+        return UPDATE_MESSAGE
+    if code == "tool_disabled":
+        return "tool_disabled: this tool was switched off. The catalog is refreshing; choose another available tool."
+    return f"{code}: {str(error)[:400]}"
+
+
+class _Cancel(threading.Event):
+    def __init__(self, is_cancelled):
+        super().__init__()
+        self.is_cancelled = is_cancelled
+
+    def is_set(self):
+        return super().is_set() or self.is_cancelled()
+
+    def wait(self, timeout=None):
+        end = time.monotonic() + timeout if timeout is not None else float("inf")
+        while not self.is_set() and time.monotonic() < end:
+            super().wait(min(0.1, max(0, end - time.monotonic())))
+        return self.is_set()
+
+    def detach(self):
+        """A long job outlives its originating turn, but keeps the same panel cancel event."""
+        if self.is_set():
+            self.set()
+        self.is_cancelled = lambda: False
+
+
+def _progress(name, progress):
+    from . import mainthread, state
+    def update():
+        card = next((i for i in reversed(state.session()["items"]) if i.get("name") == name and i.get("status") == "running"), None)
+        if card is not None:
+            card["output"] = safe_value(f"{progress.get('pct', 0)}% · {progress.get('message', 'Working…')}"
+                                        if isinstance(progress, dict) else str(progress))
+        mainthread.request_redraw()
+    mainthread.run_on_main(update)
+
+
+def _run(runtime, module, descriptor, arguments, files, out_dir, cancel, progress):
+    try:
+        if cancel.is_set():
+            raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
+        if descriptor["backend"] == "managed":
+            job = cloud_account.submit(module, descriptor, arguments, files, runtime=runtime.account,
+                project={"id": "local", "no_generation": runtime.policy.get("no_generation", False)},
+                on_progress=progress, cancel=cancel, client=runtime.client)
+        else:
+            from .byok import runner
+            inputs = {k: v for k, v in arguments.items() if k not in files}
+            job = runner.run(descriptor["name"], inputs, files, out_dir,
+                             no_generation=runtime.policy.get("no_generation", False),
+                             private_mode=runtime.policy["private_mode"], api_key=runtime.vendor_key)
+            if cancel.is_set():
+                raise cloud_http.CloudError("BYOK call canceled; no output applied. Vendor charges may still apply.", "canceled")
+        allowed = {"succeeded", "failed", "canceled"}
+        if descriptor["backend"] == "managed" and descriptor["latency"] == "long":
+            allowed.update(("queued", "running"))
+        if not isinstance(job, dict) or job.get("status") not in allowed:
+            raise cloud_http.CloudError("Cloud job returned an invalid result", "invalid_response")
+        if job.get("status") == "failed":
+            error = job.get("error") or {}
+            code = error.get("code", "vendor_failed")
+            raise cloud_http.CloudError(error.get("message", "Cloud job failed"), code,
+                                        extra={k: v for k, v in error.items() if k not in ("code", "message", "type")},
+                                        error_type=error.get("type"))
+        return job
+    except cloud_http.CloudError as ex:
+        runtime.handle_error(ex)
+        raise
+
+
+def _validate_arguments(descriptor, arguments):
+    """Check the scene-reference boundary before exporting anything or starting a paid call."""
+    json.dumps(arguments, allow_nan=False)
+    parameters = schema(descriptor)["function"]["parameters"]
+    properties = parameters.get("properties", {})
+    file_fields = {f["field"]: f for f in descriptor.get("file_inputs", [])}
+    required = set(parameters.get("required", [])) | {
+        field for field, spec in file_fields.items() if spec["required"]}
+    missing = required - arguments.keys()
+    if missing:
+        raise ValueError("Required tool input missing: " + ", ".join(sorted(missing)))
+    if parameters.get("additionalProperties") is False and arguments.keys() - properties.keys() - file_fields.keys():
+        raise ValueError("Unknown tool input; use the fields in this tool's schema.")
+    types = {"string": str, "object": dict, "array": list, "boolean": bool, "integer": int}
+    for field, value in arguments.items():
+        spec = {"type": "string"} if field in file_fields else properties.get(field, {})
+        kind = spec.get("type")
+        expected = types.get(kind) if isinstance(kind, str) else None
+        if ((expected and (not isinstance(value, expected) or kind == "integer" and type(value) is not int))
+                or kind == "number" and (type(value) not in (int, float) or not math.isfinite(value))
+                or field in file_fields and not value.strip()):
+            raise ValueError(f"Invalid {field}: use the type described in this tool's schema.")
+    if "bundle" in arguments and (not isinstance(arguments["bundle"], str)
+                                  or not re.fullmatch(r"[0-9a-f]{64}", arguments["bundle"])):
+        raise ValueError("Invalid bundle: use an uploaded manifest SHA-256.")
+
+
+def _discard_preparation(directory):
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        print('Loopcut: could not remove temporary cloud inputs')
+
+
+def execute(name, arguments):
+    """Main thread: resolve scene references, then hand remote work back to the agent thread."""
+    from . import tools
+    import bpy
+    origin_scene = getattr(getattr(bpy, 'context', None), 'scene', None)
+    try:
+        sync_settings()
+    except config.ConfigError as ex:
+        return tools.ToolResult(str(ex), ok=False)
+    if tool_name(name) == "job_status":
+        return _job_status(arguments)
+    runtime = _runtime
+    descriptor = next((d for d in (runtime.descriptors() if runtime else []) if d["name"] == tool_name(name)), None)
+    if descriptor is None:
+        known = next((d for d in (runtime.manifest["tools"] if runtime else [])
+                      if isinstance(d, dict) and d.get("name") == tool_name(name)), None)
+        local = next((d for d in catalog.descriptors(no_generation=False,
+                     private_mode=runtime.private_mode(), keys_set=runtime.keys_set)
+                     if d["name"] == tool_name(name)), None) if runtime else None
+        refused = known or local
+        if runtime and runtime.supported and runtime.no_generation() and refused and refused.get("kind") == "gen":
+            scope = "account" if ((runtime.manifest.get("account") or {}).get("settings") or {}).get("no_generation") else "project"
+            return tools.ToolResult(error_text(cloud_http.CloudError("Generation disabled", "generation_disabled", 403,
+                                                                    {"scope": scope})), ok=False)
+        if runtime and refused and (refused.get("unavailable_reason") == "private_mode"
+                or runtime.private_mode() and (refused.get("byok") or {}).get("data_class") in ("C", "D")):
+            error = cloud_http.CloudError("Private mode refuses this vendor route", "private_mode", 403,
+                                          {"data_class": (refused.get("byok") or {}).get("data_class", "unknown")})
+            return tools.ToolResult(error_text(error), ok=False)
+        if runtime and refused:
+            reason = cloud_account.refusal(refused, {"no_generation": runtime.no_generation(),
+                                                     "private_mode": runtime.private_mode()})
+            if reason:
+                return tools.ToolResult(reason, ok=False)
+        return tools.ToolResult((runtime.message if runtime else "") or "Cloud tool unavailable. Sign in, add credits or configure a vendor key, then choose an available tool.", ok=False)
+    try:
+        module = importlib.import_module(".cloud_jobs", __package__)
+    except ModuleNotFoundError as ex:
+        if ex.name != __package__ + ".cloud_jobs":
+            raise
+        return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is missing).", ok=False)
+    if any(not callable(getattr(module, fn, None)) for fn in ("resolve_files", "run", "apply_result")):
+        return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is incomplete).", ok=False)
+    out_dir = None
+    try:
+        _validate_arguments(descriptor, arguments)
+        out_dir = runtime.cache_dir / "jobs" / uuid.uuid4().hex
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = module.resolve_files(descriptor, arguments, out_dir)
+        # Exports are ours. Unresolved local paths require their own gate before hashing or upload,
+        # including tools invoked outside agent.run_loop and workers that cannot ask the user.
+        from . import files as local_files
+        external = [str(path) for path in files.values() if not Path(path).is_relative_to(out_dir)]
+        file_consent = bool(external and any(not local_files.inside(Path(path), local_files.project_roots())
+                                            for path in external))
+        from . import credentials
+        client, vendor_key = None, None
+        if descriptor["backend"] == "managed":
+            source = runtime.client
+            key = source.api_key if source.api_key is not None else credentials.api_key(source.base_url + "/v1")
+            client = cloud_http.Client(base_url=source.base_url, api_key=key, transport=source.transport,
+                                       timeout=source.timeout, client_headers=source.version_headers())
+        else:
+            vendor_key = credentials.vendor_key(descriptor["byok"]["key_name"])
+    except (cloud_http.CloudError, config.ConfigError, OSError, ValueError, tools.ToolError) as ex:
+        if out_dir is not None:
+            _discard_preparation(out_dir)
+        if isinstance(ex, cloud_http.CloudError):
+            runtime.handle_error(ex)
+        return tools.ToolResult(error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False)
+    # Freeze policies and routing before leaving Blender's thread.
+    snapshot = SimpleNamespace(policy={"no_generation": runtime.no_generation(), "private_mode": runtime.private_mode()},
+                               handle_error=runtime.handle_error, client=client, vendor_key=vendor_key, account=runtime)
+    def finish(is_cancelled, on_main):
+        cancel = _Cancel(is_cancelled)
+        progress = lambda p: _progress(name, p)
+        authorized = False
+        try:
+            cloud_account._check_cancel(cancel)
+            if file_consent:
+                cloud_account.confirm({'required': True, 'text': 'Upload local files: ' + ', '.join(external),
+                                       'credits': None, 'file_access': True})
+            approved_arguments = cloud_account.authorize(module, descriptor, arguments, files, runtime=runtime,
+                project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
+                cancel=cancel, client=snapshot.client)
+            on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
+            authorized = True
+        except cloud_http.CloudError as ex:
+            runtime.handle_error(ex)
+            return tools.ToolResult(error_text(ex), ok=False)
+        finally:
+            if not authorized:
+                _discard_preparation(out_dir)
+        try:
+            job = _run(snapshot, module, descriptor, approved_arguments, files, out_dir, cancel, progress)
+            if descriptor["latency"] == "long" and descriptor["backend"] == "managed":
+                cancel.detach()
+                with _jobs_lock:
+                    finished = [key for key, row in _jobs.items() if row["result"] is not None]
+                    for key in finished[:-31]:
+                        del _jobs[key]
+                    _jobs.setdefault(job["id"], {"descriptor": descriptor, "module": module,
+                                                "handle_error": runtime.handle_error,
+                                                "report_error": cloud_account.error_reporter(), "result": None,
+                                                'scene': origin_scene,
+                                                'complete': lambda: cloud_account.complete(runtime, approved_arguments)})
+                return tools.ToolResult(json.dumps({"job_id": job["id"], "status": job["status"],
+                                                   "next": "loopcut_cloud.job_status"}))
+            if cancel.is_set():
+                return tools.ToolResult("Cloud call canceled; no output applied.", ok=False)
+            if job.get("status") != "succeeded":
+                return tools.ToolResult(f"Cloud job {job.get('status', 'incomplete')}; no output applied.", ok=False)
+            return on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene))
+        except cloud_http.CloudError as ex:
+            return tools.ToolResult(error_text(ex), ok=False)
+        finally:
+            if descriptor['backend'] == 'managed':
+                _discard_preparation(out_dir)
+    return tools.ToolResult("Preparing cloud job…", then=finish)
+
+
+def _apply(module, descriptor, job):
+    from . import scene_diff, tools
+    before = scene_diff.snapshot()
+    try:
+        summary = module.apply_result(descriptor, job)
+    except cloud_http.CloudError as ex:
+        return tools.ToolResult(error_text(ex), ok=False, scene_before=before, scene_after=scene_diff.snapshot())
+    except (tools.ToolError, OSError, ValueError) as ex:
+        return tools.ToolResult(f"Could not apply cloud output: {str(ex)[:400]}", ok=False,
+                                scene_before=before, scene_after=scene_diff.snapshot())
+    return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot())
+
+
+def _apply_to_scene(module, descriptor, job, scene):
+    from . import tools
+    if not _same_scene(scene):
+        return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
+    return _apply(module, descriptor, job)
+
+
+def _same_scene(scene):
+    import bpy
+    current = getattr(getattr(bpy, 'context', None), 'scene', None)
+    try:
+        if scene is not None and current is not None and hasattr(scene, 'as_pointer'):
+            return scene.as_pointer() == current.as_pointer()
+        return scene is current
+    except ReferenceError:
+        return False  # The originating .blend or scene was closed while the job ran.
+
+
+def _job_status(arguments):
+    from . import tools
+    if set(arguments) - {"job_id", "cancel"} or not isinstance(arguments.get("job_id"), str) or type(arguments.get("cancel", False)) is not bool:
+        return tools.ToolResult("job_status needs a string job_id and optional boolean cancel.", ok=False)
+    with _jobs_lock:
+        record = _jobs.get(arguments["job_id"])
+        if record is None:
+            return tools.ToolResult("Unknown cloud job handle; use the job_id returned by the tool.", ok=False)
+    module = record["module"]
+    if record["result"] is not None:
+        return tools.ToolResult(record["result"].text, ok=record["result"].ok)
+    try:
+        if arguments.get("cancel"):
+            module.cancel_job(arguments["job_id"])
+        job = module.job_status(arguments["job_id"])
+    except cloud_http.CloudError as ex:
+        record["handle_error"](ex)
+        record["report_error"](ex)
+        if record.get('complete') and ex.extra.get('job', {}).get('status') in {'failed', 'canceled'}:
+            record['complete']()
+        result = tools.ToolResult(error_text(ex), ok=False)
+        if ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
+            record["result"] = result
+        return result
+    if job["status"] in ("queued", "running"):
+        return tools.ToolResult(json.dumps(safe_value({"job_id": job["id"], "status": job["status"], "progress": job["progress"]})))
+    if not _same_scene(record.get('scene')):
+        return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
+    if record.get('complete'):
+        record['complete']()
+    if arguments.get("cancel"):
+        record["result"] = tools.ToolResult("Cloud job finished before cancellation; no output applied.", ok=False)
+    elif _runtime and _runtime.no_generation() and record["descriptor"]["kind"] == "gen":
+        return tools.ToolResult("generation_disabled: generation is disabled for this project; output was not applied.", ok=False)
+    else:
+        record["result"] = _apply(module, record["descriptor"], job)
+    return record["result"]

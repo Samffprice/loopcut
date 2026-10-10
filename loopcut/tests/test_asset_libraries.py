@@ -17,7 +17,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import asset_common, asset_libraries, tools  # noqa: E402
+from loopcut import asset_common, asset_libraries, assets, tools  # noqa: E402
 from loopcut.asset_libraries import Entry  # noqa: E402
 
 PAGE = {
@@ -101,13 +101,15 @@ class ListingTest(unittest.TestCase):
         self.assertEqual(asset_libraries.remote_cache_dirname("https://blender.ambientcg.com/"), "6f18014bec4cad69")
 
     def test_labels_and_bad_arguments(self):
-        self.assertEqual(asset_libraries.describe("import_asset", {"ref": "L::f.blend::WORLD::City"}), ("Import asset City", ""))
-        self.assertEqual(asset_libraries.describe("search_assets", {"query": "oak"}), ("Search asset libraries: oak", ""))
+        self.assertEqual(assets.describe("import_asset", {"source": "library", "id": "L::f.blend::WORLD::City"}),
+                         ("Import asset City", ""))
+        self.assertEqual(assets.describe("search_assets", {"source": "library", "query": "oak"}),
+                         ("Search asset libraries: oak", ""))
         self.assertIn("import_asset", tools.CHANGES_SCENE)
-        result = tools.execute("import_asset", json.dumps({"ref": "garbage"}))
+        result = tools.execute("import_asset", json.dumps({"source": "library", "id": "garbage"}))
         self.assertFalse(result.ok)
         self.assertIn("library::file::TYPE::name", result.text)
-        result = tools.execute("search_assets", json.dumps({"query": "x", "type": "BRUSH"}))
+        result = tools.execute("search_assets", json.dumps({"source": "library", "query": "x", "type": "BRUSH"}))
         self.assertFalse(result.ok)
         self.assertIn("OBJECT, COLLECTION", result.text)
 

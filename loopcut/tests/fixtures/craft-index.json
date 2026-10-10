@@ -1,0 +1,1183 @@
+{
+  "prompts": {
+    "version": "e533a3f72029",
+    "items": {
+      "single": {
+        "chars": 7199
+      },
+      "orchestrator": {
+        "chars": 11301
+      },
+      "worker": {
+        "chars": 4274
+      },
+      "router": {
+        "chars": 2882
+      }
+    }
+  },
+  "skills": [
+    {
+      "id": "craft/animation/assets",
+      "version": 1,
+      "title": "Animation assets",
+      "when": "A animation worker considers using asset libraries",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "assets",
+      "sha256": "1d699dc7878b19674a534290a2101e63520ac54b093e8375f6685cbcee807594",
+      "chars": 207
+    },
+    {
+      "id": "craft/animation/bounce",
+      "version": 1,
+      "title": "Animation: bounce",
+      "when": "The animation brief calls for bounce",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "topic",
+      "name": "bounce",
+      "order": 3,
+      "words": "bounce|drop|fall|jump|throw|squash|ball|float|hover|bob|wobble",
+      "sha256": "bec86fe17f0252dba8dbe78af218e76e6ff35384da99d953ed6f4ebafb8da6e8",
+      "chars": 216
+    },
+    {
+      "id": "craft/animation/camera",
+      "version": 1,
+      "title": "Animation: camera",
+      "when": "The animation brief calls for camera",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "topic",
+      "name": "camera",
+      "order": 2,
+      "words": "camera|dolly|push[- ]?in|pan|fly[- ]?through|crane|tracking shot",
+      "sha256": "d2c125c6dcb7125f3899b6c96e1d53bd62e1383fde625eb915d546d511528e65",
+      "chars": 257
+    },
+    {
+      "id": "craft/animation/core",
+      "version": 1,
+      "title": "Animation craft",
+      "when": "A animation worker begins its craft pass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "core",
+      "everyday": [
+        "reveal"
+      ],
+      "sha256": "91009fd523c7fbb18ced32464b98b66aa019d86ab9616ad2ce8dd4c6d9d5f561",
+      "chars": 1806
+    },
+    {
+      "id": "craft/animation/loop",
+      "version": 1,
+      "title": "Animation: loop",
+      "when": "The animation brief calls for loop",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "topic",
+      "name": "loop",
+      "order": 0,
+      "words": "spin|rotat|turntable|wheel|fan|gear|loop|orbit|propeller|clock|cycle|seamless",
+      "sha256": "daa23ccbb9d8ecec7b7bf459b93f686870ee03e24bf27141768c7012445b2012",
+      "chars": 200
+    },
+    {
+      "id": "craft/animation/reveal",
+      "version": 1,
+      "title": "Animation: reveal",
+      "when": "The animation brief calls for reveal",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "animation",
+      "part": "topic",
+      "name": "reveal",
+      "order": 1,
+      "words": "open|close|door|lid|drawer|reveal|unfold|explod|assembl|build[- ]?up|appear",
+      "sha256": "4215c377f331b804896856da21205d5b214b50efe55220996d2bc4a46f3cfc15",
+      "chars": 295
+    },
+    {
+      "id": "craft/camera/assets",
+      "version": 1,
+      "title": "Camera assets",
+      "when": "A camera worker considers using asset libraries",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "assets",
+      "sha256": "ba07495f24372219ff533423ee2bebc3da4c3018a3539ac33e4291c8f2afd12a",
+      "chars": 163
+    },
+    {
+      "id": "craft/camera/core",
+      "version": 1,
+      "title": "Camera craft",
+      "when": "A camera worker begins its craft pass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "core",
+      "everyday": [
+        "product"
+      ],
+      "sha256": "43ca7840232dd7ef81149ff6bd0e9fb151dcb0295023633c5ccf91713096027f",
+      "chars": 1605
+    },
+    {
+      "id": "craft/camera/interior",
+      "version": 1,
+      "title": "Camera: interior",
+      "when": "The camera brief calls for interior",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "topic",
+      "name": "interior",
+      "order": 3,
+      "words": "room|interior|kitchen|living|bedroom|office|corridor|house|dungeon|hall",
+      "sha256": "1c83569edea4b98a1e96f5d4f10a9433facdc12e7811b49c9cfc3acad8eabc3e",
+      "chars": 190
+    },
+    {
+      "id": "craft/camera/moves",
+      "version": 1,
+      "title": "Camera: moves",
+      "when": "The camera brief calls for moves",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "topic",
+      "name": "moves",
+      "order": 0,
+      "words": "move|moving|dolly|orbit|pan|push[- ]?in|pull|track|crane|fly|turntable|animat|reveal|sweep|keyframe",
+      "sha256": "a71d2c0f1407bfc44b35f6550a41d08a071b29e84cb7b9442eaa4fa80fda3f93",
+      "chars": 435
+    },
+    {
+      "id": "craft/camera/multi",
+      "version": 1,
+      "title": "Camera: multi",
+      "when": "The camera brief calls for multi",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "topic",
+      "name": "multi",
+      "order": 1,
+      "words": "cameras|shots|angles|views|two|three|several|multiple|coverage|sequence",
+      "sha256": "9984b6c09edd75be839bafea90924a9ca0423f22086846a2b21f6ef50d3dc943",
+      "chars": 221
+    },
+    {
+      "id": "craft/camera/product",
+      "version": 1,
+      "title": "Camera: product",
+      "when": "The camera brief calls for product",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "camera",
+      "part": "topic",
+      "name": "product",
+      "order": 2,
+      "words": "product|packshot|bottle|watch|phone|perfume|shoe|hero|cosmetic|jewel",
+      "sha256": "28b01b92102b30cd2a677788e039d91e900d518ea95bdb73ff5233ae466668bf",
+      "chars": 180
+    },
+    {
+      "id": "craft/lighting/animated",
+      "version": 1,
+      "title": "Lighting: animated",
+      "when": "The lighting brief calls for animated",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "animated",
+      "order": 4,
+      "words": "flicker|pulse|sweep|animat|moving|rotat|keyframe|blink|strobe|flash|sequence",
+      "sha256": "4b4fb2a13b32803a1f2d9cdaf698cf45fbc08ed250ffa044f02844317575bfd2",
+      "chars": 331
+    },
+    {
+      "id": "craft/lighting/assets",
+      "version": 1,
+      "title": "Lighting assets",
+      "when": "A lighting worker considers using asset libraries",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "assets",
+      "sha256": "ab992bf518a51c2d74583624ed4cd2f5e7aedc47a52645fd40648863243cc9a2",
+      "chars": 344
+    },
+    {
+      "id": "craft/lighting/core",
+      "version": 1,
+      "title": "Lighting craft",
+      "when": "A lighting worker begins its craft pass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "core",
+      "everyday": [
+        "product"
+      ],
+      "sha256": "1f73a84cbd47fc8a1e93f6971835750541f0c3818a18a96433c533875b0b9d49",
+      "chars": 1864
+    },
+    {
+      "id": "craft/lighting/interior",
+      "version": 1,
+      "title": "Lighting: interior",
+      "when": "The lighting brief calls for interior",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "interior",
+      "order": 1,
+      "words": "room|interior|kitchen|living|bedroom|office|corridor|dungeon|indoor|lamps?|house|cosy|cozy",
+      "sha256": "890b8d8a850e072c25d65db6b58dc577c63d0dc069d954135910303aacb47826",
+      "chars": 346
+    },
+    {
+      "id": "craft/lighting/mood",
+      "version": 1,
+      "title": "Lighting: mood",
+      "when": "The lighting brief calls for mood",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "mood",
+      "order": 3,
+      "words": "dark|moody|night|dramatic|noir|horror|spooky|cinematic|neon|cyberpunk|mysterious|low[- ]key",
+      "sha256": "fc9cc09de0221c293f33b414d551b842caeeb4425a3299c6e3dea1fdd13b8f35",
+      "chars": 282
+    },
+    {
+      "id": "craft/lighting/outdoor",
+      "version": 1,
+      "title": "Lighting: outdoor",
+      "when": "The lighting brief calls for outdoor",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "outdoor",
+      "order": 2,
+      "words": "outdoors?|exterior|landscape|street|garden|sunset|sunrise|daylight|sky|forest|beach|park",
+      "sha256": "333cfe736e9b789454c82ce4488f408ff597d5dafd81a95adfd4a6af25bc8bec",
+      "chars": 206
+    },
+    {
+      "id": "craft/lighting/painterly",
+      "version": 1,
+      "title": "Lighting: painterly",
+      "when": "The lighting brief calls for painterly",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "painterly",
+      "order": 5,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "leads": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "59a84b070ba041a03c7e656694670b9170d536942f05113dd46440126fc3a345",
+      "chars": 850
+    },
+    {
+      "id": "craft/lighting/product",
+      "version": 1,
+      "title": "Lighting: product",
+      "when": "The lighting brief calls for product",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "topic",
+      "name": "product",
+      "order": 0,
+      "words": "product|studio|packshot|bottle|perfume|watch|phone|cosmetic|jewel|shoe|reveal|hero|turntable|advert|commercial",
+      "sha256": "81b7f7230490eaffcd413720097bd0d66dcfb34b59a7bfa44edf94fbb1e5c035",
+      "chars": 430
+    },
+    {
+      "id": "craft/lighting/shot-camera",
+      "version": 1,
+      "title": "Shot camera",
+      "when": "A lighting worker also owns the camera aspect",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "lighting",
+      "part": "shot",
+      "sha256": "09eb685eb0989358dd0598b86aa364468ad505242e008454c25d4df3ebd3bba9",
+      "chars": 645
+    },
+    {
+      "id": "craft/materials/assets",
+      "version": 1,
+      "title": "Materials assets",
+      "when": "A materials worker considers using asset libraries",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "assets",
+      "sha256": "660e747fd9d38d74c0d82a4ca894200ab1ee23ac78e9667f19135119e4d7bdd0",
+      "chars": 411
+    },
+    {
+      "id": "craft/materials/core",
+      "version": 1,
+      "title": "Materials craft",
+      "when": "A materials worker begins its craft pass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "core",
+      "everyday": [
+        "wood",
+        "plastic"
+      ],
+      "sha256": "2b4fef165e853fc1ba326498ee6d6e8250f2e21dfe0b08d55938bff0f0a61509",
+      "chars": 1602,
+      "swapped_chars": {
+        "craft/materials/swap-1": 1472,
+        "craft/materials/swap-2": 1804,
+        "craft/materials/swap-3": 1416,
+        "craft/materials/swap-1,craft/materials/swap-2": 1674,
+        "craft/materials/swap-1,craft/materials/swap-3": 1286,
+        "craft/materials/swap-2,craft/materials/swap-3": 1618,
+        "craft/materials/swap-1,craft/materials/swap-2,craft/materials/swap-3": 1488
+      }
+    },
+    {
+      "id": "craft/materials/emissive",
+      "version": 1,
+      "title": "Materials: emissive",
+      "when": "The materials brief calls for emissive",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "emissive",
+      "order": 6,
+      "words": "screen|neon|led|glow|emissi|bulb|light strip|sign|display|monitor|lantern|candle",
+      "sha256": "0b393fb8ac1180e5f3db6bbb5f7c80486bfb46ad44bd46ea1e9673bc0b71fa58",
+      "chars": 264
+    },
+    {
+      "id": "craft/materials/fabric",
+      "version": 1,
+      "title": "Materials: fabric",
+      "when": "The materials brief calls for fabric",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "fabric",
+      "order": 4,
+      "words": "fabric|cloth|cotton|linen|wool|velvet|leather|textile|upholster|cushion|curtain|carpet|rug|sofa|blanket|towel|felt",
+      "sha256": "191c84a400111a809d0ae23aa7626205877e02dd9ff24eff5f69398cf5040f66",
+      "chars": 289
+    },
+    {
+      "id": "craft/materials/glass",
+      "version": 1,
+      "title": "Materials: glass",
+      "when": "The materials brief calls for glass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "glass",
+      "order": 0,
+      "words": "glass|bottle|window|crystal|liquid|water|perfume|ice|transparent|clear|gem|jewel|diamond",
+      "sha256": "3111fa108f511973194c1770bc1b5ef57a260c8de732ec0dfc494f27bdff9c36",
+      "chars": 416
+    },
+    {
+      "id": "craft/materials/metal",
+      "version": 1,
+      "title": "Materials: metal",
+      "when": "The materials brief calls for metal",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "metal",
+      "order": 1,
+      "words": "metal|steel|chrome|gold|brass|copper|alumin(?:i)?um|iron|silver|bronze|titanium",
+      "sha256": "5a6b7d6a987e2c69781bd86b51f06360302a13eaf4b30accd12c7bc12429170c",
+      "chars": 418
+    },
+    {
+      "id": "craft/materials/painterly",
+      "version": 1,
+      "title": "Materials: painterly",
+      "when": "The materials brief calls for painterly",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "painterly",
+      "order": 7,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b",
+      "leads": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b",
+      "sha256": "710e199f1efe4ef355122e3ef74178e74ff73f854fbf3d99d55ba6e47d158227",
+      "chars": 3157
+    },
+    {
+      "id": "craft/materials/plastic",
+      "version": 1,
+      "title": "Materials: plastic",
+      "when": "The materials brief calls for plastic",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "plastic",
+      "order": 2,
+      "words": "plastic|rubber|vinyl|toy|lego|acrylic|polymer|silicone|lacquer|car paint|(?<!hand[- ])painted",
+      "sha256": "c0e485aab925209477cffb35e5fbae8519464e78bebfc34cf3d6707f44e2a8e9",
+      "chars": 354
+    },
+    {
+      "id": "craft/materials/stone",
+      "version": 1,
+      "title": "Materials: stone",
+      "when": "The materials brief calls for stone",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "stone",
+      "order": 5,
+      "words": "stone|marble|granite|concrete|ceramic|porcelain|tiles?|brick|plaster|clay|terracotta|rock|pottery|mug|vase|cobble",
+      "sha256": "a835180e19b884340e6d6c3eca437fc538fca51db9067a74c9b784b38f117fcb",
+      "chars": 433
+    },
+    {
+      "id": "craft/materials/swap-1",
+      "version": 1,
+      "title": "Materials core override 1",
+      "when": "The brief or wave notes overrule materials defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "swap",
+      "order": 0,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "c10d8a6acf5bdc0f6b37c3f5fda633b44969a1173a6dd79b7634c837a49a4c78",
+      "chars": 172
+    },
+    {
+      "id": "craft/materials/swap-2",
+      "version": 1,
+      "title": "Materials core override 2",
+      "when": "The brief or wave notes overrule materials defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "swap",
+      "order": 1,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "2e4fa4660b879443602637baf790411cffd91f913de5e5ca4c775c3da1f8c5ad",
+      "chars": 285
+    },
+    {
+      "id": "craft/materials/swap-3",
+      "version": 1,
+      "title": "Materials core override 3",
+      "when": "The brief or wave notes overrule materials defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "swap",
+      "order": 2,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "b441b7579554b4cc8d61af63bc18d83074fe27ad1da3e0d3f1f9ccb296f9e68e",
+      "chars": 170
+    },
+    {
+      "id": "craft/materials/toon",
+      "version": 1,
+      "title": "Materials: toon",
+      "when": "The materials brief calls for toon",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "toon",
+      "order": 8,
+      "words": "\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "leads": "\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "330b27ba632e9cc9526f129957165e5270fd085cc38cbc4b4a7276795b460e9d",
+      "chars": 650
+    },
+    {
+      "id": "craft/materials/wood",
+      "version": 1,
+      "title": "Materials: wood",
+      "when": "The materials brief calls for wood",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "materials",
+      "part": "topic",
+      "name": "wood",
+      "order": 3,
+      "words": "wood|oak|walnut|pine|timber|plank|parquet|bamboo|maple|mahogany|cherry|teak|birch",
+      "sha256": "d20bc02c16d7dbe9eab5763b9820012a029b1a89b83dc1547701b430c5a6ced9",
+      "chars": 493
+    },
+    {
+      "id": "craft/modeling/assets",
+      "version": 1,
+      "title": "Modeling assets",
+      "when": "A modeling worker considers using asset libraries",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "assets",
+      "sha256": "248ca51bdcfed24ca7beb62ae103f95a6cee7472b2b00a9d99cbbf4aeef69e61",
+      "chars": 414
+    },
+    {
+      "id": "craft/modeling/core",
+      "version": 1,
+      "title": "Modeling craft",
+      "when": "A modeling worker begins its craft pass",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "core",
+      "everyday": [
+        "furniture"
+      ],
+      "sha256": "f37963f0fa2650298e6ee2b9ba5909f8085256133527cf51700d210c1095108a",
+      "chars": 2240,
+      "swapped_chars": {
+        "craft/modeling/swap-1": 2218,
+        "craft/modeling/swap-2": 2044,
+        "craft/modeling/swap-3": 2241,
+        "craft/modeling/swap-4": 2340,
+        "craft/modeling/swap-1,craft/modeling/swap-2": 2022,
+        "craft/modeling/swap-1,craft/modeling/swap-3": 2219,
+        "craft/modeling/swap-1,craft/modeling/swap-4": 2318,
+        "craft/modeling/swap-2,craft/modeling/swap-3": 2045,
+        "craft/modeling/swap-2,craft/modeling/swap-4": 2144,
+        "craft/modeling/swap-3,craft/modeling/swap-4": 2241,
+        "craft/modeling/swap-1,craft/modeling/swap-2,craft/modeling/swap-3": 2023,
+        "craft/modeling/swap-1,craft/modeling/swap-2,craft/modeling/swap-4": 2122,
+        "craft/modeling/swap-1,craft/modeling/swap-3,craft/modeling/swap-4": 2219,
+        "craft/modeling/swap-2,craft/modeling/swap-3,craft/modeling/swap-4": 2045,
+        "craft/modeling/swap-1,craft/modeling/swap-2,craft/modeling/swap-3,craft/modeling/swap-4": 2023
+      }
+    },
+    {
+      "id": "craft/modeling/furniture",
+      "version": 1,
+      "title": "Modeling: furniture",
+      "when": "The modeling brief calls for furniture",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "furniture",
+      "order": 2,
+      "words": "chair|tables?\\b|sofa|couch|desk|shel(?:f|ves)|cabinet|bed\\b|stool|bench|dresser|wardrobe|furniture|armchair|sideboard|nightstand|bookcase",
+      "sha256": "2ac2fcf091fc61e0cea7aa2ff3896987f356fb9d38bf579666bc8125f5dcc190",
+      "chars": 337
+    },
+    {
+      "id": "craft/modeling/organic",
+      "version": 1,
+      "title": "Modeling: organic",
+      "when": "The modeling brief calls for organic",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "organic",
+      "order": 5,
+      "words": "plants?|trees?|rocks?|stones?|flowers?|lea(?:f|ves)|food|fruit|bread|cloth|pillow|character|animal|creature|organic",
+      "sha256": "2af5bf0f4bfde059bcb479c9b1c0ae72daec765bdf5f6094b041d440b72b8bc3",
+      "chars": 326
+    },
+    {
+      "id": "craft/modeling/painterly",
+      "version": 1,
+      "title": "Modeling: painterly",
+      "when": "The modeling brief calls for painterly",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "painterly",
+      "order": 0,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b",
+      "leads": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b",
+      "sha256": "39c0d19201b785392f95d032cd685ffb0f7f807369d7a92f938cc1614c48809c",
+      "chars": 3157
+    },
+    {
+      "id": "craft/modeling/product",
+      "version": 1,
+      "title": "Modeling: product",
+      "when": "The modeling brief calls for product",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "product",
+      "order": 3,
+      "words": "product|phone|laptop|headphones?|speaker|bottle|perfume|watch|device|gadget|controller|cosmetic|jar|packag|can\\b|camera body|console|earbuds?",
+      "sha256": "345106b537e84d7628a7f229f33ba8a125c69ce2ca85dc157769e2dea99855ed",
+      "chars": 349
+    },
+    {
+      "id": "craft/modeling/room",
+      "version": 1,
+      "title": "Modeling: room",
+      "when": "The modeling brief calls for room",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "room",
+      "order": 4,
+      "words": "room|walls?|floor|house|building|interior|kitchen|windows?|doors?|stairs?|dungeon|corridor|architect|office|bathroom",
+      "sha256": "0521e684b59b80a31e511eb7ec61b269c685334f079f10939d16dc88f4b12d97",
+      "chars": 328
+    },
+    {
+      "id": "craft/modeling/stylised",
+      "version": 1,
+      "title": "Modeling: stylised",
+      "when": "The modeling brief calls for stylised",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "stylised",
+      "order": 6,
+      "words": "low[- ]?poly|styli[sz]ed|cartoon|toy|game|voxel|chunky|cute",
+      "leads": "\\blow[- ]?poly\\b|\\bstyli[sz]ed\\b",
+      "sha256": "4b663df814beb232095903a4fbc8ab2df2704042f3fdfe5dcd27644c9a6887af",
+      "chars": 227
+    },
+    {
+      "id": "craft/modeling/swap-1",
+      "version": 1,
+      "title": "Modeling core override 1",
+      "when": "The brief or wave notes overrule modeling defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "swap",
+      "order": 0,
+      "words": "\\b(?:one|single) (?:joined )?mesh\\b|\\bjoined mesh\\b|\\bno parent\\b|\\bjoin(?:ed)? (?:\\w+ )?into one\\b",
+      "sha256": "6195a258acb8be0be15f30c0bafb5f1dacaba103d3c1ea26d0dce525630dfeb8",
+      "chars": 190
+    },
+    {
+      "id": "craft/modeling/swap-2",
+      "version": 1,
+      "title": "Modeling core override 2",
+      "when": "The brief or wave notes overrule modeling defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "swap",
+      "order": 1,
+      "words": "\\bflat[- ]shad|\\bshade_flat\\b|\\blow[- ]?poly\\b|\\bfaceted\\b",
+      "sha256": "2553e3c8dfc2214fba6c04681cfa07e56eb989578eddc7536358cc16e6aa3c01",
+      "chars": 236
+    },
+    {
+      "id": "craft/modeling/swap-3",
+      "version": 1,
+      "title": "Modeling core override 3",
+      "when": "The brief or wave notes overrule modeling defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "swap",
+      "order": 2,
+      "words": "\\bcreate no (?:new )?materials\\b|\\bno new materials\\b|\\b(?:do not|don't|never) (?:create|make|add) (?:any )?(?:new )?materials\\b",
+      "sha256": "c97121a8fd9d76edb0aed73e6539c4423b7810c87e669294ec7ac3006876e18f",
+      "chars": 133
+    },
+    {
+      "id": "craft/modeling/swap-4",
+      "version": 1,
+      "title": "Modeling core override 4",
+      "when": "The brief or wave notes overrule modeling defaults",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "swap",
+      "order": 3,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "f45095befd2619cc9d23f567e8448e1c1906cb871ad18aa4e7bb68b126a28a6b",
+      "chars": 232
+    },
+    {
+      "id": "craft/modeling/toon",
+      "version": 1,
+      "title": "Modeling: toon",
+      "when": "The modeling brief calls for toon",
+      "roles": [
+        "worker"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "craft": "modeling",
+      "part": "topic",
+      "name": "toon",
+      "order": 1,
+      "words": "\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "leads": "\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "eabf1b5fefd552e03109a67323babf1b12b04649cb72741de2b91de5d1c307c6",
+      "chars": 650
+    },
+    {
+      "id": "fragments/colour",
+      "version": 1,
+      "title": "Compatibility fragment: COLOUR",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "5429afd9227bab6d86a169e207823221c0c71782026ac2966ee6a086145255c9",
+      "chars": 356
+    },
+    {
+      "id": "fragments/edges",
+      "version": 1,
+      "title": "Compatibility fragment: EDGES",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "b8c95fb7cf16c08bbf209a8e66897b225c09ee69d3224f6763d8446bd9c08c8a",
+      "chars": 432
+    },
+    {
+      "id": "fragments/finish",
+      "version": 1,
+      "title": "Compatibility fragment: FINISH",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "6542db594629bca2c4c8ec17d2a9c2c20c86d788234245e0a2e1fc5f734677e7",
+      "chars": 132
+    },
+    {
+      "id": "fragments/paint_finish",
+      "version": 1,
+      "title": "Compatibility fragment: PAINT_FINISH",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "576d225f453e09a12a4ffdaa540d8f6aee39ea089c3bf2751e60f73630d7d9f6",
+      "chars": 232
+    },
+    {
+      "id": "fragments/paint_look_single",
+      "version": 1,
+      "title": "Compatibility fragment: PAINT_LOOK_SINGLE",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "43ef003f6bb9306f51cfa335de3269a184e74cd42057899c865a582e145a0100",
+      "chars": 107
+    },
+    {
+      "id": "fragments/paint_maps_single",
+      "version": 1,
+      "title": "Compatibility fragment: PAINT_MAPS_SINGLE",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "d327d0c485d2f98d1c2d4ac720ea946cfd48681af18ce309714d9590e78ee8e4",
+      "chars": 384
+    },
+    {
+      "id": "fragments/paint_shader_single",
+      "version": 1,
+      "title": "Compatibility fragment: PAINT_SHADER_SINGLE",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "6770cd848a318c13803654ee85a00d07b6076c29cca6c4b46df413ac7cf36ce4",
+      "chars": 463
+    },
+    {
+      "id": "fragments/parts",
+      "version": 1,
+      "title": "Compatibility fragment: PARTS",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "341f0a668a6f67eaebbc454ae3a354dc6a919a6e79190adeaa0b2cba2c789c3d",
+      "chars": 212
+    },
+    {
+      "id": "fragments/rough",
+      "version": 1,
+      "title": "Compatibility fragment: ROUGH",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "bae43e5709ff222c7f73c5ead445a09deadc4fe40ced5d9338028b2484184f24",
+      "chars": 302
+    },
+    {
+      "id": "fragments/subtle",
+      "version": 1,
+      "title": "Compatibility fragment: SUBTLE",
+      "when": "Used as a named fragment of the craft recipes",
+      "roles": [
+        "worker",
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "fragment",
+      "sha256": "bd90bc55fc14b86b253880403ae26ac5a09da6de4a7ab52111e1a33d82d75352",
+      "chars": 83
+    },
+    {
+      "id": "single/light",
+      "version": 1,
+      "title": "Single agent: light",
+      "when": "The request calls for light craft notes",
+      "roles": [
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "single",
+      "order": 2,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b|\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "9bfaaf9ba11e88739b446b9a22b774e75071a1796c4123b04d593b9c8f759988",
+      "chars": 729
+    },
+    {
+      "id": "single/painterly",
+      "version": 1,
+      "title": "Single agent: painterly",
+      "when": "The request calls for painterly craft notes",
+      "roles": [
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "single",
+      "order": 0,
+      "words": "\\bpainterly\\b|\\bhand[- ]?painted\\b|\\billustrat(?:ed|ion|ive)\\b|\\bbrush ?strokes?\\b|\\barcane(?:'s)?[- ](?:style|look|inspired|like)\\b|\\b(?:like|of|from|inspired by) arcane\\b|\\b(?:series|show|film) arcane\\b",
+      "sha256": "fb8256e985211935f8e1e2a08314d34b5828f8f96e02b0c4e102b4d0e9573fcc",
+      "chars": 3365
+    },
+    {
+      "id": "single/stylised",
+      "version": 1,
+      "title": "Single agent: stylised",
+      "when": "The request calls for stylised craft notes",
+      "roles": [
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "single",
+      "order": 3,
+      "words": "\\blow[- ]?poly\\b|\\bstyli[sz]ed\\b",
+      "sha256": "6a2657106de9c34e35ebd2e6fd37d9c71172ab09803f3d0db3cbba3133d3e85f",
+      "chars": 227
+    },
+    {
+      "id": "single/toon",
+      "version": 1,
+      "title": "Single agent: toon",
+      "when": "The request calls for toon craft notes",
+      "roles": [
+        "single",
+        "workspace"
+      ],
+      "requires_tools": [],
+      "tier": "paid",
+      "kind": "assist",
+      "part": "single",
+      "order": 1,
+      "words": "\\btoon\\b|\\bcel\\b|\\bcel[- ]shad\\w*|\\bnpr\\b|\\bnon[- ]photoreal\\w*",
+      "sha256": "44f783bb019f68579347fa6103a8638190cc1481a93eb09a8abebd0528b379e5",
+      "chars": 650
+    }
+  ]
+}

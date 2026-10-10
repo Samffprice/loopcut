@@ -19,7 +19,7 @@ sys.modules.setdefault("bpy", fake_bpy)
 if not hasattr(sys.modules["bpy"], "context"):
     sys.modules["bpy"].context = types.SimpleNamespace(preferences=types.SimpleNamespace(addons={}))
 
-from loopcut import blenderkit, credentials, tools  # noqa: E402
+from loopcut import assets, blenderkit, credentials, tools  # noqa: E402
 
 FILES = [{"fileType": "blend", "downloadUrl": "https://www.blenderkit.com/api/v1/downloads/a/"},
          {"fileType": "resolution_0_5K", "downloadUrl": "https://www.blenderkit.com/api/v1/downloads/b/"},
@@ -72,13 +72,15 @@ class BlenderKitTest(unittest.TestCase):
             del os.environ[blenderkit.ENV_KEY]
 
     def test_labels_gate_and_bad_arguments(self):
-        self.assertIn("import_blenderkit", tools.CHANGES_SCENE)
-        self.assertEqual(blenderkit.describe("import_blenderkit", {"asset_id": "abc"}), ("Import BlenderKit asset abc (1k)", ""))
-        self.assertEqual(blenderkit.describe("search_blenderkit", {"query": "oak", "type": "material"}), ("Search BlenderKit material: oak", ""))
-        result = tools.execute("import_blenderkit", json.dumps({"asset_id": "../x"}))
+        self.assertIn("import_asset", tools.CHANGES_SCENE)
+        self.assertEqual(assets.describe("import_asset", {"source": "blenderkit", "id": "abc"}),
+                         ("Import BlenderKit asset abc (1k)", ""))
+        self.assertEqual(assets.describe("search_assets", {"source": "blenderkit", "query": "sky", "type": "hdri"}),
+                         ("Search BlenderKit hdr: sky", ""))
+        result = tools.execute("import_asset", json.dumps({"source": "blenderkit", "id": "../x"}))
         self.assertFalse(result.ok)
         self.assertIn("letters, digits", result.text)
-        result = tools.execute("search_blenderkit", json.dumps({"query": "x", "type": "brush"}))
+        result = tools.execute("search_assets", json.dumps({"source": "blenderkit", "query": "x", "type": "brush"}))
         self.assertFalse(result.ok)
         self.assertIn("model, material, hdr", result.text)
 

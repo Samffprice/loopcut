@@ -1,0 +1,855 @@
+"""This module contains utility functions scanning asset repositories."""
+
+import os, bpy, json, zipfile, shutil, tempfile
+from pathlib import Path
+from typing import Any
+from .logservice import LogService
+from .locationservice import LocationService
+from .systemservice import SystemService
+
+_LOG = LogService.get_logger("services.assetservice")
+
+_ASSETS = dict()
+_ASSET_THUMBS = None
+_ALTERNATIVE_MATERIALS = dict()
+_ALTERNATIVE_MATERIAL_TILES = dict()
+_PACKS = None
+_CUSTOM_RIGS_CACHE = None
+
+ASSET_LIBRARY_SECTIONS = [
+        {
+            "bl_label": "Topologies library",
+            "asset_subdir": "proxymeshes",
+            "asset_type": "proxy",
+            "object_type": "Proxymeshes",
+            "eye_overrides": False,
+            "skin_overrides": True
+            },
+        {
+            "bl_label": "Skins library",
+            "asset_subdir": "skins",
+            "asset_type": "mhmat",
+            "object_type": "Material",
+            "eye_overrides": False,
+            "skin_overrides": True
+            },
+        {
+            "bl_label": "Ink layers",
+            "asset_subdir": "ink_layers",
+            "asset_type": "json",
+            "object_type": "Other",
+            "eye_overrides": False,
+            "skin_overrides": False,
+            "ink_overrides": True
+            },
+        {
+            "bl_label": "Eyes library",
+            "asset_subdir": "eyes",
+            "asset_type": "mhclo",
+            "object_type": "Eyes",
+            "eye_overrides": True,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Eyebrows library",
+            "asset_subdir": "eyebrows",
+            "asset_type": "mhclo",
+            "object_type": "Eyebrows",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Eyelashes library",
+            "asset_subdir": "eyelashes",
+            "asset_type": "mhclo",
+            "object_type": "Eyelashes",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Hair library",
+            "asset_subdir": "hair",
+            "asset_type": "mhclo",
+            "object_type": "Hair",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Teeth library",
+            "asset_subdir": "teeth",
+            "asset_type": "mhclo",
+            "object_type": "Teeth",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Tongue library",
+            "asset_subdir": "tongue",
+            "asset_type": "mhclo",
+            "object_type": "Tongue",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Clothes library",
+            "asset_subdir": "clothes",
+            "asset_type": "mhclo",
+            "object_type": "Clothes",
+            "eye_overrides": False,
+            "skin_overrides": False
+            },
+        {
+            "bl_label": "Poses library",
+            "asset_subdir": "poses",
+            "asset_type": "bvh",
+            "object_type": "Pose",
+            "eye_overrides": False,
+            "skin_overrides": False
+            }
+
+    ]
+
+
+class AssetService:
+    """
+    The AssetService class is designed to manage and facilitate operations related to assets within the MPFB2 project.
+    It provides various static methods to:
+
+    - Retrieve and update lists of assets from specified subdirectories.
+    - Find absolute paths of assets based on path fragments.
+    - List specific types of assets (e.g., .mhclo, .mhmat, .bvh, .proxy) within given subdirectories.
+    - Find alternative materials for a given asset.
+    - Retrieve available data roots and asset roots.
+    - Manage and rescan metadata for asset packs, and retrieve asset names from these packs based on specific patterns.
+
+    Overall, the AssetService class serves as a utility for handling asset-related tasks, ensuring that assets are correctly located,
+    listed, and managed within the project. To do this, a few global variables are used:
+
+    _ASSETS: This is a dictionary that stores the list of assets categorized by their subdirectories.
+    It acts as a cache to hold the asset data once it has been scanned and processed.
+
+    _ASSET_THUMBS: This variable is used to store thumbnail previews of assets. It is initialized as None and later set to a preview
+    collection from Blender's bpy.utils.previews.
+
+    _PACKS: This variable is used to store metadata about asset packs. It is initialized as None and is populated when pack metadata
+    is scanned and loaded.
+
+    ASSET_LIBRARY_SECTIONS: This is a list of dictionaries, each representing a section of the asset library. Each dictionary contains
+    metadata about a specific type of asset, including labels, subdirectory names, asset types, and override flags. This list is used
+    to define and manage different categories of assets within the project.
+    """
+
+    def __init__(self) -> None:
+        raise RuntimeError("You should not instance AssetService. Use its static methods instead.")
+
+    @staticmethod
+    def find_asset_files_matching_pattern(asset_roots: list[str], pattern: str = "*.mhclo") -> list[Path]:
+        """
+        Scan the given asset roots for files matching the specified pattern.
+
+        Args:
+            asset_roots (list): A list of root directories to scan for assets.
+            pattern (str): The file pattern to match (default is "*.mhclo").
+
+        Returns:
+            list: A list of paths to files that match the specified pattern.
+
+        Raises:
+            IOError: If the root directory is the root of the filesystem ("/"), to prevent scanning the entire hard drive.
+        """
+        _LOG.enter()
+        found_files = []
+        for root in asset_roots:
+            _LOG.debug("Will examine asset root with pattern", (root, pattern))
+            if root == "/":
+                raise IOError("Refusing to scan entire HD for assets")
+            count = 0
+            for path in Path(root).rglob(pattern):
+                if os.path.isfile(path):
+                    found_files.append(path)
+                    count = count + 1
+            _LOG.debug("File matches in root", (count, root))
+        _LOG.debug("Total matching files for all roots", len(found_files))
+        _LOG.dump("Found files", found_files)
+        if len(found_files) < 1 and _LOG.debug_enabled():
+            _LOG.warn("Surprisingly few results for find_asset_files_matching_pattern(), investigating...")
+            for root in asset_roots:
+                _LOG.debug("Root exists", (root, os.path.exists(root)))
+        return found_files
+
+    @staticmethod
+    def find_asset_absolute_path(asset_path_fragment: str, asset_subdir: str = "clothes") -> str | None:
+        """
+        Find the absolute path of an asset given a path fragment and an asset subdirectory.
+
+        Args:
+            asset_path_fragment (str): The fragment of the asset path to search for.
+            asset_subdir (str): The subdirectory under which to search for the asset (default is "clothes").
+
+        Returns:
+            str: The absolute path to the asset if found, otherwise None.
+        """
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        filename = asset_path_fragment
+        if "/" in asset_path_fragment:
+            filename = os.path.basename(filename)
+        matches = []
+        _LOG.debug("Searching for asset with basename", filename)
+        for root in roots:
+            for dirpath, subdirs, files in os.walk(root):  # pylint: disable=W0612
+                _LOG.trace("Looking in directory", dirpath)
+                if filename in files:
+                    full_path = os.path.join(root, dirpath, filename)
+                    _LOG.debug("Found match", full_path)
+                    matches.append(full_path)
+
+        if len(matches) < 1:
+            # We couldn't find the asset in question
+            _LOG.warn("Tried to locate non-existing asset", asset_path_fragment)
+            return None
+
+        if len(matches) < 2:
+            # There weren't multiple matches, so we'll assume the only
+            # found answer is the best possible
+            return os.path.abspath(matches[0])
+
+        for match in matches:
+            last_part = os.path.basename(os.path.dirname(match)) + "/" + os.path.basename(match)
+            _LOG.debug("Last part of match vs submitted path fragment", (last_part, asset_path_fragment))
+            if last_part == asset_path_fragment:
+                return os.path.abspath(match)
+
+        # Something is strange. At this point we have multiple matches for the filename, but none of them
+        # matched the asset's subdir. We'll return the first match in the hope that this is the most
+        # correct answer.
+
+        return os.path.abspath(matches[0])
+
+    @staticmethod
+    def list_mhclo_assets(asset_subdir: str = "clothes") -> list[Path]:
+        """Convenience wrapper for finding all mhclo assets for a subdir."""
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        return AssetService.find_asset_files_matching_pattern(roots, "*.mhclo")
+
+    @staticmethod
+    def list_mhmat_assets(asset_subdir: str = "skins") -> list[Path]:
+        """Convenience wrapper for finding all mhmat assets for a subdir."""
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        return AssetService.find_asset_files_matching_pattern(roots, "*.mhmat")
+
+    @staticmethod
+    def list_bvh_assets(asset_subdir: str = "poses") -> list[Path]:
+        """Convenience wrapper for finding all bvh assets for a subdir."""
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        return AssetService.find_asset_files_matching_pattern(roots, "*.bvh")
+
+    @staticmethod
+    def list_ink_layer_assets(asset_subdir: str = "ink_layers") -> list[Path]:
+        """Convenience wrapper for finding all ink layers."""
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        return AssetService.find_asset_files_matching_pattern(roots, "*.json")
+
+    @staticmethod
+    def list_proxy_assets(asset_subdir: str = "proxymeshes") -> list[Path]:
+        """Convenience wrapper for finding all proxy assets for a subdir."""
+        _LOG.enter()
+        roots = AssetService.get_asset_roots(asset_subdir)
+        return AssetService.find_asset_files_matching_pattern(roots, "*.proxy")
+
+    @staticmethod
+    def alternative_materials_for_asset(
+        asset_source: str | None,
+        asset_subdir: str = "clothes",
+        exclude_default: bool = True,
+    ) -> list[str]:
+        """
+        Find alternative materials for a given asset.
+
+        Args:
+            asset_source (str | None): The source path fragment of the asset.
+            asset_subdir (str): The subdirectory under which to search for the asset (default is "clothes").
+            exclude_default (bool): Whether to exclude the default material (default is True).
+
+        Returns:
+            list: A sorted list of paths to alternative material files for the asset.
+        """
+        _LOG.enter()
+        _LOG.debug("starting scan for alternative materials for asset source", asset_source)
+        if not asset_source:
+            return []
+        cache_key = (str(asset_source), str(asset_subdir))
+        if cache_key in _ALTERNATIVE_MATERIALS:
+            _LOG.debug("Returning cached alternative materials for", cache_key)
+            return list(_ALTERNATIVE_MATERIALS[cache_key])
+        mhclo_path = AssetService.find_asset_absolute_path(asset_source, asset_subdir)
+        _LOG.debug("alternative_materials_for_asset, mhclo path", mhclo_path)
+        if not mhclo_path:
+            _LOG.warn("Could not find asset, so no alternative materials either", asset_source)
+            _ALTERNATIVE_MATERIALS[cache_key] = []
+            return []
+        roots = AssetService.get_asset_roots(asset_subdir)
+        parent_dir = os.path.basename(os.path.dirname(os.path.realpath(mhclo_path)))
+        _LOG.debug("Parent dir to match against", parent_dir)
+        possible_materials = set()
+        for mat in AssetService.find_asset_files_matching_pattern(roots, "*.mhmat"):
+            if SystemService.string_contains_path_segment(mat, parent_dir):
+                possible_materials.add(str(mat))
+            # If asset_subdir is "eyes", then also match the alternative location for materials
+            elif asset_subdir == "eyes" and SystemService.string_contains_path_segment(mat, "materials"):
+                possible_materials.add(str(mat))
+        possible_materials = sorted(possible_materials)
+        _LOG.debug("alternative_materials_for_asset, possible materials", possible_materials)
+        if len(possible_materials) < 2 and _LOG.debug_enabled():
+            _LOG.warn("Debugging alternative materials")
+            dir_name = os.path.dirname(mhclo_path)
+            _LOG.debug("Dirname", dir_name)
+            for file in os.listdir(dir_name):
+                _LOG.debug("File/dir in same folder", file)
+        _ALTERNATIVE_MATERIALS[cache_key] = possible_materials
+        return list(possible_materials)
+
+    @staticmethod
+    def get_placeholder_thumbnail() -> Any:
+        """
+        Get the preview to use for assets which do not have a thumbnail of their own.
+
+        Returns:
+            The preview object for the bundled placeholder image, or None if it could not be loaded.
+        """
+        global _ASSET_THUMBS
+
+        if _ASSET_THUMBS is None:
+            _ASSET_THUMBS = bpy.utils.previews.new()
+
+        thumb = LocationService.get_mpfb_data("textures/notfound.thumb")
+        if not os.path.exists(thumb):
+            _LOG.warn("The bundled placeholder thumbnail is missing", thumb)
+            return None
+        if not thumb in _ASSET_THUMBS:
+            _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
+        return _ASSET_THUMBS[thumb]
+
+    @staticmethod
+    def alternative_material_tiles_for_asset(
+        asset_source: str | None,
+        asset_subdir: str = "clothes",
+    ) -> list[dict[str, Any]]:
+        """
+        Find alternative materials for an asset, with thumbnails and labels suitable for a UI grid.
+
+        The returned items have the same shape as those in the asset list, see update_asset_list().
+        Materials which do not have a thumbnail of their own get the bundled placeholder, so that
+        all tiles can be drawn at the same size.
+
+        Args:
+            asset_source (str | None): The source path fragment of the asset.
+            asset_subdir (str): The subdirectory under which to search for the asset (default is "clothes").
+
+        Returns:
+            list: A list of items describing the alternative materials for the asset.
+        """
+        global _ASSET_THUMBS
+
+        _LOG.enter()
+
+        if not asset_source:
+            return []
+
+        cache_key = (str(asset_source), str(asset_subdir))
+        if cache_key in _ALTERNATIVE_MATERIAL_TILES:
+            _LOG.debug("Returning cached alternative material tiles for", cache_key)
+            return _ALTERNATIVE_MATERIAL_TILES[cache_key]
+
+        if _ASSET_THUMBS is None:
+            _ASSET_THUMBS = bpy.utils.previews.new()
+
+        tiles = []
+        for material in AssetService.alternative_materials_for_asset(asset_source, asset_subdir):
+            item = dict()
+            item["full_path"] = str(material)
+            item["basename"] = os.path.basename(material)
+            item["dirname"] = os.path.dirname(material)
+            item["fragment"] = AssetService.path_to_fragment(material, asset_subdir=asset_subdir)
+            item["name_without_ext"] = str(item["basename"]).replace(".mhmat", "")
+            item["thumb"] = None
+            item["thumb_path"] = None
+            label = str(item["name_without_ext"]).lower().replace("_", " ")
+            item["label"] = label.capitalize()
+
+            thumb = os.path.join(item["dirname"], item["name_without_ext"] + ".thumb")
+            if os.path.exists(thumb):
+                item["thumb_path"] = thumb
+                _LOG.debug("Will try to load icon", (item["label"], thumb))
+                if not thumb in _ASSET_THUMBS:
+                    _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
+                item["thumb"] = _ASSET_THUMBS[thumb]
+            else:
+                _LOG.debug("Missing thumb, using placeholder", thumb)
+                item["thumb"] = AssetService.get_placeholder_thumbnail()
+
+            _LOG.dump("Item", item)
+            tiles.append(item)
+
+        _ALTERNATIVE_MATERIAL_TILES[cache_key] = tiles
+        return tiles
+
+    @staticmethod
+    def get_available_data_roots() -> list[str]:
+        """
+        Retrieve the available data roots from various locations.
+
+        A data root is a directory that contains asset data used by the application. This method checks multiple
+        locations for data roots, including user data, MakeHuman data, MPFB data, and a secondary root. It verifies
+        the existence of these directories and returns a list of valid data root paths.
+
+        Returns:
+            list: A list of valid data root paths.
+        """
+        _LOG.enter()
+        user_data = LocationService.get_user_data()
+        mh_data = LocationService.get_mh_user_data()
+        mpfb_data = LocationService.get_mpfb_data()
+        second_root = LocationService.get_second_root()
+
+        _LOG.dump("Data roots raw", [mpfb_data, mh_data, user_data, second_root])
+
+        roots = []
+        for root in [mpfb_data, mh_data, user_data, second_root]:
+            if root:
+                if os.path.exists(root):
+                    roots.append(root)
+                else:
+                    _LOG.warn("Data root is set but does not exist", root)
+
+        _LOG.dump("Data roots checked", roots)
+
+        return roots
+
+    @staticmethod
+    def get_asset_roots(asset_subdir: str = "clothes") -> list[str]:
+        """
+        Retrieve the available data roots from various locations.
+
+        This method checks multiple locations for the given asset subdir. These locations include user data, MakeHuman data,
+        MPFB data, and a secondary root.
+
+        Returns:
+            list: A list of valid data root paths.
+        """
+        _LOG.enter()
+        roots = AssetService.get_available_data_roots()
+        asset_roots = []
+        for root in roots:
+            test_path = os.path.join(root, asset_subdir)
+            if os.path.exists(test_path):
+                _LOG.debug("Adding asset root", test_path)
+                asset_roots.append(test_path)
+            else:
+                _LOG.debug("Asset root does not exist", test_path)
+        return asset_roots
+
+    @staticmethod
+    def update_asset_list(asset_subdir: str = "clothes", asset_type: str = "mhclo") -> None:
+        """
+        Update the list of assets for a given subdirectory and asset type.
+
+        This method scans the specified asset subdirectory for files matching the given asset type,
+        and updates the global asset list with the found assets. It also attempts to load thumbnail
+        images for the assets if available.
+
+        Args:
+            asset_subdir (str): The subdirectory under which to search for assets (default is "clothes").
+            asset_type (str): The type of assets to search for (default is "mhclo").
+        """
+        _LOG.enter()
+
+        global _ASSET_THUMBS
+
+        roots = AssetService.get_asset_roots(asset_subdir)
+        assets = AssetService.find_asset_files_matching_pattern(roots, "*." + asset_type)
+
+        asset_list = dict()
+
+        for asset in assets:
+            _LOG.debug("Asset", asset)
+            item = dict()
+            item["full_path"] = str(asset)
+            item["basename"] = os.path.basename(asset)
+            item["dirname"] = os.path.dirname(asset)
+            item["fragment"] = os.path.basename(item["dirname"]) + "/" + item["basename"]
+            item["name_without_ext"] = str(item["basename"]).replace("." + asset_type, "")
+            item["thumb"] = None
+            item["thumb_path"] = None
+            label = str(item["name_without_ext"]).lower().replace("_", " ")
+            label = label.capitalize()
+            item["label"] = label
+
+            if _ASSET_THUMBS is None:
+                _ASSET_THUMBS = bpy.utils.previews.new()
+
+            thumb = os.path.join(os.path.dirname(asset), item["name_without_ext"] + ".thumb")
+            if os.path.exists(thumb):
+                item["thumb_path"] = thumb
+                _LOG.debug("Will try to load icon", (label, thumb))
+                if not thumb in _ASSET_THUMBS:
+                    _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
+                item["thumb"] = _ASSET_THUMBS[thumb]
+            else:
+                _LOG.debug("Missing thumb", thumb)
+
+            _LOG.dump("Item", item)
+            asset_list[label] = item
+
+        _ASSETS[asset_subdir] = asset_list
+
+    @staticmethod
+    def invalidate_alternative_materials_cache() -> None:
+        """Empty the cache of alternative materials, so that it is rescanned on next request."""
+        _LOG.enter()
+        _ALTERNATIVE_MATERIALS.clear()
+        _ALTERNATIVE_MATERIAL_TILES.clear()
+
+    @staticmethod
+    def update_all_asset_lists() -> None:
+        """Update the global asset list cache"""
+        for section in ASSET_LIBRARY_SECTIONS:
+            asset_subdir = section["asset_subdir"]
+            asset_type = section["asset_type"]
+            AssetService.update_asset_list(asset_subdir, asset_type)
+        AssetService.invalidate_alternative_materials_cache()
+
+    @staticmethod
+    def get_asset_list(asset_subdir: str = "clothes", asset_type: str = "mhclo") -> dict[str, dict[str, Any]]:
+        """
+        Retrieve the list of assets for a given subdirectory and asset type.
+
+        If the asset list for the specified subdirectory is not already cached, this method will update the asset list
+        by scanning the subdirectory for files matching the given asset type.
+
+        Args:
+            asset_subdir (str): The subdirectory under which to search for assets (default is "clothes").
+            asset_type (str): The type of assets to search for (default is "mhclo").
+
+        Returns:
+            dict: A dictionary of assets found in the specified subdirectory and of the specified type.
+        """
+        if asset_subdir not in _ASSETS:
+            AssetService.update_asset_list(asset_subdir, asset_type)
+        return _ASSETS[asset_subdir]
+
+    @staticmethod
+    def path_to_fragment(
+        asset_full_path: str,
+        relative_to_fragment: str | None = None,
+        asset_subdir: str = "clothes",
+    ) -> str:
+        """Convert an absolute path of an assset to a fragment path."""
+        if not relative_to_fragment:
+            return os.path.basename(os.path.dirname(asset_full_path)) + "/" + os.path.basename(asset_full_path)
+
+        raise NotImplementedError('Manually specified relative_to_fragment has not been implemented yet.')
+
+    @staticmethod
+    def have_any_pack_meta_data() -> bool:
+        """Check if any asset pack at all as been installed."""
+        packs_dir = LocationService.get_user_data("packs")
+        _LOG.debug("Packs dir, exists", (packs_dir, os.path.exists(packs_dir)))
+
+        if not os.path.exists(packs_dir):
+            return False
+
+        for filename in os.listdir(packs_dir):
+            if ".json" in filename:
+                return True
+
+        return False
+
+    @staticmethod
+    def check_if_modern_makehuman_system_assets_installed() -> tuple[bool, bool]:
+        """Check if the makehuman system assets pack is installed in the user data directory. Also
+        check whether the brown.mhmat file is installed. If the latter isn't available, then this is an
+        indication that the user has a very old version of the makehuman system assets pack installed.
+
+        Returns:
+            tuple(bool,bool): First is true if the system assets pack is installed, False otherwise. Second is True if the brown.mhmat file is installed, False otherwise.
+        """
+
+        pack_path = os.path.join(LocationService.get_user_data("packs"), "makehuman_system_assets.json")
+        system_assets_pack_installed = os.path.exists(pack_path)
+        _LOG.debug("System assets pack installed?", (pack_path, system_assets_pack_installed))
+
+        eyes_path = os.path.join(LocationService.get_user_data("eyes"), "materials", "brown.mhmat")
+        brown_mhmat_installed = os.path.exists(eyes_path)
+        _LOG.debug("Brown.mhmat installed?", (eyes_path, brown_mhmat_installed))
+
+        return system_assets_pack_installed, brown_mhmat_installed
+
+    @staticmethod
+    def rescan_pack_metadata() -> None:
+        """
+        Load pack metadata from JSON files in the packs directory.
+
+        If pack metadata is already loaded, this method does nothing.
+        """
+        global _PACKS
+        _PACKS = dict()
+
+        packs_dir = LocationService.get_user_data("packs")
+        _LOG.debug("Packs dir, exists", (packs_dir, os.path.exists(packs_dir)))
+
+        if not os.path.exists(packs_dir):
+            return
+
+        for filename in os.listdir(packs_dir):
+            if ".json" in filename:
+                packname = filename.replace(".json", "")
+                _LOG.debug("Loading pack metadata", filename)
+                with open(os.path.join(packs_dir, filename), "r") as json_file:
+                    _PACKS[packname] = json.load(json_file)
+
+    @staticmethod
+    def get_pack_names() -> list[str]:
+        """
+        Retrieve the names of all available asset packs.
+
+        This method rescans the pack metadata if it has not been loaded yet. If no pack metadata is found,
+        it returns an empty list.
+
+        Returns:
+            list: A sorted list of asset pack names.
+        """
+        global _PACKS  # pylint: disable=W0602
+        if not _PACKS:
+            AssetService.rescan_pack_metadata()
+        if not AssetService.have_any_pack_meta_data():
+            return []
+        names = list(_PACKS.keys())
+        names.sort()
+        return names
+
+    @staticmethod
+    def system_assets_pack_is_installed() -> bool:
+        """
+        Scan the list of pack names to determine if there is a pack makehuman_system_assets seems to be installed.
+        """
+        return "makehuman_system_assets" in AssetService.get_pack_names()
+
+    @staticmethod
+    def get_asset_names_in_pack(pack_name: str) -> list[str]:
+        """
+        Retrieve the names of all assets in a specified pack.
+
+        This method rescans the pack metadata if it has not been loaded yet. If no pack metadata is found,
+        it returns an empty list.
+
+        Args:
+            pack_name (str): The name of the pack to retrieve asset names from.
+
+        Returns:
+            list: A sorted list of asset names in the specified pack.
+        """
+        global _PACKS  # pylint: disable=W0602
+        if not _PACKS:
+            AssetService.rescan_pack_metadata()
+        if not AssetService.have_any_pack_meta_data():
+            return []
+        pack_data = _PACKS[pack_name]
+        names = list(pack_data.keys())
+        names.sort()
+        return names
+
+    @staticmethod
+    def get_asset_names_in_pack_pattern(pack_pattern: str) -> list[str]:
+        """
+        Retrieve the names of all assets in packs that match a given pattern.
+
+        This method searches through all available asset packs and returns the names of assets in packs
+        whose names contain the specified pattern.
+
+        Args:
+            pack_pattern (str): The pattern to match against pack names.
+
+        Returns:
+            list: A sorted list of asset names in packs that match the specified pattern.
+        """
+        pack_names = AssetService.get_pack_names()
+        asset_names = []
+        for name in pack_names:
+            if str(pack_pattern).lower() in name.lower():
+                asset_names.extend(AssetService.get_asset_names_in_pack(name))
+        asset_names.sort()
+        return asset_names
+
+    @staticmethod
+    def get_custom_rigs(use_cache: bool = True) -> list[dict[str, Any]]:
+        """Scan user asset roots for custom rig JSON files.
+
+        Returns a list of dicts: {name, path, identifying_bones}.
+        Only scans user data roots (not the system MPFB data root).
+
+        Args:
+            use_cache (bool): If True, return cached results when available.
+
+        Returns:
+            list: List of dicts with keys 'name', 'path', 'identifying_bones'.
+        """
+        import re as _re
+        global _CUSTOM_RIGS_CACHE  # pylint: disable=W0603
+        if use_cache and _CUSTOM_RIGS_CACHE is not None:
+            return _CUSTOM_RIGS_CACHE
+
+        found = []
+        roots = []
+
+        user_data = LocationService.get_user_data()
+        if user_data and os.path.exists(user_data):
+            roots.append(user_data)
+
+        second_root = LocationService.get_second_root()
+        if second_root and os.path.exists(second_root) and second_root not in roots:
+            roots.append(second_root)
+
+        for root in roots:
+            rigs_dir = os.path.join(root, "rigs")
+            if not os.path.isdir(rigs_dir):
+                continue
+            for filename in os.listdir(rigs_dir):
+                if not filename.endswith(".json"):
+                    continue
+                name = filename[:-5]  # strip .json
+                if not _re.match(r'^[a-zA-Z0-9_]+$', name):
+                    _LOG.debug("Skipping custom rig file with invalid name", filename)
+                    continue
+                filepath = os.path.join(rigs_dir, filename)
+                try:
+                    with open(filepath, "r") as f:
+                        data = json.load(f)
+                except Exception:  # pylint: disable=W0703
+                    _LOG.warn("Could not parse custom rig file", filepath)
+                    continue
+                if "identifying_bones" not in data:
+                    continue
+                found.append({
+                    "name": name,
+                    "path": filepath,
+                    "identifying_bones": data["identifying_bones"]
+                })
+
+        _CUSTOM_RIGS_CACHE = found
+        return found
+
+    @staticmethod
+    def invalidate_custom_rig_cache() -> None:
+        """Clear the cached custom rig list so the next call to get_custom_rigs() rescans disk."""
+        global _CUSTOM_RIGS_CACHE  # pylint: disable=W0603
+        _CUSTOM_RIGS_CACHE = None
+
+    @staticmethod
+    def get_custom_rigs_enum_items() -> list[tuple[str, str, str]]:
+        """Return custom rig names as Blender enum item tuples for use in EnumProperty callbacks.
+
+        Returns:
+            list: List of (identifier, label, description) tuples. Returns a single 'NONE' entry if no custom rigs exist.
+        """
+        custom_rigs = AssetService.get_custom_rigs()
+        if not custom_rigs:
+            return [("NONE", "No custom rigs found", "")]
+        return [(r["name"], "Custom: " + r["name"], "") for r in custom_rigs]
+
+    @staticmethod
+    def check_asset_pack_zip(filename: str) -> str | None:
+        """Check if a file is a valid zip file containing a makehuman asset pack.
+
+        Args:
+            filename (str): The file to check.
+
+        Returns:
+            str or None: None if everything is fine, otherwise a string describing the error.
+            Possible error strings: "MACOS", "STRUCTURE", "NO_PACKS", "INVALID_ZIP: <reason>"
+        """
+        try:
+            with zipfile.ZipFile(filename, "r") as zf:
+                namelist = zf.namelist()
+
+            for name in namelist:
+                _LOG.debug("Zip entry:", name)
+                if name.startswith("packs/"):
+                    # A valid zip has packs/ at root level
+                    return None
+
+            has_macos = any(name.startswith("__MACOSX") for name in namelist)
+
+            # Collect distinct root-level directory names, ignoring __MACOSX and dotfiles
+            root_dirs = set()
+            for name in namelist:
+                parts = name.split("/")
+                if parts[0] and not parts[0].startswith(".") and parts[0] != "__MACOSX":
+                    root_dirs.add(parts[0])
+
+            # If there is exactly one root directory and it contains packs/, this is fixable
+            if len(root_dirs) == 1:
+                root = next(iter(root_dirs))
+                if any(n.startswith(f"{root}/packs/") for n in namelist):
+                    if has_macos:
+                        return "MACOS"
+                    return "STRUCTURE"
+
+            return "NO_PACKS"
+        except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+            return f"INVALID_ZIP: {str(e)}"
+
+    @staticmethod
+    def fix_and_extract_asset_pack_zip(filename: str, target_dir: str) -> str | None:
+        """Extract an asset pack zip to target_dir, stripping one extra root directory if needed.
+
+        Handles the common re-packaging error where the zip has a single extra root directory
+        (e.g., from Safari auto-unpacking and the user re-zipping the resulting folder).
+        __MACOSX metadata directories are always stripped during extraction.
+
+        Args:
+            filename (str): Path to the zip file.
+            target_dir (str): Destination directory (user data dir).
+
+        Returns:
+            None on success, or a string describing the error.
+        """
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(filename, "r") as zf:
+                for member in zf.infolist():
+                    if member.filename.startswith("__MACOSX"):
+                        continue
+                    zf.extract(member, tmp_dir)
+
+            root_entries = [e for e in os.listdir(tmp_dir) if not e.startswith(".")]
+
+            if "packs" in root_entries:
+                source_root = tmp_dir
+            else:
+                root_dirs = [e for e in root_entries if os.path.isdir(os.path.join(tmp_dir, e))]
+                if len(root_dirs) != 1:
+                    return "FIX_FAILED"
+                candidate = os.path.join(tmp_dir, root_dirs[0])
+                if "packs" not in os.listdir(candidate):
+                    return "FIX_FAILED"
+                source_root = candidate
+
+            for entry in os.listdir(source_root):
+                if entry.startswith("."):
+                    continue
+                src = os.path.join(source_root, entry)
+                dst = os.path.join(target_dir, entry)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+            return None
+        except Exception as e:  # pylint: disable=broad-except
+            return f"FIX_ERROR: {str(e)}"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

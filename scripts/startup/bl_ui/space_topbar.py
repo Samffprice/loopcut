@@ -625,7 +625,11 @@ class TOPBAR_MT_help(Menu):
 
         layout.separator()
 
-        layout.operator("wm.url_open_preset", text="Report a Bug", icon='URL').type = 'BUG'
+        if bpy.types.Operator.bl_rna_get_subclass_py("LOOPCUT_OT_report_bug") is not None:
+            layout.operator("loopcut.report_bug", text="Report a Bug", icon='URL')
+            layout.operator("wm.url_open_preset", text="Report a Blender Bug", icon='URL').type = 'BUG'
+        else:
+            layout.operator("wm.url_open_preset", text="Report a Bug", icon='URL').type = 'BUG'
         layout.operator("wm.sysinfo")
 
 

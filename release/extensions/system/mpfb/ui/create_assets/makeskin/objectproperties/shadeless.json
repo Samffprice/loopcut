@@ -1,0 +1,8 @@
+{
+    "type": "boolean",
+    "name": "shadeless",
+    "description": "If the material is shadeless. It is unlikely you want this",
+    "label": "Shadeless",
+    "default": false,
+    "aliases": ["MhMsShadeless"]
+}

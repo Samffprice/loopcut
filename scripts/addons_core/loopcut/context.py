@@ -50,7 +50,9 @@ CAPTURE = "loopcut_capture"   # On a user message that carries a viewport captur
 CAPTURE_TEXT = "Viewport capture from capture_viewport:"  # Marks captures from before CAPTURE.
 ATTACHED = "loopcut_attached"  # On a user message whose images the user attached.
 STEER = "loopcut_steer"        # On a user message sent while the agent was working; agent._fold_notes.
+STEP_LIMIT = "loopcut_step_limit"  # Continuation marker, including guard/budget wrap-ups; agent._wrap_up.
 REFERENCE_CARD = "loopcut_reference_card"  # On an attached message once its images were described.
+SKILL_CHARS = "loopcut_skill_chars"  # Last known placeholder size delta; survives premium_skills off.
 KEEP_IMAGES = 3      # Captures sent per request: the newest step's, until the model has acted on them.
 KEEP_ATTACHED = 3    # Pinned references sent per request, newest first.
 RECORD_HEAD = ("Earlier steps. Their code and full results are no longer shown; what you said at each step "
@@ -66,8 +68,15 @@ RECORD_CHANGES = 15   # Scene-change lines a record keeps.
 RECORD_LOOK = 300     # Characters of what a dropped capture showed.
 # Measured on the Loopcut gateway (Meta upstream) against 56 logged requests, within 7%:
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
-IMAGE_TOKENS = 800      # One capture at tools.CAPTURE_WIDTH (640 px); it was 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 7200     # System prompt and tool schemas when the caller does not say (measured 2026-09-23).
+IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
+                        # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
+FIXED_TOKENS = 7945     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+                        # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
+                        # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers).
+WORKSPACE_FIXED_TOKENS = 3845  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09.
+WORKSPACE_BUDGET = 200_000     # The least budget a workspace turn gets (agent._workspace_config), so a long build
+                               # is not folded into records at the 40k default. A model with a smaller window needs
+                               # LOOPCUT_WORKSPACE off.
 SUMMARY_TOKENS = 700    # What a summary costs, at most, once made.
 MIN_RATIO, MAX_RATIO = 0.5, 2.0
 
@@ -99,9 +108,11 @@ def is_capture(message: dict) -> bool:
 
 
 def is_turn_start(message: dict) -> bool:
-    """A message the user sent to start a turn, as opposed to a capture the agent asked for or a
-    note sent while the agent was working (which continues the turn it arrived in)."""
-    return message.get("role") == "user" and not is_capture(message) and not message.get(STEER)
+    """A message the user sent to start a turn, as opposed to a capture the agent asked for, a
+    note sent while the agent was working (which continues the turn it arrived in) or the agent's
+    request for a summary after a guard or budget stops the turn."""
+    return (message.get("role") == "user" and not is_capture(message) and not message.get(STEER)
+            and not message.get(STEP_LIMIT))
 
 
 def turn_start(messages: list) -> int:
@@ -160,7 +171,7 @@ def steps(messages: list, start: int = 0, end: int | None = None) -> list[int]:
 
 # ------------------------------------------------------------------ size
 
-def _size(message: dict) -> tuple[int, int]:
+def _size(message: dict, skill_index=None) -> tuple[int, int]:
     """(characters of text, number of images)."""
     chars, images = 0, 0
     content = message.get("content")
@@ -172,21 +183,48 @@ def _size(message: dict) -> tuple[int, int]:
                 images += 1
             else:
                 chars += len(part.get("text", ""))
+    if skill_index is not None and message.get("role") == "user":
+        chars += _skill_delta(message, skill_index)
     for call in message.get("tool_calls") or []:
         chars += len(call["function"].get("name", "")) + len(call["function"].get("arguments", ""))
     return chars, images
 
 
-def fixed_tokens(system_prompt: str, tools: list) -> int:
+def _skill_delta(message, index):
+    """Index sizes minus placeholder spelling, without expanding or changing message content.
+
+    006 keeps old ids injectable when the skills off switch empties the index. Retain the last
+    known delta on the message so saved/resumed worker threads can still budget those notes.
+    """
+    from . import prompt_index
+    content = message.get('content')
+    texts = [content] if isinstance(content, str) else [p.get('text', '') for p in content or [] if p.get('type') == 'text']
+    matches = [m for text in texts for m in prompt_index.PLACEHOLDER.finditer(text)]
+    if not matches:
+        return 0
+    entries = {entry['id']: entry for entry in index['skills']}
+    if any(identity not in entries for m in matches for identity in m[1].split(',')):
+        saved = message.get(SKILL_CHARS)
+        if type(saved) is int and saved >= -sum(len(m[0]) for m in matches):
+            return saved
+    return sum(prompt_index.expansion_chars(m[1].split(','), entries) - len(m[0]) for m in matches)
+
+
+def fixed_tokens(system_prompt: str, tools: list, *, prompt_id=None, index=None) -> int:
     """What every request costs before the conversation: the system prompt and the tool schemas."""
-    return round((len(system_prompt) + len(json.dumps(tools))) / CHARS_PER_TOKEN)
+    from . import prompt_index
+    if prompt_id and index is None:
+        from . import cloud
+        index = cloud.hosted_index(required=True)
+    hosted = prompt_index.prompt_chars(index, prompt_id) if prompt_id else 0
+    return round((len(system_prompt) + hosted + len(json.dumps(tools))) / CHARS_PER_TOKEN)
 
 
-def estimate_tokens(messages: list, fixed: int = FIXED_TOKENS) -> int:
+def estimate_tokens(messages: list, fixed: int = FIXED_TOKENS, *, skill_index=None) -> int:
     """Rough and cheap; calibrate() corrects the characters per token from what the API reports."""
     chars = images = 0
     for message in messages:
-        c, i = _size(message)
+        c, i = _size(message, skill_index)
         chars, images = chars + c, images + i
     return fixed + round(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKENS
 
@@ -364,7 +402,7 @@ def fold_steps(messages: list, indexes: list[int]) -> int:
 
 
 def fold_for_budget(messages: list, budget: int, ratio: float = 1.0, unpinned: frozenset = frozenset(),
-                    fixed: int = FIXED_TOKENS, keep: bool = False) -> int:
+                    fixed: int = FIXED_TOKENS, keep: bool = False, skill_index=None) -> int:
     """Earlier turns are always sent as records. In the current turn, once a request would exceed
     FOLD_AT of the budget (in keep mode, the whole budget), its oldest steps are folded, oldest
     first, until the request is under FOLD_TO, leaving the newest LIVE_STEPS whole. Returns how
@@ -374,7 +412,7 @@ def fold_for_budget(messages: list, budget: int, ratio: float = 1.0, unpinned: f
     folded = fold_steps(messages, steps(messages, start, current))
 
     def over(share: float) -> bool:
-        return estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed) * ratio > budget * share
+        return estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed, skill_index=skill_index) * ratio > budget * share
 
     if not over(1.0 if keep else FOLD_AT):
         return folded
@@ -388,7 +426,7 @@ def fold_for_budget(messages: list, budget: int, ratio: float = 1.0, unpinned: f
 # ------------------------------------------------------------------ compaction
 
 def compaction_cut(messages: list, budget: int, ratio: float = 1.0, unpinned: frozenset = frozenset(),
-                   fixed: int = FIXED_TOKENS, keep: bool = False) -> int | None:
+                   fixed: int = FIXED_TOKENS, keep: bool = False, skill_index=None) -> int | None:
     """Where to cut so that what follows fits COMPACT_TO of the budget: the earliest turn start
     that does, else the earliest message a request may start with (a user or assistant message;
     a tool result cannot come first). None when nothing can be summarized or nothing fits."""
@@ -396,7 +434,7 @@ def compaction_cut(messages: list, budget: int, ratio: float = 1.0, unpinned: fr
     kept = kept_messages(messages, unpinned, keep)
 
     def fits(index: int) -> bool:
-        return (estimate_tokens(fold(messages[index:], kept), fixed) + SUMMARY_TOKENS) * ratio <= budget * COMPACT_TO
+        return (estimate_tokens(fold(messages[index:], kept), fixed, skill_index=skill_index) + SUMMARY_TOKENS) * ratio <= budget * COMPACT_TO
 
     candidates = [i for i in range(start + 1, len(messages)) if messages[i].get("role") in ("user", "assistant")]
     for chosen in ([i for i in candidates if is_turn_start(messages[i])], candidates):
@@ -423,29 +461,37 @@ def transcript(messages: list) -> str:
     return "\n\n".join(lines)
 
 
-def summarize(cfg, messages: list, is_cancelled: Callable[[], bool]) -> str:
+def summarize(cfg, messages: list, is_cancelled: Callable[[], bool], session: dict) -> str:
     completion = llm.stream_chat(
         base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
         messages=[{"role": "system", "content": SUMMARY_PROMPT},
                   {"role": "user", "content": transcript(messages) + "\n\nSummarize the conversation above as instructed."}],
-        tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled)
+        tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
+        max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
+        headers=llm.correlation_headers(session["id"], "summary"), on_retry=lambda: None)
     return completion.text.strip()
 
 
 def prepare(session: dict, cfg, is_cancelled: Callable[[], bool], summarize=summarize,
-            fixed: int = FIXED_TOKENS) -> tuple[list[dict], int]:
+            fixed: int = FIXED_TOKENS, skill_index=None) -> tuple[list[dict], int]:
     """The messages for the next request, kept within cfg.context_budget, and how many stored
     messages a new summary now stands for (0 when none was made). Marks steps folded and may
     put a summary on a message; never changes the number, order or content of messages."""
     messages, unpinned = session["messages"], unpinned_refs(session)
+    if skill_index is not None:
+        for message in messages:
+            if message.get('role') == 'user':
+                delta = _skill_delta(message, skill_index)
+                if delta or SKILL_CHARS in message:
+                    message[SKILL_CHARS] = delta
     budget, ratio, keep = cfg.context_budget, session.get("token_ratio") or 1.0, cfg.keep_context
     compacted = 0
-    fold_for_budget(messages, budget, ratio, unpinned, fixed, keep)
-    if estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed) * ratio > budget:
-        cut = compaction_cut(messages, budget, ratio, unpinned, fixed, keep)
+    fold_for_budget(messages, budget, ratio, unpinned, fixed, keep, skill_index)
+    if estimate_tokens(view(messages, unpinned=unpinned, keep=keep), fixed, skill_index=skill_index) * ratio > budget:
+        cut = compaction_cut(messages, budget, ratio, unpinned, fixed, keep, skill_index)
         if cut is not None:
             try:
-                summary = summarize(cfg, view(messages, cut, unpinned, keep), is_cancelled)
+                summary = summarize(cfg, view(messages, cut, unpinned, keep), is_cancelled, session)
             except llm.LLMError as ex:
                 print(f"Loopcut: could not summarize the conversation, sending it as is: {ex}")
                 summary = ""

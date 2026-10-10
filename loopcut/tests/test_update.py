@@ -4,6 +4,7 @@ what the banner says. No Blender."""
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -127,6 +128,7 @@ class HelperTest(unittest.TestCase):
                          ["cmd.exe", "/c", "C:/t/apply.cmd", "42", "C:/t/x.msi", "C:/P/blender.exe", "C:/t/log"])
 
 
+@patch.object(update.config, "BETA", False)
 class BannerTest(unittest.TestCase):
     def test_nothing_to_say(self):
         self.assertIsNone(update.banner_for(state(status="idle", release=None), True))

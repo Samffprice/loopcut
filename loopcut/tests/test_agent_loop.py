@@ -7,10 +7,12 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -20,7 +22,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, context, conversations, llm, state  # noqa: E402
+from loopcut import agent, checkpoints, context, conversations, llm, state, workspace  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
 
 
@@ -52,6 +54,15 @@ def multi_tool_reply(*calls: tuple) -> bytes:
                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
 
 
+class Hang:
+    """A reply that writes `prefix` (maybe none), then stalls past the client's timeout= so its
+    socket read raises a bare TimeoutError (not an HTTPError/URLError: urlopen has already returned
+    by then). Same trick as test_llm.py's Hang, duplicated here rather than shared across files."""
+
+    def __init__(self, prefix: bytes = b"", delay: float = 0.25):
+        self.prefix, self.delay = prefix, delay
+
+
 class Script:
     def __init__(self):
         self.replies: list = []
@@ -66,6 +77,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         body["_auth"] = self.headers.get("Authorization")
+        # The Message object, not a plain dict: header names urllib sends are not what you typed
+        # (Request.add_header capitalizes only the first letter), so lookups must stay case-insensitive.
+        body["_headers"] = self.headers
         SCRIPT.requests.append(body)
         reply = SCRIPT.replies.pop(0)
         if isinstance(reply, tuple):
@@ -76,6 +90,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode())
+            return
+        if isinstance(reply, Hang):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            for name, value in SCRIPT.headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            if reply.prefix:
+                self.wfile.write(reply.prefix)
+                self.wfile.flush()
+            time.sleep(reply.delay)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -102,7 +127,13 @@ class AgentLoopTest(unittest.TestCase):
             "LOOPCUT_MODEL": "fake-model",
             "LOOPCUT_AUTO_RUN": "false",
             "LOOPCUT_AUTO_LOOK": "false",  # Tests that want the automatic look turn it on.
+            "LOOPCUT_ORCHESTRATE": "false",  # Today's single loop; the orchestrator tests set their own spec.
+            "LOOPCUT_ROUTER": "off",  # No router call in the scripts; test_router.py drives it.
         })
+        # Put back after the class: test_workspace measures the real _tool_schemas.
+        cls.replaced = {name: getattr(agent, name) for name in (
+            "_scene_snapshot", "_addons_line", "_project_roots", "_alike_on_main", "_update_account",
+            "_keeps_context", "_redraw", "_tool_schemas", "_changes_scene")}
         agent._scene_snapshot = lambda: None
         agent._addons_line = lambda: ""  # Reads bpy; the prompt test sets its own line.
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
@@ -111,15 +142,21 @@ class AgentLoopTest(unittest.TestCase):
         agent._keeps_context = lambda cfg: False  # account.py needs bpy.
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
-        agent._changes_scene = lambda name: name == "run_python"
+        agent._changes_scene = lambda name, arguments="": name == "run_python"
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
         cls.data_dir.cleanup()
+        for name, original in cls.replaced.items():
+            setattr(agent, name, original)
 
     def setUp(self):
+        from prompt_index_fixture import index_patch
+        patcher = index_patch()
+        patcher.start()
+        self.addCleanup(patcher.stop)
         SCRIPT.replies.clear()
         SCRIPT.requests.clear()
         SCRIPT.headers.clear()
@@ -138,11 +175,13 @@ class AgentLoopTest(unittest.TestCase):
         self.ran.append((name, arguments))
         return types.SimpleNamespace(text="cube added", ok=True, image_path=None)
 
-    def start(self, text: str) -> agent.Turn:
+    def start(self, text: str, roots: tuple = (), spec=None) -> agent.Turn:
         session = self.session
         session["items"].append(state.item_user(text))
         session["messages"].append({"role": "user", "content": text})
         turn = agent.Turn()
+        turn.spec = spec
+        turn.roots = roots  # Before the thread starts, as send() does; setting it after races the first call.
         session["busy"], session["turn"] = True, turn
         turn.thread = threading.Thread(target=agent._run, daemon=True,
                                        args=(session, turn, lambda *a: self.run_tool(*a), self.ensure_checkpoint))
@@ -166,6 +205,24 @@ class AgentLoopTest(unittest.TestCase):
         self.assertFalse(self.session["busy"])
         self.assertEqual(SCRIPT.requests[0]["_auth"], "Bearer test-key")
         self.assertEqual(SCRIPT.requests[0]["messages"][0]["role"], "system")
+
+    def test_sends_conversation_and_role_headers_for_the_gateway(self):
+        """Loopcut's gateway correlates a usage row with the conversation and role that made it
+        (x-loopcut-conversation / x-loopcut-role); the single loop's own request must send both."""
+        SCRIPT.replies.append(text_reply("hi"))
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}):
+            self.start("hi").thread.join(5)
+        headers = SCRIPT.requests[0]["_headers"]
+        self.assertEqual(headers.get("x-loopcut-conversation"), self.session["id"])
+        self.assertEqual(headers.get("x-loopcut-role"), "single")
+
+    def test_byok_request_has_no_loopcut_headers(self):
+        SCRIPT.replies.append(text_reply("hi"))
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": ""}):
+            self.start("hi").thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 1)
+        headers = SCRIPT.requests[0]["_headers"]
+        self.assertFalse([name for name in headers if name.lower().startswith("x-loopcut-")])
 
     def test_installed_addons_are_named_at_the_end_of_the_system_prompt(self):
         agent._addons_line = lambda: "Installed add-ons: Probe [probe] bpy.ops.probe.say_* (2)"
@@ -311,11 +368,340 @@ class AgentLoopTest(unittest.TestCase):
     def test_step_limit_is_not_a_completed_turn(self):
         from unittest.mock import patch
         with patch.dict(os.environ, {"LOOPCUT_MAX_STEPS": "1"}):
-            SCRIPT.replies.append(tool_reply("get_scene_info", {}))
+            SCRIPT.replies += [tool_reply("get_scene_info", {}), text_reply("Read the scene; nothing else yet.")]
             turn = self.start("inspect")
             turn.thread.join(5)
         self.assertEqual(turn.outcome, "step_limit")
         self.assertEqual(self.session["turn_outcome"], "step_limit")
+
+    def test_unlimited_turns_run_forty_tool_steps_in_every_user_loop(self):
+        for spec in (agent.SINGLE_SPEC, agent.ORCH_SPEC, agent.WORKSPACE_SPEC):
+            for limit in (None, "0"):
+                with self.subTest(role=spec.role, limit=limit), \
+                        mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                        mock.patch.object(agent, "_route"), mock.patch.object(agent, "_workspace_turn"):
+                    os.environ.pop("LOOPCUT_MAX_STEPS", None)
+                    if limit is not None:
+                        os.environ["LOOPCUT_MAX_STEPS"] = limit
+                    self.session = state.reset()
+                    self.ran.clear()
+                    SCRIPT.requests.clear()
+                    SCRIPT.replies[:] = [tool_reply("get_scene_info", {"name_contains": f"part{i}"})
+                                         for i in range(40)] + [text_reply("All forty finished.")]
+                    turn = self.start("inspect", spec=spec)
+                    turn.thread.join(10)
+                    self.assertFalse(turn.thread.is_alive())
+                    self.assertEqual(turn.outcome, "completed")
+                    self.assertEqual(len(self.ran), 40)
+                    self.assertEqual(len(SCRIPT.requests), 41)
+                    self.assertFalse(any("steps left" in text for text in self.results()))
+                    self.assertEqual(self.session["items"][-1]["text"], "All forty finished.")
+
+    def failing_tools(self, *, change=False, ok=False):
+        def run(name, arguments):
+            self.ran.append((name, arguments))
+            before = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                      "scene": {}, "mode": "OBJECT"}
+            return types.SimpleNamespace(text="Tool failed" if not ok else "OK", ok=ok, image_path=None,
+                                         scene_before=before, scene_after={**before, "object_count": len(self.ran)}
+                                         if change else before.copy())
+        self.run_tool = run
+        self.session["auto_run"] = True
+
+    def test_identical_failures_stop_and_wrap_up_in_every_user_loop(self):
+        for spec in (agent.SINGLE_SPEC, agent.ORCH_SPEC, agent.WORKSPACE_SPEC):
+            # Failed reads keep their refusal; refusals count toward the same guard as failures.
+            for tool, args in (("get_scene_info", {}), ("run_python", {"code": "broken()", "summary": "Try"})):
+                with self.subTest(role=spec.role, tool=tool), \
+                        mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                        mock.patch.object(agent, "_route"), \
+                        mock.patch.object(agent, "_workspace_turn"):
+                    self.session = state.reset()
+                    self.ran.clear()
+                    SCRIPT.requests.clear()
+                    self.failing_tools()
+                    SCRIPT.replies[:] = [tool_reply(tool, args)] * 8 + [text_reply("Blocked by the tool failure.")]
+                    turn = self.start("build", spec=spec)
+                    turn.thread.join(10)
+                    self.assertFalse(turn.thread.is_alive())
+                    self.assertEqual(turn.outcome, "no_progress")
+                    self.assertEqual(self.session["turn_outcome"], "no_progress")
+                    self.assertEqual(len(self.ran), 2 if tool == "get_scene_info" else 8)
+                    self.assertEqual(len(SCRIPT.requests), 9)
+                    self.assertEqual(self.session["items"][-2], state.item_notice(agent.NO_PROGRESS_NOTICE))
+                    self.assertEqual(self.session["items"][-1]["text"], "Blocked by the tool failure.")
+                    self.assertEqual(SCRIPT.requests[-1]["messages"][-1]["content"], agent.NO_PROGRESS_PROMPT)
+                    self.assertFalse(context.is_turn_start(self.session["messages"][-2]))
+                    if tool == "get_scene_info":
+                        self.assertIn("Same error as before", self.results()[1])
+                        self.assertTrue(all(result.startswith("Not run: you made this same call at steps 1 and 2")
+                                            for result in self.results()[2:]))
+                        self.assertEqual([i["status"] for i in self.session["items"] if i["kind"] == "tool"],
+                                         ["failed"] * 2 + ["rejected"] * 6)
+                    else:
+                        self.assertIn("This error has now come up 3 times", self.results()[2])
+
+    def test_scene_changes_distinct_calls_and_successes_keep_the_turn_running(self):
+        for case in ("scene_changes", "different_arguments", "successes", "success_between"):
+            with self.subTest(case=case):
+                self.session = state.reset()
+                self.ran.clear()
+                self.failing_tools(change=case == "scene_changes", ok=case == "successes")
+                calls = [("run_python", {"code": "broken()", "summary": "Try"}) for _ in range(16)]
+                if case == "different_arguments":
+                    calls = [(name, {**args, "code": f"try_{i}()"}) for i, (name, args) in enumerate(calls)]
+                if case == "success_between":
+                    run = self.run_tool
+                    def sometimes_ok(name, arguments):
+                        result = run(name, arguments)
+                        result.ok = len(self.ran) in (8, 16)
+                        return result
+                    self.run_tool = sometimes_ok
+                SCRIPT.replies[:] = [tool_reply(*call) for call in calls] + [text_reply("Finished.")]
+                turn = self.start("build")
+                turn.thread.join(10)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(turn.outcome, "completed")
+                self.assertEqual(len(self.ran), 16)
+                self.assertFalse(any(i.get("text") == agent.NO_PROGRESS_NOTICE for i in self.session["items"]))
+
+    def test_no_progress_closes_pending_calls_and_ignores_tools_in_wrap_up(self):
+        self.failing_tools()
+        call = ("run_python", {"code": "broken()", "summary": "Try"})
+        # Three failed calls plus three duplicates, then a failure and a duplicate reach eight.
+        SCRIPT.replies[:] = [multi_tool_reply(call, call)] * 3
+        SCRIPT.replies += [multi_tool_reply(call, call, ("get_scene_info", {})),
+                           sse({"choices": [{"delta": {"content": "Blocked.", "tool_calls": [
+                               {"index": 0, "id": "summary_call", "type": "function",
+                                "function": {"name": "get_scene_info", "arguments": "{}"}}]}}]},
+                               {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})]
+        turn = self.start("build")
+        turn.thread.join(10)
+        self.assertEqual(turn.outcome, "no_progress")
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(len(self.ran), 4)
+        self.assertEqual(len(SCRIPT.requests), 5)
+        last_results = [m for m in SCRIPT.requests[-1]["messages"] if m["role"] == "tool"][-3:]
+        self.assertEqual([m["tool_call_id"] for m in last_results], ["call_1", "call_2", "call_3"])
+        self.assertIn("Not run: duplicate", last_results[-2]["content"])
+        self.assertIn("Not run: stopped because no progress", last_results[-1]["content"])
+        self.assertEqual(self.session["messages"][-1], {"role": "assistant", "content": "Blocked."})
+
+    def test_refusals_after_successful_reads_stop_the_turn(self):
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate):
+                self.session = state.reset()
+                self.ran.clear()
+                SCRIPT.requests.clear()
+                read = ("get_scene_info", {})
+                pending = ("get_object_info", {"names": ["Cube"]})
+                # Two cached successes then eight refusals, or one success then eight duplicates.
+                SCRIPT.replies[:] = ([] if duplicate else [tool_reply(*read)] * 9)
+                SCRIPT.replies += [multi_tool_reply(*([read] * 9 if duplicate else [read]), pending),
+                                   text_reply("Blocked by repeated reads.")]
+                turn = self.start("inspect")
+                turn.thread.join(10)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(turn.outcome, "no_progress")
+                self.assertEqual(len(self.ran), 1 if duplicate else 2)
+                self.assertEqual(len(SCRIPT.requests), 2 if duplicate else 11)
+                self.assertIn("Not run: stopped because no progress", self.results()[-1])
+                cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+                self.assertEqual(sum(i["status"] == "rejected" for i in cards), 8)
+                self.assertEqual(self.session["items"][-2], state.item_notice(agent.NO_PROGRESS_NOTICE))
+                self.assertEqual(self.session["items"][-1]["text"], "Blocked by repeated reads.")
+
+    def test_alternating_failures_stop_on_the_eighth_occurrence_of_one_key(self):
+        for reads in (False, True):
+            with self.subTest(reads=reads):
+                self.session = state.reset()
+                self.ran.clear()
+                SCRIPT.requests.clear()
+                self.failing_tools()
+                a, b = (("get_scene_info", {}), ("get_object_info", {})) if reads else (
+                    ("run_python", {"code": "a()", "summary": "A"}),
+                    ("run_python", {"code": "b()", "summary": "B"}))
+                SCRIPT.replies[:] = [tool_reply(*call) for call in [a, b] * 7 + [a]]
+                SCRIPT.replies.append(text_reply("Blocked by alternating failures."))
+                turn = self.start("build")
+                turn.thread.join(10)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(turn.outcome, "no_progress")
+                self.assertEqual(len(self.ran), 4 if reads else 15)
+                self.assertEqual(len(SCRIPT.requests), 16)
+
+    def test_successful_reads_of_other_keys_do_not_reset_the_guard(self):
+        self.failing_tools()
+        run = self.run_tool
+        def read_succeeds(name, arguments):
+            result = run(name, arguments)
+            result.ok = name == "get_scene_info"
+            return result
+        self.run_tool = read_succeeds
+        failure = ("run_python", {"code": "broken()", "summary": "Try"})
+        SCRIPT.replies[:] = [multi_tool_reply(failure, ("get_scene_info", {"name_contains": str(i)}))
+                             for i in range(7)]
+        SCRIPT.replies += [tool_reply(*failure), text_reply("Blocked.")]
+        turn = self.start("build")
+        turn.thread.join(10)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(turn.outcome, "no_progress")
+        self.assertEqual(len(self.ran), 15)
+        self.assertEqual(len(SCRIPT.requests), 9)
+
+    def test_success_of_one_key_does_not_reset_another_keys_failures(self):
+        self.failing_tools()
+        run = self.run_tool
+        def succeeds_once(name, arguments):
+            result = run(name, arguments)
+            result.ok = len(self.ran) == 15
+            return result
+        self.run_tool = succeeds_once
+        a = ("run_python", {"code": "a()", "summary": "A"})
+        b = ("run_python", {"code": "b()", "summary": "B"})
+        SCRIPT.replies[:] = [tool_reply(*call) for call in [a, b] * 7 + [a, a, b]]
+        SCRIPT.replies.append(text_reply("B is still blocked."))
+        turn = self.start("build")
+        turn.thread.join(10)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(turn.outcome, "no_progress")
+        self.assertEqual(len(self.ran), 17)
+        self.assertEqual(len(SCRIPT.requests), 18)
+
+    def test_scene_changes_user_notes_and_approval_rejections_reset_all_counts(self):
+        for reset in ("measured_change", "unmeasured_mutation", "user_note", "approval_rejection"):
+            with self.subTest(reset=reset):
+                self.session = state.reset()
+                self.ran.clear()
+                SCRIPT.requests.clear()
+                self.failing_tools()
+                run = self.run_tool
+                def reset_between(name, arguments):
+                    result = run(name, arguments)
+                    if len(self.ran) == 14:
+                        if reset == "user_note":
+                            agent.send("Try again after my edits.")
+                        elif reset == "approval_rejection":
+                            self.session["auto_run"] = False
+                    if json.loads(arguments)["code"] == "reset()":
+                        if reset == "measured_change":
+                            result.scene_after["object_count"] = 1
+                        elif reset == "unmeasured_mutation":
+                            del result.scene_before, result.scene_after
+                    return result
+                self.run_tool = reset_between
+                def reject(turn):
+                    self.session["auto_run"] = True
+                    return False
+                a = ("run_python", {"code": "a()", "summary": "A"})
+                b = ("run_python", {"code": "b()", "summary": "B"})
+                middle = [] if reset == "user_note" else [("run_python", {"code": "reset()", "summary": "Reset"})]
+                SCRIPT.replies[:] = [tool_reply(*call) for call in [a, b] * 7 + middle + [a, b] * 7 + [b]]
+                SCRIPT.replies.append(text_reply("Blocked after retrying."))
+                with mock.patch.object(agent, "_wait_for_approval", side_effect=reject) as approval:
+                    turn = self.start("build")
+                    turn.thread.join(10)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(turn.outcome, "no_progress")
+                self.assertEqual(len(self.ran), 29 if reset in ("user_note", "approval_rejection") else 30)
+                self.assertEqual(len(SCRIPT.requests), 30 + len(middle))
+                self.assertEqual(approval.call_count, int(reset == "approval_rejection"))
+
+    def test_capture_and_checkpoint_refusals_count_as_no_progress(self):
+        for refusal in ("capture", "checkpoint"):
+            with self.subTest(refusal=refusal):
+                self.session = state.reset()
+                self.session["auto_run"] = True
+                self.ran.clear()
+                SCRIPT.requests.clear()
+                if refusal == "checkpoint":
+                    self.checkpoint_error = checkpoints.CheckpointError("Disk full.")
+                call = ("capture_viewport", {}) if refusal == "capture" else (
+                    "run_python", {"code": "add()", "summary": "Add"})
+                SCRIPT.replies[:] = [tool_reply(*call)] * 8 + [text_reply("Blocked.")]
+                with mock.patch.object(agent, "_capture_refusal", return_value="Same look." if refusal == "capture" else ""):
+                    turn = self.start("build")
+                    turn.thread.join(10)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(turn.outcome, "no_progress")
+                self.assertEqual(self.ran, [])
+                self.assertEqual(len(SCRIPT.requests), 9)
+
+    def limited(self, steps: int, *summary) -> agent.Turn:
+        """A turn of `steps` distinct steps against LOOPCUT_MAX_STEPS=steps, then the `summary` replies."""
+        from unittest.mock import patch
+        schemas = [{"type": "function", "function": {"name": "get_scene_info", "parameters": {}}}]
+        with patch.dict(os.environ, {"LOOPCUT_MAX_STEPS": str(steps)}), \
+                patch.object(agent, "_tool_schemas", lambda: schemas):
+            SCRIPT.replies += [tool_reply("get_scene_info", {"name_contains": f"part{i}"}) for i in range(steps)]
+            SCRIPT.replies += list(summary)
+            turn = self.start("build it")
+            turn.thread.join(5)
+        return turn
+
+    def results(self) -> list[str]:
+        return [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+
+    def test_three_steps_before_the_limit_the_model_is_told(self):
+        turn = self.limited(5, text_reply("Summary."))
+        self.assertEqual(turn.outcome, "step_limit")
+        self.assertEqual(len(self.ran), 5)
+        self.assertEqual(len(SCRIPT.requests), 6)
+        self.assertEqual(self.session["items"][-1]["text"], "Summary.")
+        results = self.results()
+        self.assertEqual(results[:1] + results[2:], ["cube added"] * 4)
+        self.assertEqual(results[1], "cube added\n\n(3 steps left in this turn. Finish what matters most, or wrap up: "
+                                     "say what is done, what is left and what you did not verify.)")
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertIn("3 steps left", cards[1]["output"])
+
+    def test_at_the_limit_one_more_request_asks_where_the_work_stands(self):
+        from loopcut import context
+        prompt = agent.STEP_LIMIT_PROMPT.format(steps=2)
+        for keep in ("false", "true"):  # Keep mode too: the summary request extends the last one whole.
+            with self.subTest(keep_context=keep):
+                self.setUp()
+                from unittest.mock import patch
+                with patch.dict(os.environ, {"LOOPCUT_KEEP_CONTEXT": keep}):
+                    turn = self.limited(2, text_reply("Done: the table. Left: chairs. Not verified: scale."))
+                self.assertEqual(len(SCRIPT.requests), 3)
+                last, before = SCRIPT.requests[2], SCRIPT.requests[1]
+                self.assertNotIn("tool_choice", last, "GLM and MiMo ignore it, Muse Spark refuses it")
+                self.assertEqual(last["tools"], before["tools"], "the same tools: the cached prefix holds")
+                self.assertEqual(last["messages"][:len(before["messages"])], before["messages"], "append-only")
+                self.assertEqual(last["messages"][len(before["messages"]):][0]["role"], "assistant")
+                self.assertEqual(last["messages"][-1], {"role": "user", "content": prompt})
+                self.assertEqual(self.session["items"][-2], state.item_error("Stopped after 2 steps without finishing."))
+                self.assertEqual(self.session["items"][-1]["kind"], "assistant")
+                self.assertEqual(self.session["items"][-1]["text"], "Done: the table. Left: chairs. Not verified: scale.")
+                asked, answer = self.session["messages"][-2:]
+                self.assertEqual(asked["content"], prompt)
+                self.assertFalse(context.is_turn_start(asked), "it continues the turn")
+                self.assertEqual(answer, {"role": "assistant", "content": "Done: the table. Left: chairs. Not verified: scale."})
+                self.assertEqual(turn.outcome, "step_limit")
+
+    def test_a_tool_call_in_the_summary_is_dropped(self):
+        summary = sse({"choices": [{"delta": {"content": "Done: the table."}}]},
+                      {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9", "type": "function",
+                                                              "function": {"name": "get_scene_info", "arguments": "{}"}}]}}]},
+                      {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+        self.limited(1, summary)
+        self.assertEqual(len(self.ran), 1)
+        self.assertEqual(self.session["messages"][-1], {"role": "assistant", "content": "Done: the table."})
+
+    def assert_bare_stop(self, turn: agent.Turn, requests: int):
+        self.assertEqual(len(SCRIPT.requests), requests, "no retry")
+        self.assertEqual(self.session["items"][-1], state.item_error("Stopped after 1 steps without finishing."))
+        self.assertFalse(any(i["kind"] == "assistant" and not i["text"] for i in self.session["items"]))
+        self.assertEqual(self.session["messages"][-1]["role"], "tool", "the unanswered request is not kept")
+        self.assertEqual(turn.outcome, "step_limit")
+
+    def test_when_the_summary_fails_the_bare_stop_stands(self):
+        self.assert_bare_stop(self.limited(1, (400, {"error": {"message": "Bad request."}})), 2)
+
+    def test_a_summary_with_only_tool_calls_is_a_bare_stop(self):
+        self.assert_bare_stop(self.limited(1, tool_reply("get_scene_info", {})), 2)
+        self.assertEqual(len(self.ran), 1)
 
     def test_cancelled_main_thread_job_never_executes_after_worker_stops(self):
         from concurrent.futures import Future
@@ -369,6 +755,50 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(turn.scene_after, after)
         self.assertEqual(turn.outcome, "cancelled")
         self.assertEqual(next(i for i in self.session["items"] if i["kind"] == "tool")["status"], "done")
+
+    def test_cost_guard_switches_are_panel_notices_right_after_their_step(self):
+        from unittest.mock import patch
+        line = "Subsurf on Chair_Seat, est. 12M faces: viewport display off; lower the viewport level"
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(
+            text=f"OK\n\nCost guard: switched off show_viewport ...\n- {line}", ok=True, image_path=None,
+            guard_notes=[{"text": line, "modifiers": [["Chair_Seat", "Subsurf"]]}])
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "false", "LOOPCUT_AUTO_RUN": "true"}):
+            SCRIPT.replies += [tool_reply("run_python", {"code": "seat()", "summary": "Seat"}), text_reply("Done.")]
+            turn = self.start("chair")
+            turn.thread.join(5)
+        items = self.session["items"]
+        card = next(n for n, i in enumerate(items) if i["kind"] == "tool")
+        self.assertEqual(items[card + 1], state.item_guard(line, [["Chair_Seat", "Subsurf"]]))
+        self.assertEqual(items[card + 1]["action_label"], "Show anyway")
+        self.assertIn(line, next(m for m in self.session["messages"] if m["role"] == "tool")["content"])
+
+    def test_a_refused_render_keeps_its_guard_notice_and_gets_the_step_budget_s_note(self):
+        from unittest.mock import patch
+        refusal = ("Render refused by the cost guard: at render settings this is over its limit of 4M faces per "
+                   "object and 12M per scene, and one long render cannot be stopped. Nothing was changed.\n"
+                   "- Subsurf on Seat renders at est. 16M faces; lower its render_levels\nLower these, then render again.")
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            return types.SimpleNamespace(ok=False, image_path=None, guard_notes=[{"text": refusal, "modifiers": []}],
+                                         text=f"Traceback (most recent call last):\n  File \"<loopcut>\", line 1, "
+                                              f"in <module>\nRuntimeError: {refusal}\n\n{refusal}\n\nScene changes: none")
+        self.run_tool = run_tool
+        self.session["auto_run"] = self.session["auto_heavy"] = True
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "false"}):
+            SCRIPT.replies += [tool_reply("run_python", {"code": "bpy.ops.render.render()", "summary": f"Render {i}"})
+                               for i in (1, 2, 3)] + [text_reply("The seat is too heavy to render.")]
+            self.start("render it").thread.join(5)
+        self.assertEqual(len(self.ran), 3, "a refusal is a failure, annotated, never refused itself")
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertTrue(all(results[n].startswith(f"Traceback") and f"\n\n{refusal}\n\nScene changes" in results[n]
+                            for n in range(3)), "the guard's report stays whole")
+        self.assertIn("(Same error as before.", results[1])
+        self.assertIn("This approach is not working", results[2])
+        items = self.session["items"]
+        cards = [n for n, i in enumerate(items) if i["kind"] == "tool"]
+        self.assertEqual([items[n + 1] for n in cards], [state.item_guard(refusal, [])] * 3, "and in the panel")
+        self.assertIn("This approach is not working", items[cards[2]]["output"])
 
     def test_a_huge_step_result_is_folded_not_summarized_at_the_next_turn(self):
         os.environ["LOOPCUT_CONTEXT_BUDGET"] = "16000"
@@ -508,11 +938,115 @@ class AgentLoopTest(unittest.TestCase):
         with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "true"}):
             agent._run(self.session, turn, self._looking_tools(), self.ensure_checkpoint, lambda a, b: False)
 
+    def test_the_automatic_look_frames_what_the_step_changed_not_the_first_objects(self):
+        """A dungeon run's automatic looks always framed its first twelve floor tiles, whatever it built."""
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        tile = {"type": "MESH", "visible": True, "location": (0, 0, 0), "materials": ()}
+        before = {"too_many": False, "object_count": 20, "materials": {}, "collections": {}, "scene": {}, "mode": "OBJECT",
+                  "objects": {f"Floor_{n:02d}": dict(tile) for n in range(20)}}
+        after = {**before, "objects": {**before["objects"], "Torch": dict(tile), "Floor_07": {**tile, "location": (0, 0, 1)},
+                                       "Torch_Light": {**tile, "type": "LIGHT"}}}
+
+        def run_tool(name, arguments):
+            self.ran.append((name, json.loads(arguments)))
+            if name == "capture_viewport":
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached.", ok=True, image_path=shot)
+            return types.SimpleNamespace(text="OK", ok=True, image_path=None, scene_before=before, scene_after=after)
+
+        SCRIPT.replies += [tool_reply("run_python", {"code": "add()", "summary": "Add"}), text_reply("Done.")]
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("build it"))
+        self.session["messages"].append({"role": "user", "content": "build it"})
+        self.session["busy"], self.session["turn"] = True, turn
+        agent._run(self.session, turn, run_tool, self.ensure_checkpoint)
+        self.assertEqual(self.ran[-1], ("capture_viewport", {"angle": "three_quarter", "focus": ["Floor_07", "Torch"]}))
+        self.assertEqual(turn.touched, [], "the next look frames only what changes after this one")
+
+    def test_the_automatic_look_keeps_the_models_last_focus(self):
+        """HIGH chest S15 (eval 20260929): a focused final look, then an edit whose result named nothing it
+        touched; the automatic look kept the angle but went through the pack's camera."""
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+
+        def run_tool(name, arguments):
+            self.ran.append((name, json.loads(arguments)))
+            if name == "capture_viewport":
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached.", ok=True, image_path=shot)
+            return types.SimpleNamespace(text="OK", ok=True, image_path=None, scene_before=empty,
+                                         scene_after={**empty, "object_count": len(self.ran)})
+
+        SCRIPT.replies += [tool_reply("capture_viewport", {"angle": "final", "focus": ["Chest"]}),
+                           tool_reply("run_python", {"code": "edit()", "summary": "Edit"}),
+                           tool_reply("capture_viewport", {"angle": "front"}),
+                           tool_reply("run_python", {"code": "edit()", "summary": "Edit"}), text_reply("Done.")]
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("build it"))
+        self.session["messages"].append({"role": "user", "content": "build it"})
+        self.session["busy"], self.session["turn"] = True, turn
+        agent._run(self.session, turn, run_tool, self.ensure_checkpoint)
+        looks = [arguments for name, arguments in self.ran if name == "capture_viewport"]
+        self.assertEqual(looks, [{"angle": "final", "focus": ["Chest"]}, {"angle": "final", "focus": ["Chest"]},
+                                 {"angle": "front"}, {"angle": "front"}], "a look without focus clears it")
+
+    def test_a_specs_after_tool_note_lands_on_the_result(self):
+        """LoopSpec.after_tool: the orchestrator's note on a worker's object (P2), on that call's result."""
+        import dataclasses
+        self.session["auto_run"] = True
+        seen = []
+
+        def run_tool(name, arguments):
+            return types.SimpleNamespace(text="OK", ok=True, image_path=None)
+
+        def after_tool(session, name, result):
+            seen.append(name)
+            return "\n\nBarrel was built by worker barrel: send fixes back with delegate continues."
+
+        SCRIPT.replies += [tool_reply("run_python", {"code": "edit()", "summary": "Edit"}), text_reply("Done.")]
+        turn = agent.Turn()
+        turn.spec = dataclasses.replace(agent.SINGLE_SPEC, after_tool=after_tool)
+        self.session["items"].append(state.item_user("fix the barrel"))
+        self.session["messages"].append({"role": "user", "content": "fix the barrel"})
+        self.session["busy"], self.session["turn"] = True, turn
+        agent._run(self.session, turn, run_tool, self.ensure_checkpoint)
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual(seen, ["run_python"])
+        self.assertTrue(results[0].endswith("Barrel was built by worker barrel: send fixes back with delegate continues."),
+                        results[0])
+
     def test_a_look_the_model_placed_after_its_change_is_not_doubled(self):
         """A reply of run_python then capture_viewport once got an automatic look between the two:
         two images of the same scene in every lighting step."""
         self._run_batch(("run_python", {"code": "add()", "summary": "Add"}), ("capture_viewport", {"angle": "camera"}))
         self.assertEqual(self.ran, ["run_python", "capture_viewport"])
+
+    def test_the_same_look_after_a_scene_change_in_the_same_reply_runs_again(self):
+        """product_reveal: two capture_viewport calls in one reply with a run_python between them that set
+        another frame; the second look was dropped as a duplicate of the first."""
+        look = ("capture_viewport", {"angle": "camera"})
+        self._run_batch(look, ("run_python", {"code": "bpy.context.scene.frame_set(90)", "summary": "Frame 90"}), look)
+        self.assertEqual(self.ran, ["capture_viewport", "run_python", "capture_viewport"])
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertFalse([r for r in results if r.startswith("Not run")], results)
+
+    def test_the_same_call_twice_with_nothing_between_still_runs_once(self):
+        look = ("capture_viewport", {"angle": "camera"})
+        self._run_batch(look, ("get_scene_info", {}), look)
+        self.assertEqual(self.ran, ["capture_viewport", "get_scene_info"], "a read between changes nothing")
+        self.setUp()
+        add = ("run_python", {"code": "add()", "summary": "Add"})
+        self._run_batch(add, add, look)
+        self.assertEqual(self.ran, ["run_python", "capture_viewport"], "a doubled change runs once")
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual(results[1], "Not run: duplicate of call #1 in this step; see its result.")
 
     def test_the_automatic_look_comes_after_the_whole_reply(self):
         self._run_batch(("run_python", {"code": "add()", "summary": "Add"}), ("get_scene_info", {}))
@@ -580,6 +1114,120 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("(Look 9 this turn.", cards[8]["output"])
         self.assertIn("(Look 10 this turn.", cards[9]["output"])
 
+    def failing_run(self, errors: list[str]):
+        """run_tool that fails the way run_python does, with the next of `errors`."""
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            error = errors[len(self.ran) - 1]
+            return types.SimpleNamespace(ok=False, image_path=None, text=(
+                f"Traceback (most recent call last):\n  File \"<loopcut>\", line {len(self.ran)}, in <module>\n"
+                f"{error}\n\nScene changes: none"))
+        self.run_tool = run_tool
+
+    def test_the_same_call_twice_in_one_reply_runs_once(self):
+        # An eval saw 8 of these a step, for 11 steps.
+        search = ("search_assets", {"source": "polyhaven", "query": "wood table", "type": "model"})
+        SCRIPT.replies += [multi_tool_reply(*[search] * 8, ("inspect_api", {"path": "bpy.types.Object"})),
+                           text_reply("Found one.")]
+        self.start("find a table").thread.join(5)
+        self.assertEqual([name for name, _ in self.ran], ["search_assets", "inspect_api"])
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual(results[0], "cube added")
+        self.assertEqual(results[1:8], ["Not run: duplicate of call #1 in this step; see its result."] * 7)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual([c["status"] for c in cards], ["done"] + ["rejected"] * 7 + ["done"], "not run, not failed")
+
+    def test_the_same_read_is_nudged_then_not_run_until_the_scene_changes(self):
+        self.session["auto_run"] = True
+        info = lambda: tool_reply("get_object_info", {"names": ["Cube"]})
+        SCRIPT.replies += [info(), info(), info(), tool_reply("run_python", {"code": "move()", "summary": "Move"}),
+                           info(), text_reply("Done.")]
+        self.start("check the cube").thread.join(5)
+        self.assertEqual([name for name, _ in self.ran], ["get_object_info"] * 2 + ["run_python", "get_object_info"])
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual(results[0], "cube added")
+        self.assertTrue(results[1].startswith("cube added\n\n(Same result as your identical call at step 1"))
+        self.assertTrue(results[2].startswith("Not run: you made this same call at steps 1 and 2"))
+        self.assertEqual(results[4], "cube added", "the scene changed in between: it runs, and no note")
+        self.assertEqual([c["status"] for c in self.session["items"] if c["kind"] == "tool"],
+                         ["done", "done", "rejected", "done", "done"])
+
+    def test_an_asset_search_is_a_read_per_source_and_an_import_changes_the_scene(self):
+        self.session["auto_run"] = True
+        search = lambda source="polyhaven": tool_reply("search_assets", {"source": source, "query": "wood table",
+                                                                         "type": "model"})
+        imported = tool_reply("import_asset", {"source": "polyhaven", "id": "wooden_table_02"})
+        SCRIPT.replies += [search(), search(), search(), search("blenderkit"), imported, search(), text_reply("Done.")]
+        from unittest.mock import patch
+        from loopcut import tools
+        with patch.object(agent, "_changes_scene", lambda name, arguments="": name in tools.CHANGES_SCENE):  # setUpClass stubs it.
+            self.start("find a table").thread.join(5)
+        ran = [(name, json.loads(arguments).get("source")) for name, arguments in self.ran]
+        self.assertEqual(ran, [("search_assets", "polyhaven")] * 2 + [("search_assets", "blenderkit"),
+                                                                      ("import_asset", "polyhaven"),
+                                                                      ("search_assets", "polyhaven")])
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertIn("(Same result as your identical call at step 1", results[1])
+        self.assertTrue(results[2].startswith("Not run: you made this same call at steps 1 and 2"))
+        self.assertEqual(results[3], "cube added", "another source is another call")
+        self.assertEqual(results[5], "cube added", "the import changed the scene: the search runs, with no note")
+
+    def test_a_render_job_s_status_is_never_refused_or_noted_as_a_repeat(self):
+        self.session["auto_heavy"] = True
+        status = ("render_job", {"action": "status", "job_id": "j1"})
+        start = ("render_job", {"action": "start", "output_dir": "//renders", "frames": [1], "budget_seconds": 60})
+        SCRIPT.replies += [multi_tool_reply(start, start, status, status), tool_reply(*status), tool_reply(*status),
+                           tool_reply(*status), text_reply("Rendering.")]
+        self.start("render it").thread.join(5)
+        actions = [json.loads(arguments)["action"] for _, arguments in self.ran]
+        self.assertEqual(actions, ["start"] + ["status"] * 5, "status runs every time; a doubled start runs once")
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertEqual(results[1], "Not run: duplicate of call #1 in this step; see its result.")
+        self.assertEqual(results[2:], ["cube added"] * 5, "no note, however alike")
+
+    def test_polling_a_running_job_is_pointed_to_wait(self):
+        # product_reveal, 2026-09-27: 19 status calls, each followed by run_python sleeping.
+        status = ("render_job", {"action": "status", "job_id": "j1"})
+        sleep = ("run_python", {"code": "import time\ntime.sleep(20)", "summary": "Wait for the render"})
+        self.run_tool = lambda name, arguments: (self.ran.append((name, arguments)) or types.SimpleNamespace(
+            ok=True, image_path=None, text='{"state": "running"}' if name == "render_job" else "Scene changes: none"))
+        self.session["auto_run"] = True
+        SCRIPT.replies += [multi_tool_reply(status, sleep)] * 3 + [text_reply("It is rendering.")]
+        self.start("render it").thread.join(5)
+        self.assertEqual(len(self.ran), 6, "never refused")
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertTrue(all("Sleeping in run_python holds Blender's main thread" in r for r in results[1::2]))
+        self.assertNotIn("wait=", results[0] + results[2])
+        self.assertIn("(Status checked 3 times this turn while the job runs.", results[4])
+
+    def test_a_repeated_failure_is_annotated_never_refused(self):
+        self.session["auto_run"] = True
+        error = "AttributeError: 'NoneType' object has no attribute 'inputs'"
+        self.failing_run([error] * 3)
+        SCRIPT.replies += [tool_reply("run_python", {"code": f"try_{i}()", "summary": f"Try {i}"}) for i in (1, 2, 3)]
+        SCRIPT.replies.append(text_reply("This is not working; here is why."))
+        self.start("scatter spheres").thread.join(5)
+        self.assertEqual(len(self.ran), 3, "code always runs")
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertTrue(all(f"{error}\n\nScene changes: none" in r for r in results), "the whole error is kept")
+        self.assertTrue(results[0].endswith("Scene changes: none"))
+        self.assertTrue(results[1].endswith('\n\n(Same error as before. Already tried: step 1 "Try 1".)'))
+        self.assertIn('(This error has now come up 3 times. Already tried: step 1 "Try 1", step 2 "Try 2". '
+                      'This approach is not working', results[2])
+        self.assertIn("not working", SCRIPT.requests[3]["messages"][-1]["content"], "the model sees it")
+        self.assertEqual([c["status"] for c in self.session["items"] if c["kind"] == "tool"], ["failed"] * 3)
+
+    def test_failing_runs_in_a_row_get_a_nudge_whatever_the_errors(self):
+        self.session["auto_run"] = True
+        self.failing_run(["NameError: name 'plane' is not defined", "KeyError: 'Scatter'",
+                          "TypeError: enum \"POINTS\" not found", "ValueError: count must be positive"])
+        SCRIPT.replies += [tool_reply("run_python", {"code": f"step_{i}()", "summary": f"Step {i}"}) for i in range(4)]
+        SCRIPT.replies.append(text_reply("Stepping back."))
+        self.start("scatter spheres").thread.join(5)
+        results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
+        self.assertFalse(any("in a row" in r for r in results[:3]))
+        self.assertIn("(4 run_python calls in a row have failed. Step back before the next one", results[3])
+
     def test_attached_images_get_a_reference_card_before_the_first_request(self):
         from loopcut import conversations, context
         picture = Path(self.data_dir.name) / "chair.png"
@@ -609,6 +1257,26 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("Gone."))
         self.start("and now").thread.join(5)
         self.assertEqual(SCRIPT.requests[3]["messages"][1]["content"][1]["type"], "text", "unpinned: dropped")
+
+    def test_the_workspace_agent_gets_attached_images_without_a_reference_card(self):
+        from loopcut import conversations, context
+        picture = Path(self.data_dir.name) / "chest.png"
+        picture.write_bytes(b"\x89PNG chest still")
+        session = self.session
+        session["attachments"] = [{"ref": conversations.store_image(session, picture),
+                                   "full": conversations.store_image(session, picture), "name": "chest.png"}]
+        SCRIPT.replies.append(text_reply("Looking at the still."))
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+        with mock.patch.dict(os.environ, {"LOOPCUT_ORCHESTRATE": "false", "LOOPCUT_WORKSPACE": "true"}), \
+                mock.patch.object(agent, "_workspace_turn"):
+            self.assertTrue(agent.send("paint it like this"))
+            session["turn"].thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 1, "no card request first")
+        self.assertTrue(SCRIPT.requests[0]["messages"][0]["content"].startswith(workspace.PROMPT))
+        sent = SCRIPT.requests[0]["messages"][1]["content"]
+        self.assertEqual(sent[1]["type"], "image_url")
+        self.assertNotIn("reference_card", sent[0]["text"])
+        self.assertFalse(session["messages"][0].get(context.REFERENCE_CARD))
 
     def test_conversation_is_on_disk_after_a_turn(self):
         from loopcut import conversations
@@ -652,8 +1320,9 @@ class AgentLoopTest(unittest.TestCase):
             return types.SimpleNamespace(text="Image attached.", ok=True, image_path=shot)
 
         self.run_tool = run_tool
-        calls = [{"index": i, "id": f"call_{i}", "type": "function",
-                  "function": {"name": "capture_viewport", "arguments": "{}"}} for i in range(2)]
+        calls = [{"index": i, "id": f"call_{i}", "type": "function",  # Two angles: one angle twice runs once.
+                  "function": {"name": "capture_viewport", "arguments": json.dumps({"angle": angle})}}
+                 for i, angle in enumerate(("front", "side"))]
         SCRIPT.replies += [sse({"choices": [{"delta": {"tool_calls": calls}}]},
                                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
                            text_reply("Looks right.")]
@@ -700,7 +1369,7 @@ class AgentLoopTest(unittest.TestCase):
     def test_a_render_asks_every_time_even_after_always_allow(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "a()", "summary": "a"}),
                            tool_reply("see_render", {"render": True}),
-                           tool_reply("run_python", {"code": "bpy.ops.render.render(write_still=True)", "summary": "render"}),
+                           tool_reply("run_python", {"code": "bpy.ops.object.bake(type='COMBINED')", "summary": "render"}),
                            text_reply("Done.")]
         turn = self.start("render it")
         awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
@@ -721,7 +1390,7 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies += [tool_reply("see_render", {"render": True}),
                            tool_reply("see_render", {"render": True}),
                            tool_reply("run_python", {"code": "a()", "summary": "a"}),
-                           tool_reply("run_python", {"code": "bpy.ops.render.render(write_still=True)", "summary": "render"}),
+                           tool_reply("run_python", {"code": "bpy.ops.object.bake(type='COMBINED')", "summary": "render"}),
                            text_reply("Done.")]
         turn = self.start("render it twice")
         awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
@@ -749,6 +1418,44 @@ class AgentLoopTest(unittest.TestCase):
         turn.thread.join(5)
         self.assertEqual([n for n, _ in self.ran], ["see_render"])
 
+    def test_a_package_install_asks_every_time_even_with_auto_run_and_always_allow(self):
+        # C29: in the RC smoke test, auto-run on, the agent pip-installed imageio-ffmpeg without asking.
+        os.environ["LOOPCUT_AUTO_RUN"] = "true"
+        self.addCleanup(os.environ.update, {"LOOPCUT_AUTO_RUN": "false"})
+        self.session["auto_run"] = self.session["auto_heavy"] = True
+        pip = "import subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pip', 'install', 'imageio-ffmpeg'])"
+        SCRIPT.replies += [tool_reply("run_python", {"code": "a()", "summary": "a"}),
+                           tool_reply("run_python", {"code": pip, "summary": "Install imageio-ffmpeg"}),
+                           tool_reply("run_python", {"code": "import ensurepip", "summary": "pip"}),
+                           text_reply("Done.")]
+        turn = self.start("check the frames")
+        awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
+        self.wait_for(awaiting, "the install's card")
+        self.assertEqual([json.loads(a)["code"] for _, a in self.ran], ["a()"], "only the ordinary step ran unasked")
+        self.assertTrue(awaiting()[0]["install"])
+        self.assertTrue(agent.decide(True, always=True), "Enter or Always on an install allows this one only")
+        self.wait_for(lambda: awaiting() and awaiting()[0]["summary"] == "pip", "the next install's card")
+        agent.decide(False)
+        turn.thread.join(5)
+        self.assertEqual([json.loads(a)["code"] for _, a in self.ran], ["a()", pip], "the rejected install never ran")
+        shown = state.new_session()
+        shown["items"] = [dict(next(i for i in self.session["items"] if i.get("summary") == "pip"), status="awaiting")]
+        display = layout.build(shown, 520, 800, 1.0, LayoutTest.measure, "m", None,
+                               {"selection": [], "context_budget": 24_000, "account": None})
+        text = " ".join(prim.get("text", "") for prim in display["prims"])
+        self.assertIn("Loopcut asks every time", text)
+        self.assertIn("Run", text)
+        self.assertNotIn("Always allow", text, "an install has no Always allow")
+
+    def test_a_worker_cannot_install_and_is_told_so(self):
+        import dataclasses
+        SCRIPT.replies += [tool_reply("run_python", {"code": "!pip3 install trimesh", "summary": "pip"}),
+                           text_reply("Done without it.")]
+        turn = self.start("go", spec=dataclasses.replace(agent.SINGLE_SPEC, asks=False))
+        turn.thread.join(5)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(SCRIPT.requests[1]["messages"][-1]["content"], agent.INSTALL_REFUSAL)
+
     def test_file_reads_inside_the_project_run_unasked_and_writes_ask(self):
         project = Path(self.data_dir.name) / "project"
         project.mkdir(exist_ok=True)
@@ -757,8 +1464,7 @@ class AgentLoopTest(unittest.TestCase):
                            tool_reply("list_files", {"path": str(Path(self.data_dir.name) / "elsewhere")}),
                            tool_reply("write_file", {"path": str(project / "out.txt"), "content": "hi"}),
                            text_reply("Done.")]
-        turn = self.start("look around")
-        turn.roots = (project.resolve(),)
+        turn = self.start("look around", roots=(project.resolve(),))
         awaiting = lambda: [i for i in self.session["items"] if i.get("status") == "awaiting"]
         self.wait_for(lambda: awaiting() and awaiting()[0]["name"] == "list_files", "the outside read's card")
         self.assertEqual([n for n, _ in self.ran], ["read_file", "see_render"], "in-project read and last render ran unasked")
@@ -778,6 +1484,22 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["usage"], {"input": 240, "cached": 0, "output": 16, "context": 120})
         self.assertEqual(SCRIPT.requests[0]["stream_options"], {"include_usage": True})
 
+    def test_a_conversation_resumed_from_disk_keeps_working_and_counting(self):
+        """Reopening a file resumes its saved conversation (conversations.load). Its usage must keep
+        every key a new session has: the first turn after a reopen used to die on KeyError('cached')
+        (S4 beta RC smoke, 2026-10-09)."""
+        usage = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 8,
+                                          "prompt_tokens_details": {"cached_tokens": 100}}}
+        SCRIPT.replies += [sse({"choices": [{"delta": {"content": "Hi."}}]}, usage)] * 2
+        self.start("hi").thread.join(5)
+        conversations.save(self.session)
+        self.session = state.replace(conversations.load(self.session["id"]))
+        self.start("again").thread.join(5)
+        self.assertEqual([i["text"] for i in self.session["items"] if i["kind"] == "error"], [])
+        self.assertEqual(set(self.session["usage"]), set(state.new_session()["usage"]))
+        self.assertEqual([i["kind"] for i in self.session["items"]], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(self.session["usage"], {"input": 240, "cached": 200, "output": 16, "context": 120})
+
     def test_overloaded_api_is_retried_and_the_user_never_sees_it(self):
         llm.RETRY_DELAYS, saved = (0.01, 0.01, 0.01), llm.RETRY_DELAYS
         self.addCleanup(setattr, llm, "RETRY_DELAYS", saved)
@@ -794,6 +1516,139 @@ class AgentLoopTest(unittest.TestCase):
         self.start("hi").thread.join(5)
         self.assertEqual(self.session["items"][-1], state.item_error("HTTP 503: Overloaded."))
 
+    def _short_timeout(self):
+        """Patches llm.stream_chat so this test's Hang() replies (which stall past a short
+        client-side timeout=, not an HTTP error) read as TimeoutError quickly; agent.py itself
+        always asks for the 120s default. Same RETRY_DELAYS trick as the 503 tests above."""
+        llm.RETRY_DELAYS, saved = (0.01, 0.01, 0.01), llm.RETRY_DELAYS
+        self.addCleanup(setattr, llm, "RETRY_DELAYS", saved)
+        real = llm.stream_chat
+        patcher = mock.patch.object(llm, "stream_chat", side_effect=lambda **kw: real(**{**kw, "timeout": 0.05}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_read_timeout_before_any_reply_text_is_retried_and_the_user_never_sees_it(self):
+        """The z.ai hiccup this guards against: a whole task ending on its first call with
+        TimeoutError('The read operation timed out') and no LLMError to catch it (agent.py's
+        'Internal error' fallback). Now it is retried like a 503, invisibly."""
+        self._short_timeout()
+        SCRIPT.replies += [Hang(delay=0.2), text_reply("Here now.")]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Here now.")
+        self.assertEqual(len(SCRIPT.requests), 2)
+        self.assertNotEqual(self.session["items"][-1]["kind"], "error")
+
+    def test_a_read_timeout_mid_reply_retries_once_without_doubling_the_card(self):
+        """Content already reached the reply card (reply["text"]) before the stream broke; the
+        retried request starts from scratch, so agent.py's on_retry must have cleared the stale
+        partial text first, or the card would read 'Once upon a Fresh answer.'."""
+        self._short_timeout()
+        partial = b'data: {"choices":[{"delta":{"content":"Once upon a "}}]}\n\n'
+        SCRIPT.replies += [Hang(prefix=partial, delay=0.2), text_reply("Fresh answer.")]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Fresh answer.")
+        self.assertEqual(len(SCRIPT.requests), 2)
+
+    def test_a_read_timeout_mid_reply_twice_surfaces_as_an_error(self):
+        """Only one retry is spent once content has streamed; a second break in a row is shown,
+        not silently retried again."""
+        self._short_timeout()
+        partial = b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+        SCRIPT.replies += [Hang(prefix=partial, delay=0.2), Hang(prefix=partial, delay=0.2)]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["kind"], "error")
+        self.assertIn("Connection lost while streaming the reply", self.session["items"][-1]["text"])
+        self.assertEqual(len(SCRIPT.requests), 2)
+
+    # ------------------------------------------------------------------ the output cap (max_tokens)
+
+    def test_the_configured_output_cap_is_sent_as_max_tokens(self):
+        SCRIPT.replies.append(text_reply("hi"))
+        self.start("hi").thread.join(5)
+        self.assertEqual(SCRIPT.requests[0]["max_tokens"], 32000, "config.py's default")
+
+    def capped_reply(self, usage: dict | None = None) -> bytes:
+        chunks = [{"choices": [{"delta": {}, "finish_reason": "length"}]}]
+        if usage is not None:
+            chunks.append({"choices": [], "usage": usage})
+        return sse(*chunks)
+
+    def test_a_capped_reply_with_nothing_usable_is_retried_once(self):
+        """The z.ai/GLM failure this guards against: a step burns its whole output cap on reasoning
+        and stops with no text and no tool call. Retried once, invisibly, with a short nudge the
+        first request did not carry."""
+        SCRIPT.replies += [self.capped_reply(), text_reply("Here now.")]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Here now.")
+        self.assertNotEqual(self.session["items"][-1]["kind"], "error")
+        self.assertEqual(len(SCRIPT.requests), 2)
+        first, second = SCRIPT.requests[0]["messages"], SCRIPT.requests[1]["messages"]
+        self.assertEqual(second[:-1], first, "the retry sends the same messages, plus one more")
+        self.assertEqual(second[-1]["role"], "user")
+        self.assertIn("Decide now and act", second[-1]["content"])
+        # The nudge is not saved: the conversation itself only gained the user turn and its reply.
+        self.assertEqual([m["role"] for m in self.session["messages"]], ["user", "assistant"])
+
+    def test_a_capped_tool_call_cut_mid_argument_is_also_retried(self):
+        """finish_reason "length" with a tool call whose JSON never closed: not usable either."""
+        cut = sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                                          "function": {"name": "run_python",
+                                                                       "arguments": '{"code": "incomple'}}]}}]},
+                  {"choices": [{"delta": {}, "finish_reason": "length"}]})
+        SCRIPT.replies += [cut, text_reply("Done.")]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Done.")
+        self.assertEqual(len(SCRIPT.requests), 2)
+
+    def test_a_capped_reply_with_a_complete_tool_call_is_not_retried(self):
+        """finish_reason "length" right after a whole, valid tool call is a usable step, not a
+        failure: nothing to retry."""
+        whole = sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                                            "function": {"name": "run_python",
+                                                                         "arguments": '{"code": "x()"}'}}]}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "length"}]})
+        SCRIPT.replies += [whole, text_reply("Done.")]
+        self.start("hi")
+        self.awaiting()
+        agent.decide(True)
+        self.session["turn"].thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 2, "the second request is the next step, not a cap retry")
+        self.assertEqual(self.ran, [("run_python", '{"code": "x()"}')])
+
+    def test_a_capped_reply_twice_in_a_row_is_this_steps_error(self):
+        SCRIPT.replies += [self.capped_reply(), self.capped_reply()]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["items"][-1]["kind"], "error")
+        self.assertIn("output cap", self.session["items"][-1]["text"])
+        self.assertIn("twice in a row", self.session["items"][-1]["text"])
+        self.assertEqual(len(SCRIPT.requests), 2, "no third attempt")
+
+    def test_max_effort_retries_the_capped_step_at_high(self):
+        with mock.patch.dict(os.environ, {"LOOPCUT_REASONING_EFFORT": "max"}):
+            SCRIPT.replies += [self.capped_reply(), text_reply("ok")]
+            self.start("hi").thread.join(5)
+        self.assertEqual(SCRIPT.requests[0]["reasoning_effort"], "max")
+        self.assertEqual(SCRIPT.requests[1]["reasoning_effort"], "high")
+
+    def test_a_non_max_effort_keeps_its_own_effort_on_retry(self):
+        with mock.patch.dict(os.environ, {"LOOPCUT_REASONING_EFFORT": "low"}):
+            SCRIPT.replies += [self.capped_reply(), text_reply("ok")]
+            self.start("hi").thread.join(5)
+        self.assertEqual(SCRIPT.requests[0]["reasoning_effort"], "low")
+        self.assertEqual(SCRIPT.requests[1]["reasoning_effort"], "low")
+
+    def test_capped_retry_usage_is_counted_for_both_attempts(self):
+        first_usage = {"prompt_tokens": 100, "completion_tokens": 32000, "prompt_tokens_details": {"cached_tokens": 0}}
+        second_usage = {"prompt_tokens": 140, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}
+        SCRIPT.replies += [self.capped_reply(first_usage), sse({"choices": [{"delta": {"content": "Here."}}]},
+                                                               {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                                                                "usage": second_usage})]
+        self.start("hi").thread.join(5)
+        self.assertEqual(self.session["usage"], {"input": 240, "cached": 0, "output": 32005, "context": 140})
+        self.assertEqual(self.session["usage_by_role"]["single"],
+                         {"input": 240, "cached": 0, "output": 32005, "requests": 2})
+
+    @mock.patch.object(agent.config, "BETA", False)
     def test_out_of_allowance_is_a_card_with_the_gateway_s_offer_not_an_error(self):
         SCRIPT.replies += [(402, {"error": {
             "message": "You have used this week's allowance on the Free plan. It resets in 3 days.",
@@ -834,6 +1689,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["items"][-1]["text"], "Here is your chair.")
         self.assertFalse(agent.resume(), "nothing to resume once the turn has finished")
 
+    @mock.patch.object(agent.config, "BETA", False)
     def test_usage_headers_update_the_account_and_warn_once_when_the_week_is_nearly_used(self):
         SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
                                "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})
@@ -859,6 +1715,162 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["items"][-1],
                          state.item_error("HTTP 403: This key was revoked."))
         self.assertFalse(self.session["busy"])
+
+    # ORCH_SPEC: level inference, the finish gate, usage by role. The wave itself is test_waves'
+    # business: here delegate is a fake tool that records what it was handed, as waves.prepare does.
+    def orchestrate(self, text: str, job=None) -> agent.Turn:
+        patcher = mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        session = self.session
+        session["turn_number"] = session.get("turn_number", 0) + 1
+        session["auto_run"] = True  # delegate asks first like any scene change; that is AgentLoopTest's.
+        session["items"].append(state.item_user(text))
+        session["messages"].append({"role": "user", "content": text})
+        turn = agent.Turn()
+        turn.spec, self.job = agent.ORCH_SPEC, job
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            if name == "delegate" and not json.loads(arguments).get("dry_run"):
+                wave = json.loads(arguments)["wave"]
+                turn.delegations.append([w["deliverable"] for w in wave["workers"]])
+                turn.job = self.job
+            return types.SimpleNamespace(text="ok", ok=True, image_path=None)
+        session["busy"], session["turn"] = True, turn
+        turn.thread = threading.Thread(target=agent._run, daemon=True, args=(session, turn, run_tool, self.ensure_checkpoint))
+        turn.thread.start()
+        turn.thread.join(5)
+        return turn
+
+    @staticmethod
+    def wave(*deliverables) -> dict:
+        return {"wave": {"workers": [{"id": d.lower(), "deliverable": d} for d in deliverables]}}
+
+    def test_orchestrator_levels_come_from_what_the_orchestrator_did(self):
+        SCRIPT.replies += [
+            text_reply("It has 3 objects."),                                                      # 0
+            tool_reply("get_scene_info", {}), text_reply("Two cubes."),                           # 0
+            tool_reply("run_python", {"code": "x()"}), text_reply("Moved."),                      # 1
+            tool_reply("delegate", self.wave("Chair")), text_reply("Built."),                     # 2
+            tool_reply("delegate", {**self.wave("Chair"), "dry_run": True}), text_reply("Fine."),  # 0: a dry run starts nothing
+            tool_reply("run_python", {"code": "y()"}), tool_reply("delegate", self.wave("Desk", "Lamp")),
+            text_reply("Room done."),                                                              # 1, escalated to 3
+            tool_reply("delegate", self.wave("Desk")), tool_reply("delegate", self.wave("Lamp")),
+            text_reply("Both done."),                                                              # 2, then 3 in all
+        ]
+        for text in ("what is here", "describe it", "move it", "a chair", "check a chair", "a room", "desk then lamp"):
+            self.orchestrate(text)
+        self.assertEqual([(entry["first"], entry["final"]) for entry in self.session["turn_levels"]],
+                         [(0, 0), (0, 0), (1, 1), (2, 2), (0, 0), (1, 3), (2, 3)])
+        self.assertEqual([entry["turn"] for entry in self.session["turn_levels"]], [1, 2, 3, 4, 5, 6, 7])
+
+    def test_orchestrator_the_finish_gate_bounces_at_most_twice_through_the_loop(self):
+        job = FakeJob([{"status": "fail", "detail": "lamp floats 12 mm above"}, {"status": "pass"}])
+        SCRIPT.replies += [tool_reply("delegate", self.wave("Lamp")), text_reply("Done."), text_reply("Fixed it."),
+                           text_reply("It still floats.")]
+        turn = self.orchestrate("a lamp on the desk, keep the mug", job)
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual((len(SCRIPT.requests), job.ran, job.finished), (4, 3, 2))
+        bounces = [m for m in self.session["messages"] if m.get(context.STEP_LIMIT)]
+        self.assertEqual(len(bounces), 2)
+        self.assertIn('- id "lamp c1": contact Lamp rests_on Desk: lamp floats 12 mm above', bounces[0]["content"])
+        self.assertEqual(SCRIPT.requests[2]["messages"][-1]["content"], bounces[1]["content"], "sent as the next message")
+        final = [i for i in self.session["items"] if i["kind"] == "assistant"][-1]["text"]
+        self.assertTrue(final.startswith("It still floats.\n\nVerified by Loopcut on this scene: 1 of 2 checks."), final)
+        self.assertEqual(self.session["turn_levels"][-1], {"turn": 1, "first": 2, "final": 2})
+
+    def test_orchestrator_usage_is_kept_by_role_and_still_summed(self):
+        usage = {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                                          "prompt_tokens_details": {"cached_tokens": 60}}}
+        SCRIPT.replies += [sse({"choices": [{"delta": {"content": "Hi."}}]}, usage)]
+        self.orchestrate("hi")
+        self.assertEqual(self.session["usage_by_role"], {"orchestrator": {"input": 100, "cached": 60, "output": 10,
+                                                                          "requests": 1}})
+        self.assertEqual(self.session["usage"]["input"], 100)
+
+    def test_orchestrator_send_picks_the_orchestrator_when_workers_are_on(self):
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+        SCRIPT.replies += [text_reply("Hi."), text_reply("Hi.")]
+        with mock.patch.dict(os.environ, {"LOOPCUT_ORCHESTRATE": "true", "LOOPCUT_MAX_WORKERS": "2",
+                                          "LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                mock.patch('loopcut.cloud.prompt_index_available', return_value=True), \
+                mock.patch.object(agent, "_launch", wraps=agent._launch) as launched:
+            self.assertTrue(agent.send("hi"))
+            # A completed worker clears session['turn'] before send() can return.
+            turn = launched.call_args.args[1]
+            turn.thread.join(5)
+        self.assertEqual((turn.spec, turn.roles.max_workers), (agent.ORCH_SPEC, 2))
+        with mock.patch.object(agent, "_launch", wraps=agent._launch) as launched:
+            self.assertTrue(agent.send("hi again"))  # LOOPCUT_ORCHESTRATE=false: today's loop.
+            launched.call_args.args[1].thread.join(5)
+        orchestrated, single = SCRIPT.requests
+        self.assertEqual(orchestrated["_headers"].get("x-loopcut-prompt"), "orchestrator")
+        self.assertEqual(orchestrated["messages"][0]["content"], agent._system_tail(self.session))
+        self.assertEqual([t["function"]["name"] for t in orchestrated["tools"]], ["delegate", "checks", "accept_quarantine",
+                                                                                   "export_glb"])
+        self.assertNotIn("## Workers", single["messages"][0]["content"])
+        self.assertNotIn("tools", single, "no tools offered (the test stubs them) and none added")
+        self.assertEqual([e["turn"] for e in self.session["turn_levels"]], [1, 2])
+
+    def test_a_look_the_router_sends_to_the_workspace_runs_the_workspace_loop_from_then_on(self):
+        """LOOPCUT_WORKSPACE with workers on: the router's decision (router.to_workspace) switches the turn to
+        WORKSPACE_SPEC before its first request, and the conversation stays there."""
+        from loopcut import router
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+        SCRIPT.replies += [text_reply("Painted."), text_reply("Again.")]
+        started = []
+
+        def divert(session, turn, cfg, is_cancelled, stream=None, divert=None):
+            self.assertIs(divert, router.to_workspace)
+            turn.diverted = True
+        with mock.patch.dict(os.environ, {"LOOPCUT_ORCHESTRATE": "true", "LOOPCUT_WORKSPACE": "true",
+                                          "LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                mock.patch.object(router, "start_turn", side_effect=divert) as routed, \
+                mock.patch('loopcut.cloud.prompt_index_available', return_value=True), \
+                mock.patch.object(agent, "_workspace_turn", side_effect=lambda session, turn: started.append(turn)), \
+                mock.patch.object(agent, "_on_main", side_effect=lambda fn, is_cancelled=None: fn()), \
+                mock.patch.object(agent, "_launch", wraps=agent._launch) as launched:
+            self.assertTrue(agent.send("paint the chest"))
+            first = launched.call_args.args[1]
+            first.thread.join(5)
+            self.assertTrue(agent.send("brighter brass"))
+            second = launched.call_args.args[1]
+            second.thread.join(5)
+        self.assertEqual(routed.call_count, 1, "only the first turn is routed")
+        self.assertEqual((first.spec, second.spec), (agent.WORKSPACE_SPEC, agent.WORKSPACE_SPEC))
+        self.assertEqual(self.session["mode"], "workspace")
+        self.assertEqual(started, [first, second], "the diverted turn is noted by _route, the next by its own on_turn_start")
+        self.assertTrue(first.config.keep_context, "diverted, the turn keeps its steps whole")
+        self.assertGreaterEqual(first.config.context_budget, context.WORKSPACE_BUDGET)
+        for request in SCRIPT.requests:
+            self.assertTrue(request["messages"][0]["content"].startswith(workspace.PROMPT))
+            self.assertIn("apply_build", [t["function"]["name"] for t in request["tools"]])
+
+
+class FakeJob:
+    """What the finish gate needs of waves.Job: no workers to wait for."""
+    crew, on_main = [], None
+
+    def __init__(self, results):
+        self.results, self.bounces, self.finished, self.ran = results, 0, None, 0
+        self.checker, self.retired = self.check, {}
+        self.log = {"level": 0}
+
+    def check(self, checks):
+        self.ran += 1
+        return self.results[:len(checks)]
+
+    def final_checks(self):
+        return [("lamp c1", {"kind": "contact", "a": "Lamp", "relation": "rests_on", "b": "Desk", "id": "c1",
+                             "quote": "a lamp on the desk"}),
+                ("keep", {"kind": "unchanged", "names": ["Mug"], "id": "k1", "quote": "keep the mug"})]
+
+    def finish(self, bounces, results):
+        self.finished = bounces
+
+    def write(self):
+        pass
 
 
 class LayoutTest(unittest.TestCase):

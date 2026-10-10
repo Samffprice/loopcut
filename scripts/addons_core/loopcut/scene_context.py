@@ -2,18 +2,29 @@
 
 Cursor knows which file is open and what is selected; "make this shinier" has to work here too.
 The block is added to the message the model receives, not to what the chat shows. @Name in a
-message pulls in that object, material or collection by name: @Table, @"Left Chair".
+message pulls in that object, material or collection by name: @Table, @"Left Chair"; a text block or
+an image too (what a worker's brief owns: a recipe it must find, not "nothing has that name").
 
-Main thread only, except parse_mentions and candidates_from which are pure.
+Main thread only, except parse_mentions, candidates_from and the camera/light/keyframe line
+formatters (_camera_line, _light_line, _hex_color, _aim_target, _keyed_channels, _scene_facts),
+which only duck-type against bpy's attributes and so are pure too.
 """
 
 import json
+import math
 import re
 
 MAX_SELECTED = 8
 MAX_MENTIONS = 5
 MAX_CHANGES = 12     # Lines of what the user changed since the agent's last step.
 DIGEST_OBJECTS = 20  # Up to this many objects, the block names them all: cheaper than a get_scene_info call.
+MAX_CAMERAS = 4       # Cameras, lights and animated objects listed in full below this...
+MAX_LIGHTS = 6
+MAX_ANIMATED = 8
+MAX_KEYS_SHOWN = 8       # ...frame numbers shown per keyed channel...
+MAX_CHANNELS_PER_OBJECT = 6  # ...and channels shown per object, before "+N more": a rig's fcurves
+                              # (one per bone per axis) would otherwise dwarf everything else here.
+_TRACK_CONSTRAINTS = ("TRACK_TO", "DAMPED_TRACK", "LOCKED_TRACK")
 _MENTION = re.compile(r'(?<![\w@])@(?:"([^"\n]+)"|([\w.\-]+))')
 
 
@@ -68,7 +79,7 @@ def _resolve(name: str):
     import bpy
     from . import addons
     for kind, store in (("object", bpy.data.objects), ("material", bpy.data.materials),
-                        ("collection", bpy.data.collections)):
+                        ("collection", bpy.data.collections), ("text", bpy.data.texts), ("image", bpy.data.images)):
         if name in store:
             return kind, store[name]
     for entry in addons.enabled():
@@ -86,6 +97,11 @@ def _describe_mention(name: str) -> str:
         body = {**tools.object_summary(found), **object_info.describe(found)}
     elif kind == "material":
         body = object_info.describe_material(found)
+    elif kind in ("text", "image"):  # A brief may own one (a painter's recipe): say it is there, and what it holds.
+        from . import ownership
+        body = {"holds": ownership.support_about(found)}
+        if kind == "text":
+            body["starts"] = found.as_string()[:160]
     elif kind == "add-on":
         body = {"module": found["module"], "description": found["description"],
                 "operators": found["operators"][:40], "note": "inspect_api describes each operator"}
@@ -110,6 +126,106 @@ def _digest(objects, selected) -> str:
         counts[o.type] = counts.get(o.type, 0) + 1
     listed = ", ".join(f"{t} {n}" for t, n in sorted(counts.items(), key=lambda c: -c[1]))
     return f"objects by type: {listed}. get_scene_info lists them."
+
+
+def _aim_target(obj) -> str | None:
+    """The target of a camera's first enabled Track To / Damped Track / Locked Track constraint,
+    if any: the closest thing to a live "aim point" once frame_camera has pointed it by rotation
+    alone (it does not create a constraint, so an aim set that way has nothing here to read back)."""
+    for constraint in obj.constraints:
+        if constraint.type in _TRACK_CONSTRAINTS and not constraint.mute and getattr(constraint, "target", None):
+            return constraint.target.name
+    return None
+
+
+def _camera_line(obj) -> str:
+    cam = obj.data
+    lens = f"ortho scale {cam.ortho_scale:g}" if cam.type == "ORTHO" else f"lens {cam.lens:g}mm"
+    parts = [lens, f"sensor_fit {cam.sensor_fit}", f"shift {cam.shift_x:g}/{cam.shift_y:g}"]
+    target = _aim_target(obj)
+    if target:
+        parts.append(f"tracks {target}")
+    return f"{obj.name}: " + ", ".join(parts)
+
+
+def _hex_color(color) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in color[:3])
+
+
+def _light_line(obj) -> str:
+    light = obj.data
+    parts = [light.type, f"color {_hex_color(light.color)}", f"energy {light.energy:g}"]
+    if light.type == "SPOT":
+        parts.append(f"spot size {math.degrees(light.spot_size):.1f}°")
+    return f"{obj.name}: " + ", ".join(parts)
+
+
+def _fcurves(obj):
+    """An object's fcurves, slotted (Blender 4.4+ layered actions) or the old single list."""
+    data = obj.animation_data
+    action = data.action if data else None
+    if action is None:
+        return []
+    slot = getattr(data, "action_slot", None)
+    if slot is not None and hasattr(action, "layers"):
+        curves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                bag = strip.channelbag(slot)
+                if bag:
+                    curves += list(bag.fcurves)
+        return curves
+    return list(getattr(action, "fcurves", []))
+
+
+def _keyed_channels(obj) -> str | None:
+    """"<name>: <path> keys <frames>; ..." — the keyed channels (location, rotation, a bone's
+    path, ...) with their frame numbers, not values: exactly what a "make the middle faster"
+    follow-up needs, and the scene is the source of truth for the values anyway."""
+    frames_by_path: dict[str, set] = {}
+    for curve in _fcurves(obj):
+        frames_by_path.setdefault(curve.data_path, set()).update(round(k.co[0]) for k in curve.keyframe_points)
+    if not frames_by_path:
+        return None
+    paths = sorted(frames_by_path)
+    parts = []
+    for path in paths[:MAX_CHANNELS_PER_OBJECT]:
+        frames = sorted(frames_by_path[path])
+        shown = ", ".join(str(f) for f in frames[:MAX_KEYS_SHOWN])
+        if len(frames) > MAX_KEYS_SHOWN:
+            shown += f" (+{len(frames) - MAX_KEYS_SHOWN} more)"
+        parts.append(f"{path} keys {shown}")
+    if len(paths) > MAX_CHANNELS_PER_OBJECT:
+        parts.append(f"+{len(paths) - MAX_CHANNELS_PER_OBJECT} more channels")
+    return f"{obj.name}: " + "; ".join(parts)
+
+
+def _scene_facts(objects) -> list[str]:
+    """Camera lens/sensor fit/shift/aim, light colour/energy/spot size, and keyed channels by
+    frame: facts a timing, colour or composition follow-up needs, and that get_scene_info would
+    otherwise have to be called again to recover once the step that set them up has folded out of
+    the history. Capped so a big scene (or a rigged one) stays small: this is paid every message."""
+    lines = []
+    cameras = [o for o in objects if o.type == "CAMERA" and o.data]
+    if cameras:
+        lines.append("cameras:")
+        lines += ["  " + _camera_line(o) for o in cameras[:MAX_CAMERAS]]
+        if len(cameras) > MAX_CAMERAS:
+            lines.append(f"  ... and {len(cameras) - MAX_CAMERAS} more")
+    lights = [o for o in objects if o.type == "LIGHT" and o.data]
+    if lights:
+        lines.append("lights:")
+        lines += ["  " + _light_line(o) for o in lights[:MAX_LIGHTS]]
+        if len(lights) > MAX_LIGHTS:
+            lines.append(f"  ... and {len(lights) - MAX_LIGHTS} more")
+    animated = [o for o in objects if o.animation_data and o.animation_data.action]
+    keyed = [line for line in (_keyed_channels(o) for o in animated[:MAX_ANIMATED]) if line]
+    if keyed:
+        lines.append("animated (keyed channels, frame numbers):")
+        lines += ["  " + line for line in keyed]
+        if len(animated) > MAX_ANIMATED:
+            lines.append(f"  ... and {len(animated) - MAX_ANIMATED} more animated objects")
+    return lines
 
 
 def _since_last_step(since: dict | None) -> list[str]:
@@ -158,6 +274,7 @@ def for_message(text: str, since: dict | None = None) -> str:
     else:
         lines.append("selected: nothing")
     lines.append(_digest(scene.objects, selected))
+    lines += _scene_facts(scene.objects)
     lines += _since_last_step(since)
     lines += [_describe_mention(name) for name in parse_mentions(text)[:MAX_MENTIONS]]
     return "<scene_context>\n" + "\n".join(lines) + "\n</scene_context>"

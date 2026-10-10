@@ -120,6 +120,28 @@ for purpose in ("geometry", "materials"):
     assert not meta["views"][0]["signal"]["near_black"]
     print(f"INSPECTION {purpose}: generated camera, explicit engine, visible signal", flush=True)
 
+# Exposure and colour in numbers: an icy blue world, then the same world blown out.
+background = scene.world.node_tree.nodes["Background"]
+kept = (tuple(background.inputs["Color"].default_value), background.inputs["Strength"].default_value,
+        scene.view_settings.view_transform)
+scene.view_settings.view_transform, cube.hide_render = "Standard", True
+background.inputs["Color"].default_value = (0.3, 0.5, 0.8, 1)
+signals = []
+for strength in (1.0, 40.0):
+    background.inputs["Strength"].default_value = strength
+    request = inspection.inspect_scene("final_lighting", cameras=["Camera"], frames=[2], max_side=128, samples=1)
+    wait(request.pending_job)
+    result = inspection.finish(request.pending_job)
+    assert result.ok, result.text
+    signals.append(json.loads(result.text.split("\n", 1)[1])["views"][0]["signal"])
+background.inputs["Color"].default_value, background.inputs["Strength"].default_value = kept[0], kept[1]
+scene.view_settings.view_transform, cube.hide_render = kept[2], False
+icy, blown = signals
+assert 200 <= icy["mean_hue"] <= 225 and icy["mean_saturation"] > .25 and not icy["too_bright"], icy
+assert icy["clipped"] == 0 and .6 < icy["mean_luminance"] < .8, icy
+assert blown["too_bright"] and blown["clipped"] > .9 and blown["mean_luminance"] > .95, blown
+print(f"INSPECTION signal: icy blue {icy}; blown out {blown}", flush=True)
+
 for args in ({"cameras": ["Missing"]}, {"focus": ["Missing"]}, {"frames": [True]}, {"max_side": 9999}):
     result = tools.execute("inspect_scene", json.dumps({"purpose": "final_lighting", **args}))
     assert not result.ok and result.image_path is None, result
@@ -133,28 +155,31 @@ for mutate in (lambda: setattr(scene.render, "resolution_x", 258),
     assert token != inspection.live_token(), "a render-relevant edit did not invalidate the inspection"
 print("INSPECTION tracks output, color-management, camera and shader edits", flush=True)
 
-sys.path.insert(0, str(Path(__file__).parent / "evals"))
-import grade
-grade.MAX_SIDE, grade.CYCLES_SAMPLES = 128, 1
-scene.render.image_settings.media_type = "VIDEO"
-scene.render.image_settings.file_format = "FFMPEG"
-before = preserved()
-task = SimpleNamespace(id="coverage", render_frames=[1, 2, 3], render_cameras=["*"])
-grade_out = root / "grade"
-grade_out.mkdir(exist_ok=True)
-files, notes, evidence = grade.render(task, grade_out)
-assert len(files) == len(evidence) == 6
-assert {(e["camera"], e["frame"]) for e in evidence} == {
-    (camera, frame) for camera in ("Camera", "Side Camera") for frame in (1, 2, 3)}
-assert preserved() == before, "grading leaked camera/frame/video settings"
-task.render_cameras = ["Missing"]
-try:
-    grade.render(task, grade_out)
-    raise AssertionError("missing camera was silently substituted")
-except ValueError as error:
-    assert "missing" in str(error)
-assert preserved() == before
-print("INSPECTION grader covers all cameras/frames and restores video settings on success/failure", flush=True)
+if (Path(__file__).parent / "evals").exists():
+    sys.path.insert(0, str(Path(__file__).parent / "evals"))
+    import grade
+    grade.MAX_SIDE, grade.CYCLES_SAMPLES = 128, 1
+    scene.render.image_settings.media_type = "VIDEO"
+    scene.render.image_settings.file_format = "FFMPEG"
+    before = preserved()
+    task = SimpleNamespace(id="coverage", render_frames=[1, 2, 3], render_cameras=["*"])
+    grade_out = root / "grade"
+    grade_out.mkdir(exist_ok=True)
+    files, notes, evidence = grade.render(task, grade_out)
+    assert len(files) == len(evidence) == 6
+    assert {(e["camera"], e["frame"]) for e in evidence} == {
+        (camera, frame) for camera in ("Camera", "Side Camera") for frame in (1, 2, 3)}
+    assert preserved() == before, "grading leaked camera/frame/video settings"
+    task.render_cameras = ["Missing"]
+    try:
+        grade.render(task, grade_out)
+        raise AssertionError("missing camera was silently substituted")
+    except ValueError as error:
+        assert "missing" in str(error)
+    assert preserved() == before
+    print("INSPECTION grader covers all cameras/frames and restores video settings on success/failure", flush=True)
+else:
+    print("SKIP inspection grader (eval harness not in this checkout)", flush=True)
 
 cancel = threading.Event()
 finished = []

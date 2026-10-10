@@ -1,0 +1,416 @@
+# SPDX-FileCopyrightText: 2026 Oxicid
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+import bpy
+import bmesh
+
+from . import unwrap
+from .. import utypes
+from .. import utils
+from ..utypes import AdvIslands
+from ..preferences import univ_settings
+
+
+class RelaxData:
+    def __init__(self, _umesh: utypes.UMesh, _selected_elem, _coords_before, _border_corners, _save_transform_islands):
+        self.umesh = _umesh
+        self.selected_elem = _selected_elem
+        self.coords_before = _coords_before
+        self.border_corners = _border_corners
+        self.save_transform_islands: list[utypes.SaveTransform] = _save_transform_islands
+
+    def remove_all_pins_from_umesh(self):
+        uv = self.umesh.uv
+        for f in self.umesh.bm.faces:
+            for crn in f.loops:
+                crn[uv].pin_uv = False
+
+
+# noinspection PyTypeHints
+class UNIV_OT_Relax(unwrap.UNIV_OT_Unwrap):
+    bl_idname = "uv.univ_relax"
+    bl_label = "Relax"
+    bl_description = "Warning: Incorrect behavior with flipped islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    iterations: bpy.props.IntProperty(name='Iterations', default=20, min=5, max=150, soft_max=50)
+    legacy: bpy.props.BoolProperty(name='Legacy Behavior', default=False)
+    border_blend: bpy.props.FloatProperty(name='Border Blend', default=0.1, min=0, soft_min=0, soft_max=1)
+    use_correct_aspect: bpy.props.BoolProperty(name='Correct Aspect', default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def draw(self, context):
+        if self.slim_support and not self.legacy and unwrap.MULTIPLAYER != 1:
+            self.layout.label(text=f'Multiplayer: x{unwrap.MULTIPLAYER}')
+        self.layout.prop(self, 'iterations', slider=True)
+        if not self.slim_support or self.legacy:
+            self.layout.prop(self, 'border_blend', slider=True)
+        if self.slim_support:
+            self.layout.prop(self, 'legacy')
+        self.layout.prop(self, 'use_correct_aspect')
+
+        self.layout.prop(univ_settings(), 'use_texel')
+        self.layout.prop(self, 'fill_holes')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slim_support: bool = bpy.app.version >= (4, 3, 0)
+        if self.slim_support:
+            self.unwrap = 'MINIMUM_STRETCH'
+
+    def execute(self, context):
+        self.umeshes = utypes.UMeshes()
+        self.umeshes.fix_context()
+
+        # self.umeshes.elem_mode
+        # Legacy
+        if not self.slim_support or self.legacy:
+            self.umeshes.filter_by_selected_uv_by_context()
+            if self.umeshes.sync:
+                if self.umeshes.elem_mode == 'FACE':
+                    self.legacy_sync_relax_faces()
+                else:
+                    self.legacy_sync_relax_verts_or_edges()
+            else:
+                self.relax_non_sync()
+
+            for umesh in self.umeshes:
+                umesh.bm.select_flush_mode()
+
+            self.umeshes.update()
+            # Always return FINISHED for legacy, to avoid not showed property.
+            return {'FINISHED'}
+
+        else:  # SLIM
+            operators = context.window_manager.operators
+            if not operators or operators[-1].name != 'Relax':
+                unwrap.MULTIPLAYER = 1
+                unwrap.UNIQUE_NUMBER_FOR_MULTIPLY = -1
+
+            selected_umeshes, unselected_umeshes = self.umeshes.filtered_by_selected_and_visible_uv_by_context()
+            self.umeshes = selected_umeshes if selected_umeshes else unselected_umeshes
+            if not self.umeshes:
+                return self.umeshes.update()
+
+            if not selected_umeshes and self.max_distance is not None:
+                return self.pick_unwrap(no_flip=True, iterations=self.iterations)
+
+            if not selected_umeshes:
+                self.report({'WARNING'}, 'Need selected geometry')
+                return {'CANCELLED'}
+
+            if self.umeshes.sync:
+                if self.umeshes.elem_mode == 'FACE':
+                    self.unwrap_sync_faces(no_flip=True, iterations=self.iterations)
+                else:
+                    self.unwrap_sync_verts_or_edges(no_flip=True, iterations=self.iterations)
+            else:
+                self.unwrap_non_sync(no_flip=True, iterations=self.iterations)
+
+        return self.umeshes.update()
+
+    def legacy_sync_relax_verts_or_edges(self):
+        # TODO: Ignore relax if selected face exist
+        crn: bmesh.types.BMLoop
+        relax_data: list[RelaxData] = []
+
+        for umesh in self.umeshes:
+            if self.umeshes.elem_mode == 'VERT':
+                selected_elem = utils.calc_selected_verts(umesh)
+            else:
+                selected_elem = utils.calc_selected_3d_edges(umesh)
+
+            uv = umesh.uv
+            islands = AdvIslands.calc_visible(umesh)
+            for isl in islands:
+                isl.mark_seam()
+
+            # Find island border
+            border_corners = set()  # Need restore
+            for v in umesh.bm.verts:
+                if not v.select:
+                    continue
+                if v.is_boundary:
+                    border_corners.update(v.link_loops)
+                    continue
+
+                # TODO: Replace with is_boundary_vert_func
+                has_unlinked = len({crn[uv].uv.copy().freeze() for crn in v.link_loops}) > 1
+                if has_unlinked or any(not crn.face.select for crn in v.link_loops):
+                    border_corners.update(v.link_loops)
+                    continue
+
+                has_hidden = any(not crn.face.select for crn in v.link_loops)
+                if has_hidden:
+                    border_corners.update(v.link_loops)
+
+            # selected_elem is used to restore the selection flags instead faces_to_select.
+            faces_to_select = set()
+            verts_to_select = set()  # TODO: Check without this (Need to verify whether BMFace.select selects linked edges or vertices in different modes.)
+
+            # Expand the element selection so that Unwrap works.
+            for f in utils.calc_unselected_uv_faces_iter(umesh):
+                if sum(v.select for v in f.verts) not in (0, len(f.verts)):
+                    faces_to_select.add(f)
+                    for v in f.verts:
+                        if not v.select:
+                            verts_to_select.add(v)
+
+            # TODO: Check in Blender 5.0 with sync_valid
+            for f in faces_to_select:
+                f.select = True
+            for v in verts_to_select:
+                v.select = True
+
+            if self.umeshes.elem_mode == 'EDGE':  # TODO: Check without this
+                for e in umesh.bm.edges:
+                    e.select = sum(v.select for v in e.verts) == 2
+
+            for f in umesh.bm.faces:
+                for crn in f.loops:
+                    crn[uv].pin_uv = True
+
+            for crn in border_corners:
+                crn[uv].pin_uv = False
+
+
+            save_transform_islands = []
+            for isl in islands:
+                if any(v.select for f in isl for v in f.verts):
+                    save_transform_islands.append(isl.save_transform(flip_if_needed=True))
+
+            # NOTE: Save coords_before after apply flip_if_needed.
+            coords_before = [crn[uv].uv.copy() for crn in border_corners]
+
+            relax_data.append(RelaxData(umesh, selected_elem, coords_before, border_corners, save_transform_islands))
+
+        self.legacy_sync_verts_or_edges_relax_ex(relax_data)
+
+    def legacy_sync_verts_or_edges_relax_ex(self, relax_data: list[RelaxData]):
+        # Relax
+        bpy.ops.uv.minimize_stretch(fill_holes=self.fill_holes, iterations=self.iterations*5)
+        if any(rd.coords_before for rd in relax_data):
+            bpy.ops.uv.unwrap(method='CONFORMAL')
+            # Blend Borders
+            for rd in relax_data:
+                uv = rd.umesh.uv
+                for co, crn in zip(rd.coords_before, rd.border_corners):
+                    crn_uv_co = crn[uv].uv
+                    crn_uv_co[:] = co.lerp(crn_uv_co, self.border_blend)
+        bpy.ops.uv.minimize_stretch(fill_holes=self.fill_holes, iterations=self.iterations*5)
+
+        for rd in relax_data:
+            for isl in rd.save_transform_islands:  # TODO: Weld half selected islands
+                isl.inplace(flip_if_needed=True)
+
+                utils.set_global_texel(isl.island)  # Set Texel without rotate check.
+
+        bpy.ops.uv.select_all(action='DESELECT')
+
+        for rd in relax_data:
+            for elem in rd.selected_elem:
+                elem.select = True
+
+        for rd in relax_data:
+            uv = rd.umesh.uv
+            for f in rd.umesh.bm.faces:
+                for crn in f.loops:
+                    crn[uv].pin_uv = False
+
+    def legacy_sync_relax_faces(self):
+        assert self.umeshes.elem_mode == 'FACE'
+        from ..utils import linked_crn_uv_unordered_included, shared_is_linked
+
+        relax_data: list[RelaxData] = []
+        for umesh in self.umeshes:
+            uv = umesh.uv
+            islands = AdvIslands.calc_extended(umesh)
+
+            for isl in islands:
+                isl.mark_seam()
+
+            to_select = set()
+            border_corners = set()
+            # Find border from selection corners
+            for f in utils.calc_selected_uv_faces(umesh):
+                for crn in f.loops:
+                    linked_crn = linked_crn_uv_unordered_included(crn, uv)
+                    border = False
+                    for l_crn in linked_crn:
+                        if l_crn.face.hide:
+                            continue
+
+                        pair_crn = l_crn.link_loop_radial_prev
+                        if pair_crn == l_crn:
+                            border = True
+                            continue
+
+                        next_face = pair_crn.face
+                        if next_face.select:
+                            continue
+                        if next_face.hide:
+                            border = True
+                            continue
+
+                        if shared_is_linked(pair_crn, l_crn, uv):
+                            to_select.add(pair_crn.face)
+                        border = True
+                    if border:
+                        border_corners.update(linked_crn)
+
+            for f in to_select:
+                f.select = True
+
+            for f in umesh.bm.faces:
+                for crn in f.loops:
+                    crn[uv].pin_uv = True
+
+            for crn in border_corners:
+                crn[uv].pin_uv = False
+
+            save_transform_islands = []
+            for isl in islands:
+                save_transform_islands.append(isl.save_transform(flip_if_needed=True))
+
+            # NOTE: Save coords_before after apply flip_if_needed.
+            coords_before = [crn[uv].uv.copy() for crn in border_corners]
+
+            relax_data.append(RelaxData(umesh, to_select, coords_before, border_corners, save_transform_islands))
+
+        self.legacy_non_sync_or_sync_faces_relax_ex(relax_data)
+
+    def legacy_non_sync_or_sync_faces_relax_ex(self, relax_data: list[RelaxData]):
+        # Relax
+        bpy.ops.uv.minimize_stretch(fill_holes=self.fill_holes, iterations=self.iterations*5)
+        if any(rd.coords_before for rd in relax_data):
+            bpy.ops.uv.unwrap(method='CONFORMAL')
+            # Blend Borders
+            for rd in relax_data:
+                uv = rd.umesh.uv
+                for co, crn in zip(rd.coords_before, rd.border_corners):
+                    crn_uv = crn[uv]
+                    crn_uv.uv = co.lerp(crn_uv.uv, self.border_blend)
+        bpy.ops.uv.minimize_stretch(fill_holes=self.fill_holes, iterations=self.iterations*5)
+
+
+        for rd in relax_data:
+            for isl in rd.save_transform_islands:  # TODO: Fix, weld half selected islands
+                isl.inplace(flip_if_needed=True)
+
+                utils.set_global_texel(isl.island)  # Set Texel without rotate check.
+
+            for elem in rd.selected_elem:
+                elem.select = False
+
+            rd.remove_all_pins_from_umesh()
+
+    def relax_non_sync(self):
+        from ..utils import linked_crn_uv_unordered, is_boundary_func, vert_select_get_func, is_visible_func
+
+        relax_data: list[RelaxData] = []
+        for umesh in self.umeshes:
+            is_boundary = is_boundary_func(umesh)
+            is_vert_select = vert_select_get_func(umesh)
+            is_visible = is_visible_func(umesh.sync)
+            uv = umesh.uv
+            islands = AdvIslands.calc_extended_any_elem(umesh)
+
+            for isl in islands:
+                isl.mark_seam()
+
+            border_corners_for_unwrap = set()
+
+            for f in utils.calc_selected_uv_faces(umesh):
+                for crn in f.loops:
+                    if is_vert_select(crn) and is_boundary(crn):
+                        border_corners_for_unwrap.add(crn)
+                        for l_crn in linked_crn_uv_unordered(crn, uv):
+                            if is_visible(l_crn.face):
+                                border_corners_for_unwrap.add(l_crn)
+
+            for f in umesh.bm.faces:
+                for crn in f.loops:
+                    crn[uv].pin_uv = True
+
+            for l_crn in border_corners_for_unwrap:
+                l_crn[uv].pin_uv = False
+
+            save_transform_islands = []
+            for isl in islands:
+                save_transform_islands.append(isl.save_transform(flip_if_needed=True))
+
+            # NOTE: Save coords_before after apply flip_if_needed.
+            coords_before = [crn[uv].uv.copy() for crn in border_corners_for_unwrap]
+
+            relax_data.append(RelaxData(umesh, [], coords_before, border_corners_for_unwrap, save_transform_islands))
+
+        self.legacy_non_sync_or_sync_faces_relax_ex(relax_data)
+
+
+# noinspection PyTypeHints
+class UNIV_OT_Relax_VIEW3D(unwrap.UNIV_OT_Unwrap_VIEW3D):
+    bl_idname = "mesh.univ_relax"
+    bl_label = "Relax"
+    bl_description = "Warning: Incorrect behavior with flipped islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    unwrap: bpy.props.StringProperty(default='MINIMUM_STRETCH', options={'HIDDEN'})
+    iterations: bpy.props.IntProperty(name='Iterations', default=20, min=5, max=150, soft_max=50)
+
+    def draw(self, context):
+        if unwrap.MULTIPLAYER != 1:
+            self.layout.label(text=f'Multiplayer: x{unwrap.MULTIPLAYER}')
+        self.layout.prop(self, 'iterations', slider=True)
+
+        self.layout.prop(univ_settings(), 'use_texel')
+        self.layout.prop(self, 'fill_holes')
+        self.layout.prop(self, 'use_correct_aspect')
+
+    def execute(self, context):
+        operators = context.window_manager.operators
+        if not operators or operators[-1].name != 'Relax':
+            unwrap.MULTIPLAYER = 1
+            unwrap.UNIQUE_NUMBER_FOR_MULTIPLY = -1
+
+        self.umeshes = utypes.UMeshes.calc(self.report, verify_uv=False)
+
+        self.umeshes.fix_context()
+        self.umeshes.set_sync()
+        self.umeshes.sync_invalidate()
+
+        from ..preferences import univ_settings
+        self.texel = univ_settings().texel_density
+        self.texture_size = (int(univ_settings().size_x) + int(univ_settings().size_y)) / 2
+
+        if self.use_correct_aspect:
+            self.umeshes.calc_aspect_ratio(from_mesh=True)
+
+        if self.unwrap == 'MINIMUM_STRETCH' and bpy.app.version < (4, 3, 0):
+            self.report({'WARNING'}, 'Relax is not supported in Blender versions below 4.3')
+            return {'CANCELLED'}
+
+        selected_umeshes, unselected_umeshes = self.umeshes.filtered_by_selected_and_visible_uv_by_context()
+        self.umeshes = selected_umeshes if selected_umeshes else unselected_umeshes
+        if not self.umeshes:
+            return self.umeshes.update()
+
+        if not selected_umeshes and self.mouse_pos_from_3d:
+            return self.pick_unwrap(no_flip=True, iterations=self.iterations)
+        else:
+            if not selected_umeshes:
+                self.report({'WARNING'}, 'Need selected geometry')
+                return {'CANCELLED'}
+
+            for u in reversed(self.umeshes):
+                if not u.has_uv and not u.total_face_sel:
+                    self.umeshes.umeshes.remove(u)
+            if not self.umeshes:
+                self.report({'WARNING'}, 'Need selected faces for objects without uv')
+                return {'CANCELLED'}
+
+            self.unwrap_selected(no_flip=True, iterations=self.iterations)
+            self.umeshes.update()
+            return {'FINISHED'}

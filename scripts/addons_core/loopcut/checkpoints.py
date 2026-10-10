@@ -5,7 +5,8 @@ current state (including manual edits made since), so a restore is itself a chec
 be undone. The user's own .blend on disk is never written to.
 
 A snapshot is a compressed copy-save of the whole .blend. One is taken per user message, lazily,
-right before the first scene-changing step of that turn, so chat-only turns cost nothing.
+right before the first scene-changing step of that turn, so chat-only turns cost nothing, and one
+before each merge of a wave of workers (kind "wave"), which restores to before that wave was asked for.
 
 In the Loopcut build of Blender a snapshot is a recovery file (wm.loopcut_snapshot_write): it
 records the path of the file it was taken from, so restoring it (wm.loopcut_snapshot_restore)
@@ -188,6 +189,16 @@ def ensure_for_turn(session: dict) -> None:
     session["pending_checkpoint"] = None
 
 
+def ensure_for_wave(session: dict, label: str, message_index: int, item_index: int) -> str:
+    """Main thread, as a wave's workers start (waves.prepare): snapshot the scene and return the
+    checkpoint's id, which each of the wave's merges names. message_index and item_index point at the
+    orchestrator's delegate message and the wave card, so restoring puts the scene back to before the
+    delegate call, every merge of the wave undone, and cuts the conversation to just before the wave
+    was asked for. Raises CheckpointError; the wave must not start without one."""
+    entry = _write_snapshot(_store(session), "wave", label, message_index=message_index, item_index=item_index)
+    return entry["id"]
+
+
 def status(session: dict, checkpoint_id: str) -> str:
     """'ok' | 'expired' | 'missing', for the UI."""
     try:
@@ -195,6 +206,31 @@ def status(session: dict, checkpoint_id: str) -> str:
     except CheckpointError:
         return "missing"
     return "expired" if entry["expired"] else "ok"
+
+
+def bundle_from_checkpoint(session: dict, checkpoint_id: str, staging_dir) -> dict:
+    """Collect one indexed checkpoint without opening it in the live Blender. No upload.
+
+    Return {manifest, missing, unsupported, system}; callers can review dependencies.
+    Recovery files preserve source-relative paths, while stock copy-saves rebase them.
+    """
+    from . import bundles
+    import threading
+    if threading.current_thread() is threading.main_thread():
+        store = _store(session)
+    else:
+        from . import mainthread
+        store = mainthread.run_on_main(lambda: _store(session)).result(timeout=30)
+    entry = store.get(checkpoint_id)
+    snapshot = store.snapshot_path(checkpoint_id)
+    if entry["expired"] or not snapshot.is_file():
+        raise CheckpointError("That checkpoint has expired to stay within the storage budget.")
+    original = entry.get("source", "") if entry.get("in_place", False) else None
+    info = bundles.collect(snapshot, staging_dir, original_path=original)
+    info["created_at"] = bundles._timestamp(entry["created"])
+    source = {"kind": "checkpoint", "session": session["id"], "checkpoint": checkpoint_id}
+    return {"manifest": bundles.manifest(staging_dir, info, source),
+            "missing": info["missing"], "unsupported": info["unsupported"], "system": info["system"]}
 
 
 def _blocking_job() -> str | None:
@@ -263,6 +299,9 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
         del session["messages"][cut_messages:]
         del session["items"][cut_items:]
         session["input"], session["cursor"], session["anchor"] = text, len(text), None
+    elif target["kind"] == "wave":  # Mid-turn: back to before the delegate call, the input left alone.
+        del session["messages"][cut_messages:]
+        del session["items"][cut_items:]
     else:
         tail_file = store.tail_path(checkpoint_id)
         saved = json.loads(tail_file.read_text(encoding="utf-8")) if tail_file.is_file() else None

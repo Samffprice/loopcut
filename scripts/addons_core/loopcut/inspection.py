@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 
-from . import checkpoints, job_tools, jobs
+from . import checkpoints, cost_guard, job_tools, jobs
 from .tools import ToolError, ToolResult
 
 PURPOSES = {"geometry", "materials", "final_lighting"}
@@ -20,21 +20,21 @@ _generation = 0
 
 SCHEMAS = [{"type": "function", "function": {
     "name": "inspect_scene",
-    "description": "Inspect named cameras and frames in one annotated contact sheet (max 12 views). "
-    "geometry uses Workbench; materials uses an EEVEE studio-light rig; final_lighting uses the scene's "
-    "actual engine and lighting, capped in resolution and samples. Renders in a background copy; "
-    "leaves camera, frame, selection and editors untouched. Asks once for this bounded inspection. "
-    "A scene edit while rendering rejects the stale image. Focus names are labeled; without a camera, "
-    "a temporary camera frames them. Named cameras keep their original composition.",
+    "description": "Inspect named cameras and frames in one annotated contact sheet (max 12 views), each "
+    "view's exposure and colour in numbers. geometry uses Workbench; materials an EEVEE studio-light rig; "
+    "final_lighting the scene's own engine and lighting, capped in resolution and samples. Renders a "
+    "background copy; changes nothing. A scene edit while rendering rejects the stale image. Focus names "
+    "are labeled; without a camera, a temporary camera frames them.",
     "parameters": {"type": "object", "properties": {
         "purpose": {"type": "string", "enum": sorted(PURPOSES)},
         "cameras": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
         "frames": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 5,
                    "description": "Defaults to the current frame. For animation inspect first/middle/last or meaningful phases."},
         "focus": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
-        "max_side": {"type": "integer", "minimum": 128, "maximum": 640, "description": "Per-view limit; default 384. Sheet stays within 1536px."},
-        "samples": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Default 16; never final production quality."},
-        "budget_seconds": {"type": "integer", "minimum": 5, "maximum": 180, "description": "Worker render budget; scene-copy preparation is extra. Default 90."},
+        "max_side": {"type": "integer", "minimum": 128, "maximum": 640, "description": "Per view; default 384"},
+        "samples": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Default 16"},
+        "budget_seconds": {"type": "integer", "minimum": 5, "maximum": 180, "description": "Default 90"},
+        "view_layer": {"type": "string"},
     }, "required": ["purpose"]}}}]
 
 
@@ -103,20 +103,30 @@ def validate_request(purpose, cameras, frames, focus, max_side, samples, budget_
 
 
 def inspect_scene(purpose: str, cameras=None, frames=None, focus=None, max_side=384, samples=16,
-                  budget_seconds=90) -> ToolResult:
+                  budget_seconds=90, view_layer="") -> ToolResult:
+    """view_layer: the one rendered and measured in (view_layers.production: else the active one
+    when it renders, else the first that renders). Its name goes to the job, whose own Blender has
+    no idea which layer the user had active."""
     import bpy
+    from . import view_layers
     scene = bpy.context.scene
     cameras = ([scene.camera.name] if scene.camera else []) if cameras is None else cameras
     frames = [scene.frame_current] if frames is None else frames
     focus = [] if focus is None else focus
     try:
         validate_request(purpose, cameras, frames, focus, max_side, samples, budget_seconds)
+        refusal = cost_guard.render_refusal()  # The worker renders at render levels, whatever the engine.
+        if refusal:
+            raise ToolError(refusal)
         for name in cameras:
             if name not in scene.objects or scene.objects[name].type != "CAMERA":
                 raise jobs.JobError(f"Camera {name!r} is not in this scene.")
         for name in focus:
             if name not in scene.objects:
                 raise jobs.JobError(f"Focus object {name!r} is not in this scene.")
+        if not isinstance(view_layer, str):
+            raise jobs.JobError("view_layer is a view layer's name.")
+        layer = view_layers.production(scene, view_layer)
         register()
         # Reserve the footer before sizing renders, keeping text readable without scaling the sheet.
         scale = min(max_side / max(scene.render.resolution_x, scene.render.resolution_y),
@@ -128,7 +138,8 @@ def inspect_scene(purpose: str, cameras=None, frames=None, focus=None, max_side=
         spec, path = job_tools.create_spec(str(Path(bpy.app.tempdir).resolve()), sorted(frames), budget_seconds,
                                            camera=cameras[0] if cameras else None, width=width, height=height,
                                            samples=samples, _allow_no_camera=True, _engine=engine)
-        spec.update(kind="inspection", purpose=purpose, cameras=cameras, focus=focus,
+        spec.update(kind="inspection", purpose=purpose, cameras=cameras, focus=focus, view_layer=layer.name,
+                    view_layer_asked=bool(view_layer),
                     camera=cameras[0] if cameras else "Automatic focus view",
                     engine=engine,
                     source_engine=scene.render.engine, output=str(path / "output"),

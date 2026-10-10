@@ -130,6 +130,9 @@ def _run_sign_in() -> None:
             raise AccountError("The sign-in reply was incomplete")
         _state.update(status="waiting", user_code=user_code, url=url, error="")
         _redraw()
+        if _cancel.is_set():
+            _state.update(status="idle", user_code="", url="")
+            return
         open_browser(url)
         deadline = time.monotonic() + 15 * 60
         while time.monotonic() < deadline:
@@ -138,23 +141,28 @@ def _run_sign_in() -> None:
                 _redraw()
                 return
             polled = _post("/api/device/poll", {"device_code": device_code})
+            if _cancel.is_set():
+                _state.update(status="idle", user_code="", url="")
+                return
             outcome = polled.get("status")
             if outcome == "pending":
                 continue
             if outcome == "approved" and polled.get("api_key"):
                 key = str(polled["api_key"])
-                mainthread.run_on_main(lambda: _store_key(key)).result()
+                mainthread.run_on_main(lambda: None if _cancel.is_set() else _store_key(key)).result()
                 _state.update(status="idle", user_code="", url="", error="")
                 _refresh_account(key)
                 return
             raise AccountError("Sign-in was denied" if outcome == "denied" else "The sign-in code expired; try again")
         raise AccountError("The sign-in code expired; try again")
     except AccountError as ex:
-        _state.update(status="error", error=str(ex), user_code="", url="")
+        print(f"Loopcut: sign-in failed: {ex}")
+        _state.update(status="error", error=str(ex) + ". Try Sign in to Loopcut again, or use another route.", user_code="", url="")
     except Exception as ex:  # Worker thread: show it rather than lose it.
         import traceback
         traceback.print_exc()
-        _state.update(status="error", error=f"Internal error: {ex!r}", user_code="", url="")
+        _state.update(status="error", error="Sign-in could not finish. Try Sign in to Loopcut again, or use another route.",
+                      user_code="", url="")
     finally:
         _redraw()
 
@@ -167,6 +175,10 @@ def _store_key(key: str) -> None:
     if prefs is not None and prefs.provider != "LOOPCUT":
         prefs.provider = "LOOPCUT"
     settings.config_changed()
+    try:
+        bpy.ops.wm.save_userpref()
+    except RuntimeError as ex:
+        print(f"Loopcut: could not save preferences after sign-in: {ex}")
     for callback in list(on_signed_in):
         try:
             callback()
@@ -229,7 +241,7 @@ def models() -> list[dict]:
             parts.append(f"{multiplier:g}x usage")
         unlock = r.get("unlock_plan") or {}
         if not r.get("available", True):
-            parts.append(f"{unlock.get('name') or 'a higher'} plan")
+            parts.append("Unavailable" if config.BETA else f"{unlock.get('name') or 'a higher'} plan")
         out.append({"id": str(r["id"]), "label": str(r.get("display_name") or r["id"]),
                     "blurb": str(r.get("blurb") or ""), "note": "  ·  ".join(parts),
                     "available": bool(r.get("available", True)),
@@ -245,7 +257,7 @@ def keeps_context(base_url: str, model_id: str) -> bool:
     """Whether the service lists this model with keep_context: its upstream's cache rewards only
     requests that extend the previous one whole, so context.py must not rewrite a turn."""
     return base_url.rstrip("/") == BASE_URL and any(
-        r.get("id") == model_id and r.get("keep_context") is True for r in _state["models"])
+        r.get("id") == model_id and r.get("keep_context") is True for r in (_state["models"] or []))
 
 
 def model_label(model_id: str) -> str:
@@ -312,6 +324,8 @@ def sign_out() -> None:
     _set_account(None)
     _state.update(error="", status="idle", models=None, default_model="fast")
     settings.config_changed()
+    from . import cloud
+    cloud.refresh_async()
 
 
 def refresh_account() -> None:
@@ -328,7 +342,7 @@ def account_line() -> str:
     if not account:
         return "Signed in"
     who = account.get("email") or "Signed in"
-    plan = str(account.get("plan") or "").capitalize()
+    plan = "" if config.BETA else str(account.get("plan") or "").capitalize()  # The beta has no plans to show.
     return f"{who}  ·  {plan} plan" if plan else who
 
 
@@ -428,6 +442,7 @@ def draw(column) -> None:
         return
     if state["status"] == "starting":
         column.label(text="Contacting Loopcut…")
+        column.operator("loopcut.cancel_sign_in", text="Cancel")
         return
     if signed_in():
         row = column.row(align=True)
@@ -436,7 +451,7 @@ def draw(column) -> None:
         for line in usage_lines():
             column.label(text=line)
         row = column.row(align=True)
-        row.operator("wm.url_open", text="Account and Billing").url = f"{SERVICE_URL}/account"
+        row.operator("wm.url_open", text="Account" if config.BETA else "Account and Billing").url = f"{SERVICE_URL}/account"
         row.operator("loopcut.sign_out")
     else:
         column.operator("loopcut.sign_in", icon="USER")

@@ -42,7 +42,8 @@ def main() -> int:
 
     # create temporary package dir
     try:
-        shutil.copytree(install_dir, package_dir)
+        shutil.copytree(install_dir, package_dir,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
 
         for f in os.listdir(package_dir):
             if f.startswith('makes'):

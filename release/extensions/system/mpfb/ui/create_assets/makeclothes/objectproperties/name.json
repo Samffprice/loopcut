@@ -1,0 +1,8 @@
+{
+    "type": "string",
+    "name": "name",
+    "description": "The name of this asset. This will be used when autogenerating a file name for the asset library. It will also be written to the mhclo and be used in, for example, exports from Makehuman",
+    "label": "Name",
+    "default": "new_clothes",
+    "aliases": ["MhClothesName"]
+}

@@ -15,20 +15,29 @@ _PACKAGE = __package__
 _ROOT = Path(__file__).parent
 # Dependency order: a module comes after everything it imports.
 # state (the session) and settings (registered preferences) are left alone on purpose.
-_MODULES = ("config", "credentials", "llm", "context", "scene_diff", "object_info", "api_docs", "tools", "scene_context",
+_MODULES = ("config", "prompt_index", "skills.loader", "skills", "credentials", "llm", "context", "cost_guard", "scene_diff", "object_info", "api_docs", "tools", "scene_context",
             "checkpoints", "conversations", "agent", "ui.theme", "ui.textedit", "ui.layout", "ui.draw", "ui.host")
 _INTERVAL = 0.4
-_mtimes: dict[str, float] = {}
+_mtimes: dict[str, tuple] = {}
 
 
 def _path(name: str) -> Path:
-    return _ROOT / (name.replace(".", "/") + ".py")
+    path = _ROOT / name.replace(".", "/")
+    return path / "__init__.py" if path.is_dir() else path.with_suffix(".py")
+
+
+def _mtime(name: str) -> tuple:
+    """Skill bodies share their loader's reload boundary so its cache is discarded first."""
+    paths = [_path(name)]
+    if name == "skills.loader":
+        paths.extend((_ROOT / "skills").rglob("*.md"))
+    return tuple((str(path), path.stat().st_mtime_ns) for path in sorted(paths))
 
 
 def _changed() -> list[str]:
     changed = []
     for name in _MODULES:
-        mtime = _path(name).stat().st_mtime
+        mtime = _mtime(name)
         if _mtimes.get(name) not in (None, mtime):
             changed.append(name)
         _mtimes[name] = mtime

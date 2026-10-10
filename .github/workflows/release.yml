@@ -25,6 +25,8 @@ on:
         default: ""
 
 env:
+  # Python build helpers must not add caches to the source/install trees.
+  PYTHONDONTWRITEBYTECODE: "1"
   # Goes into file names and shell commands, so it is passed as data and checked, never pasted into a script.
   RELEASE_TAG: ${{ inputs.release_tag }}
 
@@ -166,6 +168,7 @@ jobs:
           cpack -G WIX || echo WiX packaging failed, shipping the zip only
 
       # The kernel step above may fail without failing the run; say so where it cannot be missed.
+      # Runs after CPack: Blender's isolated Python can create runtime caches.
       - name: Smoke test the build
         run: |
           tr -d '\r' < build/CMakeCache.txt | grep -q '^CMAKE_BUILD_TYPE:STRING=Release$' || { echo "::error title=Not a Release build::CMAKE_BUILD_TYPE is not Release; the package would need the debug C runtime."; exit 1; }

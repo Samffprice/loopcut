@@ -1,0 +1,11 @@
+# Internal client-track planning and logs stay in the private development repository.
+loopcut/track/
+# The eval harness and tests dedicated to it stay private; add-on checks and other tests stay public.
+loopcut/harness/evals/
+loopcut/tests/test_eval_*.py
+loopcut/tests/test_chatgpt_eval.py
+loopcut/tests/test_codex_answer.py
+# Managed server code belongs to the private platform repository.
+loopcut-web/
+# Third-party captures must never enter a public snapshot.
+mixar-research/

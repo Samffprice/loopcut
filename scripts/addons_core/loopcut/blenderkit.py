@@ -1,4 +1,4 @@
-"""BlenderKit (Blendkit) as two tools: search and import.
+"""BlenderKit (Blendkit): search and import, source blenderkit of assets.py's tools.
 
 The largest library Loopcut can reach: tens of thousands of free models, materials and HDRIs
 need no account at all (search is public and free assets download anonymously), and a user's own
@@ -40,37 +40,6 @@ DEFAULT_RESOLUTION = "1k"
 DEFAULT_LIMIT = 8
 MAX_LIMIT = 12
 LICENSES = {"royalty_free": "Royalty Free (commercial use, no credit needed)", "cc_zero": "CC0"}
-
-SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
-    {"type": "function", "function": {
-        "name": "search_blenderkit",
-        "description": (
-            "Search BlenderKit, the largest library: models (furniture, props, vehicles, plants, "
-            "characters), PBR materials and HDRIs, realistic and stylised. Tens of thousands are free "
-            "with no account; a Full-plan key in preferences unlocks the rest. Returns numbered matches "
-            "with a thumbnail sheet; then import_blenderkit(asset_id)."),
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Words to match: 'office chair', 'oak floor', 'overcast sky'"},
-            "type": {"type": "string", "enum": list(TYPES)},
-            "limit": {"type": "integer", "description": f"Default {DEFAULT_LIMIT}, max {MAX_LIMIT}"},
-        }, "required": ["query", "type"]},
-    }},
-    {"type": "function", "function": {
-        "name": "import_blenderkit",
-        "description": (
-            "Download and import a BlenderKit asset by id. A model arrives as a collection at the "
-            "origin in meters (the result gives its bounds: place it); a material is applied to "
-            "`apply_to` objects; an HDRI becomes the scene world. Files are cached; 1k suits previews, "
-            "2k final renders."),
-        "parameters": {"type": "object", "properties": {
-            "asset_id": {"type": "string", "description": "The id from search_blenderkit"},
-            "resolution": {"type": "string", "enum": list(RESOLUTIONS), "description": f"Default {DEFAULT_RESOLUTION}"},
-            "apply_to": {"type": "array", "items": {"type": "string"},
-                         "description": "Materials only: objects to give the material"},
-        }, "required": ["asset_id"]},
-    }},
-]
-
 
 # ------------------------------------------------------------------ pure helpers (unit tested)
 
@@ -216,7 +185,7 @@ def search_blenderkit(query: str, type: str, limit: int = DEFAULT_LIMIT) -> Tool
     text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {query!r} ({scope}), "
             f"numbered as on the sheet (left to right, top to bottom):\n" + "\n".join(lines))
     if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_blenderkit(asset_id)."
+        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=blenderkit, id)."
     if any(not a.get("canDownload", True) for a in results):
         text += f"\nFull-plan assets need the user's BlenderKit key ({PLANS})."
     return ToolResult(_clip(text), image_path=image)
@@ -242,14 +211,27 @@ def _tag(blocks, asset: dict) -> None:
             print(f"Loopcut: could not tag {block.name}: {ex}")
 
 
-def import_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply_to: list[str] | None = None) -> ToolResult:
-    if not valid_slug(str(asset_id)):
-        raise ToolError("asset_id is the id from search_blenderkit: letters, digits, _ and - only.")
-    resolution = resolution or DEFAULT_RESOLUTION
+def _check_apply_to(apply_to) -> list[str]:
     apply_to = apply_to or []
     missing = [n for n in apply_to if n not in bpy.data.objects]
     if missing:
         raise ToolError(f"No such object(s) to apply to: {', '.join(missing)}")
+    return apply_to
+
+
+def import_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply_to: list[str] | None = None) -> ToolResult:
+    if not valid_slug(str(asset_id)):
+        raise ToolError("id is the id search_assets gave: letters, digits, _ and - only.")
+    _check_apply_to(apply_to)  # Before any download, as the user sees it.
+    return load_blenderkit(fetch_blenderkit(asset_id, resolution, apply_to), apply_to)
+
+
+def fetch_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply_to: list[str] | None = None) -> dict:
+    """import_blenderkit's network half (a worker's parent runs it, on the main thread: the scene id
+    lives on the live scene). The key never leaves it; what load_blenderkit needs, JSON-able."""
+    if not valid_slug(str(asset_id)):
+        raise ToolError("id is the id search_assets gave: letters, digits, _ and - only.")
+    resolution = resolution or DEFAULT_RESOLUTION
     asset = _asset(str(asset_id))
     kind = str(asset.get("assetType") or "")
     if kind not in TYPES:
@@ -262,7 +244,18 @@ def import_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply
         raise ToolError(f"{asset.get('name')!r} publishes no downloadable file")
     file_type, file = picked
     path = _fetch(asset, file, cache_root() / str(asset_id) / file_type)
-    name = str(asset.get("name") or asset_id)
+    author = {"fullName": str((asset.get("author") or {}).get("fullName") or "")}
+    return {"id": str(asset_id), "kind": kind, "path": str(path), "file_type": file_type,
+            "name": str(asset.get("name") or asset_id),
+            "asset": {"id": asset.get("id"), "assetBaseId": asset.get("assetBaseId"), "name": asset.get("name"),
+                      "license": asset.get("license"), "author": author}}
+
+
+def load_blenderkit(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
+    """import_blenderkit's scene half (a worker's child runs it): the downloaded file, no network."""
+    apply_to = _check_apply_to(apply_to)
+    kind, name, file_type, asset = fetched["kind"], fetched["name"], fetched["file_type"], fetched["asset"]
+    path = Path(fetched["path"])
     if kind == "hdr":
         world = asset_common.hdri_world(name, path)
         _tag([world], asset)
@@ -309,6 +302,3 @@ def import_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply
     rows = [object_summary(obj) for obj in imported]
     return ToolResult(_clip(f"Imported {name!r} ({file_type}) as {len(imported)} object(s) at the origin, in meters. "
                             f"Place it now. {credit_line(asset)}\n" + json.dumps(rows, separators=(",", ":"), default=str)))
-
-
-DISPATCH = {"search_blenderkit": search_blenderkit, "import_blenderkit": import_blenderkit}

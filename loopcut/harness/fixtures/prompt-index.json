@@ -1,0 +1,12 @@
+{
+  "prompts": {
+    "version": "000000000000",
+    "items": {
+      "single": {"chars": 64},
+      "orchestrator": {"chars": 64},
+      "worker": {"chars": 64},
+      "router": {"chars": 64}
+    }
+  },
+  "skills": []
+}

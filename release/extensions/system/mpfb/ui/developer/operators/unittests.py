@@ -1,0 +1,32 @@
+"""Functionality for running unit tests. See README in the test directory before using this."""
+
+from ....services import LogService
+from ....services import LocationService
+from .... import ClassManager
+from ...mpfboperator import MpfbOperator
+import bpy
+
+_LOG = LogService.get_logger("developer.unittests")
+
+class MPFB_OT_Unit_Tests_Operator(MpfbOperator):
+    """Run unit tests. See console output for results"""
+    bl_idname = "mpfb.unit_tests"
+    bl_label = "Run unit tests"
+    bl_options = {'REGISTER'}
+
+    def get_logger(self):
+        return _LOG
+
+    def hardened_execute(self, context):
+        _LOG.enter()
+        import pytest
+        tests = LocationService.get_mpfb_test("tests")
+        retcode = pytest.main(["-x", tests])
+        if retcode:
+            self.report({'ERROR'}, "Unit tests have finished with error code " + str(retcode) + ". See console output for results.")
+        else:
+            self.report({'INFO'}, "Unit tests have finished without error. See console output for results.")
+
+        return {'FINISHED'}
+
+ClassManager.add_class(MPFB_OT_Unit_Tests_Operator)

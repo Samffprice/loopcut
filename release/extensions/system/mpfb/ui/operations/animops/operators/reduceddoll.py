@@ -1,0 +1,82 @@
+"""Functionality for creating an upload copy for mixamo."""
+
+from .....services import LogService
+from .....services import ObjectService
+from .....services import RigService
+from ..... import ClassManager
+from ....mpfboperator import MpfbOperator
+from ....mpfbcontext import MpfbContext
+from ....pollstrategy import pollstrategy, PollStrategy
+import bpy, math
+
+_LOG = LogService.get_logger("animops.reduceddoll")
+
+@pollstrategy(PollStrategy.ANY_MAKEHUMAN_OBJECT_ACTIVE)
+class MPFB_OT_Reduced_Doll_Operator(MpfbOperator):
+    """Create a reduced copy of the character. The copy will have all clothes and body parts removed, the the helper geometry deleted and all shape keys baked"""
+    bl_idname = "mpfb.reduced_doll"
+    bl_label = "Mixamo reduced doll"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def get_logger(self):
+        return _LOG
+
+    def hardened_execute(self, context):
+        _LOG.enter()
+
+        from ...animops.animopspanel import ANIMOPS_PROPERTIES  # pylint: disable=C0415
+
+        ctx = MpfbContext(context=context, scene_properties=ANIMOPS_PROPERTIES)
+
+        if not ctx.basemesh:
+            self.report({"ERROR"}, "No basemesh found")
+            return {'CANCELLED'}
+
+        if not ctx.rig:
+            self.report({"ERROR"}, "No skeleton found")
+            return {'CANCELLED'}
+
+        base_name = ctx.rig.name
+
+        if ctx.basemesh.parent != ctx.rig:
+            self.report({"ERROR"}, "Basemesh must have rig as parent")
+            return {'CANCELLED'}
+
+        new_skeleton = ctx.rig.copy()
+        new_skeleton.data = ctx.rig.data.copy()
+        new_skeleton.name = base_name + "_reduced"
+
+        new_bm = ctx.basemesh.copy()
+        new_bm.data = ctx.basemesh.data.copy()
+        new_bm.name = base_name + "_body_reduced"
+        new_bm.parent = new_skeleton
+
+        for modifier in new_bm.modifiers:
+            if modifier.type == 'ARMATURE':
+                modifier.object = new_skeleton
+            else:
+                new_bm.modifiers.remove(modifier)
+
+        ObjectService.link_blender_object(new_skeleton)
+        ObjectService.link_blender_object(new_bm, parent=new_skeleton)
+
+        ObjectService.deselect_and_deactivate_all()
+
+        ObjectService.activate_blender_object(new_bm, context=context, deselect_all=True)
+
+        bpy.ops.mpfb.delete_helpers()
+        bpy.ops.mpfb.bake_shapekeys()
+
+        new_skeleton.select_set(True)
+
+        if not "mixamo" in RigService.identify_rig(new_skeleton):
+            self.report({"WARNING"}, "Skeleton is not a mixamo rig. This is probably not suitable for upload to Mixamo.")
+        else:
+            self.report({"INFO"}, "Done")
+
+        if ctx.call_fbx:
+            bpy.ops.export_scene.fbx('INVOKE_DEFAULT', use_selection=True)
+
+        return {'FINISHED'}
+
+ClassManager.add_class(MPFB_OT_Reduced_Doll_Operator)

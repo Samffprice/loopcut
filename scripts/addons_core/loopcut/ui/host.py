@@ -103,18 +103,64 @@ def draw_area() -> None:
     area, region = context.area, context.region
     if not is_host(area):
         return
+    from .. import cloud, cloud_account
+    cloud.panel_seen()
+    prefs = settings.preferences()
     session = state.session()
     model, needs_setup, budget = _config_cached()
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
+    from .. import cloud_jobs
+    from .. import chatgpt_ui, onboarding
+    if any(item["kind"] == "user" for item in session["items"]):
+        onboarding.dismiss_hints()
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
                             "context_budget": budget, "model_options": options, "model_label": settings.model_label(model),
-                            "update": update.banner()})
+                            "hints_dismissed": onboarding.hints_dismissed(),
+                            "sign_in": {"loopcut": account.status(), "chatgpt": chatgpt_ui.status()},
+                            "update": update.banner(), "cloud_jobs": cloud_jobs.ui_rows(),
+                            "service_policy": {key: getattr(prefs, key, default) for key, default in cloud_account.DEFAULTS.items()},
+                            "service_signed_in": bool(cloud._runtime and cloud._runtime.signed_in),
+                            "project_override": cloud_account.project_override(context.scene),
+                            **_cloud_panel_state(session)})
     session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
+
+
+def _cloud_panel_state(session: dict) -> dict:
+    """Defer catalog changes until a turn ends; interest responses can update in place."""
+    from .. import cloud, cloud_account
+    service = cloud_account.panel_data(cloud._runtime)
+    current = cloud.coming_soon()
+    message = service["message"] or cloud.ui_message()
+    if not session["busy"] or "cloud_panel" not in _runtime:
+        _runtime["cloud_panel"] = {"rows": current, "message": message}
+    saved = _runtime["cloud_panel"]
+    responses = {row["name"]: {key: row[key] for key in ("state", "notify_sign_in") if key in row} for row in current}
+    return {"coming_soon": [{**row, **responses.get(row["name"], {})} for row in saved["rows"]],
+            "coming_soon_expanded": _coming_soon_expanded(),
+            "cloud_message": message if message == saved["message"] else "",
+            "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"]}
+
+
+def _coming_soon_expanded() -> bool:
+    """Show extras on first sight; a hidden preference remembers later choices across accounts."""
+    return state.ui.get("coming_soon_expanded", getattr(settings.preferences(), "coming_soon_expanded", True))
+
+
+def _toggle_coming_soon() -> None:
+    expanded = not _coming_soon_expanded()
+    state.ui["coming_soon_expanded"] = expanded
+    prefs = settings.preferences()
+    if prefs is not None:
+        prefs.coming_soon_expanded = expanded
+        try:
+            bpy.ops.wm.save_userpref()
+        except RuntimeError as ex:
+            print(f"Loopcut: could not save Coming soon preference: {ex}")
 
 
 def _draw_trampoline() -> None:
@@ -151,6 +197,8 @@ def _pick_mention(session: dict, index: int) -> None:
 
 def _submit(session: dict) -> None:
     if agent.send(session["input"]):
+        from .. import onboarding
+        onboarding.dismiss_hints()
         textedit.set_text(session, "")
     state.ui["mentions"] = []
 
@@ -183,6 +231,7 @@ def _filter_picker() -> None:
 
 def _close_popups() -> None:
     state.ui["picker"], state.ui["model_menu"] = None, False
+    state.ui["service_settings"] = False
 
 
 def _pick_from_picker(session: dict, index: int) -> None:
@@ -246,6 +295,7 @@ def _do_action(session: dict, action) -> None:
     elif kind == "picker_pick":
         _pick_from_picker(session, index)
     elif kind == "model_menu":
+        state.ui["service_settings"] = False
         state.ui["model_menu"] = not state.ui.get("model_menu")
         state.ui["picker"] = None
     elif kind == "model_pick":
@@ -254,14 +304,82 @@ def _do_action(session: dict, action) -> None:
         config_changed()
     elif kind == "noop":
         pass
+    elif kind == "cloud_interest":
+        from .. import cloud
+        cloud.record_interest(index)
+    elif kind == "cloud_toggle":
+        _toggle_coming_soon()
+    elif kind == "cloud_page":
+        state.ui["coming_soon_start"] = index
+    elif kind == "service_settings":
+        state.ui["service_settings"] = not state.ui.get("service_settings")
+        state.ui["model_menu"], state.ui["picker"] = False, None
+    elif kind == "service_toggle":
+        prefs = settings.preferences()
+        if prefs is not None:
+            setattr(prefs, index, not getattr(prefs, index))
+    elif kind == "project_generation":
+        from .. import cloud, cloud_account
+        cloud_account.set_project_override(bpy.context.scene, index)
+        cloud.sync_settings()
+    elif kind == "cloud_upgrade" and not config.BETA:
+        from .. import cloud_http
+        url = session["items"][index]["cloud_error"]["upgrade"]
+        cloud_http.validate_url(url)
+        account.open_browser(url)
+    elif kind == "cloud_dismiss":
+        from .. import cloud
+        cloud.dismiss_ui_message(index)
+    elif kind == "sign_in":
+        if index == "chatgpt":
+            bpy.ops.loopcut.chatgpt_sign_in()
+        else:
+            bpy.ops.loopcut.sign_in()
+    elif kind == "sign_in_new":
+        bpy.ops.loopcut.chatgpt_sign_in(new_account=True)
+    elif kind == "sign_in_copy":
+        if index == "chatgpt":
+            bpy.ops.loopcut.chatgpt_copy_link()
+        else:
+            bpy.ops.loopcut.copy_sign_in_link()
+    elif kind == "sign_in_cancel":
+        if index == "chatgpt":
+            bpy.ops.loopcut.chatgpt_cancel()
+        else:
+            bpy.ops.loopcut.cancel_sign_in()
+    elif kind == "own_key":
+        _close_popups()
+        from .. import chatgpt_ui
+        account.cancel_sign_in()
+        chatgpt_ui.cancel_sign_in()
+        prefs = settings.preferences()
+        if prefs is not None and prefs.provider in {"LOOPCUT", "CHATGPT"}:
+            prefs.provider = "OPENAI"
+        _open_settings()
+    elif kind == "example_request":
+        if not session["busy"] and 0 <= index < len(layout.EXAMPLE_REQUESTS):
+            textedit.set_text(session, layout.EXAMPLE_REQUESTS[index])
+            session["focused"] = True
+            _close_popups()
     elif kind == "open_settings":
+        state.ui["service_settings"] = False
         _close_popups()
         _open_settings()
     elif kind == "open_url":
-        account.open_browser(session["items"][index]["url"])
+        url = state.notice_for_display(session["items"][index])["url"]
+        if url:
+            account.open_browser(url)
+    elif kind == "guard_show":
+        from .. import cost_guard
+        item = session["items"][index]
+        cost_guard.show_again(item["modifiers"])  # The user's call, even if it is slow to draw.
+        if session.get("turn") is not None:  # A running turn's reads may say something new now.
+            session["turn"].ledger.scene_changed()
+        item["action_label"] = ""
+        conversations.save(session)
     elif kind == "open_account":
         account.open_browser(config.account_url())
-    elif kind == "limit_upgrade":
+    elif kind == "limit_upgrade" and not config.BETA:
         _start_upgrade(session, session["items"][index])
     elif kind == "limit_fast":
         settings.set_tier(account.default_model())
@@ -305,6 +423,14 @@ def _do_action(session: dict, action) -> None:
     elif kind in {"job_cancel", "job_resume", "job_preview", "job_open"}:
         from .. import job_tools
         job_tools.ui_action(kind, index)
+    elif kind == "cloud_job_cancel":
+        from .. import cloud_jobs
+        cloud_jobs.cancel_job(index)
+    elif kind == "worker_cancel":
+        from .. import waves
+        waves.cancel_worker(*index)  # (wave, worker): that worker stops and is not merged; the rest go on.
+    elif kind == "accept_quarantine":
+        _accept_quarantine(session, session["items"][index])
     elif kind == "open_conversation":
         _switch(session, lambda: conversations.load(index))
     elif kind == "new_chat":
@@ -325,9 +451,25 @@ def _do_action(session: dict, action) -> None:
         update.dismiss()
 
 
+def _accept_quarantine(session: dict, item: dict) -> None:
+    """Bring a wave's held-back datablocks into the scene. Clicks arrive on the main thread, which
+    is where merge.accept_quarantine must run."""
+    from .. import merge
+    try:
+        text = merge.accept_quarantine(item["wave"])
+    except (merge.MergeError, RuntimeError) as ex:
+        session["items"].append(state.item_error(f"Could not accept the held-back items: {ex}"))
+        return
+    item["resolved"] = "accepted"
+    session["items"].append(state.item_notice(text))
+    conversations.save(session)
+
+
 def _start_upgrade(session: dict, item: dict) -> None:
     """Open the plans page and wait for the plan to change; then the turn goes on by itself,
     so the user comes back to Blender to find the work under way."""
+    if config.BETA:
+        return
     account.open_browser(item["upgrade"]["url"])
     item["status"] = "waiting"
 
@@ -551,7 +693,7 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         by_word = event.alt or (event.ctrl and sys.platform != "darwin")
         if state.ui.get("picker") is not None and _picker_key(session, event):
             return True
-        if state.ui.get("model_menu") and kind == "ESC":
+        if (state.ui.get("model_menu") or state.ui.get("service_settings")) and kind == "ESC":
             _close_popups()
             return True
         mentions = state.ui.get("mentions") or []
@@ -632,7 +774,8 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
-POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "mention_pick", "open_settings"}
+POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "mention_pick", "open_settings", "service_settings",
+                 "service_toggle", "project_generation"}
 
 
 class LOOPCUT_OT_hover(bpy.types.Operator):

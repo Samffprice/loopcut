@@ -129,6 +129,12 @@ endif()
 set(CPACK_PACKAGE_EXECUTABLES "blender-launcher" "Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
 set(CPACK_CREATE_DESKTOP_LINKS "blender-launcher" "Loopcut ${MAJOR_VERSION}.${MINOR_VERSION}")
 
+# A reused macOS app bundle can already contain caches from an earlier launch.
+# Check the final staging tree, including files copied by install(TARGETS).
+list(APPEND CPACK_PRE_BUILD_SCRIPTS
+  "${CMAKE_SOURCE_DIR}/build_files/cmake/loopcut_release_hygiene.cmake"
+)
+
 include(CPack)
 
 # Target for build_archive.py script, to automatically pass along

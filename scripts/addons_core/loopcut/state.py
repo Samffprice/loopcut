@@ -7,6 +7,9 @@ take the conversation with it.
 
 import time
 import uuid
+from urllib.parse import urlsplit
+
+from . import config
 
 _session: dict | None = None
 restoring = False  # True while checkpoints.restore loads a file, so that load is not taken for the user's.
@@ -38,11 +41,27 @@ def new_session() -> dict:
         "projects": [],                  # conversations.project_key of every file this has worked in.
         "title": "",
         "created": time.time(),
+        "mode": "",                      # "workspace": this conversation's single agent has a workspace (agent._configure).
+        "codex_thread": "",              # LOOPCUT_CODEX_APP: the Codex thread this conversation continues (codex_app.py).
         "auto_run": False,               # "Always allow" for this conversation; never saved.
         "auto_heavy": False,             # "Always allow renders" (and bakes) likewise.
+        "contact_watch": [],             # check_contact pairs run_python measures again; never saved.
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},
+        # The same by role once the orchestrator hands work to workers: {role: {input, cached, output,
+        # requests}}; "usage" stays the sum. turn_levels: {turn, first, final} per turn (agent.py);
+        # jobs: one JobLog per turn that delegated (waves.py). Read by the evals; never saved.
+        "usage_by_role": {},
+        "turn_levels": [],
+        "routing": None,                 # The router's last decision (router.Decision.record); never saved.
+        "jobs": [],
+        # The orchestrator's own run_python edits to worker-built objects' meshes or materials
+        # (orchestrator.edit_note): {turn, objects: {name: worker}} each. Read by the evals; never saved.
+        "worker_edits": [],
+        "checks": {},                    # Checks the finish gate carries to later turns: label -> check (waves.Job). Never saved.
+        "snapshots": {},                 # The checks tool's snapshots: id -> {turn, objects: {name: record}}. Never saved.
+        "turn_number": 0,                # Turns started with send(); what turn_levels and jobs call "turn".
         "token_ratio": 0.0,              # context.calibrate: reported / estimated tokens. Never saved.
         "mention": 0,                    # Highlighted row of the @-mention list.
     }
@@ -87,12 +106,32 @@ def item_notice(text: str, action_label: str = "", checkpoint: str = "", url: st
     return {"kind": "notice", "text": text, "action_label": action_label, "checkpoint": checkpoint, "url": url}
 
 
+def notice_for_display(item: dict) -> dict:
+    """Old conversations may retain the pre-beta low-allowance purchase notice."""
+    if config.BETA and urlsplit(item.get("url", "")).path.rstrip("/") in {"/pricing", "/checkout"}:
+        return {**item, "text": item["text"].split(" Upgrading now", 1)[0], "url": "", "action_label": ""}
+    return item
+
+
+def item_guard(text: str, modifiers: list) -> dict:
+    """The cost guard switched a modifier's viewport display off, or refused a render. modifiers:
+    [[object, modifier]] the button shows again; its label is cleared once it has."""
+    return {**item_notice(text, action_label="Show anyway" if modifiers else ""),
+            "modifiers": [list(m) for m in modifiers]}
+
+
 def item_limit(text: str, reason: str, plan: str, resets_at: str, upgrade: dict | None) -> dict:
     """The gateway refused a request for want of allowance. upgrade: {url, plan, label, note}
     from the gateway, or None on the top plan. status: "" | waiting (the plans page is open and
     the add-on polls for the new plan) | done (upgraded; the turn goes on by itself)."""
+    if config.BETA and reason in {"week_limit", "session_limit", "model_not_in_plan"}:
+        text = {"week_limit": "This week's allowance is used.",
+                "session_limit": "This session's allowance is used.",
+                "model_not_in_plan": "This model is unavailable."}[reason]
+        if resets_at:
+            text += f" It resets {resets_at}."
     return {"kind": "limit", "text": text, "reason": reason, "plan": plan, "resets_at": resets_at or "",
-            "upgrade": dict(upgrade) if upgrade else None, "status": ""}
+            "upgrade": dict(upgrade) if upgrade and not config.BETA else None, "status": ""}
 
 
 def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:
@@ -102,3 +141,29 @@ def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:
 
 def item_error(text: str) -> dict:
     return {"kind": "error", "text": text}
+
+
+WAVE_RUNNING = ("queued", "starting", "working", "checking", "merging")  # A saved one reloads as "stopped".
+
+
+def wave_row(worker: str, deliverable: str, role: str) -> dict:
+    """One worker in a wave card. status: queued | starting | working | checking | merging | done |
+    partial | failed | cancelled (its own Cancel) | stopped (Stop, the budget before it started, its
+    time, or a reload while it ran) | question. checks: "4/5" once run. merged: its result is in the
+    scene (each worker merges as it finishes, not with its whole wave)."""
+    return {"id": worker, "deliverable": deliverable, "role": role, "status": "queued", "steps": 0,
+            "checks": "", "note": "", "merged": False}
+
+
+def item_wave(wave: str, number: int, rows: list[dict]) -> dict:
+    """The workers of one delegate call; waves.py updates the rows as they run."""
+    count = len(rows)
+    return {"kind": "wave", "wave": wave, "number": number,
+            "text": f"Wave {number} · {count} worker{'s' if count != 1 else ''}", "rows": rows}
+
+
+def item_merge(wave: str, text: str, lines: list[str], checkpoint: str, quarantined: list[str]) -> dict:
+    """What a wave's merge did, with the way back (checkpoint) and what it kept aside (quarantined).
+    resolved: "" while its buttons show."""
+    return {"kind": "merge", "wave": wave, "text": text, "lines": list(lines), "checkpoint": checkpoint,
+            "quarantined": list(quarantined), "resolved": ""}

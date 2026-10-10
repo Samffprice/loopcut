@@ -1,0 +1,12 @@
+{
+    "type": "enum",
+    "name": "phenotype_proportions",
+    "description": "Proportions of created human",
+    "label": "Proportions",
+    "default": "average",
+    "items": [
+        ["min", "Inverted V-shape", "This represents a character with wide hips but narrow shoulders", 1],
+        ["average", "Average", "Average", 2],
+        ["max", "V-shape", "This represents a character with wide shoulders but narrow hips", 3]
+    ]
+}

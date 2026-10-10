@@ -42,6 +42,7 @@ def turn(number: int, steps: int, chars: int) -> list[dict]:
 
 class Config:
     base_url, api_key, model, context_budget, keep_context = "http://127.0.0.1:1", "k", "m", 40_000, False
+    max_output_tokens, call_max_seconds = 32_000, 300.0
 
 
 class KeepConfig(Config):
@@ -133,7 +134,8 @@ class FoldTest(unittest.TestCase):
         session = {"messages": messages}
         sent, _ = cx.prepare(session, Config, lambda: False)
         self.assertEqual(records(sent), [], "under FOLD_AT nothing folds: the cache holds")
-        messages += [m for n in range(8, 70) for m in step(1, n, 1000)]
+        # 52 more steps: past FOLD_AT, and their records still fit FOLD_TO beside FIXED_TOKENS (62 did at 7,200).
+        messages += [m for n in range(8, 60) for m in step(1, n, 1000)]
         before = cx.estimate_tokens(cx.view(messages))
         self.assertGreater(before, Config.context_budget * cx.FOLD_AT)
         sent, _ = cx.prepare(session, Config, lambda: False)
@@ -285,7 +287,7 @@ class CompactionTest(unittest.TestCase):
         session = {"messages": messages, "token_ratio": 0.0}
         asked = []
 
-        def fake_summarize(cfg, messages, is_cancelled):
+        def fake_summarize(cfg, messages, is_cancelled, session):
             asked.append(messages)
             return "Three pasted documents; six cubes."
 
@@ -308,7 +310,7 @@ class CompactionTest(unittest.TestCase):
         messages = [{"role": "user", "content": "p" * 200_000}] + turn(2, 1, 100)
         tried = []
 
-        def failing(cfg, messages, is_cancelled):
+        def failing(cfg, messages, is_cancelled, session):
             tried.append(messages)
             raise llm.LLMError("HTTP 500: no")
 
@@ -316,6 +318,23 @@ class CompactionTest(unittest.TestCase):
         self.assertEqual((len(tried), compacted), (1, 0))
         self.assertIs(sent[0], messages[0], "no summary: the conversation starts at the start")
         self.assertTrue(all(cx.SUMMARY not in m for m in messages))
+
+    def test_summarize_sends_the_summary_correlation_role(self):
+        """Loopcut's gateway correlates a usage row with the conversation and role that made it
+        (x-loopcut-conversation / x-loopcut-role); the summarizing call must send both, role=summary."""
+        from unittest.mock import patch
+
+        from loopcut import llm
+        captured = {}
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            return llm.Completion(text="A summary.")
+
+        with patch.object(cx.llm, "stream_chat", fake_stream):
+            result = cx.summarize(Config, turn(1, 1, 10), lambda: False, {"id": "conv-abc"})
+        self.assertEqual(result, "A summary.")
+        self.assertEqual(captured["headers"], {"x-loopcut-conversation": "conv-abc", "x-loopcut-role": "summary"})
 
 
 class BudgetTest(unittest.TestCase):

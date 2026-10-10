@@ -23,6 +23,20 @@ class InspectionTests(unittest.TestCase):
             with self.subTest(override=override), self.assertRaises(jobs.JobError):
                 inspection.validate_request(**(defaults | override))
 
+    def test_the_signal_says_exposure_and_colour_in_numbers(self):
+        icy = jobs.color_signal([0.58, 0.74, 0.91], 0.0)
+        self.assertEqual(icy["mean_hue"], 211)
+        self.assertAlmostEqual(icy["mean_saturation"], 0.363, places=3)
+        self.assertFalse(icy["too_bright"])
+        dark = jobs.color_signal([0.05, 0.045, 0.04], 0.0)
+        self.assertLess(dark["mean_luminance"], 0.05)
+        self.assertEqual(dark["mean_hue"], 30, "warm, however dim")
+        blown = jobs.color_signal([0.97, 0.97, 0.97], 0.62)
+        self.assertEqual((blown["clipped"], blown["too_bright"], blown["mean_hue"], blown["mean_saturation"]),
+                         (0.62, True, None, 0.0), "grey has no hue")
+        self.assertFalse(jobs.color_signal([0.5, 0.5, 0.5], jobs.TOO_BRIGHT)["too_bright"])
+        self.assertEqual(jobs.color_signal([1.2, -0.1, 0.0], 0.0)["mean_hue"], 0, "clamped into 0..1")
+
     def test_inspection_requires_one_bounded_approval(self):
         self.assertEqual(agent._approval("inspect_scene", '{"purpose":"geometry"}', ()), "heavy")
         self.assertFalse(agent._changes_scene("inspect_scene"))

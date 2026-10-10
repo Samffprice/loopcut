@@ -1,4 +1,4 @@
-"""The user's Blender asset libraries as two tools: search and import.
+"""The user's Blender asset libraries: search and import, source library of assets.py's tools.
 
 Every library registered in Preferences counts: folders of .blend files on disk (kits the user
 bought or made), remote libraries (a URL serving Blender's listing format, like ambientCG), and
@@ -45,36 +45,6 @@ SEARCH_TYPES = ("OBJECT", "COLLECTION", "MATERIAL", "WORLD", "NODETREE")
 ID_CODES = {"OB": "OBJECT", "GR": "COLLECTION", "MA": "MATERIAL", "WO": "WORLD", "NT": "NODETREE",
             "ME": "MESH", "IM": "IMAGE", "AC": "ACTION", "LA": "LIGHT", "CA": "CAMERA", "AR": "ARMATURE", "CU": "CURVE"}
 
-SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
-    {"type": "function", "function": {
-        "name": "search_assets",
-        "description": (
-            "Search the user's Blender asset libraries: their own kits on disk, the Online Essentials "
-            "library (base meshes, materials, HDRI worlds) and any remote library they added (ambientCG: "
-            "PBR materials). Returns numbered matches with a sheet of thumbnails where the library has "
-            "them; import with import_asset(ref)."),
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Words to match names, tags and descriptions"},
-            "type": {"type": "string", "enum": list(SEARCH_TYPES), "description": "Only this kind of asset"},
-            "limit": {"type": "integer", "description": f"Default {DEFAULT_LIMIT}, max {MAX_LIMIT}"},
-        }, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "import_asset",
-        "description": (
-            "Bring an asset from search_assets into the scene by its ref. An object or collection "
-            "arrives at the origin (the result gives its bounds: place and scale it); a material is "
-            "applied to `apply_to` objects; a world becomes the scene world; a node group is added to "
-            "the file. Remote assets download first, once."),
-        "parameters": {"type": "object", "properties": {
-            "ref": {"type": "string", "description": "The ref from search_assets"},
-            "apply_to": {"type": "array", "items": {"type": "string"},
-                         "description": "Materials only: objects to give the material"},
-        }, "required": ["ref"]},
-    }},
-]
-
-
 @dataclass
 class Library:
     name: str
@@ -114,7 +84,7 @@ class Entry:
 def parse_ref(ref: str) -> tuple[str, str, str, str]:
     parts = str(ref).split(REF_SEP)
     if len(parts) != 4 or not all(parts) or parts[2] not in ID_TYPES:
-        raise ToolError("ref is the string search_assets gave: library::file::TYPE::name")
+        raise ToolError("id is the ref search_assets gave: library::file::TYPE::name")
     library, file, id_type, name = parts
     if Path(file).is_absolute() or ".." in Path(file).parts:
         raise ToolError("ref names a file outside its library")
@@ -173,6 +143,28 @@ def describe_entry(index: int, entry: Entry) -> str:
 def remote_cache_dirname(url: str) -> str:
     """Blender's folder for a remote library: the first 16 hex digits of the URL's md5."""
     return hashlib.md5(url.encode()).hexdigest()[:16]
+
+
+def remote_key(url: str, file: str, id_type: str, name: str) -> str:
+    """Proposal 007 identity. Only scheme/host and the root's trailing slash normalize.
+
+    Never use this URL for the cache dirname: Blender hashes the published URL instead.
+    Ineligible local listing entries can still be used, but cannot merge with index rows.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if (parts.scheme.lower() != "https" or not parts.hostname or parts.username or parts.password
+            or parts.query or parts.fragment or "|" in url or any(c.isspace() for c in url)
+            or any(ord(c) < 32 or ord(c) == 127 for c in url)
+            or not safe_relative_path(file) or id_type not in SEARCH_TYPES or not name
+            or any(c == "|" or ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise ValueError("Ineligible remote asset identity")
+    root = urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
+    return f"remote:{root}|{file}|{id_type}|{name}"
+
+
+def safe_relative_path(value: str) -> bool:
+    return (isinstance(value, str) and bool(value) and not value.startswith("/")
+            and ".." not in value.split("/") and not any(c in "\\\\|" or ord(c) < 32 or ord(c) == 127 for c in value))
 
 
 def describe(name: str, arguments: dict):
@@ -297,7 +289,7 @@ def search_assets(query: str, type: str = "", limit: int = DEFAULT_LIMIT) -> Too
     registered = libraries()
     if not registered:
         raise ToolError("No asset libraries are registered in Preferences > File Paths > Asset Libraries, "
-                        "and Online Essentials is off. Ask the user to add one, or use search_polyhaven.")
+                        "and Online Essentials is off. Ask the user to add one, or use source polyhaven.")
     entries, notes = all_entries()
     pool = [e for e in entries if e.id_type in SEARCH_TYPES and (not type or e.id_type == type)]
     found = rank(query, pool, text_of=Entry.text, name_of=lambda e: e.name, limit=limit)
@@ -307,7 +299,7 @@ def search_assets(query: str, type: str = "", limit: int = DEFAULT_LIMIT) -> Too
     lines = [describe_entry(i, entry) for i, entry in enumerate(found, 1)]
     image = sheet([_thumbnail(entry) for entry in found], "assets_sheet.png")
     text = (f"{len(found)} asset(s) for {query!r}, numbered as on the sheet (left to right, top to bottom); "
-            f"pass the ref to import_asset:\n" + "\n".join(lines))
+            f"pass the ref as import_asset's id:\n" + "\n".join(lines))
     if image:
         text += "\n\nImage attached: thumbnails in that order (blank: the library has no preview)."
     if notes:
@@ -339,9 +331,12 @@ def _ensure_files(library: Library, entry: Entry) -> Path:
     """The asset's .blend on disk, downloading a remote asset's files into Blender's cache first."""
     if not library.remote:
         return library.path / entry.file
+    if not safe_relative_path(entry.file):
+        raise ToolError("Remote asset names a file outside its library")
     for item in entry.files:
         target = library.path / item["path"]
-        if Path(item["path"]).is_absolute() or ".." in Path(item["path"]).parts:
+        if (not safe_relative_path(item["path"])
+                or not target.resolve().is_relative_to(library.path.resolve())):
             raise ToolError(f"{library.name} lists a file path outside its folder: {item['path']}")
         download(item["url"], target, item.get("hash"), item.get("size") or 0)
     return library.path / entry.file
@@ -359,12 +354,28 @@ def _pack_images(materials) -> None:
                     pass
 
 
-def import_asset(ref: str, apply_to: list[str] | None = None) -> ToolResult:
-    library, entry = _find(ref)
+def _check_apply_to(apply_to) -> list[str]:
     apply_to = apply_to or []
     missing = [n for n in apply_to if n not in bpy.data.objects]
     if missing:
         raise ToolError(f"No such object(s) to apply to: {', '.join(missing)}")
+    return apply_to
+
+
+def import_asset(ref: str, apply_to: list[str] | None = None) -> ToolResult:
+    _check_apply_to(apply_to)  # Before any download, as the user sees it.
+    return load_asset(fetch_asset(ref, apply_to), apply_to)
+
+
+def fetch_asset(ref: str, apply_to: list[str] | None = None) -> dict:
+    """import_asset's library half (a worker's parent runs it, on the main thread: the libraries are
+    preferences): find the entry, download a remote one's files. JSON-able for load_asset."""
+    library, entry = _find(ref)
+    return fetch_entry(library, entry)
+
+
+def fetch_entry(library: Library, entry: Entry) -> dict:
+    """Shared registered-library/report-entry fetch; loads use the same load_asset path."""
     if entry.min_version:
         try:
             wanted = tuple(int(v) for v in entry.min_version.split(".")[:2])
@@ -375,55 +386,64 @@ def import_asset(ref: str, apply_to: list[str] | None = None) -> ToolResult:
     blend = _ensure_files(library, entry)
     if not blend.is_file():
         raise ToolError(f"{blend.name} is missing from {library.name}")
-    attr = ID_TYPES[entry.id_type]
-    link = library.import_method == "LINK"
+    return {"ref": entry.ref, "library": library.name, "blend": str(blend), "id_type": entry.id_type, "name": entry.name,
+            "link": library.import_method == "LINK", "reuse": library.import_method == "APPEND_REUSE",
+            "license": entry.license, "author": entry.author}
+
+
+def load_asset(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
+    """import_asset's scene half (a worker's child runs it): append or link from the file, no network."""
+    apply_to = _check_apply_to(apply_to)
+    library_name, id_type, name = fetched["library"], fetched["id_type"], fetched["name"]
+    license_name, author = fetched.get("license") or "", fetched.get("author") or ""
+    blend = Path(fetched["blend"])
+    attr = ID_TYPES[id_type]
+    link = bool(fetched.get("link"))
     before = {obj.name for obj in bpy.data.objects}
-    with bpy.data.libraries.load(str(blend), link=link) as (data_from, data_to):
-        if entry.name not in getattr(data_from, attr):
-            raise ToolError(f"{blend.name} no longer holds {entry.id_type} {entry.name!r}")
-        setattr(data_to, attr, [entry.name])
+    reuse = {"reuse_local_id": True} if fetched.get("reuse") and not link else {}
+    with bpy.data.libraries.load(str(blend), link=link, **reuse) as (data_from, data_to):
+        if name not in getattr(data_from, attr):
+            raise ToolError(f"{blend.name} no longer holds {id_type} {name!r}")
+        setattr(data_to, attr, [name])
     block = getattr(data_to, attr)[0]
     if block is None:
-        raise ToolError(f"Blender could not load {entry.name!r} from {blend.name}")
-    credit = f"{entry.license or 'license unstated'}" + (f", by {entry.author}" if entry.author else "")
+        raise ToolError(f"Blender could not load {name!r} from {blend.name}")
+    credit = f"{license_name or 'license unstated'}" + (f", by {author}" if author else "")
     scene = bpy.context.scene
-    if entry.id_type == "OBJECT":
+    if id_type == "OBJECT":
         scene.collection.objects.link(block)
         for child in block.children_recursive:
             if child.name not in scene.objects:
                 scene.collection.objects.link(child)
-    elif entry.id_type == "COLLECTION":
+    elif id_type == "COLLECTION":
         scene.collection.children.link(block)
-    elif entry.id_type == "WORLD":
+    elif id_type == "WORLD":
         previous = scene.world.name if scene.world else None
         scene.world = block
-        return ToolResult(f"World {block.name!r} from {library.name} is now the scene world"
+        return ToolResult(f"World {block.name!r} from {library_name} is now the scene world"
                           + (f"; the previous world {previous!r} is kept, unused" if previous else "") + f". {credit}.")
-    elif entry.id_type == "MATERIAL":
+    elif id_type == "MATERIAL":
         applied = []
-        for name in apply_to:
-            obj = bpy.data.objects[name]
+        for target in apply_to:
+            obj = bpy.data.objects[target]
             if not hasattr(obj.data, "materials"):
                 continue
             if obj.data.materials:
                 obj.data.materials[obj.active_material_index] = block
             else:
                 obj.data.materials.append(block)
-            applied.append(name)
+            applied.append(target)
         if not link:
             _pack_images([block])
         where = f", applied to {', '.join(applied)}" if applied else ", not applied to anything yet"
-        return ToolResult(f"Material {block.name!r} from {library.name}{where}. {credit}.")
+        return ToolResult(f"Material {block.name!r} from {library_name}{where}. {credit}.")
     else:
-        return ToolResult(f"{entry.id_type.title()} {block.name!r} from {library.name} is in the file"
+        return ToolResult(f"{id_type.title()} {block.name!r} from {library_name} is in the file"
                           f" (bpy.data.{attr}[{block.name!r}]). {credit}.")
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
     if not link:
         _pack_images({slot.material for obj in imported for slot in getattr(obj, "material_slots", [])})
     rows = [object_summary(obj) for obj in imported]
-    return ToolResult(_clip(f"Imported {entry.id_type.lower()} {block.name!r} from {library.name}: "
+    return ToolResult(_clip(f"Imported {id_type.lower()} {block.name!r} from {library_name}: "
                             f"{len(imported)} object(s) at the origin. Place and scale it now. {credit}.\n"
                             + json.dumps(rows, separators=(",", ":"), default=str)))
-
-
-DISPATCH = {"search_assets": search_assets, "import_asset": import_asset}

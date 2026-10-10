@@ -1,13 +1,13 @@
 """First run of the Loopcut build, drawn in the splash screen: bring your Blender setup along,
-connect a model, see what is sent where.
+optionally create a Loopcut account, connect a model, see what is sent where.
 
 The fork's splash menus (WM_MT_splash_quick_setup, WM_MT_splash in bl_operators/wm.py) call
 draw_splash() and draw themselves when it returns False. Which of the two menus is on screen is
 Blender's decision: the quick setup until preferences are saved, the normal splash after.
 
 Steps: "import" (only if stock Blender settings were found), "setup" (Blender's own quick setup,
-for a fresh start), "connect", "privacy", "done". State lasts for the session; someone who quits
-half way gets the normal splash next time and the panel itself asks for a key.
+for a fresh start), "account" (optional), "connect" (model), "privacy", "done". State lasts for the
+session; someone who quits half way gets the normal splash next time and the panel itself asks for a key.
 """
 
 import shutil
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import bpy
 
-from . import account, blender_import, config, settings
+from . import account, blender_import, chatgpt_auth, config, settings
 
 _state = {"step": None, "imported": None, "failed": [], "error": "", "own_key": False}
 _popups = set()  # Splash regions to repaint while a sign-in is in flight; see _refresh_popups.
@@ -28,6 +28,9 @@ def _source():
 
 
 def _connected() -> bool:
+    prefs = settings.preferences()
+    if prefs is not None and prefs.provider == "CHATGPT" and not _on_chatgpt_plan():
+        return False
     try:
         config.load()
     except config.ConfigError:
@@ -35,8 +38,29 @@ def _connected() -> bool:
     return True
 
 
+def hints_dismissed() -> bool:
+    """Keep the first-message hints dismissed across files, chats and app launches."""
+    from . import state
+    prefs = settings.preferences()
+    return bool(state.ui.get("hints_dismissed") or getattr(prefs, "first_message_sent", False))
+
+
+def dismiss_hints() -> None:
+    from . import state
+    if hints_dismissed():
+        return
+    state.ui["hints_dismissed"] = True
+    prefs = settings.preferences()
+    if prefs is not None:
+        prefs.first_message_sent = True
+        try:
+            bpy.ops.wm.save_userpref()
+        except RuntimeError as ex:
+            print(f"Loopcut: could not save first-message preference: {ex}")
+
+
 def _after_setup() -> str:
-    return "done" if _connected() or settings.preferences() is None else "connect"
+    return "done" if settings.preferences() is None else "account"
 
 
 def draw_splash(layout, context, first_run: bool) -> bool:
@@ -55,7 +79,9 @@ def draw_splash(layout, context, first_run: bool) -> bool:
         return False  # Preferences existed at startup: not a first run.
     if step in ("import", "setup"):  # Preferences were just saved or imported.
         step = _state["step"] = _after_setup()
-    if step == "connect":
+    if step == "account":
+        _draw_account(layout, context)
+    elif step == "connect":
         _draw_connect(layout, context)
     elif step == "privacy":
         _draw_privacy(layout)
@@ -117,6 +143,9 @@ def _draw_connect(layout, context) -> None:
     column.prop(prefs, "provider")
     if prefs.provider == "LOOPCUT":
         account.draw(column.column(align=True))
+    elif prefs.provider == "CHATGPT":
+        from . import chatgpt_ui
+        chatgpt_ui.draw(column.column(align=True), prefs)
     else:
         if prefs.provider == "CUSTOM":
             column.prop(prefs, "base_url")
@@ -128,11 +157,18 @@ def _draw_connect(layout, context) -> None:
         row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
         if settings.has_models():
             row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
+        _notes(column, "Choose your model provider, enter its API key, then type a model name or use the refresh button. "
+               "The 'Your own keys' fields in preferences are for optional cloud tools, not the chat model.")
+        if not _connected():
+            try:
+                config.load()
+            except config.ConfigError as ex:
+                _notes(column, str(ex), "Correct the connection fields above to enable Continue.")
     column.separator(factor=2)
     sub = column.column()
     sub.enabled = _connected()
     _step_button(sub, "Continue", "privacy", save=True)
-    _link(column, "Back to Loopcut sign-in", "loopcut.onboarding_own_key").enable = False
+    _link(column, "Back to model choices", "loopcut.onboarding_own_key").enable = False
     layout.separator(factor=2.0)
 
 
@@ -168,7 +204,9 @@ def _refresh_popups():
             continue
         region.tag_redraw()
         region.tag_refresh_ui()
-    busy = account.status()["status"] in ("starting", "waiting")
+    from . import chatgpt_ui
+    busy = (account.status()["status"] in ("starting", "waiting")
+            or chatgpt_ui.status()["status"] == "waiting")
     return _REFRESH_SECONDS if busy and _popups else None
 
 
@@ -180,61 +218,91 @@ def _watch_popup(context) -> None:
         bpy.app.timers.register(_refresh_popups, first_interval=_REFRESH_SECONDS, persistent=True)
 
 
-def _draw_sign_in(layout, context) -> None:
-    """The Loopcut account step: one big button, the rest out of the way."""
-    state = account.status()
-    if state["status"] in ("starting", "waiting"):
-        _watch_popup(context)
-    layout.separator(factor=1.5)
-    _centered(layout).label(text="Welcome to Loopcut")
+def _on_chatgpt_plan() -> bool:
+    prefs = settings.preferences()
+    info = chatgpt_auth.status()
+    return prefs is not None and info.get("signed_in") and info.get("plan_usage")
+
+
+def _draw_account(layout, context) -> None:
+    """Accounts are encouraged independently of the model connection and never gate it."""
+    column = _content(layout, "Create your free Loopcut account")
+    status = account.status()
+    if account.signed_in():
+        column.label(text=f"Signed in as {account.account_line()}", icon="CHECKMARK")
+        _step_button(column, "Continue", "connect")
+    else:
+        if status["status"] in ("starting", "waiting"):
+            _watch_popup(context)
+        if status["status"] == "waiting":
+            column.label(text=f"Approve code {status['user_code']} in your browser", icon="URL")
+            row = column.row(align=True)
+            row.operator("loopcut.open_sign_in_page", text="Open the page again")
+            row.operator("loopcut.copy_sign_in_link", text="Copy link")
+            _link(column, "Cancel", "loopcut.cancel_sign_in")
+        elif status["status"] == "starting":
+            column.label(text="Contacting Loopcut…", icon="TIME")
+            _link(column, "Cancel", "loopcut.cancel_sign_in")
+        else:
+            primary = column.column()
+            primary.scale_y = 1.7
+            primary.operator("loopcut.sign_in", text="Create free account", icon_value=account.mark_icon())
+            if status["status"] == "error":
+                _notes(column, "Loopcut accounts open soon")
+                _step_button(column, "Continue", "connect")
+        props = _link(column, "Skip for now", "loopcut.onboarding_step")
+        props.step, props.save = "connect", False
     layout.separator(factor=2.0)
 
-    split = layout.split(factor=0.2)  # The button spans the middle 60 %.
-    split.label()
-    middle = split.split(factor=0.75).column()
-    middle.scale_y = 1.7
-    if state["status"] == "waiting":
-        middle.label(text=f"Approve code {state['user_code']} in your browser", icon="URL")
-        row = middle.row(align=True)
-        row.operator("loopcut.open_sign_in_page", text="Open the Page Again")
-        row.operator("loopcut.copy_sign_in_link", text="Copy Link")
-        sub = middle.row()
-        sub.scale_y = 0.6
-        sub.active = False
-        sub.label(text="Browser did not open? Copy the link and paste it in.")
-    elif state["status"] == "starting":
-        middle.label(text="Contacting Loopcut…", icon="TIME")
-    elif account.signed_in():
-        middle.label(text=f"Signed in as {account.account_line()}", icon="CHECKMARK")
-        _step_button(middle, "Continue", "privacy", save=True)
-    else:
-        middle.operator("loopcut.sign_in", text="Sign in to Loopcut", icon_value=account.mark_icon())
-    if state["status"] == "error" and state["error"]:
-        _centered(layout).label(text=state["error"], icon="ERROR")
 
-    layout.separator(factor=1.5)
-    if state["status"] == "waiting":
-        _link(layout, "Cancel", "loopcut.cancel_sign_in")
-    elif not account.signed_in():
-        props = _link(layout, "I don't want to use AI features yet", "loopcut.onboarding_step")
-        props.step, props.save = "done", True
-        _link(layout, "Use your own API key", "loopcut.onboarding_own_key").enable = True
+def _draw_sign_in(layout, context) -> None:
+    """Model choices stay available whether the optional Loopcut account was skipped or failed."""
+    from . import chatgpt_ui
+    chatgpt = chatgpt_ui.status()
+    column = _content(layout, "Connect a model")
+    if chatgpt["status"] == "waiting":
+        _watch_popup(context)
+        column.label(text="Finish signing in with ChatGPT in your browser", icon="URL")
+        row = column.row(align=True)
+        if chatgpt["url"]:
+            row.operator("loopcut.chatgpt_copy_link", text="Copy link")
+        row.operator("loopcut.chatgpt_cancel", text="Cancel")
+        _notes(column, "Browser did not open? Copy the link and paste it into your browser.")
+    elif _on_chatgpt_plan():
+        column.label(text=f"Signed in with ChatGPT: {chatgpt_ui.account_line()}", icon="CHECKMARK")
+        props = column.operator("loopcut.onboarding_step", text="Continue")
+        props.step, props.save, props.provider = "privacy", True, "CHATGPT"
+    else:
+        primary = column.column()
+        primary.scale_y = 1.7
+        primary.operator("loopcut.chatgpt_sign_in", text="Sign in with ChatGPT", icon="USER")
+        _notes(column, "Recommended")
+    if chatgpt["status"] == "error" and chatgpt["error"]:
+        _notes(column, chatgpt["error"][:160], "Try signing in again, or use your own API key.")
+        _link(column, "Use another ChatGPT account", "loopcut.chatgpt_sign_in").new_account = True
+    _link(column, "Use your own API key", "loopcut.onboarding_own_key").enable = True
+    if account.signed_in():
+        column.separator()
+        props = column.operator("loopcut.onboarding_step", text="Use Loopcut's models")
+        props.step, props.save, props.provider = "privacy", True, "LOOPCUT"
+        _notes(column, "Fast and Pro")
+    column.separator()
+    props = _link(column, "Skip for now", "loopcut.onboarding_step")
+    props.step, props.save = "privacy", False
     layout.separator(factor=2.0)
 
 
 def _on_signed_in() -> None:
-    """Main thread, from account.py: the account step is done, move on."""
-    if _state["step"] == "connect":
+    """A Loopcut account opens model choices; a connected ChatGPT plan opens privacy."""
+    if _state["step"] == "account":
+        _state["step"] = "connect"
+    elif _state["step"] == "connect" and getattr(settings.preferences(), "provider", None) == "CHATGPT":
         _state["step"] = "privacy"
-        try:
-            bpy.ops.wm.save_userpref()
-        except RuntimeError as ex:
-            print(f"Loopcut: could not save preferences after sign-in: {ex}")
 
 
 def _draw_privacy(layout) -> None:
     prefs = settings.preferences()
-    provider = settings.provider_label(prefs.provider)
+    provider = "OpenAI, on your ChatGPT plan" if prefs.provider == "CHATGPT" else settings.provider_label(prefs.provider)
     column = _content(layout, "Privacy and Control")
     _notes(column,
            f"Your messages, a description of the scene and viewport captures go to {provider}. "
@@ -259,7 +327,8 @@ def _draw_done(layout) -> None:
         shown = ", ".join(failed[:4]) + (f" and {len(failed) - 4} more" if len(failed) > 4 else "")
         column.label(text=f"Did not load in this version: {shown}", icon="ERROR")
     shortcut = "Cmd+L" if sys.platform == "darwin" else "Ctrl+Alt+L"
-    ready = "Loopcut is ready" if _connected() else "Add a key in Preferences > Add-ons > Loopcut to start"
+    ready = (f"Loopcut is ready on {settings.route_label()}" if _connected()
+             else "Sign in or use your own model key in the Loopcut panel to start")
     column.label(text=f"{ready}. {shortcut} jumps to the chat.", icon="NONE" if _state["imported"] else "CHECKMARK")
     layout.separator()
     layout.separator(type="LINE")
@@ -303,7 +372,7 @@ def _import_now() -> None:
         blender_import.copy_settings(source, Path(bpy.utils.resource_path("USER")))
     except (OSError, shutil.Error) as ex:
         print(f"Loopcut: could not copy {source}: {ex}")
-        _state["error"] = "Could not copy the settings; details are in the console."
+        _state["error"] = "Could not copy the settings. Try importing again, or choose Start Fresh."
         return
     _state.update(step="setup", imported=version, error="")  # draw_splash picks what follows.
     with bpy.context.temp_override(window=window):
@@ -355,13 +424,15 @@ class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
     enable: bpy.props.BoolProperty(default=True)
 
     def execute(self, context):
+        if self.enable:
+            from . import chatgpt_ui
+            account.cancel_sign_in()
+            chatgpt_ui.cancel_sign_in()
         _state["own_key"] = self.enable
         prefs = settings.preferences()
         if prefs is not None:
-            if self.enable and prefs.provider == "LOOPCUT":
-                prefs.provider = "META"
-            elif not self.enable:
-                prefs.provider = "LOOPCUT"
+            if self.enable and prefs.provider in {"LOOPCUT", "CHATGPT"}:
+                prefs.provider = "OPENAI"
         if context.region_popup is not None:
             context.region_popup.tag_refresh_ui()
         return {"FINISHED"}
@@ -372,10 +443,20 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
     bl_label = "Continue"
     bl_options = {"INTERNAL"}
 
-    step: bpy.props.EnumProperty(items=[(s, s, "") for s in ("setup", "connect", "privacy", "done")])
+    step: bpy.props.EnumProperty(items=[(s, s, "") for s in ("setup", "account", "connect", "privacy", "done")])
     save: bpy.props.BoolProperty()
+    provider: bpy.props.EnumProperty(items=[(s, s, "") for s in ("CURRENT", "LOOPCUT", "CHATGPT")],
+                                     default="CURRENT", options={"HIDDEN", "SKIP_SAVE"})
 
     def execute(self, context):
+        if _state["step"] == "account":
+            account.cancel_sign_in()  # Skipping must not let a pending account change the model later.
+        if _state["step"] == "connect":
+            from . import chatgpt_ui
+            chatgpt_ui.cancel_sign_in()
+        prefs = settings.preferences()
+        if self.provider != "CURRENT" and prefs is not None:
+            prefs.provider = self.provider
         _state["step"] = self.step
         if self.save:
             bpy.ops.wm.save_userpref()

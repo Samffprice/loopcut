@@ -4,6 +4,8 @@
 #   loopcut/scripts/publish_release.sh v0.1.3            publish
 #   loopcut/scripts/publish_release.sh v0.1.3 --draft    only add update.json; the release stays a draft
 #   loopcut/scripts/publish_release.sh v0.1.3 --partial  publish with the installers present so far
+#   loopcut/scripts/publish_release.sh v0.1.3 --dry-run FILE...  print the update.json these local
+#                                                           installers would get; no GitHub call at all
 # Run once release_mac.sh --upload and the Windows workflow have both added their installers, or
 # with --partial to publish one platform first: the app on the other platform then shows the
 # release notes without an installer until this runs again with the missing one uploaded.
@@ -17,6 +19,31 @@ version="${1:?usage: loopcut/scripts/publish_release.sh v0.1.3 [--draft]}"
 printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "version must look like v0.1.3" >&2; exit 1; }
 addon="$("$repo/loopcut/scripts/addon_version.sh")"
 [ "$version" = "$addon" ] || { echo "the add-on says $addon (bl_info in scripts/addons_core/loopcut/__init__.py); bump it first" >&2; exit 1; }
+
+if [ "${2:-}" = "--dry-run" ]; then
+  # The same manifest from local files: the SHA-256 and size GitHub would report for them once uploaded.
+  shift 2
+  [ "$#" -gt 0 ] || { echo "--dry-run needs the installer files" >&2; exit 1; }
+  exec python3 - "$github" "$version" "$@" <<'PY'
+import hashlib, json, os, sys
+github, version, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+installers = {f"loopcut-{version}-arm64.dmg": "darwin-arm64", f"loopcut-{version}-windows64.msi": "windows-x64"}
+assets = {}
+for path in files:
+    name = os.path.basename(path)
+    if name not in installers:
+        sys.exit(f"{name} is not an installer name for {version} ({', '.join(installers)})")
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    assets[installers[name]] = {"name": name, "url": f"https://github.com/{github}/releases/download/{version}/{name}",
+                                "sha256": digest.hexdigest(), "size": os.path.getsize(path)}
+json.dump({"version": version[1:], "tag": version, "notes_url": f"https://github.com/{github}/releases/tag/{version}",
+           "assets": assets}, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+fi
 
 cd "$repo"  # gh finds the GitHub repository from the checkout it runs in.
 # The releases list, not the tag: a draft has no tag yet. One JSON object per line.
@@ -51,11 +78,11 @@ json.dump({"version": version[1:], "tag": version, "notes_url": f"https://github
 sys.stdout.write("\n")
 PY
 cat update.json
-gh release upload "$version" update.json --clobber
+gh release upload "$version" update.json --clobber --repo "$github"
 rm -f update.json
 if [ "${2:-}" = "--draft" ]; then
   echo "update.json added; $version stays a draft"
 else
-  gh release edit "$version" --draft=false --latest
+  gh release edit "$version" --draft=false --latest --repo "$github"
   echo "published $version: the app's next check offers it"
 fi

@@ -1,4 +1,4 @@
-"""Poly Pizza (low-poly, stylised models; CC0 and CC-BY) as two tools: search and import.
+"""Poly Pizza (low-poly, stylised models; CC0 and CC-BY): search and import, source polypizza of assets.py's tools.
 
 Where Poly Haven is scanned realism, Poly Pizza is the rescued Google Poly archive plus new
 uploads: light single-GLB props for game, stylised and social work. It needs a free API key
@@ -33,38 +33,7 @@ CATEGORIES = {"Food & Drink": 0, "Clutter": 1, "Weapons": 2, "Transport": 3, "Fu
               "Scenes & Levels": 10, "Other": 11}
 LICENCES = {"CC-BY": 0, "CC0": 1}
 NO_KEY = ("Poly Pizza needs a free API key: ask the user to paste one from poly.pizza (account > API) into "
-          "Loopcut's preferences under Asset libraries. Poly Haven and search_assets need no key.")
-
-SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
-    {"type": "function", "function": {
-        "name": "search_polypizza",
-        "description": (
-            "Search Poly Pizza: light low-poly, stylised models (game props, characters, vehicles, "
-            "plants, food), each one GLB, CC0 or CC-BY. Use it for a stylised or game look, or many "
-            "props cheaply; Poly Haven for realism. Returns numbered matches with a thumbnail sheet; "
-            "then import_polypizza(model_id)."),
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Words to match: 'low poly tree', 'robot'"},
-            "category": {"type": "string", "enum": list(CATEGORIES)},
-            "licence": {"type": "string", "enum": list(LICENCES),
-                        "description": "CC0 needs no credit; default both"},
-            "animated": {"type": "boolean", "description": "Only animated models"},
-            "limit": {"type": "integer", "description": f"Default {DEFAULT_LIMIT}, max {MAX_LIMIT}"},
-        }, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "import_polypizza",
-        "description": (
-            "Download and import a Poly Pizza model by id. It arrives at the origin; scale is "
-            "arbitrary in this archive, so pass target_size (meters, largest side) or scale it after. "
-            "The result names Poly Pizza with a link and any attribution due: repeat them to the user."),
-        "parameters": {"type": "object", "properties": {
-            "model_id": {"type": "string", "description": "The id from search_polypizza"},
-            "target_size": {"type": "number", "description": "Largest dimension in meters after import"},
-        }, "required": ["model_id"]},
-    }},
-]
-
+          "Loopcut's preferences under Asset libraries. Sources polyhaven and library need no key.")
 
 # ------------------------------------------------------------------ pure helpers (unit tested)
 
@@ -160,7 +129,7 @@ def search_polypizza(query: str, category: str = "", licence: str = "", animated
     text = (f"{len(results)} of {data.get('total', len(results))} Poly Pizza models for {query!r}, numbered as on "
             f"the sheet (left to right, top to bottom):\n" + "\n".join(lines))
     if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_polypizza(model_id)."
+        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=polypizza, id)."
     return ToolResult(_clip(text), image_path=image)
 
 
@@ -173,8 +142,14 @@ def _thumbnail(model: dict) -> Path | None:
 
 
 def import_polypizza(model_id: str, target_size: float = 0.0) -> ToolResult:
+    return load_polypizza(fetch_polypizza(model_id, target_size), target_size)
+
+
+def fetch_polypizza(model_id: str, target_size: float = 0.0) -> dict:
+    """import_polypizza's network half (a worker's parent runs it): the key stays here. The GLB in
+    the cache and the model's credit fields, JSON-able."""
     if not valid_slug(str(model_id)):
-        raise ToolError("model_id is the id from search_polypizza: letters, digits, _ and - only.")
+        raise ToolError("id is the id search_assets gave: letters, digits, _ and - only.")
     headers = _headers()
     try:
         model = get_json(f"{API}/model/{urllib.parse.quote(str(model_id), safe='')}", headers)
@@ -191,6 +166,13 @@ def import_polypizza(model_id: str, target_size: float = 0.0) -> ToolResult:
         raise ToolError("Poly Pizza's file server answered with a web page instead of the model (its Cloudflare "
                         "bot check blocks datacenter and VPN addresses). Try again from a normal connection, or "
                         "the user can download the GLB at " + SITE + str(model_id) + " and import it.")
+    return {"id": str(model_id), "path": str(path),
+            "model": {key: model.get(key) for key in ("ID", "Title", "Licence", "Attribution")}}
+
+
+def load_polypizza(fetched: dict, target_size: float = 0.0) -> ToolResult:
+    """import_polypizza's scene half (a worker's child runs it): the downloaded GLB, no network."""
+    model_id, model, path = fetched["id"], fetched["model"], Path(fetched["path"])
     before = {obj.name for obj in bpy.data.objects}
     try:
         bpy.ops.import_scene.gltf(filepath=str(path))
@@ -221,6 +203,3 @@ def import_polypizza(model_id: str, target_size: float = 0.0) -> ToolResult:
     return ToolResult(_clip(f"Imported {model.get('Title', model_id)!r} ({model_id}) as {len(imported)} object(s) "
                             f"at the origin.{scaled} {credit_line(model)}\n"
                             + json.dumps(rows, separators=(",", ":"), default=str)))
-
-
-DISPATCH = {"search_polypizza": search_polypizza, "import_polypizza": import_polypizza}

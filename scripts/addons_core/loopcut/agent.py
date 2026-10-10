@@ -4,8 +4,9 @@ import dataclasses
 import json
 import threading
 from concurrent.futures import TimeoutError as FutureTimeout
+from typing import Any, Callable
 
-from . import checkpoints, config, context, conversations, llm, state
+from . import checkpoints, config, context, conversations, llm, repeats, state
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
 run_python runs bpy code; get_scene_info and get_object_info read the scene; inspect_api is this Blender's \
@@ -18,13 +19,14 @@ or collection, described in the same block.
 - Look before you edit: use the context block, and get_object_info before changing an existing material, \
 modifier or rig; change what is there instead of rebuilding the user's work.
 - One run_python step per coherent piece of work (a whole material, several objects), not one per object. \
-Its result ends with "Scene changes", measured from the scene: trust that; do not print values to check.
+Its result ends with "Scene changes", measured from the scene: trust that; do not print values to check. \
+Verify placement and contact with check_contact, not from bounds or captures.
 - Your bpy knowledge is from older versions. When unsure of a name, and always after an AttributeError, \
 TypeError or "enum not found", look it up with inspect_api before retrying.
 - The context lists the running Blender version and available render engines. Use those capabilities. \
 Material previews use studio lighting; rendered viewport captures use EEVEE and approximate Cycles. \
 Do not rebuild materials or boost lights to compensate for an unverified preview problem. Use a real \
-camera render when final lighting, glass or reflections need verification.
+camera render (see_render) when final lighting, glass or reflections need verification.
 - inspect_scene returns a labeled contact sheet across named cameras and frames. Use geometry for \
 shape, materials for neutral studio lighting, final_lighting for the actual scene engine and lights. \
 It renders a copy with a bounded budget while the editor stays responsive; stale results are rejected. \
@@ -46,21 +48,21 @@ match the viewpoint with the camera, build from the card, then compare_with_refe
 change and fix the differences you see; look_at_reference for a detail at full resolution.
 - Files: list_files and read_file read the disk (an image file you then see); write_file and move_file \
 change it, with the user's approval; nothing deletes. see_render shows the user's last render, or with \
-render=true renders now: that, like any render or bake in run_python, waits for the user's OK \
+render=true renders now: that, like a bake in run_python, waits for the user's OK \
 unless they allowed renders.
-- For render/export deliverables use start_render_job: a saved scene copy renders outside the editing \
-process, with an explicit frame list, dimensions, samples and time budget. Approval covers this job \
-only. render_job_status reports progress and verified files; cancel_render_job stops it; resume_render_job \
+- For render/export deliverables use render_job with action start: a saved scene copy renders outside the \
+editing process, with an explicit frame list, dimensions, samples and time budget. Approval covers this job \
+only. Action status reports progress and verified files; cancel stops it; resume \
 reuses verified frames from the SAME saved revision with a fresh approval of the same budget. MP4 jobs \
 retain their PNG sequence. Do not poll repeatedly while nothing changes. Give the user the job status \
 and output location; never describe a queued/running job as a completed export. Jobs remain in the Jobs \
 view after closing the chat. Previews of jobs show their saved revision, not later scene edits.
-- Libraries, before building a realistic or stylised prop, material or sky from primitives: search_blenderkit \
-is BlenderKit, the largest (free without an account; a plan key unlocks more); search_polyhaven is Poly Haven \
-(CC0 scans, PBR materials, HDRIs); search_assets is the user's own Blender asset libraries (their kits, Online \
-Essentials, remote libraries); search_polypizza is Poly Pizza (low-poly stylised, CC0 or CC-BY: tell the \
-user it came from Poly Pizza with the link, and the attribution line for CC-BY). Choose by thumbnail, then \
-place and scale what arrives; say which library each asset came from.
+- Libraries, before building a realistic or stylised prop, material or sky from primitives: search_assets, \
+then import_asset from the same source. blenderkit is BlenderKit, the largest (free without an account; a \
+plan key unlocks more); polyhaven is Poly Haven (CC0 scans, PBR materials, HDRIs); library is the user's own \
+Blender asset libraries (their kits, Online Essentials, remote libraries); polypizza is Poly Pizza (low-poly \
+stylised, CC0 or CC-BY: tell the user it came from Poly Pizza with the link, and the attribution line for \
+CC-BY). Choose by thumbnail, then place and scale what arrives; say which library each asset came from.
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
@@ -76,7 +78,8 @@ menus you have not checked. When they report a missing control or unexpected out
 live editors, output settings and API before answering; never repeat instructions they said failed. \
 run_python can borrow another editor automatically, even when no 3D viewport is open. For video \
 output, inspect ImageFormatSettings: IMAGE and VIDEO media types expose different formats.
-- Before finishing a multi-part job, check each requested deliverable against the scene: camera framing, \
+- Before finishing a multi-part job, check each requested deliverable against the scene: camera framing \
+(frame_camera with report_only measures it), \
 animation endpoints and middle, preservation constraints, output settings and actual output files. \
 Distinguish a configured scene, a preview, and a completed render or export; say which you verified.
 - Start every reply that calls tools with a sentence or two: what you see now and why this step. Older \
@@ -95,6 +98,30 @@ SOFT_LOOKS = 8
 DEFAULT_ANGLE = "three_quarter"
 LOW_ALLOWANCE = 0.8  # Share of the week's allowance used at which the conversation gets a heads-up, once.
 CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene"}
+# An explicit step limit (cfg.max_steps > 0) is announced this many steps before it; at it, the model is asked
+# once more, for text only, to say where the work stands (_wrap_up).
+STEPS_LEFT_NOTICE = 3
+STEPS_LEFT_NOTE = ("\n\n({left} steps left in this turn. Finish what matters most, or wrap up: say what is done, "
+                   "what is left and what you did not verify.)")
+# A worker's own (LoopSpec.steps_left_note), in its system prompt's words: "Finish what matters most"
+# read as licence to keep building, and the LOW barrel broke its lid there (analysis §5.6).
+WORKER_STEPS_LEFT_NOTE = ("\n\n(About {left} steps left in the budget. Stop improving now: "
+                          "call check_brief, then report_back.)")
+STEP_LIMIT_PROMPT = ("[Loopcut] This turn has used all {steps} of its steps, so tools are off now: any tool call "
+                     "is ignored. Reply in plain text only, in three short parts: what is done, what is left, and "
+                     "what you did not verify.")
+BUDGET_PROMPT = ("[Loopcut] The job's budget is spent ({reason}), so tools are off now: any tool call is ignored. "
+                 "Reply in plain text only, in three short parts: what is done, what is left, and what you did "
+                 "not verify.")
+NO_PROGRESS_NOTICE = (f"Stopped after {repeats.NO_PROGRESS_FAILURES} identical tool failures in a row "
+                      "without a scene change.")
+NO_PROGRESS_PROMPT = ("[Loopcut] The same tool call keeps failing without changing the scene, so tools are off "
+                      "now: any tool call is ignored. Reply in plain text only: what is done, what is blocked "
+                      "and why, and what you did not verify.")
+# _request's one retry of a step that hit the output cap (max_tokens, or llm.py's call_max_seconds)
+# without producing anything usable: appended to that request only, never saved to the conversation.
+CAP_RETRY_PROMPT = ("[Loopcut] That reply stopped without a usable answer or tool call. Decide now and act: "
+                    "call one tool, or reply in a few plain sentences.")
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -116,13 +143,36 @@ class Turn:
         self.changed = True      # The user's message itself is a change worth a look.
         self.last_look = ""      # Tool and arguments of the model's previous look.
         self.angle = DEFAULT_ANGLE  # The angle the model last asked for: what the automatic looks use.
+        self.focus: list = []       # The focus of its last capture_viewport: what the automatic looks keep framing.
+        self.shot: dict = {}        # Its camera and view_layer (a worker's production shot): kept the same way.
+        self.touched: list = []     # Objects changed since the last look (scene_diff.touched): what the next frames.
         self.roots: tuple = ()      # Folders the file tools read unasked; files.project_roots, set by send().
         # scene_diff snapshots from before the first and after the last scene-changing step.
         self.config: config.Config | None = None  # Loaded on the main thread by send().
         self.scene_before: dict | None = None
         self.scene_after: dict | None = None
         self.notes: list = []       # (text, chat item) sent while the turn runs; folded in at the next step.
-        self.outcome = "running"  # completed, cancelled, step_limit or error; retained by evals.
+        self.ledger = repeats.Ledger()  # Failures and reads the model repeats; see repeats.py.
+        self.outcome = "running"  # completed, cancelled, step_limit, no_progress, budget or error; retained by evals.
+        self.stop_reason = ""    # The budget or guard that stopped it; preserved through its wrap-up.
+        # With workers on (send() read config.load_roles), who does what, and the loop's spec; None
+        # for both is today's single loop.
+        self.roles: config.Roles | None = None
+        self.spec: "LoopSpec | None" = None
+        self.job = None              # waves.Job once this turn delegates: budget, checks, JobLog.
+        self.delegations: list = []  # Deliverables of each wave this turn started (waves.prepare).
+        self.level_first: int | None = None  # Levels inferred from what the model did; see _note_level.
+        self.level_max = 0
+        # router.py: whether this turn was routed, the decision (None: none), and whether its one
+        # nudge towards delegating was sent.
+        self.route_tried = False
+        self.routed = None
+        self.nudged = False
+        # The workspace (workspace.py): whether the router may send this orchestrated turn to the single
+        # agent's workspace loop (_configure), and whether it did (router.start_turn's divert).
+        self.may_divert = False
+        self.diverted = False
+        self.codex = None  # config.CodexApp when Codex's own loop runs the turn (CODEX_SPEC, codex_app.py).
 
 
 def _redraw() -> None:
@@ -130,19 +180,19 @@ def _redraw() -> None:
     mainthread.request_redraw()
 
 
-def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
-    from . import mainthread, tools
+def _on_main(fn, is_cancelled=lambda: False):
+    """fn() on the main thread, waited for here; a stop before the pump reaches it means it never runs."""
+    from . import mainthread
 
-    def execute():
+    def guarded():
         if is_cancelled():
             raise llm.Cancelled()
-        return tools.execute(name, arguments)
+        return fn()
 
-    future = mainthread.run_on_main(execute)
+    future = mainthread.run_on_main(guarded)
     while True:
         try:
-            result = future.result(timeout=_POLL_SECONDS)
-            break
+            return future.result(timeout=_POLL_SECONDS)
         except FutureTimeout:
             if future.done():
                 return future.result()  # Propagate a tool's TimeoutError; it is not a polling timeout.
@@ -150,9 +200,23 @@ def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
                 raise llm.Cancelled()
             # A native Blender operation already running cannot be interrupted safely. Keep
             # the turn busy until its result is accounted for; do not start another tool.
+
+
+def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
+    from . import mainthread, tools
+    if name == "delegate":
+        # Refresh on the agent thread before the UI thread builds the workers' opening messages.
+        from . import cloud, prompt_index
+        try:
+            cloud.hosted_index()
+        except prompt_index.IndexError as ex:
+            return tools.ToolResult(f"Could not start the workers: {ex}. Nothing started.", ok=False)
+    result = _on_main(lambda: tools.execute(name, arguments), is_cancelled)
     if getattr(result, "pending_job", None):
         from . import inspection
         return inspection.wait_result(result.pending_job, is_cancelled, mainthread.run_on_main)
+    if getattr(result, "then", None):  # Waits here, between main-thread calls, never in the UI pump.
+        return result.then(is_cancelled, lambda fn: _on_main(fn, is_cancelled))
     return result
 
 
@@ -177,29 +241,64 @@ def _fresh_images(images: list) -> list:
 def _approval(name: str, arguments: str, roots) -> str:
     """"" when the call runs unasked; "gate" when the user must approve it unless they said
     "Always allow" or auto-run is on; "heavy" for a render, a bake, a simulation, which can hold
-    Blender for minutes: it asks unless they said "Always allow renders"; see _asks."""
-    from . import files, tools
+    Blender for minutes: it asks unless they said "Always allow renders"; "install" for code that
+    installs packages or downloads code and runs it: it asks every time (tools.INSTALLS); see _asks."""
+    from . import files, tools, workspace
+    from . import orchestrator
     parsed = _arguments(arguments)
+    from . import cloud
+    if cloud.is_tool(name):
+        return ""  # Cloud execution gates resolved file uploads and cost consent together.
+    if tools.installs(name, parsed) or workspace.installs(name, parsed, roots):
+        return "install"
     if tools.is_heavy(name, parsed):
         return "heavy"
-    if name in tools.NEEDS_APPROVAL or files.needs_approval(name, parsed, roots):
+    if (name in tools.NEEDS_APPROVAL and not _only_reads(name, parsed) and not orchestrator.waits(name, parsed)
+            or files.needs_approval(name, parsed, roots) or workspace.needs_approval(name, parsed, roots)):
         return "gate"
     return ""
+
+
+INSTALL_REFUSAL = ("Not run: installing packages or running downloaded code needs the user's OK, and a worker "
+                   "cannot ask. Do without it, or report back what you need.")
 
 
 def _asks(approval: str, name: str, session: dict, cfg) -> bool:
     """Whether the step waits for the user. "Always allow renders" waives only the render itself:
     code that renders is still code, so it also needs "Always allow" or auto-run."""
     from . import tools
+    if approval == "install":
+        return True  # Neither auto-run nor any "Always allow" covers putting third-party code on their machine.
     allowed = cfg.auto_run or session["auto_run"]
     if approval == "heavy":
         return not session["auto_heavy"] or (name in tools.NEEDS_APPROVAL and not allowed)
     return bool(approval) and not allowed
 
 
-def _changes_scene(name: str) -> bool:
+def _only_reads(name: str, parsed: dict) -> bool:
+    """A scene-changing tool's call that only measures: frame_camera report_only, delegate dry_run."""
+    from . import orchestrator, tools
+    return tools.only_reads(name, parsed) or orchestrator.only_reads(name, parsed)
+
+
+def _changes_scene(name: str, arguments: str = "") -> bool:
+    from . import cloud, tools
+    return cloud.changes_scene(name) or name in tools.CHANGES_SCENE and not _only_reads(name, _arguments(arguments))
+
+
+def _same_while_unchanged(name: str, arguments: str = "") -> bool:
     from . import tools
-    return name in tools.CHANGES_SCENE
+    return name in tools.SAME_WHILE_UNCHANGED or _only_reads(name, _arguments(arguments))
+
+
+def _changes_over_time(name: str, arguments: str) -> bool:
+    from . import cloud, tools
+    return cloud.tool_name(name) == "job_status" or tools.changes_over_time(name, _arguments(arguments))
+
+
+def _in_view(step_message: dict) -> bool:
+    """Whether a step's results are still sent whole, not folded into its record."""
+    return not step_message.get(context.FOLDED)
 
 
 def _ensure_checkpoint_on_main(session: dict) -> None:
@@ -213,14 +312,24 @@ def _scene_context(text: str, since: dict | None) -> str:
 
 
 def _addons_line() -> str:
-    from . import addons
-    return addons.line(addons.enabled())
+    from . import addons, bundled_addons
+    try:
+        bundled = bundled_addons.packages()
+    except bundled_addons.BundledAddonError as ex:  # A broken bundle manifest never stops a turn.
+        print(f"Loopcut: bundled add-ons: {ex}")
+        bundled = []
+    return addons.line(addons.enabled(), bundled)
 
 
 def _system_prompt(session: dict) -> str:
     """The fixed prompt plus what is installed, read at the turn's start on the main thread."""
     extra = session.get("addons_line") or ""
     return f"{SYSTEM_PROMPT}\n\n{extra}" if extra else SYSTEM_PROMPT
+
+
+def _system_tail(session: dict) -> str:
+    extra = session.get("addons_line") or ""
+    return "\n\n" + extra if extra else ""
 
 
 def _scene_snapshot() -> dict:
@@ -264,12 +373,48 @@ def _keeps_context(cfg: config.Config) -> bool:
     return account.keeps_context(cfg.base_url, cfg.model)
 
 
-def _turn_config() -> config.Config:
-    """config.load(), with keep mode switched on when the Loopcut service lists the model with it."""
-    cfg = config.load()
+def _keep_mode(cfg: config.Config) -> config.Config:
+    """Keep mode switched on when the Loopcut service lists the model with it."""
     if not cfg.keep_context and _keeps_context(cfg):
         cfg = dataclasses.replace(cfg, keep_context=True)
     return cfg
+
+
+def _turn_config() -> config.Config:
+    return _keep_mode(config.load())
+
+
+def _configure(turn: Turn, session: dict | None = None) -> None:
+    """Main thread: the turn's config and spec. With workers on and a known prompt index,
+    ORCH_SPEC, keep mode resolved per role; otherwise the single loop. With LOOPCUT_WORKSPACE on, the
+    single loop is WORKSPACE_SPEC, and so is a conversation the router sent there (session["mode"]);
+    an orchestrated conversation that never delegated may be sent there by the router (_route). With
+    LOOPCUT_CODEX_APP on, every turn is the workspace's, run by Codex (CODEX_SPEC). Raises ConfigError."""
+    session = session if session is not None else state.session()
+    from . import cloud
+    cloud.sync_settings()
+    codex = config.codex_app()
+    if codex is not None:
+        session["mode"] = "workspace"
+        turn.config, turn.spec, turn.codex = _turn_config(), CODEX_SPEC, codex
+        return
+    roles = config.load_roles()
+    # The disk cache normally supplies this before the first refresh completes. With no
+    # known index yet (or an older server), the open single loop is safe for the first turn.
+    orchestrate = roles.orchestrate and cloud.prompt_index_available()
+    if roles.workspace and (session.get("mode") == "workspace" or not orchestrate):
+        session["mode"] = "workspace"
+        turn.config = _workspace_config(_keep_mode(roles.orchestrator) if roles.orchestrate else _turn_config())
+        turn.spec = WORKSPACE_SPEC
+        return
+    if orchestrate:
+        turn.roles = dataclasses.replace(roles, orchestrator=_keep_mode(roles.orchestrator),
+                                         worker=_keep_mode(roles.worker))
+        turn.config, turn.spec = turn.roles.orchestrator, ORCH_SPEC
+        turn.may_divert = roles.workspace and _never_delegated(session)
+    else:
+        turn.config = _keep_mode(roles.orchestrator) if roles.orchestrate else _turn_config()
+        turn.spec = SINGLE_SPEC
 
 
 def _update_account(info: dict) -> None:
@@ -278,14 +423,15 @@ def _update_account(info: dict) -> None:
 
 
 def _warn_low_allowance(session: dict, items: list, info: dict) -> None:
-    """Once per conversation, when the week's allowance is nearly used: the moment to upgrade
-    is before the stop, not at it."""
+    """Warn once before the week's allowance runs out; beta has no purchase action."""
     used = (info.get("week") or {}).get("used")
     if session.get("warned_low") or not isinstance(used, (int, float)) or used < LOW_ALLOWANCE:
         return
     session["warned_low"] = True
     left, plan = max(0, round((1 - used) * 100)), str(info.get("plan") or "")
-    if plan == "free":
+    if config.BETA:
+        items.append(state.item_notice(f"About {left}% of this week's allowance is left."))
+    elif plan == "free":
         items.append(state.item_notice(
             f"About {left}% of this week's free allowance is left. Upgrading now keeps this conversation "
             f"going without a stop.", "See plans", url=config.pricing_url("low_allowance")))
@@ -327,9 +473,9 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import asset_libraries, blenderkit, files, inspection, job_tools, polyhaven, polypizza, tools
-    return (tools.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + polyhaven.SCHEMAS
-            + asset_libraries.SCHEMAS + polypizza.SCHEMAS + blenderkit.SCHEMAS)
+    from . import assets, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools
+    return (tools.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
+            + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + cloud.tool_schemas())
 
 
 def _describe(call: llm.ToolCall) -> tuple[str, str]:
@@ -342,9 +488,14 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
-    from . import asset_libraries, blenderkit, files, job_tools, polyhaven, polypizza
-    for module in (job_tools, files, polyhaven, asset_libraries, polypizza, blenderkit):
-        described = module.describe(call.name, arguments)
+    from . import assets, camera, cloud, contact, files, job_tools, tools
+    name = call.name
+    if tools.RENAMED.get(name, (name,))[0] != name:  # A saved call to a tool since merged.
+        name, arguments = tools.current_call(name, arguments)
+    from . import orchestrator, paint_tools, texture_tools, uv_tools, workspace
+    for module in (job_tools, files, assets, contact, camera, orchestrator, uv_tools, texture_tools, paint_tools,
+                   workspace, cloud):
+        described = module.describe(name, arguments)
         if described:
             return described
     return str(arguments.get("summary") or call.name), str(arguments.get("code") or "")
@@ -403,6 +554,27 @@ def _wait_for_approval(turn: Turn) -> bool:
     return turn.approved
 
 
+def _cloud_consent(turn, card, asks, details, *, files_allowed=False):
+    """Cost consent is per call, even when ordinary scene edits are auto-approved."""
+    if "error" in details:
+        card["cloud_error"] = details["error"]
+        card["expanded"] = True
+        _redraw()
+        return True
+    card["cost"] = details["text"]
+    if not details["required"] or (details.get('file_access') and files_allowed):
+        return True
+    if not asks:
+        return False
+    turn.decided.clear()
+    card.update(status="awaiting", paid_approval=not details.get('file_access', False), heavy=False)
+    _redraw()
+    approved = _wait_for_approval(turn)
+    card["status"] = "running" if approved else "rejected"
+    _redraw()
+    return approved
+
+
 def _image_message(reference: str, what: str) -> dict:
     """A capture as a message: a reference to a file in the conversation's folder, expanded when a
     request is sent. `what` it shows is text, so it outlives the image."""
@@ -426,6 +598,11 @@ def _capture_refusal(turn: Turn, call_name: str, arguments: str) -> str:
         return ""
     turn.captures += 1
     turn.angle = angle
+    if call_name == "capture_viewport":
+        parsed = _arguments(arguments)
+        focus = parsed.get("focus")
+        turn.focus = [str(name) for name in focus] if isinstance(focus, list) else []
+        turn.shot = {k: parsed[k] for k in ("camera", "view_layer") if isinstance(parsed.get(k), str) and parsed[k]}
     look = f"{call_name} {json.dumps(_arguments(arguments), sort_keys=True)}"
     if call_name != "run_python" and not turn.changed and look == turn.last_look:
         turn.idle_captures += 1
@@ -447,7 +624,13 @@ def _look_note(turn: Turn) -> str:
             f"after each change. Finish soon, and say what you could not verify.)")
 
 
-def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled) -> list[str]:
+def _correlation_headers(session: dict, role: str) -> dict:
+    """This session's x-loopcut-conversation / x-loopcut-role (llm.correlation_headers) for the
+    given role (orchestrator/worker/single here; router.py and context.py send their own)."""
+    return llm.correlation_headers(session["id"], role)
+
+
+def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single") -> list[str]:
     """Describe the images the user just attached, so the description outlives the turn and any
     summary, and the model works from a checklist rather than a glance. Returns their names."""
     refs = [p["image_url"]["url"] for p in message["content"] if p.get("type") == "image_url"]
@@ -457,7 +640,9 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
     completion = llm.stream_chat(
         base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
         messages=[{"role": "system", "content": REFERENCE_PROMPT}, {"role": "user", "content": parts}],
-        tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled)
+        tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
+        max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
+        headers=_correlation_headers(session, "reference"), on_retry=lambda: None)  # Nothing shown mid-stream to undo.
     card = completion.text.strip()
     if card:
         message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
@@ -474,8 +659,17 @@ def _auto_look(session: dict, turn: Turn, run_tool, alike) -> tuple[str, "Path |
     image: the capture is free, the image in every later request is not.
     Returns (text for the step's result, image path or None)."""
     from . import tools
+    latest = (turn.scene_after or {}).get("objects") or {}
+    focus = [name for name in dict.fromkeys(turn.touched) if name in latest]
+    # Else the model's own last focus, kept like its angle: a worker's changes carry no snapshots, so
+    # its auto-look went through the camera after a focused final look (analysis §5.5).
+    focus = focus or [name for name in turn.focus if name in latest or not latest]
+    turn.touched = []
     try:
-        shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle}))
+        shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle, **turn.shot,
+                                                        **({"focus": focus} if focus else {})}))
+        if (focus or turn.shot) and not shot.ok:  # Something named is gone after all: the whole scene, as before.
+            shot = run_tool("capture_viewport", json.dumps({"angle": turn.angle}))
     except llm.Cancelled:
         return "", None  # The mutation already ran; keep its result before honoring Stop.
     if not (shot.ok and shot.image_path):
@@ -492,8 +686,397 @@ def _auto_look(session: dict, turn: Turn, run_tool, alike) -> tuple[str, "Path |
     return f"\n\n{shot.text}", shot.image_path
 
 
+class BudgetStop(Exception):
+    """Raised by a LoopSpec's before_request when a budget shared beyond this loop is spent (a
+    job's dollars or a worker's time): the loop stops asking for tools and wraps up."""
+
+
+@dataclasses.dataclass
+class LoopSpec:
+    """Every choice the loop makes that differs by role, so one loop serves the single agent
+    (today's), the orchestrator and the workers. The prompt and tools are fixed for a
+    conversation's life, so the provider's cached prefix holds."""
+    role: str                                   # "orchestrator" | "worker" | "single" (today)
+    system: Callable[[dict], str]               # session -> system prompt
+    schemas: Callable[[], list]                 # the tools offered
+    save: Callable[[dict], None]                # conversations.save, or a worker's transcript writer
+    asks: bool = True                           # False: never waits for approval (workers)
+    checkpoints: bool = True                    # False: never checkpoints the live scene (workers)
+    changes_card: bool = True                   # False: no "what changed" card at the end (workers)
+    scene_changed: Callable = _scene_changed    # result -> whether it changed the scene
+    before_request: Callable[[int], None] | None = None    # step -> None; may wait, or raise BudgetStop
+    on_usage: Callable[[dict], None] | None = None          # after every completion, with its usage ({} if none)
+    after_step: Callable[[dict, "Turn"], bool] | None = None  # True: stop now (a worker reported back)
+    # A reply with no tool calls, or a stopped turn's wrap-up: text to send back as a message
+    # that continues the turn (the finish gate's bounce), or a result whose text and image go back
+    # (the workers it waited for, with their contact sheet), or None to let the turn end.
+    on_final: Callable[[dict, "Turn", "llm.Completion | None"], Any] | None = None
+    # Before the first request (the router): may add to the message that started the turn.
+    on_turn_start: Callable[[dict, "Turn"], None] | None = None
+    steps_left_note: str = STEPS_LEFT_NOTE      # Appended STEPS_LEFT_NOTICE steps before the step limit.
+    # (session, tool name, result) -> text appended to that result: the orchestrator's note when its own
+    # run_python changed an object a worker built (orchestrator.edit_note). Informational only.
+    after_tool: Callable[[dict, str, Any], str] | None = None
+    # (session, turn) as the turn ends, however it ends: the orchestrator's workers still running stop
+    # after a Stop, and are waited for and merged after an error (waves.end_turn).
+    on_end: Callable[[dict, "Turn"], None] | None = None
+    # False: attached images go to the model as they are, with no <reference_card> (the workspace agent,
+    # which has them at full size in its folder; a card's wording is a cheaper reading of them).
+    reference_card: bool = True
+    # (session, turn, cfg, run_tool, ensure_checkpoint) -> outcome: another agent loop runs the turn after
+    # on_turn_start (Codex's, codex_app.run_turn), its tool calls run through run_tool; the turn's start and
+    # end, Stop and errors stay this loop's.
+    drive: Callable | None = None
+    prompt_id: str | None = None                # Hosted injection; workspace/summary remain open.
+
+
+# Today's single loop. The lambdas look the functions up when called, so tests can replace them.
+SINGLE_SPEC = LoopSpec(role="single", system=lambda session: _system_prompt(session),
+                       schemas=lambda: _tool_schemas(), save=lambda session: conversations.save(session), prompt_id="single")
+
+
+def _orchestrator_schemas() -> list[dict]:
+    from . import orchestrator
+    return _tool_schemas() + orchestrator.SCHEMAS
+
+
+def _acceptance_run(checks: list, spawn=None) -> list:
+    from . import acceptance
+    return acceptance.run(checks, spawn)
+
+
+def _route(session: dict, turn: Turn) -> None:
+    """The router's decision for this turn, as a note on the user's message (router.py). With the
+    workspace on, a conversation that never delegated and whose turn is a look (router.to_workspace)
+    goes to the single agent's workspace loop instead, for this turn and the rest of the conversation:
+    no note, the orchestrator's model, WORKSPACE_SPEC (run_loop picks up turn.spec)."""
+    from . import router
+    roles = getattr(turn, "roles", None)
+    divert = router.to_workspace if getattr(turn, "may_divert", False) else None
+    router.start_turn(session, turn, roles.router if roles else None, turn.cancel.is_set, divert=divert)
+    if getattr(turn, "diverted", False):
+        session["mode"] = "workspace"
+        turn.spec = WORKSPACE_SPEC
+        turn.config = _workspace_config(turn.config)
+        turn.roots = _on_main(_project_roots, turn.cancel.is_set)  # Relative paths now mean the workspace.
+        _workspace_turn(session, turn)
+
+
+def _never_delegated(session: dict) -> bool:
+    """No orchestrator-only tool was ever called: the single agent's tools cover the whole history."""
+    from . import orchestrator
+    own = {s["function"]["name"] for s in orchestrator.SCHEMAS}
+    return not any(call.get("function", {}).get("name") in own for m in session["messages"]
+                   for call in m.get("tool_calls") or ())
+
+
+def _orchestrator_edit_note(session: dict, name: str, result) -> str:
+    from . import orchestrator
+    return orchestrator.edit_note(session, name, result)
+
+
+def _orchestrator_final(session: dict, turn: Turn, completion) -> str | None:
+    """A level-3 turn that delegated nothing is nudged once; then the finish gate."""
+    from . import router
+    return router.nudge(turn, completion) or _finish_gate(session, turn, completion)
+
+
+def _orchestrator_end(session: dict, turn: Turn) -> None:
+    from . import waves
+    waves.end_turn(session, turn)
+
+
+def _finish_gate(session: dict, turn: Turn, completion):
+    """A turn that delegated ends only once Loopcut has run its checks on the live scene."""
+    from . import orchestrator
+    job = getattr(turn, "job", None)
+    if job is None:
+        return None
+    run_checks = job.checker or (lambda checks: _on_main(lambda: _acceptance_run(checks, job.baseline),
+                                                         turn.cancel.is_set))
+    return orchestrator.finish_gate(session, turn, completion, run_checks)
+
+
+# The orchestrator: today's prompt and tools (level 1 unchanged) plus the workers section and
+# delegate, checks and accept_quarantine; the router's note before its first request,
+# its nudge and the finish gate on its last reply.
+ORCH_SPEC = LoopSpec(role="orchestrator", system=lambda session: _system_tail(session), prompt_id="orchestrator",
+                     schemas=lambda: _orchestrator_schemas(), save=lambda session: conversations.save(session),
+                     on_final=lambda session, turn, completion: _orchestrator_final(session, turn, completion),
+                     on_turn_start=lambda session, turn: _route(session, turn),
+                     after_tool=lambda session, name, result: _orchestrator_edit_note(session, name, result),
+                     on_end=lambda session, turn: _orchestrator_end(session, turn))
+
+
+def _workspace_prompt(session: dict) -> str:
+    from . import workspace
+    return workspace.system_prompt(session.get("addons_line") or "")
+
+
+def _workspace_schemas() -> list[dict]:
+    from . import cloud, workspace
+    return [s for s in _tool_schemas() if s["function"]["name"] in workspace.LIVE_TOOLS
+            or cloud.is_tool(s["function"]["name"])] + workspace.SCHEMAS
+
+
+def _workspace_config(cfg: config.Config) -> config.Config:
+    """Keep mode, and a budget of at least context.WORKSPACE_BUDGET: the workspace agent's steps are not
+    rewritten into records mid-turn (Codex keeps a thread whole until its window fills)."""
+    return dataclasses.replace(cfg, keep_context=True,
+                               context_budget=max(cfg.context_budget, context.WORKSPACE_BUDGET))
+
+
+def _workspace_turn(session: dict, turn: Turn) -> None:
+    """The workspace made and noted on the turn's message, with the craft notes its words call for."""
+    from . import cloud, skills, workspace
+    options = cloud.skill_options()
+    craft = None
+    if config.load_roles().single_craft:
+        if getattr(turn, "codex", None):
+            from . import codex_app
+            available = {s["name"] for s in codex_app.dynamic_tools()} | {"shell"}
+        else:
+            available = {s["function"]["name"] for s in _workspace_schemas()}
+        options = {**options, "available_tools": available | set(options.get("available_tools", ()))}
+        craft = lambda text: skills.single_notes(text, role="workspace", **options)
+    workspace.start_turn(session, turn.cancel.is_set, lambda fn: _on_main(fn, turn.cancel.is_set), craft=craft)
+
+
+# The single agent in workspace mode (workspace.py, LOOPCUT_WORKSPACE=on): its own short prompt, the
+# workspace tools and a few live ones, as a coding agent works in a terminal that has Blender.
+WORKSPACE_SPEC = LoopSpec(role="single", system=lambda session: _workspace_prompt(session),
+                          schemas=lambda: _workspace_schemas(), save=lambda session: conversations.save(session),
+                          on_turn_start=lambda session, turn: _workspace_turn(session, turn), reference_card=False)
+
+
+def _codex_turn(session: dict, turn: Turn, cfg: config.Config, run_tool, ensure_checkpoint) -> str:
+    from . import codex_app
+    return codex_app.run_turn(session, turn, cfg, run_tool, ensure_checkpoint)
+
+
+# LOOPCUT_CODEX_APP: the workspace turn run by Codex's own agent loop, Loopcut's live tools as its dynamic tools.
+CODEX_SPEC = dataclasses.replace(
+    WORKSPACE_SPEC, drive=lambda session, turn, cfg, run_tool, ensure_checkpoint: _codex_turn(
+        session, turn, cfg, run_tool, ensure_checkpoint))
+
+
+# Tools that act without being scene changes checkpoints cover: files written, renders started, and the
+# workspace's commands and edits.
+_ACTS = {"write_file", "move_file", "shell", "run_blender", "edit_file"}
+
+
+def _acts(name: str, arguments: str) -> bool:
+    parsed = _arguments(arguments)
+    return (_changes_scene(name, arguments) or name in _ACTS
+            or name == "render_job" and parsed.get("action") in ("start", "resume")
+            or name == "see_render" and str(parsed.get("render")).lower() == "true")
+
+
+def _note_level(turn: Turn, name: str, arguments: str, delegations_before: int) -> None:
+    """Level from actions, no declaration: a read is 0, any other action 1, a wave that started 2
+    for one deliverable and 3 for more; over the turn, 3 once two or more deliverables were handed
+    out in all. first is the first action's level, so a later delegate after level-1 work is an
+    escalation (final > first). A refused or dry-run delegate is no action."""
+    if name == "delegate":
+        started = turn.delegations[delegations_before:]
+        level = (3 if max(len(d) for d in started) >= 2 else 2) if started else 0
+    else:
+        level = 1 if _acts(name, arguments) else 0
+    if not level:
+        return
+    if turn.level_first is None:
+        turn.level_first = level
+    handed = {deliverable for wave in turn.delegations for deliverable in wave}
+    turn.level_max = max(turn.level_max, level, 3 if len(handed) >= 2 else 0)
+
+
+def _record_level(session: dict, turn: Turn) -> None:
+    """session["turn_levels"]: {turn, first, final}, plus routed (the router's level, None when it
+    gave none) once the router ran and nudged once it nudged; a resumed turn updates its own entry."""
+    levels = session.setdefault("turn_levels", [])
+    number = session.get("turn_number") or 1
+    entry = {"turn": number, "first": turn.level_first or 0, "final": turn.level_max}
+    if getattr(turn, "route_tried", False):
+        entry["routed"] = turn.routed.level if turn.routed else None
+    if getattr(turn, "nudged", False):
+        entry["nudged"] = True
+    if levels and levels[-1]["turn"] == number:
+        previous = levels[-1]
+        entry = {**previous, **entry, "first": previous["first"] or entry["first"],
+                 "final": max(previous["final"], entry["final"])}
+        levels[-1] = entry
+    else:
+        levels.append(entry)
+    job = getattr(turn, "job", None)
+    if job is not None:
+        job.log["level"] = entry["final"]
+        job.write()
+
+
+def _completion_unusable(completion: llm.Completion) -> bool:
+    """Hit the output cap (the model's own finish_reason "length", or llm.py's call_max_seconds
+    reporting the same way) without giving the loop anything it can act on: no reply text, and no
+    tool call whose arguments survived intact -- one cut mid-argument is invalid JSON, not a usable
+    call, so it is treated the same as no call at all."""
+    if completion.finish_reason != "length" or completion.text.strip():
+        return False
+    for call in completion.tool_calls:
+        if not call.arguments.strip():
+            continue
+        try:
+            json.loads(call.arguments)
+        except ValueError:
+            return True
+    return not completion.tool_calls
+
+
+def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SINGLE_SPEC) -> llm.Completion:
+    """One request with the conversation as it stands, streamed into a reply card. A reply that
+    hits the output cap (max_tokens, or call_max_seconds -- llm.py reports both as finish_reason
+    "length") without a usable reply or tool call is retried once: the same messages, plus a short
+    instruction to decide and act now, and at effort "high" instead of "max". A second cap hit in a
+    row raises llm.LLMError, which run_loop already shows as this step's error."""
+    items = session["items"]
+    from . import cloud, prompt_index
+    hosted = spec.prompt_id if config.on_service(cfg.base_url) else None
+    if spec.prompt_id in ("worker", "orchestrator") and not hosted:
+        raise config.ConfigError("Workers and orchestration require the Loopcut service")
+    try:
+        index = cloud.hosted_index(required=hosted != "single") if hosted else None
+    except prompt_index.IndexError as ex:
+        if hosted == "orchestrator":
+            raise config.ConfigError("Loopcut could not load its service prompt index; try again in a moment") from ex
+        if hosted != "single":
+            raise
+        print("Loopcut: could not load the service prompt index; using the open single-loop prompt")
+        index = None
+    if hosted == "single" and index is None:
+        hosted = None  # Older servers and unavailable manifests use the open prompt and its budget.
+    system = _system_tail(session) if hosted in ("single", "orchestrator") else spec.system(session)
+    schemas = spec.schemas()
+    fixed = context.fixed_tokens(system, schemas, prompt_id=hosted, index=index)
+    prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed, skill_index=index)
+    if compacted:
+        items.append(state.item_notice(
+            f"Summarized {compacted} earlier messages so requests stay small."))
+    estimated = context.estimate_tokens(prepared, fixed, skill_index=index)
+    reply = state.item_assistant()
+    items.append(reply)
+
+    def on_text(delta: str) -> None:
+        reply["text"] += delta
+        _redraw()
+
+    def on_retry() -> None:
+        """A read timeout or reset broke the stream after some of this reply had already shown; the
+        card is reset so the retried request's own text does not land on top of the stale partial
+        reply (llm.stream_chat retries once, from scratch, only when this is given)."""
+        reply["text"] = ""
+        _redraw()
+
+    full_refs = {r["ref"]: r.get("full") or r["ref"] for r in session.get("references") or []} \
+        if session.get("mode") == "workspace" else None
+    wired = [*([{"role": "system", "content": system}] if system else []),
+             *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session), cfg.keep_context,
+                                          full_refs=full_refs)]
+
+    def call(messages: list[dict], effort: str) -> llm.Completion:
+        return llm.stream_chat(
+            base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+            messages=messages, tools=schemas, reasoning_effort=effort,
+            on_text=on_text, is_cancelled=turn.cancel.is_set,
+            max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
+            headers=_correlation_headers(session, spec.role), on_retry=on_retry,
+            prompt_id=hosted,
+        )
+
+    def record(completion: llm.Completion) -> None:
+        if completion.usage:
+            for key in ("input", "cached", "output"):
+                session["usage"][key] += completion.usage.get(key, 0)
+            session["usage"]["context"] = completion.usage["input"]
+            context.calibrate(session, estimated, completion.usage["input"])
+        bucket = session.setdefault("usage_by_role", {}).setdefault(
+            spec.role, {"input": 0, "cached": 0, "output": 0, "requests": 0})
+        for key in ("input", "cached", "output"):
+            bucket[key] += (completion.usage or {}).get(key, 0)
+        bucket["requests"] += 1
+        if spec.on_usage:
+            spec.on_usage(completion.usage or {})
+        if completion.account:
+            _update_account(completion.account)
+            _warn_low_allowance(session, items, completion.account)
+
+    def cap_reason(completion: llm.Completion) -> str:
+        return "the wall-clock limit" if completion.timed_out else f"the {cfg.max_output_tokens}-token output cap"
+
+    completion = call(wired, cfg.reasoning_effort)
+    record(completion)
+    if _completion_unusable(completion):
+        retry_effort = "high" if cfg.reasoning_effort == "max" else cfg.reasoning_effort
+        print(f"Loopcut: {spec.role} step hit {cap_reason(completion)} with no usable reply or tool call; "
+              f"retrying once at effort={retry_effort}.")
+        completion = call(wired + [{"role": "user", "content": CAP_RETRY_PROMPT}], retry_effort)
+        record(completion)
+        if _completion_unusable(completion):
+            reason = cap_reason(completion)
+            print(f"Loopcut: {spec.role} step hit {reason} again on the retry; giving up on this step.")
+            reply["streaming"] = False
+            if not reply["text"].strip():
+                items.remove(reply)
+            raise llm.LLMError(f"{spec.role.capitalize()} step stopped at {reason} twice in a row, "
+                               f"without a usable reply or tool call.")
+    reply["streaming"] = False
+    if not reply["text"].strip():
+        items.remove(reply)
+    return completion
+
+
+def _wrap_up(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SINGLE_SPEC,
+             prompt: str = "") -> llm.Completion | None:
+    """After a guard or budget stops the turn, one more request, asking for text only, so it ends with the
+    model saying where the work stands rather than a bare stop. The tools stay in the request, so
+    it extends the last one and the provider's cached prefix holds. tool_choice "none" would say
+    it better, but measured 2026-09-27 GLM and MiMo ignore it and Muse Spark refuses it (HTTP 400);
+    all three answered this appended message in text. A tool call in the reply is dropped; with no
+    text, or any failure, the bare stop stands, without a retry. Returns the completion kept, if any."""
+    if turn.cancel.is_set():
+        return None
+    items, messages = session["items"], session["messages"]
+    first = len(items)
+    # Marked so it continues the turn: as a turn start it would fold the turn's steps (context.py).
+    messages.append({"role": "user", context.STEP_LIMIT: True,
+                     "content": prompt or STEP_LIMIT_PROMPT.format(steps=cfg.max_steps)})
+    try:
+        completion = _request(session, turn, cfg, spec)
+    except Exception as ex:  # Cancelled too. Whatever went wrong, the turn still ends as it would have.
+        print(f"Loopcut: no summary after {turn.outcome}: {ex!r}")
+        completion = None
+    for item in [i for i in items[first:] if i["kind"] == "assistant" and not i["text"].strip()]:
+        items.remove(item)  # The reply card of a request that failed, or of a reply with only tool calls.
+    if completion and completion.text.strip():
+        # The text only: a tool call can no longer run, and one left unanswered breaks the history.
+        messages.append({"role": "assistant", "content": completion.text})
+        return completion
+    messages.pop()  # Unanswered, it would tell the next turn that tools are off.
+    return None
+
+
+def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec, prompt: str = "") -> None:
+    """The turn ends short of finishing: the wrap-up, then the spec's last word (it cannot bounce)."""
+    completion = _wrap_up(session, turn, cfg, spec, prompt)
+    if spec.on_final and not turn.cancel.is_set():
+        spec.on_final(session, turn, completion)
+
+
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
          ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
+    """The turn's loop with the spec send() chose; today's single loop when it chose none."""
+    run_loop(session, turn, getattr(turn, "spec", None) or SINGLE_SPEC, run_tool, ensure_checkpoint, alike)
+
+
+def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_main,
+             ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     items, messages = session["items"], session["messages"]
     alike = alike or _alike_on_main
     if run_tool is _run_tool_on_main:
@@ -501,70 +1084,93 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
     try:
         cfg = turn.config or config.load()
         last = messages[-1] if messages else {}
-        if last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
+        if spec.reference_card and last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
             try:
-                names = _reference_card(session, cfg, last, turn.cancel.is_set)
+                names = _reference_card(session, cfg, last, turn.cancel.is_set, spec.role)
                 items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
             except llm.LLMError as ex:
                 print(f"Loopcut: could not describe the attached images: {ex}")
-        for _ in range(cfg.max_steps):
+        if spec.on_turn_start:
+            spec.on_turn_start(session, turn)
+            if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
+                spec = turn.spec
+        if spec.drive:
+            turn.outcome = spec.drive(session, turn, cfg, run_tool, ensure_checkpoint)
+            return
+        no_progress = repeats.NoProgress()
+        step = 0
+        while not cfg.max_steps or step < cfg.max_steps:
+            step += 1
             if turn.cancel.is_set():
                 raise llm.Cancelled()
+            if turn.notes:
+                turn.ledger.scene_changed()  # What the user says mid-turn may come with edits of their own.
+                if no_progress:
+                    no_progress.reset()
             _fold_notes(session, turn)
-            system, schemas = _system_prompt(session), _tool_schemas()
-            fixed = context.fixed_tokens(system, schemas)
-            prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed)
-            if compacted:
-                items.append(state.item_notice(
-                    f"Summarized {compacted} earlier messages so requests stay small."))
-            estimated = context.estimate_tokens(prepared, fixed)
-            reply = state.item_assistant()
-            items.append(reply)
-
-            def on_text(delta: str, reply=reply) -> None:
-                reply["text"] += delta
-                _redraw()
-
-            completion = llm.stream_chat(
-                base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
-                messages=[{"role": "system", "content": system},
-                          *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session),
-                                                       cfg.keep_context)],
-                tools=schemas, reasoning_effort=cfg.reasoning_effort,
-                on_text=on_text, is_cancelled=turn.cancel.is_set,
-            )
-            reply["streaming"] = False
-            if completion.usage:
-                for key in ("input", "cached", "output"):
-                    session["usage"][key] += completion.usage.get(key, 0)
-                session["usage"]["context"] = completion.usage["input"]
-                context.calibrate(session, estimated, completion.usage["input"])
-            if completion.account:
-                _update_account(completion.account)
-                _warn_low_allowance(session, items, completion.account)
-            if not reply["text"].strip():
-                items.remove(reply)
+            if spec.before_request:
+                spec.before_request(step)
+            completion = _request(session, turn, cfg, spec)
             messages.append(completion.as_message())
             if not completion.tool_calls:
+                bounce = spec.on_final(session, turn, completion) if spec.on_final and not turn.cancel.is_set() else None
+                if bounce:  # Sent back, marked so it continues the turn, and the loop goes on.
+                    text = bounce if isinstance(bounce, str) else bounce.text
+                    messages.append({"role": "user", context.STEP_LIMIT: True, "content": text})
+                    if getattr(bounce, "image_path", None):  # The late workers' contact sheet.
+                        messages.append(_image_message(conversations.store_image(session, bounce.image_path),
+                                                       _image_what(text)))
+                    spec.save(session)
+                    _redraw()
+                    continue
                 turn.outcome = "cancelled" if turn.cancel.is_set() else "completed"
                 return
 
+            step_message = messages[-1]
             images = []
             changed_by = None  # (card, tool message) of the reply's last step that changed the scene.
-            for call in completion.tool_calls:
+            # Call key -> [its number in this reply, the ledger's revision after it]: the same call twice
+            # in one reply runs once, unless something that may change the scene ran in between (a
+            # run_python that moved to another frame, then the same look again).
+            seen = {}
+            stalled = False
+            for number, call in enumerate(completion.tool_calls, 1):
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
                 summary, code = _describe(call)
                 card = state.item_tool(call.name, summary, code)
                 items.append(card)
+                key = repeats.call_key(call.name, call.arguments)
+                read = _same_while_unchanged(call.name, call.arguments)
+                earlier = seen.get(key)
+                twice = earlier is not None and earlier[1] == turn.ledger.revision
+                skip = ("" if _changes_over_time(call.name, call.arguments)  # A job's status moves on by itself.
+                        else f"Not run: duplicate of call #{earlier[0]} in this step; see its result." if twice
+                        else turn.ledger.refusal(key, _in_view) if read else "")
+                if not twice:
+                    seen[key] = [number, turn.ledger.revision]
+                if skip:  # Not run, so not failed: "rejected" is the card of a step that did not run.
+                    card["status"], card["output"] = "rejected", skip
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": skip})
+                    if no_progress and no_progress.skip(key):
+                        stalled = True
+                        break
+                    continue
                 approval = _approval(call.name, call.arguments, turn.roots)
-                if _asks(approval, call.name, session, cfg):
+                if approval == "install" and not spec.asks:  # A worker cannot ask, so it cannot install.
+                    card["status"] = "rejected"
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": INSTALL_REFUSAL})
+                    continue
+                if spec.asks and _asks(approval, call.name, session, cfg):
                     turn.decided.clear()
                     # heavy: asking because it renders, so the card's "always" allows renders.
                     card["status"] = "awaiting"
                     card["heavy"] = approval == "heavy" and not session["auto_heavy"]
+                    card["install"] = approval == "install"
                     _redraw()
                     if not _wait_for_approval(turn):
+                        if no_progress:
+                            no_progress.reset()
                         card["status"] = "rejected"
                         messages.append({"role": "tool", "tool_call_id": call.id,
                                          "content": "The user rejected this action. Ask what they want instead."})
@@ -578,9 +1184,12 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                         card["status"] = "failed"
                         card["output"] = "Not captured: " + refusal.split(".")[0] + "."
                         messages.append({"role": "tool", "tool_call_id": call.id, "content": f"Not captured: {refusal}"})
+                        if no_progress and no_progress.skip(key):
+                            stalled = True
+                            break
                         continue
                     arguments, note = _without_capture(arguments), f"\n\nCapture skipped: {refusal}"
-                if _changes_scene(call.name):
+                if spec.checkpoints and _changes_scene(call.name, call.arguments):
                     try:
                         ensure_checkpoint(session)
                     except checkpoints.CheckpointError as ex:
@@ -590,22 +1199,53 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                         messages.append({"role": "tool", "tool_call_id": call.id, "content":
                                          f"This step was NOT run, because a checkpoint could not be saved "
                                          f"first: {ex} Tell the user; do not retry."})
+                        if no_progress and no_progress.skip(key):
+                            stalled = True
+                            break
                         continue
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
-                result = run_tool(call.name, arguments)
+                delegations = len(turn.delegations)
+                from . import cloud_account
+                with cloud_account.approval_context(lambda details: _cloud_consent(turn, card, spec.asks, details,
+                        files_allowed=cfg.auto_run or session['auto_run'])):
+                    result = run_tool(call.name, arguments)
+                if spec.role != "worker":
+                    _note_level(turn, call.name, call.arguments, delegations)
+                changed = spec.scene_changed(result)
+                may_change = _changes_scene(call.name, call.arguments)
+                if may_change or changed:
+                    # Any run of a scene-changing tool, not only a measured change: scene_diff does
+                    # not see every setting, and a read after such a step may well differ.
+                    turn.ledger.scene_changed()
+                    seen[key][1] = turn.ledger.revision  # Its own double right after it is still one call.
+                if no_progress:
+                    # Workers return the child's measured change flag instead of full snapshots.
+                    # Without either, a potentially mutating tool is conservatively progress.
+                    measured = ((spec.role == "worker" and hasattr(result, "changed"))
+                                or (getattr(result, "scene_before", None) is not None
+                                    and getattr(result, "scene_after", None) is not None))
+                    stalled = no_progress.record(key, result.ok, changed or (may_change and not measured))
+                result.text += turn.ledger.record(step, key, result.text, result.ok, read, step_message)
                 if note:
                     result.text += note
+                if spec.after_tool:
+                    result.text += spec.after_tool(session, call.name, result) or ""
                 asked_look = call.name in CAPTURE_TOOLS or (call.name == "run_python" and _wants_capture(arguments))
-                if _scene_changed(result):
+                if changed:
                     turn.changed, turn.idle_captures = True, 0
+                    if getattr(result, "scene_before", None) is not None and getattr(result, "scene_after", None) is not None:
+                        from . import scene_diff
+                        turn.touched += scene_diff.touched(result.scene_before, result.scene_after)
                 if asked_look:  # After the change: run_python's own capture is taken after its code ran.
                     result.text += _look_note(turn)
-                    turn.changed = False
+                    turn.changed, turn.touched = False, []
                 card["status"] = "done" if result.ok else "failed"
                 card["output"] = result.text
+                for guard in getattr(result, "guard_notes", None) or ():  # Already in result.text too.
+                    items.append(state.item_guard(guard["text"], guard["modifiers"]))
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})
-                if _scene_changed(result) and not asked_look and not refusal:
+                if changed and not asked_look and not refusal:
                     changed_by = (card, messages[-1])
                 if result.image_path:
                     # Stored now: every capture is written to the same file, so a second capture in
@@ -615,6 +1255,12 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 if getattr(result, "scene_before", None) is not None:
                     turn.scene_before = turn.scene_before or result.scene_before
                     turn.scene_after = result.scene_after
+                if stalled:
+                    break
+            if stalled:
+                # A failure or refusal can stop the batch; close every pending call before the wrap-up.
+                conversations.close_open_tool_calls(messages, "Not run: stopped because no progress was made.")
+            last = card, messages[-1]  # The step's last result, where a note on the step budget goes.
             # One automatic look per reply, after all of it, unless the model looked after its last change.
             if changed_by and turn.changed and cfg.auto_look and not turn.cancel.is_set():
                 card, message = changed_by
@@ -623,12 +1269,31 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
                 message["content"] += text
                 if path:
                     images.append((conversations.store_image(session, path), _image_what(text), None, card, message))
+            if not stalled and cfg.max_steps and cfg.max_steps - step == STEPS_LEFT_NOTICE:
+                note = spec.steps_left_note.format(left=STEPS_LEFT_NOTICE)
+                last[0]["output"] += note
+                last[1]["content"] += note
             # Tool messages must directly follow the assistant message, so images go after them all.
             messages.extend(_image_message(reference, what) for reference, what in _fresh_images(images))
-            conversations.save(session)  # The history is consistent here: every call has its result.
+            spec.save(session)  # The history is consistent here: every call has its result.
             _redraw()
+            if stalled:
+                turn.outcome = "no_progress"
+                turn.stop_reason = "the no-progress guard (repeated failures or refusals without a scene change)"
+                items.append(state.item_notice(NO_PROGRESS_NOTICE))
+                _end_at_limit(session, turn, cfg, spec, NO_PROGRESS_PROMPT)
+                return
+            if spec.after_step and spec.after_step(session, turn):
+                turn.outcome = "completed"
+                return
         turn.outcome = "step_limit"
         items.append(state.item_error(f"Stopped after {cfg.max_steps} steps without finishing."))
+        _end_at_limit(session, turn, cfg, spec)
+    except BudgetStop as ex:
+        turn.outcome = "budget"
+        turn.stop_reason = str(ex)
+        items.append(state.item_error(f"Stopped by the budget: {ex}"))
+        _end_at_limit(session, turn, cfg, spec, BUDGET_PROMPT.format(reason=ex))
     except llm.Cancelled:
         turn.outcome = "cancelled"
         items.append(state.item_error("Stopped."))
@@ -645,7 +1310,16 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
         items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
-        changed = _changes_item(session, turn)
+        if spec.on_end:
+            try:
+                spec.on_end(session, turn)
+            except Exception as ex:  # Never keeps the turn from ending.
+                import traceback
+                traceback.print_exc()
+                items.append(state.item_error(f"Internal error while ending the turn: {ex!r}"))
+        if spec.role != "worker":
+            _record_level(session, turn)
+        changed = _changes_item(session, turn) if spec.changes_card else None
         if changed:
             items.append(changed)
         if turn.scene_after is not None:
@@ -666,7 +1340,7 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             if item in items:
                 items.remove(item)
         try:
-            conversations.save(session)
+            spec.save(session)
         except OSError as ex:
             items.append(state.item_error(f"Could not save this conversation: {ex}"))
         if late:
@@ -693,11 +1367,12 @@ def send(text: str) -> bool:
         return False
     turn = Turn()
     try:
-        turn.config = _turn_config()
+        _configure(turn, session)
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
         return False
     turn.roots = _project_roots()
+    session["turn_number"] = session.get("turn_number", 0) + 1
     user_item = state.item_user(text, [a["name"] for a in attachments])
     checkpoints.begin_turn(session, user_item)
     session["items"].append(user_item)
@@ -711,7 +1386,8 @@ def send(text: str) -> bool:
             {"type": "text", "text": content},
             *({"type": "image_url", "image_url": {"url": a["ref"]}} for a in attachments)]})
         known = {r["ref"] for r in session["references"]}
-        session["references"] += [{"ref": a["ref"], "full": a.get("full", a["ref"]), "name": a["name"], "pinned": True}
+        session["references"] += [{"ref": a["ref"], "full": a.get("full", a["ref"]), "name": a["name"], "pinned": True,
+                                   **({"source": a["source"]} if a.get("source") else {})}
                                   for a in attachments if a["ref"] not in known]
         session["attachments"] = []
     else:
@@ -739,7 +1415,7 @@ def resume() -> bool:
         return False
     turn = Turn()
     try:
-        turn.config = _turn_config()
+        _configure(turn, session)
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
         return False
@@ -756,7 +1432,7 @@ def decide(approved: bool, always: bool = False) -> bool:
     card = next((i for i in session["items"] if i.get("status") == "awaiting"), None)
     if turn is None or card is None:
         return False
-    if approved and always:
+    if approved and always and not card.get("paid_approval") and not card.get("install"):
         session["auto_heavy" if card.get("heavy") else "auto_run"] = True
     turn.approved = approved
     turn.decided.set()
