@@ -3,11 +3,10 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
-from loopcut import config, state  # noqa: E402
+from loopcut import state  # noqa: E402
 from loopcut.ui import layout, theme as T  # noqa: E402
 
 
@@ -217,6 +216,20 @@ def prim(display, id):
     return next(p for p in display["prims"] if p["id"] == id)
 
 
+def idea(name, title=None, level=None, badge=None, voted=False, summary="", state="ready"):
+    """A row as cloud.coming_soon() makes it for the vote strip and view."""
+    return {"name": name, "title": title or name.title(), "summary": summary, "state": state, "category": "",
+            "voted": voted, "level": level, "badge": badge}
+
+
+def right(p):
+    return p["x"] + measure("ui", p["size"], p["text"])
+
+
+def vote_view(width=420, height=800, **ui):
+    return layout.build(state.new_session(), width, height, 1, measure, ui={"view": "vote", **ui})
+
+
 class FirstRunTest(unittest.TestCase):
     def test_signed_out_has_equal_sign_in_routes_and_a_quiet_key_link(self):
         display = build(needs_setup=True)
@@ -285,84 +298,48 @@ class CloudPanelTest(unittest.TestCase):
         signed_in = build(service_settings=True, service_signed_in=True)
         self.assertNotIn('Sign in to Loopcut', texts(signed_in).values())
 
-    def test_signed_out_reminder_is_below_button_and_wraps_at_narrow_widths(self):
+    def test_signed_out_vote_view_has_a_sign_in_note_that_wraps_short_of_the_button(self):
+        rows = [idea("future", "Future tool", 0.5)]
         for width in (240, 420, 900):
-            for response in ('sending', 'thanks', 'notify', 'sign_in', 'retry'):
-                with self.subTest(width=width, response=response):
-                    rows = [{'name': 'future', 'title': 'Future tool', 'state': response, 'notify_sign_in': True}]
-                    display = layout.build(state.new_session(), width, 800, 1, measure, ui={'coming_soon': rows})
-                    button, sign_in = hit(display, 'cloud.future'), hit(display, 'cloud.future.signin')
-                    self.assertEqual(sign_in['action'], ('sign_in', 'loopcut'))
-                    self.assertGreaterEqual(sign_in['y'], button['y'] + button['h'])
-                    notes = [p for p in display['prims'] if p['id'].startswith('cloud.future.note.')]
-                    self.assertEqual(' '.join(p['text'] for p in notes), 'Sign in to Loopcut to hear when it launches')
-                    for p in notes:
-                        self.assertLessEqual(p['x'] + measure('ui', p['size'], p['text']), sign_in['x'])
-                    if response in ('notify', 'sign_in', 'retry'):
-                        self.assertEqual(button['action'], ('cloud_interest', 'future'))
-                    self.assertNotIn('error', ' '.join(texts(display).values()).lower())
+            with self.subTest(width=width):
+                display = vote_view(width, coming_soon=rows, service_signed_in=False)
+                sign_in, row = hit(display, "vote.signin"), hit(display, "vote.future")
+                self.assertEqual(sign_in["action"], ("sign_in", "loopcut"))
+                self.assertGreaterEqual(sign_in["y"], row["y"] + row["h"], "below the ideas")
+                self.assertLessEqual(sign_in["x"] + sign_in["w"], width - T.PAD)
+                notes = [p for p in display["prims"] if p["id"].startswith("vote.signin.note.")]
+                self.assertEqual(" ".join(p["text"] for p in notes), "Sign in to hear when your picks launch.")
+                for p in notes:
+                    self.assertLessEqual(right(p), sign_in["x"])
+                if width == 240:
+                    self.assertGreater(len(notes), 1)
+                self.assertNotIn("error", " ".join(texts(display).values()).lower())
+        signed_in = vote_view(coming_soon=rows, service_signed_in=True)
+        self.assertNotIn("vote.signin", ids(signed_in, "hits"))
+        self.assertFalse([p for p in signed_in["prims"] if p["id"].startswith("vote.signin")])
 
-    def test_many_reminders_keep_every_extra_reachable_and_input_below_header(self):
-        rows = [{'name': str(n), 'title': 'Future tool ' + str(n), 'state': 'notify',
-                 'notify_sign_in': True, 'category': 'Images' if n < 4 else ''} for n in range(17)]
+    def test_many_ideas_stay_reachable_between_the_header_and_the_footer(self):
+        rows = [idea(str(n), "Future tool " + str(n), (17 - n) / 17) for n in range(17)]
         for width in (240, 420, 900):
-            seen, starts, start = set(), [], 0
-            while True:
-                self.assertNotIn(start, starts)
-                starts.append(start)
-                display = layout.build(state.new_session(), width, 600, 1, measure,
-                                       ui={'coming_soon': rows, 'coming_soon_start': start})
-                self.assertGreaterEqual(prim(display, 'input.zone')['y'], T.HEADER_HEIGHT)
-                self.assertGreaterEqual(hit(display, 'cloud.toggle')['y'], T.HEADER_HEIGHT)
-                seen.update(h['action'][1] for h in display['hits'] if h['action'][0] == 'cloud_interest')
-                categories = [p['text'] for p in display['prims'] if p['id'].startswith('cloud.category.')]
-                if all(int(h['action'][1]) >= 4 for h in display['hits'] if h['action'][0] == 'cloud_interest'):
-                    self.assertEqual(categories, [])
-                if 'cloud.next' not in ids(display, 'hits'):
-                    break
-                start = hit(display, 'cloud.next')['action'][1]
-            self.assertEqual(seen, {r['name'] for r in rows})
-            self.assertLess(hit(display, 'cloud.previous')['action'][1], start)
-
-    def test_collapsed_box_keeps_heading_and_toggle_only(self):
-        rows = [{'name': 'future', 'title': 'Future tool', 'state': 'ready', 'category': 'Images'}]
-        expanded = build(coming_soon=rows)
-        collapsed = build(coming_soon=rows, coming_soon_expanded=False)
-        self.assertEqual(hit(collapsed, 'cloud.toggle')['action'], ('cloud_toggle', None))
-        self.assertIn('Optional extras · Coming soon', texts(collapsed).values())
-        self.assertNotIn('cloud.future', ids(collapsed, 'hits'))
-        self.assertFalse([p for p in collapsed['prims'] if p['id'].startswith('cloud.category.')])
-        self.assertLess(prim(collapsed, 'cloud.box')['h'], prim(expanded, 'cloud.box')['h'])
-
-    @mock.patch.object(config, 'BETA', False)  # The beta's tips: test_beta_gates.py.
-    def test_privacy_labels_and_refusal_tips_keep_response_geometry_stable(self):
-        session = chat(state.item_user('Add a floor'), busy=True)
-        rows = [{'name': str(n), 'title': 'Future ' + str(n), 'state': 'ready',
-                 'data_label': 'May train (C)', 'reason': 'Private mode blocks this vendor.'} for n in range(4)]
-        suffixes = {'ready': '', 'sending': '…', 'thanks': ' · Thank you',
-                    'notify': '', 'retry': ' · Retry'}
-        for width in (240, 420, 900):
-            first = None
-            for response, suffix in suffixes.items():
-                for row in rows:
-                    row['state'] = response
-                display = layout.build(session, width, 800, 1, measure, ui={'coming_soon': rows})
-                first = first or display
-                self.assertEqual(prim(display, 'input.card'), prim(first, 'input.card'))
-                self.assertEqual(prim(display, 'item0.user.card'), prim(first, 'item0.user.card'))
-                button, label = hit(display, 'cloud.0'), prim(display, 'cloud.0.label')
-                self.assertEqual([button[k] for k in ('x', 'y', 'w', 'h')],
-                                 [hit(first, 'cloud.0')[k] for k in ('x', 'y', 'w', 'h')])
-                self.assertLessEqual(measure('ui', label['size'], label['text']), button['w'] - 16)
-                self.assertTrue(label['text'].endswith(suffix))
-                if width == 900:
-                    self.assertIn(rows[0]['data_label'], label['text'])
-                self.assertIn(rows[0]['data_label'], button['tip'])
-                self.assertIn(rows[0]['reason'], button['tip'])
-                expected = {'thanks': 'Thank you', 'sending': 'Sending', 'notify': 'Tell us',
-                            'retry': 'try again', 'ready': 'Tell us'}[response]
-                self.assertIn(expected, button['tip'])
-
+            with self.subTest(width=width):
+                seen, scroll = set(), 0
+                while True:
+                    display = vote_view(width, 600, coming_soon=rows, service_signed_in=False, vote_scroll=scroll)
+                    footer = prim(display, "vote.footer.rule")["y"]
+                    for h in display["hits"]:
+                        if h["action"][0] == "vote":
+                            self.assertGreater(h["y"] + h["h"], T.HEADER_HEIGHT, "culled once above the view")
+                            self.assertLess(h["y"], footer, "culled once below the view")
+                            if h["y"] >= T.HEADER_HEIGHT and h["y"] + h["h"] <= footer:
+                                seen.add(h["action"][1])
+                    if scroll >= display["max_scroll"]:
+                        break
+                    scroll += 100
+                self.assertGreater(display["max_scroll"], 0)
+                self.assertEqual(seen, {r["name"] for r in rows})
+                sign_in = hit(display, "vote.signin")
+                self.assertLessEqual(sign_in["y"] + sign_in["h"], footer, "the end of the list clears the footer")
+                self.assertEqual(footer, 600 - layout.VOTE_FOOTER_HEIGHT)
     def test_screenshot_fixtures_build_without_blender(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness"))
         from c11_shots import fixtures, STATES
@@ -378,34 +355,54 @@ class CloudPanelTest(unittest.TestCase):
                 if name == "narrow_job":
                     self.assertIn("cloud.job_fixture.cancel", ids(display, "hits"))
 
-    def test_optional_extras_use_manifest_titles_and_thank_you(self):
-        rows = [{"name": "future", "title": "Manifest title", "state": "ready"}]
+    def test_strip_opens_the_vote_and_names_the_leader(self):
+        rows = [idea("sfx", "Sound effects", 0.4), idea("image_generate", "Image generation", 1.0, "most_wanted")]
         display = build(coming_soon=rows)
-        self.assertIn("Optional extras · Coming soon", texts(display).values())
-        self.assertEqual(texts(display)["cloud.future.label"], "Manifest title")
-        self.assertEqual(hit(display, "cloud.future")["action"], ("cloud_interest", "future"))
-        rows[0]["state"] = "thanks"
-        clicked = build(coming_soon=rows)
-        self.assertEqual(texts(clicked)["cloud.future.label"], "Manifest title · Thank you")
-        self.assertEqual(hit(clicked, "cloud.future")["action"], ("noop", None))
-        self.assertEqual(prim(display, "input.card"), prim(clicked, "input.card"))
+        strip = hit(display, "vote.strip")
+        self.assertEqual(strip["action"], ("votes_open", None))
+        self.assertEqual(texts(display)["vote.strip.label"], layout.VOTE_STRIP)
+        tail = prim(display, "vote.strip.tail")
+        self.assertEqual(tail["text"], "Image generation leads  ›")
+        self.assertLessEqual(right(prim(display, "vote.strip.label")), tail["x"])
+        self.assertLessEqual(right(tail), strip["x"] + strip["w"])
+        for leader in ({"badge": "popular"}, {"badge": None}):  # Only a most-wanted first row is named.
+            self.assertEqual(texts(build(coming_soon=[rows[0], {**rows[1], **leader}]))["vote.strip.tail"], "›")
+        # The order the vote view froze decides who is first.
+        self.assertEqual(texts(build(coming_soon=rows, vote_order=["sfx", "image_generate"]))["vote.strip.tail"], "›")
 
-    def test_response_states_do_not_move_messages_or_input_during_a_turn(self):
+    def test_narrow_strip_drops_the_leader_but_keeps_the_way_in(self):
+        rows = [idea("image_generate", "Image generation", 1.0, "most_wanted")]
+        display = layout.build(state.new_session(), 240, 600, 1, measure, ui={"coming_soon": rows})
+        strip, tail = hit(display, "vote.strip"), prim(display, "vote.strip.tail")
+        self.assertEqual(strip["action"], ("votes_open", None))
+        self.assertEqual(tail["text"], "›")
+        self.assertLessEqual(right(prim(display, "vote.strip.label")), tail["x"])
+        self.assertLessEqual(strip["x"] + strip["w"], 240 - T.PAD)
+
+    def test_strip_is_hidden_without_ideas_and_in_the_vote_view(self):
+        rows = [idea("future", "Future tool", 0.5)]
+        without, chat_view = build(), build(coming_soon=rows)
+        self.assertNotIn("vote.strip", ids(without, "hits"))
+        self.assertEqual(prim(without, "input.card")["h"], prim(chat_view, "input.card")["h"])
+        self.assertEqual(prim(without, "input.zone")["y"] - prim(chat_view, "input.zone")["y"], 28, "the strip's line")
+        voting = build(coming_soon=rows, view="vote")
+        self.assertNotIn("vote.strip", ids(voting, "hits"))
+        self.assertNotIn("input.card", ids(voting, "hits"), "the footer stands in for the composer")
+
+    def test_vote_states_do_not_move_messages_or_input_during_a_turn(self):
         session = chat(state.item_user("Add a floor"), busy=True)
-        rows = [{"name": str(n), "title": "Future tool " + str(n), "state": "ready"} for n in range(4)]
+        changes = ({}, {"state": "sending"}, {"voted": True}, {"level": 1.0, "badge": "most_wanted"},
+                   {"level": 0.2, "badge": "popular", "voted": True})
         for width in (240, 420):
-            displays = []
-            for response in ("ready", "sending", "thanks", "notify", "retry"):
-                for row in rows:
-                    row["state"] = response
-                displays.append(layout.build(session, width, 800, 1, measure, ui={"coming_soon": rows}))
-            for display in displays[1:]:
-                self.assertEqual(prim(display, "input.card"), prim(displays[0], "input.card"))
-                self.assertEqual(prim(display, "item0.user.card"), prim(displays[0], "item0.user.card"))
-        display = build(coming_soon=[{"name": "x", "title": "Tool", "state": "sign_in"}])
-        self.assertEqual(hit(display, "cloud.x")["action"], ("cloud_interest", "x"))
-        self.assertEqual(hit(display, "cloud.x.signin")["action"], ("sign_in", "loopcut"))
-
+            with self.subTest(width=width):
+                displays = [layout.build(session, width, 800, 1, measure, ui={
+                    "coming_soon": [{**idea(str(n), "Future tool " + str(n)), **change} for n in range(4)],
+                    "vote_notice": "All 3 votes used. Take one back first."}) for change in changes]
+                for display in displays[1:]:
+                    self.assertEqual(prim(display, "input.card"), prim(displays[0], "input.card"))
+                    self.assertEqual(prim(display, "item0.user.card"), prim(displays[0], "item0.user.card"))
+                    self.assertEqual(hit(display, "vote.strip"), hit(displays[0], "vote.strip"))
+                    self.assertNotIn("vote.footer.status.l0", ids(display, "prims"), "the notice is the vote view's")
     def test_cloud_message_is_dismissible_and_keeps_busy_geometry_when_dismissed(self):
         session = chat(state.item_user("Add lighting"), busy=True)
         message = "Update Loopcut to use cloud tools"
@@ -430,6 +427,143 @@ class CloudPanelTest(unittest.TestCase):
             self.assertLessEqual(pct["x"] + measure("ui", pct["size"], pct["text"]), cancel["x"])
             self.assertLessEqual(cancel["x"] + cancel["w"], 240 - T.PAD)
             self.assertEqual(cancel["action"], ("cloud_job_cancel", "job_test"))
+
+
+def status(display):
+    return " ".join(p["text"] for p in display["prims"] if p["id"].startswith("vote.footer.status."))
+
+
+class VoteViewTest(unittest.TestCase):
+    def test_rows_rank_by_level_vote_on_click_and_say_what_a_click_does(self):
+        rows = [idea("sfx", "Sound effects", 0.4, summary="Sound effects for a shot."),
+                idea("render", "Cloud rendering", 1.0, "most_wanted", voted=True, summary="Render on our machines."),
+                idea("rig", "Auto-rig")]
+        display = vote_view(coming_soon=rows)
+        votes = [h for h in display["hits"] if h["action"][0] == "vote"]
+        self.assertEqual([h["id"] for h in votes], ["vote.render", "vote.sfx", "vote.rig"], "no level ranks last")
+        self.assertEqual([h["action"] for h in votes], [("vote", "render"), ("vote", "sfx"), ("vote", "rig")])
+        self.assertEqual([h["y"] for h in votes], sorted(h["y"] for h in votes))
+        self.assertEqual(hit(display, "vote.render")["tip"], "Render on our machines.\nClick to take your vote back")
+        self.assertEqual(hit(display, "vote.sfx")["tip"], "Sound effects for a shot.\nClick to vote")
+        self.assertEqual(hit(display, "vote.rig")["tip"], "Click to vote", "no summary: only what a click does")
+        self.assertEqual(texts(display)["vote.render.toggle.glyph"], "✓")
+        self.assertEqual(texts(display)["vote.sfx.toggle.glyph"], "▲")
+        self.assertEqual(texts(display)["header.crumb"], "›  What's next")
+        sending = vote_view(coming_soon=[{**rows[1], "state": "sending"}])
+        self.assertEqual(texts(sending)["vote.render.toggle.glyph"], "…")
+        # A frozen order wins over the levels; ideas it does not name follow, by level.
+        frozen = vote_view(coming_soon=rows, vote_order=["sfx", "render"])
+        self.assertEqual([h["id"] for h in frozen["hits"] if h["action"][0] == "vote"],
+                         ["vote.sfx", "vote.render", "vote.rig"])
+
+    def test_with_every_vote_placed_the_other_rows_say_to_take_one_back(self):
+        rows = [idea(str(n), "Idea " + str(n), 0.5, voted=n < 3) for n in range(4)]
+        display = vote_view(coming_soon=rows)
+        self.assertEqual(hit(display, "vote.3")["tip"], "All 3 votes are placed. Take one back to move it.")
+        self.assertEqual(hit(display, "vote.3")["action"], ("vote", "3"), "the click still reaches the limit notice")
+        for n in range(3):
+            self.assertEqual(hit(display, "vote." + str(n))["tip"], "Click to take your vote back")
+
+    def test_fill_follows_the_level_and_ideas_without_one_have_none(self):
+        rows = [idea("a", "A", 1.0, voted=True), idea("b", "B", 0.25), idea("c", "C", 0.0), idea("d", "D", None),
+                idea("e", "E", 1.7)]
+        display = vote_view(coming_soon=rows)
+        row = prim(display, "vote.a.row")
+        fills = {name: prim(display, "vote." + name + ".fill") for name in "abce"}
+        self.assertEqual(fills["a"]["w"], row["w"])
+        self.assertEqual(fills["b"]["w"], round(row["w"] * 0.25))
+        self.assertEqual(fills["c"]["w"], 2 * T.RADIUS, "a sliver, never nothing")
+        self.assertEqual(fills["e"]["w"], row["w"], "clamped to the row")
+        self.assertNotIn("vote.d.fill", ids(display, "prims"))
+        self.assertEqual((fills["a"]["x"], fills["a"]["y"], fills["a"]["h"]), (row["x"], row["y"], row["h"]))
+        self.assertNotEqual(fills["a"]["color"], fills["b"]["color"], "your own picks are stronger")
+        self.assertNotEqual(row["border_color"], prim(display, "vote.b.row")["border_color"])
+
+    def test_narrow_rows_drop_the_badge_and_keep_the_whole_title(self):
+        rows = [idea("image_generate", "Image generation", 1.0, "most_wanted"),
+                idea("sfx", "Sound effects", 0.8, "popular"), idea("odd", "Odd", 0.5, "legendary")]
+        wide = vote_view(900, coming_soon=rows)
+        self.assertEqual(texts(wide)["vote.image_generate.badge.label"], "Most wanted")
+        self.assertEqual(texts(wide)["vote.sfx.badge.label"], "Popular")
+        self.assertNotIn("vote.odd.badge", ids(wide, "prims"), "only the badges Loopcut knows")
+        title, badge = prim(wide, "vote.image_generate.title"), prim(wide, "vote.image_generate.badge")
+        self.assertLessEqual(right(title), badge["x"])
+        self.assertLessEqual(badge["x"] + badge["w"], prim(wide, "vote.image_generate.toggle")["x"])
+        narrow = vote_view(240, coming_soon=rows)
+        self.assertFalse([p for p in narrow["prims"] if p["id"].endswith(".badge")])
+        self.assertEqual(texts(narrow)["vote.image_generate.title"], "Image generation")
+        self.assertEqual(texts(narrow)["vote.sfx.title"], "Sound effects")
+        long = vote_view(240, coming_soon=[idea("long", "A very long idea title " * 3, 1.0, "most_wanted")])
+        title = prim(long, "vote.long.title")
+        self.assertTrue(title["text"].endswith("…"))
+        self.assertLessEqual(right(title), prim(long, "vote.long.toggle")["x"])
+
+    def test_footer_counts_votes_left_and_a_notice_wins(self):
+        for voted, expected in ((0, "3 votes left"), (1, "2 votes left"), (2, "1 vote left"),
+                                (3, "All votes placed. Thank you!")):
+            with self.subTest(voted=voted):
+                display = vote_view(coming_soon=[idea(str(n), "Idea " + str(n), 0.5, voted=n < voted) for n in range(4)])
+                self.assertEqual(status(display), expected)
+                tokens = [prim(display, "vote.token." + str(n)) for n in range(3)]
+                self.assertEqual([t["color"] == T.ACCENT for t in tokens], [n < voted for n in range(3)])
+        rows = [idea("a", "A", 0.5, voted=True)]
+        notice = "All 3 votes used. Take one back first."
+        display = vote_view(coming_soon=rows, vote_notice=notice)
+        self.assertEqual(status(display), notice)
+        self.assertEqual(prim(display, "vote.footer.status.l0")["color"], T.WARN)
+        failed = "Couldn't reach Loopcut; that vote wasn't saved. Try again."
+        for width in (240, 420, 900):
+            with self.subTest(width=width):
+                display = vote_view(width, coming_soon=rows, vote_notice=failed)
+                back = hit(display, "vote.back")
+                lines = [p for p in display["prims"] if p["id"].startswith("vote.footer.status.")]
+                self.assertLessEqual(len(lines), 2)
+                if width > 240:
+                    self.assertEqual(status(display), failed)
+                else:
+                    self.assertTrue(lines[-1]["text"].endswith("…"), "two lines, the second cut short")
+                for p in lines:
+                    self.assertLessEqual(right(p), back["x"])
+                    self.assertGreaterEqual(p["x"], prim(display, "vote.token.2")["x"] + prim(display, "vote.token.2")["w"])
+
+    def test_back_button_leaves_and_nothing_overlaps_the_footer(self):
+        rows = [idea(str(n), "Idea " + str(n), 0.5) for n in range(3)]
+        for width in (240, 420):
+            with self.subTest(width=width):
+                display = vote_view(width, 600, coming_soon=rows, service_signed_in=False)
+                back = hit(display, "vote.back")
+                self.assertEqual(back["action"], ("history_close", None))
+                self.assertLessEqual(back["x"] + back["w"], width - T.PAD)
+                top = prim(display, "vote.footer.rule")["y"]
+                self.assertEqual(top, 600 - layout.VOTE_FOOTER_HEIGHT)
+                self.assertGreaterEqual(back["y"], top)
+                self.assertLessEqual(back["y"] + back["h"], 600)
+                for p in display["prims"]:
+                    if p["id"].startswith(("vote.footer.", "vote.token.", "vote.back")):
+                        self.assertGreaterEqual(p["y"], top, p["id"])
+                    elif p["id"].startswith("vote.") and not p["id"].startswith("vote.strip"):
+                        self.assertLessEqual(p["y"] + p["h"], top, p["id"])
+
+    def test_footnote_says_what_the_bars_mean_or_where_votes_go_without_them(self):
+        def footnote(rows):
+            display = vote_view(900, coming_soon=rows)
+            return " ".join(p["text"] for p in display["prims"] if p["id"].startswith("vote.footnote."))
+        self.assertEqual(footnote([idea("a", "A", 1.0), idea("b", "B")]), layout.VOTE_FOOTNOTE)
+        self.assertEqual(footnote([idea("a", "A"), idea("b", "B")]), layout.VOTE_FOOTNOTE_OFFLINE)
+
+    def test_the_list_reads_from_the_top_and_its_scroll_is_clamped(self):
+        rows = [idea(str(n), "Future tool " + str(n), 0.5) for n in range(17)]
+        first = vote_view(420, 600, coming_soon=rows)
+        self.assertEqual(prim(first, "vote.title")["y"], T.HEADER_HEIGHT + T.PAD, "top-anchored, unlike the chat")
+        top_row = hit(first, "vote.0")
+        limit = first["max_scroll"]
+        self.assertGreater(limit, 100)
+        scrolled = vote_view(420, 600, coming_soon=rows, vote_scroll=40)
+        self.assertEqual(hit(scrolled, "vote.0")["y"], top_row["y"] - 40)
+        self.assertEqual(vote_view(420, 600, coming_soon=rows, vote_scroll=-50)["prims"], first["prims"])
+        self.assertEqual(vote_view(420, 600, coming_soon=rows, vote_scroll=limit + 500)["prims"],
+                         vote_view(420, 600, coming_soon=rows, vote_scroll=limit)["prims"])
+        self.assertEqual(vote_view(420, 600, coming_soon=rows[:2])["max_scroll"], 0.0)
 
 
 def worker(id, status, **extra):

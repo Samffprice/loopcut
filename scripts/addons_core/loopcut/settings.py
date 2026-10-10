@@ -199,7 +199,6 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     bl_idname = PACKAGE
 
     first_message_sent: bpy.props.BoolProperty(default=False, options={"HIDDEN"})
-    coming_soon_expanded: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
 
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],

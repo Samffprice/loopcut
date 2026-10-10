@@ -252,6 +252,11 @@ def _empty_manifest():
 
 # Contract 0.6 (proposal 010): optional ToolDescriptor.display {title, summary, category} for buttons only;
 # the top-level title and description stay model-facing. Category ids become short group labels.
+VOTES_MAX = 3  # Until the server says otherwise.
+VOTE_BADGES = ("most_wanted", "popular")
+VOTE_LIMIT_NOTICE = "All {} votes used. Take one back first."
+VOTE_FAILED_NOTICE = "Couldn't reach Loopcut; that vote wasn't saved. Try again."
+VOTE_SIGN_IN_NOTICE = "Sign in to Loopcut to vote."
 CATEGORY_LABELS = {"render": "Render", "images": "Images", "3d_models": "3D models", "audio": "Audio",
                    "characters": "Characters", "assets": "Assets"}
 
@@ -281,6 +286,12 @@ class Runtime:
         self.prompt_updates = 0
         self.skills = []
         self.interests = {}
+        # Votes on what comes next (contract 0.7 /v1/votes): the server's picture, or only the picks made
+        # here while the server has no votes ("server": False, the interest event stands in).
+        self.votes = {"mine": [], "levels": {}, "badges": {}, "max": VOTES_MAX, "server": None}
+        # Votes clicked but not yet answered (name -> casting): shown at once, sent one at a time under
+        # vote_lock so the server's answers arrive, and apply, in click order.
+        self.vote_states, self.vote_notice, self.vote_lock = {}, "", threading.Lock()
         self.dismissed_message = ""
         self.quotes = {}  # Session-only amounts for the approval card, never vendor input.
         self.quote_requests = {}
@@ -311,6 +322,10 @@ class Runtime:
             if not isinstance(interests, dict):
                 raise ValueError("Invalid cached interests")
             self.interests = {name: "thanks" for name, state in interests.items() if state == "thanks"}
+            mine = payload.get("votes_mine", [])
+            if not isinstance(mine, list) or not all(isinstance(name, str) for name in mine):
+                raise ValueError("Invalid cached votes")
+            self.votes["mine"] = mine[:VOTES_MAX]
         except FileNotFoundError:
             return
         except (OSError, ValueError, KeyError, cloud_http.CloudError) as ex:
@@ -339,6 +354,7 @@ class Runtime:
         try:
             _write_json(self.cache_dir / "manifest.json", {"manifest": safe_value(self.manifest, (self.client.api_key,)), "etag": self.etag,
                                                           "supported": self.supported, "interests": self.interests,
+                                                          "votes_mine": self.votes["mine"],
                                                           "dismissed_message": self.dismissed_message})
         except OSError as ex:
             print(f"Loopcut: could not save the cloud catalog cache: {ex}")
@@ -459,11 +475,122 @@ class Runtime:
     def coming_soon(self):
         with self.lock:
             return [{"name": d["name"], "title": _display(d, "title") or d["title"],
-                     "summary": _display(d, "summary"), "state": self.interests.get(d["name"], "ready"),
+                     "summary": _display(d, "summary"),
+                     "state": "sending" if d["name"] in self.vote_states else "ready",
                      "category": _category_label(_display(d, "category") or d.get("category")),
-                     "notify_sign_in": not self.signed_in and self.interests.get(d["name"], "ready") != "ready",
-                     "data_label": cloud_account.data_label(d), "reason": cloud_account.refusal(d, self.policy)}
+                     "voted": d["name"] in self.votes["mine"], "level": self.votes["levels"].get(d["name"]),
+                     "badge": self.votes["badges"].get(d["name"])}
                     for d in self.manifest["tools"] if _descriptor(d) and d["status"] == "coming_soon"]
+
+    def _vote_identity(self):
+        """The query and body identity for /v1/votes: the install id, which a signed-in call also sends
+        so the server can move this install's earlier votes to the account."""
+        from . import credentials
+        install_id = credentials.interest_install_id()
+        if install_id is None and not self.signed_in:
+            raise OSError("No install id for a signed-out vote")
+        return install_id
+
+    def _apply_votes(self, data, settled=None):
+        """Take the server's picture: our picks, and a level (0-1) and badge per tool. Never counts.
+        Votes still waiting their turn (all but `settled`) stay drawn the way they were clicked."""
+        tools = data.get("tools")
+        mine, limit = data.get("mine"), data.get("max_votes")
+        if (not isinstance(tools, list) or not isinstance(mine, list) or type(limit) is not int
+                or not 1 <= limit <= 10 or not all(isinstance(name, str) for name in mine)):
+            raise cloud_http.CloudError("Invalid votes from Loopcut", "invalid_response")
+        levels, badges = {}, {}
+        for row in tools:
+            if not isinstance(row, dict) or not isinstance(row.get("tool"), str):
+                continue
+            level = row.get("level")
+            if type(level) in (int, float) and math.isfinite(level):
+                levels[row["tool"]] = max(0.0, min(1.0, float(level)))
+            if row.get("badge") in VOTE_BADGES:
+                badges[row["tool"]] = row["badge"]
+        with self.lock:
+            mine = mine[:limit]
+            for name, casting in self.vote_states.items():
+                if name != settled:
+                    mine = mine + [name] if casting and name not in mine else \
+                        [m for m in mine if m != name] if not casting else mine
+            self.votes = {"mine": mine, "levels": levels, "badges": badges, "max": limit, "server": True}
+            self._save()
+
+    def refresh_votes(self):
+        """GET /v1/votes. A server without votes (404) leaves the picks made here and no bars."""
+        try:
+            install_id = self._vote_identity()
+            query = f"?install_id={quote(install_id)}" if install_id else ""
+            with self.vote_lock:
+                self._apply_votes(self.client.request("GET", "/v1/votes" + query, auth=self.signed_in))
+        except cloud_http.CloudError as ex:
+            if ex.status == 404:
+                with self.lock:
+                    self.votes["server"] = False
+        except OSError:
+            pass
+
+    def vote(self, name):
+        """Cast or take back one vote. The picks change at once and go back if the server refuses."""
+        with self.lock:
+            if name not in {d["name"] for d in self.coming_soon()} or name in self.vote_states:
+                return False
+            before = list(self.votes["mine"])
+            casting = name not in before
+            if casting and len(before) >= self.votes["max"]:
+                self.vote_notice = VOTE_LIMIT_NOTICE.format(self.votes["max"])
+                return False
+            self.vote_notice = ""
+            self.vote_states[name] = casting
+            self.votes["mine"] = before + [name] if casting else [m for m in before if m != name]
+        try:
+            with self.vote_lock:
+                return self._send_vote(name, casting)
+        except (cloud_http.CloudError, OSError) as ex:
+            refused = (not self.signed_in and isinstance(ex, cloud_http.CloudError)
+                       and (ex.status == 401 or ex.code == "sign_in_required"))
+            with self.lock:
+                self.votes["mine"] = ([m for m in self.votes["mine"] if m != name] if casting
+                                      else self.votes["mine"] + [name])
+                # The server was reached and wants an account (signed-out votes switched off).
+                self.vote_notice = VOTE_SIGN_IN_NOTICE if refused else VOTE_FAILED_NOTICE
+            return False
+        finally:
+            with self.lock:
+                self.vote_states.pop(name, None)
+                self._save()
+
+    def _send_vote(self, name, casting):
+        """One vote's request, under vote_lock. Raises what the caller undoes."""
+        with self.lock:
+            server = self.votes["server"]
+        if server is not False:
+            install_id = self._vote_identity()
+            path = "/v1/votes/" + quote(name, safe="")
+            try:
+                if casting:
+                    body = {"app_version": config.app_version(), **({"install_id": install_id} if install_id else {})}
+                    data = self.client.request("PUT", path, body, auth=self.signed_in)
+                else:
+                    query = f"?install_id={quote(install_id)}" if install_id else ""
+                    data = self.client.request("DELETE", path + query, auth=self.signed_in)
+                self._apply_votes(data, settled=name)
+                return True
+            except cloud_http.CloudError as ex:
+                if ex.status == 409:
+                    with self.lock:
+                        self.votes["mine"] = [m for m in self.votes["mine"] if m != name]
+                        self.vote_notice = VOTE_LIMIT_NOTICE.format(self.votes["max"])
+                    return False
+                if ex.status != 404 or ex.code == "unknown_tool":
+                    raise
+                with self.lock:
+                    self.votes["server"] = False
+        # A server without votes: a cast is still an interest event; a take-back stays on this computer.
+        if casting:
+            self.interest(name)
+        return True
 
     def interest(self, name):
         """One in-flight/successful event per tool per runtime; failed sends can be retried."""
@@ -678,6 +805,32 @@ def dismiss_ui_message(message):
             if message and message == _runtime.message:
                 _runtime.dismissed_message = message
                 _runtime._save()
+
+
+def vote_notice():
+    if _runtime:
+        with _runtime.lock:
+            return _runtime.vote_notice
+    return ""
+
+
+def _in_background(name, work):
+    def run():
+        work()
+        from . import mainthread
+        mainthread.request_redraw()
+    threading.Thread(target=run, name=name, daemon=True).start()
+
+
+def refresh_votes():
+    if _runtime:
+        _in_background("loopcut-votes", _runtime.refresh_votes)
+
+
+def vote(name):
+    if _runtime:
+        runtime = _runtime
+        _in_background("loopcut-vote", lambda: runtime.vote(name))
 
 
 def record_interest(name):

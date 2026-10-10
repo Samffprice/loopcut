@@ -30,6 +30,7 @@ BUTTON_GHOST = _hex("#2a2a2a")
 NONE = (0.0, 0.0, 0.0, 0.0)
 
 FONT_SIZE = 13
+FONT_SIZE_TITLE = 15
 FONT_SIZE_SMALL = 11
 FONT_SIZE_CODE = 12
 LINE_HEIGHT = 1.5        # Multiplier on font size.

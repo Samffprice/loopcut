@@ -125,7 +125,10 @@ def draw_area() -> None:
                             "service_signed_in": bool(cloud._runtime and cloud._runtime.signed_in),
                             "project_override": cloud_account.project_override(context.scene),
                             **_cloud_panel_state(session)})
-    session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
+    if state.ui.get("view") == "vote":
+        state.ui["vote_scroll"] = min(max(state.ui.get("vote_scroll", 0.0), 0.0), display["max_scroll"])
+    else:
+        session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
 
@@ -139,28 +142,47 @@ def _cloud_panel_state(session: dict) -> dict:
     if not session["busy"] or "cloud_panel" not in _runtime:
         _runtime["cloud_panel"] = {"rows": current, "message": message}
     saved = _runtime["cloud_panel"]
-    responses = {row["name"]: {key: row[key] for key in ("state", "notify_sign_in") if key in row} for row in current}
-    return {"coming_soon": [{**row, **responses.get(row["name"], {})} for row in saved["rows"]],
-            "coming_soon_expanded": _coming_soon_expanded(),
+    responses = {row["name"]: {key: row[key] for key in ("state", "voted", "level", "badge") if key in row}
+                 for row in current}
+    rows = [{**row, **responses.get(row["name"], {})} for row in saved["rows"]]
+    if state.ui.get("view") == "vote" and not state.ui.get("vote_order") and any(row.get("level") for row in rows):
+        # Rank once per visit, when the levels arrive: rows must not jump while someone is voting.
+        state.ui["vote_order"] = [row["name"] for row in sorted(rows, key=lambda row: -(row.get("level") or 0))]
+    if state.ui.get("view") == "vote":
+        rows = _eased_levels(rows)
+    return {"coming_soon": rows, "vote_notice": cloud.vote_notice(),
             "cloud_message": message if message == saved["message"] else "",
             "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"]}
 
 
-def _coming_soon_expanded() -> bool:
-    """Show extras on first sight; a hidden preference remembers later choices across accounts."""
-    return state.ui.get("coming_soon_expanded", getattr(settings.preferences(), "coming_soon_expanded", True))
+VOTE_EASE_SECONDS = 0.5     # A bar's move to a new level.
+VOTE_INTRO_STAGGER = 0.035  # On opening the view, each rank starts its grow this much after the one above.
 
 
-def _toggle_coming_soon() -> None:
-    expanded = not _coming_soon_expanded()
-    state.ui["coming_soon_expanded"] = expanded
-    prefs = settings.preferences()
-    if prefs is not None:
-        prefs.coming_soon_expanded = expanded
-        try:
-            bpy.ops.wm.save_userpref()
-        except RuntimeError as ex:
-            print(f"Loopcut: could not save Coming soon preference: {ex}")
+def _eased_levels(rows: list[dict]) -> list[dict]:
+    """Bars grow from nothing when the vote view opens (state.ui["vote_anim"] cleared), then ease to each
+    new level the server sends, from wherever they are drawn."""
+    now, anim = time.time(), state.ui.setdefault("vote_anim", {})
+    order = {name: rank for rank, name in enumerate(state.ui.get("vote_order") or [])}
+    eased = []
+    for row in rows:
+        target = row.get("level")
+        if target is None:
+            eased.append(row)
+            continue
+        start, end, began = anim.get(row["name"], (0.0, target, now + order.get(row["name"], 0) * VOTE_INTRO_STAGGER))
+        if end != target:
+            start, end, began = _ease(start, end, began, now), target, now
+        anim[row["name"]] = (start, end, began)
+        if now < began + VOTE_EASE_SECONDS:
+            state.ui["animate_until"] = max(state.ui.get("animate_until", 0.0), began + VOTE_EASE_SECONDS)
+        eased.append({**row, "level": _ease(start, end, began, now)})
+    return eased
+
+
+def _ease(start: float, end: float, began: float, now: float) -> float:
+    t = min(1.0, max(0.0, (now - began) / VOTE_EASE_SECONDS))
+    return start + (end - start) * (1 - (1 - t) ** 3)  # Ease out: quick, then settling.
 
 
 def _draw_trampoline() -> None:
@@ -304,13 +326,14 @@ def _do_action(session: dict, action) -> None:
         config_changed()
     elif kind == "noop":
         pass
-    elif kind == "cloud_interest":
+    elif kind == "votes_open":
         from .. import cloud
-        cloud.record_interest(index)
-    elif kind == "cloud_toggle":
-        _toggle_coming_soon()
-    elif kind == "cloud_page":
-        state.ui["coming_soon_start"] = index
+        _close_popups()
+        state.ui.update({"view": "vote", "vote_order": None, "vote_scroll": 0.0, "vote_anim": {}})
+        cloud.refresh_votes()
+    elif kind == "vote":
+        from .. import cloud
+        cloud.vote(index)
     elif kind == "service_settings":
         state.ui["service_settings"] = not state.ui.get("service_settings")
         state.ui["model_menu"], state.ui["picker"] = False, None
@@ -636,6 +659,12 @@ class LOOPCUT_OT_scroll(bpy.types.Operator):
 
 
 def scroll(session: dict, event) -> None:
+    if state.ui.get("view") == "vote":  # Read from the top down, unlike the chat, which sits at its end.
+        step = {"WHEELUPMOUSE": -SCROLL_STEP, "WHEELDOWNMOUSE": SCROLL_STEP}.get(event.type, 0.0)
+        if event.type == "TRACKPADPAN":
+            step = event.mouse_prev_y - event.mouse_y
+        state.ui["vote_scroll"] = max(state.ui.get("vote_scroll", 0.0) + step, 0.0)
+        return
     if event.type == "WHEELUPMOUSE":
         session["scroll"] += SCROLL_STEP
     elif event.type == "WHEELDOWNMOUSE":

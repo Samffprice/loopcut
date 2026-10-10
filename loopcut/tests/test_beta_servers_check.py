@@ -31,7 +31,8 @@ class BetaServersCheckTest(unittest.TestCase):
                                     env={**os.environ, 'BETA_SMOKE_TEST_KEY': 'lc_demo'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('PASS pro selected orchestrator', result.stdout)
-        self.assertIn('PASS interest payload accepted and row thanked', result.stdout)
+        self.assertIn('PASS signed out: the vote click sent the right request for this server', result.stdout)
+        self.assertIn('PASS signed in: the vote click sent the right request for this server', result.stdout)
         self.assertIn('PASS worker request carries its hosted prompt id', result.stdout)
 
     def test_missing_key_is_a_nonzero_failure_before_network(self):

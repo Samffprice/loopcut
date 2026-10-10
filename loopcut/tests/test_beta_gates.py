@@ -145,26 +145,28 @@ class BetaGatesTest(unittest.TestCase):
             names = [entry[1] for entry in layout.calls if entry[0] == 'operator']
             self.assertEqual('loopcut.blenderkit_get_key' in names, not beta)
             texts = [entry[1] for entry in layout.calls if entry[0] == 'label']
-            self.assertIn('Loopcut 0.2.0' + (' beta' if beta else ''), texts)
+            self.assertIn('Loopcut 0.2.1' + (' beta' if beta else ''), texts)
             if beta:
                 self.assert_no_purchase(texts)
                 self.assertNotIn('Workers and routing run on Loopcut plans', texts)
 
-    def test_coming_soon_tips_are_one_neutral_line_without_credits(self):
-        rows = [{'name': 'image_generate', 'title': 'Image generation', 'state': 'ready', 'category': 'Images',
-                 'data_label': 'Data class unknown', 'reason': self.cloud_account.refusal(
-                     {'unavailable_reason': 'sign_in'}, {})}]
-        tips = {}
-        for response in ('ready', 'thanks'):
-            rows[0]['state'] = response
-            display = self.display(coming_soon=rows)
-            tips[response] = next(h for h in display['hits'] if h['id'] == 'cloud.image_generate')['tip']
-        self.assertEqual(tips['ready'], "Image generation: Coming soon. Click to tell us you'd use it.")
-        self.assertEqual(tips['thanks'], 'Image generation: Thank you for telling us.')
-        with patch.object(self.config, 'BETA', False):
-            display = self.display(coming_soon=[dict(rows[0], state='ready', reason='Sign in to use credits.')])
-            self.assertIn('Sign in to use credits.', next(h for h in display['hits']
-                                                          if h['id'] == 'cloud.image_generate')['tip'])
+    def test_vote_tips_are_neutral_without_credits_prices_or_data_classes(self):
+        rows = [{'name': 'image_generate', 'title': 'Image generation', 'summary': 'Make an image from a prompt.',
+                 'state': 'ready', 'category': 'Images', 'voted': False, 'level': 0.6, 'badge': 'popular'},
+                {'name': 'render', 'title': 'Cloud rendering', 'summary': 'Render on our machines.', 'state': 'ready',
+                 'category': 'Render', 'voted': True, 'level': 1.0, 'badge': 'most_wanted'}]
+        for beta in (True, False):  # None of these run yet: no route, price or data class to explain either way.
+            with self.subTest(beta=beta), patch.object(self.config, 'BETA', beta):
+                for view in ('chat', 'vote'):
+                    display = self.display(coming_soon=rows, view=view, service_signed_in=False)
+                    self.assert_no_purchase(display)
+                    shown = ' '.join([p['text'] for p in display['prims'] if p['t'] == 'text'] +
+                                     [h['tip'] for h in display['hits']]).lower()
+                    for word in ('credit', 'price', '$', 'data class', 'private (', 'may train', 'retention'):
+                        self.assertNotIn(word, shown)
+                tips = {h['id']: h['tip'] for h in display['hits'] if h['action'][0] == 'vote'}
+                self.assertEqual(tips, {'vote.image_generate': 'Make an image from a prompt.\nClick to vote',
+                                        'vote.render': 'Render on our machines.\nClick to take your vote back'})
 
     def test_no_credits_or_billing_in_preferences_or_the_panel(self):
         for reason in ('sign_in', 'credits', 'plan'):
@@ -202,18 +204,18 @@ class BetaGatesTest(unittest.TestCase):
         self.assertIn('tester@example.test  ·  Pro plan', before)
 
     def test_version_display_and_machine_versions_are_separate(self):
-        self.assertEqual(self.config.version_label(), '0.2.0 beta')
-        self.assertIn('0.2.0 beta', [p.get('text') for p in self.display()['prims']])
-        self.assertEqual(self.update.current_version(), (0, 2, 0))
-        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.0 blender/5.2.0')
-        release = {'version': (0, 2, 1), 'label': '0.2.1', 'asset': None}
+        self.assertEqual(self.config.version_label(), '0.2.1 beta')
+        self.assertIn('0.2.1 beta', [p.get('text') for p in self.display()['prims']])
+        self.assertEqual(self.update.current_version(), (0, 2, 1))
+        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.1 blender/5.2.0')
+        release = {'version': (0, 2, 2), 'label': '0.2.2', 'asset': None}
         status = {'release': release, 'status': 'available', 'dismissed': False, 'error': '', 'progress': 0}
-        self.assertIn('0.2.1 beta', self.update.banner_for(status, False)['text'])
-        self.assertIn('0.2.1 beta', self.update.status_line(status, (0, 2, 0)))
+        self.assertIn('0.2.2 beta', self.update.banner_for(status, False)['text'])
+        self.assertIn('0.2.2 beta', self.update.status_line(status, (0, 2, 1)))
         for state in ('idle', 'current'):
-            self.assertIn('0.2.0 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 0)))
+            self.assertIn('0.2.1 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 1)))
         with patch.object(self.config, 'BETA', False):
-            self.assertEqual(self.config.version_label(), '0.2.0')
+            self.assertEqual(self.config.version_label(), '0.2.1')
             self.assertNotIn('beta', self.update.banner_for(status, False)['text'])
 
     def test_config_environment_switches(self):
@@ -241,7 +243,7 @@ class BetaGatesTest(unittest.TestCase):
                 self.draw_help(expect_loopcut=True)
                 splash = Splash()
                 self.support._draw_info(types.SimpleNamespace(layout=splash), None)
-                self.assertIn(('label', 'Loopcut 0.2.0 beta'), splash.records)
+                self.assertIn(('label', 'Loopcut 0.2.1 beta'), splash.records)
                 self.assertEqual(splash.operators()[0][1], 'loopcut.report_bug')
                 with patch.object(self.config, 'BUG_REPORT_URL', 'https://example.test/form'):
                     self.support.LOOPCUT_OT_report_bug().execute(None)

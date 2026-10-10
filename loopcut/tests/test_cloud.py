@@ -68,6 +68,18 @@ def error(code, status, **extra):
     return Reply({'error': {'code': code, 'message': 'Service refused the call', 'type': 'service_error', **extra}}, status)
 
 
+def ideas(*names, **changes):
+    """A manifest of Coming soon tools, the ones people vote on."""
+    return manifest(*(tool(name, status='coming_soon', available=False) for name in names), **changes)
+
+
+def tally(mine=(), levels=None, badges=None, max_votes=3):
+    """A /v1/votes picture (contract 0.7): our picks, and a level (0-1) and badge per tool. Never a count."""
+    badges = badges or {}
+    return Reply({'max_votes': max_votes, 'mine': list(mine),
+                  'tools': [{'tool': name, 'level': level, 'badge': badges.get(name)} for name, level in (levels or {}).items()]})
+
+
 def served(*, words=None, requires=('loopcut_cloud.asset_search',), craft=None):
     fields = {'id': 'examples/runtime', 'version': 1, 'title': 'Runtime integration', 'when': 'Use available tools',
               'roles': ['single', 'workspace', 'worker'], 'requires_tools': list(requires), 'tier': 'paid', 'kind': 'assist'}
@@ -211,7 +223,7 @@ class RuntimeTest(RuntimeFixture):
         runtime.refresh()
         self.assertTrue(runtime.interest('image_generate'))
         self.assertFalse(runtime.interest('image_generate'))
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'thanks')
+        self.assertEqual(runtime.interests, {'image_generate': 'thanks'})
         self.assertEqual(self.transport.calls[-1]['body'], {'type': 'interest', 'tool': 'image_generate', 'source': 'coming_soon_button',
                                                            'app_version': config.app_version()})
         self.assertFalse(runtime.interest('not_a_tool'))
@@ -220,10 +232,10 @@ class RuntimeTest(RuntimeFixture):
         runtime = self.runtime(Reply(manifest(tool(status='coming_soon'))), error('rate_limited', 429, retry_after=10), Reply(status=204))
         runtime.refresh()
         self.assertFalse(runtime.interest('image_generate'))
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'retry')
+        self.assertEqual(runtime.interests['image_generate'], 'retry')
         self.assertTrue(runtime.interest('image_generate'))
 
-    def test_signed_out_interest_posts_anonymously_and_a_refusal_asks_to_sign_in(self):
+    def test_signed_out_interest_posts_anonymously_and_the_vote_view_asks_to_sign_in(self):
         from loopcut import credentials, state
         from loopcut.ui import layout
         config_dir = Path(tempfile.mkdtemp())
@@ -235,17 +247,17 @@ class RuntimeTest(RuntimeFixture):
             self.assertTrue(runtime.refresh())
             self.assertFalse(runtime.interest('image_generate'))  # An older server refuses anonymous events.
             install_id = credentials.interest_install_id()
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'notify')
+        self.assertEqual(runtime.interests['image_generate'], 'notify')
         self.assertEqual(len(self.transport.calls), 2)
         self.assertNotIn('authorization', self.transport.calls[1]['headers'])
         self.assertEqual(self.transport.calls[1]['body'], {'type': 'interest', 'tool': 'image_generate',
                                                            'source': 'coming_soon_button', 'install_id': install_id,
                                                            'app_version': config.app_version()})
-        display = layout.build(state.new_session(), 420, 600, 1,
-            lambda font, size, text: len(text) * size * .6, 'fast', None, {'coming_soon': runtime.coming_soon()})
-        action = next(hit['action'] for hit in display['hits'] if hit['id'] == 'cloud.image_generate')
-        self.assertEqual(action, ('cloud_interest', 'image_generate'))
-        reminder = next(hit for hit in display['hits'] if hit['id'] == 'cloud.image_generate.signin')
+        display = layout.build(state.new_session(), 420, 600, 1, lambda font, size, text: len(text) * size * .6, 'fast',
+                               None, {'view': 'vote', 'coming_soon': runtime.coming_soon(), 'service_signed_in': runtime.signed_in})
+        action = next(hit['action'] for hit in display['hits'] if hit['id'] == 'vote.image_generate')
+        self.assertEqual(action, ('vote', 'image_generate'))
+        reminder = next(hit for hit in display['hits'] if hit['id'] == 'vote.signin')
         self.assertEqual(reminder['action'], ('sign_in', 'loopcut'))
 
     def test_double_click_while_sending_posts_once(self):
@@ -265,12 +277,12 @@ class RuntimeTest(RuntimeFixture):
             try:
                 self.assertTrue(entered.wait(2))
                 self.assertFalse(runtime.interest('image_generate'))
-                self.assertEqual(runtime.coming_soon()[0]['state'], 'sending')
+                self.assertEqual(runtime.interests['image_generate'], 'sending')
             finally:
                 release.set()
                 worker.join(timeout=2)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'thanks')
+        self.assertEqual(runtime.interests['image_generate'], 'thanks')
         self.assertEqual(sum(c['method'] == 'POST' for c in self.transport.calls), 1)
 
     def test_skills_cached_verified_and_flags_drop(self):
@@ -311,6 +323,325 @@ class RuntimeTest(RuntimeFixture):
         runtime.refresh()
         self.assertEqual(len(self.transport.calls), 1)
         self.assertEqual(runtime.server_skills(), [])
+
+
+class VoteTest(RuntimeFixture):
+    IDEAS = ('render', 'sfx', 'lip_sync', 'auto_rig')
+
+    def voting(self, *replies, signed_in=True):
+        runtime = self.runtime(Reply(ideas(*self.IDEAS, **({} if signed_in else {'account': None}))), *replies,
+                               signed_in=signed_in)
+        self.assertTrue(runtime.refresh())
+        return runtime
+
+    def row(self, runtime, name, *keys):
+        row = next(row for row in runtime.coming_soon() if row['name'] == name)
+        return {key: row[key] for key in keys} if keys else row
+
+    def test_a_cast_shows_at_once_then_takes_the_servers_picture(self):
+        runtime = self.voting(tally(['render'], {'render': 1.0, 'sfx': 0.4}, {'render': 'most_wanted'}))
+        seen, original = [], runtime.client.request
+        def send(*args, **kwargs):
+            seen.append(self.row(runtime, 'render', 'voted', 'state', 'level'))
+            return original(*args, **kwargs)
+        with patch.object(runtime.client, 'request', side_effect=send):
+            self.assertTrue(runtime.vote('render'))
+        self.assertEqual(seen, [{'voted': True, 'state': 'sending', 'level': None}])
+        call = self.transport.calls[-1]
+        self.assertEqual((call['method'], call['url']), ('PUT', 'https://service.test/v1/votes/render'))
+        self.assertEqual(call['body'], {'app_version': config.app_version()})
+        self.assertEqual(call['headers']['authorization'], 'Bearer lc_demo')
+        keys = ('voted', 'level', 'badge', 'state')
+        self.assertEqual(self.row(runtime, 'render', *keys), {'voted': True, 'level': 1.0, 'badge': 'most_wanted', 'state': 'ready'})
+        self.assertEqual(self.row(runtime, 'sfx', *keys), {'voted': False, 'level': 0.4, 'badge': None, 'state': 'ready'})
+        self.assertIsNone(self.row(runtime, 'auto_rig')['level'])
+        self.assertEqual((runtime.vote_states, cloud.vote_notice()), ({}, ''))
+        self.assertFalse(runtime.vote('not_coming_soon'))
+        self.assertEqual(len(self.transport.calls), 2)
+
+    def test_taking_a_vote_back_sends_a_delete(self):
+        runtime = self.voting(tally(['render', 'sfx'], {'render': 1.0}), tally(['sfx'], {'render': 0.8}))
+        runtime.refresh_votes()
+        get = self.transport.calls[-1]
+        self.assertEqual((get['method'], get['url']), ('GET', 'https://service.test/v1/votes'))
+        self.assertTrue(self.row(runtime, 'render')['voted'])
+        self.assertTrue(runtime.vote('render'))
+        call = self.transport.calls[-1]
+        self.assertEqual((call['method'], call['url'], call['body']), ('DELETE', 'https://service.test/v1/votes/render', None))
+        self.assertEqual(runtime.votes['mine'], ['sfx'])
+        self.assertEqual(self.row(runtime, 'render', 'voted', 'level'), {'voted': False, 'level': 0.8})
+
+    def test_a_vote_past_the_limit_sets_the_notice_without_a_request(self):
+        runtime = self.voting(tally(['render', 'sfx', 'lip_sync'], {'render': 1.0}), tally(['sfx', 'lip_sync']))
+        runtime.refresh_votes()
+        calls = len(self.transport.calls)
+        self.assertFalse(runtime.vote('auto_rig'))
+        self.assertEqual(len(self.transport.calls), calls)
+        self.assertEqual(cloud.vote_notice(), cloud.VOTE_LIMIT_NOTICE.format(3))
+        self.assertEqual(runtime.votes['mine'], ['render', 'sfx', 'lip_sync'])
+        self.assertEqual((runtime.vote_states, self.row(runtime, 'auto_rig')['voted']), ({}, False))
+        self.assertTrue(runtime.vote('render'), 'taking one back is always allowed')
+        self.assertEqual(cloud.vote_notice(), '', 'and it clears the notice')
+
+    def test_the_servers_limit_is_the_one_counted(self):
+        runtime = self.voting(tally(['render', 'sfx'], max_votes=2))
+        runtime.refresh_votes()
+        self.assertFalse(runtime.vote('lip_sync'))
+        self.assertEqual(cloud.vote_notice(), cloud.VOTE_LIMIT_NOTICE.format(2))
+        self.assertEqual(len(self.transport.calls), 2)
+
+    def test_a_409_takes_only_that_vote_back_with_the_limit_notice(self):
+        runtime = self.voting(tally(['sfx'], {'sfx': 1.0}), error('vote_limit', 409))
+        runtime.refresh_votes()  # The server already counts votes cast from another computer.
+        self.assertFalse(runtime.vote('render'))
+        self.assertEqual([c['method'] for c in self.transport.calls[1:]], ['GET', 'PUT'])
+        self.assertEqual(runtime.votes['mine'], ['sfx'])
+        self.assertEqual(self.row(runtime, 'render', 'voted', 'state'), {'voted': False, 'state': 'ready'})
+        self.assertEqual(cloud.vote_notice(), cloud.VOTE_LIMIT_NOTICE.format(3))
+        self.assertEqual(runtime.vote_states, {})
+
+    def test_a_server_without_votes_turns_a_cast_into_one_interest_event(self):
+        runtime = self.voting(error('not_found', 404), Reply(status=204))
+        self.assertTrue(runtime.vote('render'))
+        put, post = self.transport.calls[1:]
+        self.assertEqual(put['method'], 'PUT')
+        self.assertEqual((post['method'], post['url']), ('POST', 'https://service.test/v1/events'))
+        self.assertEqual(post['body'], {'type': 'interest', 'tool': 'render', 'source': 'coming_soon_button',
+                                        'app_version': config.app_version()})
+        self.assertIs(runtime.votes['server'], False)
+        self.assertEqual(runtime.votes['mine'], ['render'])
+        self.assertEqual(runtime.interests, {'render': 'thanks'})
+        self.assertEqual(self.row(runtime, 'render', 'voted', 'level'), {'voted': True, 'level': None})
+        self.assertEqual(cloud.vote_notice(), '')
+        # From now on nothing asks the vote endpoints: a take-back stays here, a second cast sends no second event.
+        self.assertTrue(runtime.vote('render'))
+        self.assertEqual(runtime.votes['mine'], [])
+        self.assertTrue(runtime.vote('render'))
+        self.assertEqual(runtime.votes['mine'], ['render'])
+        self.assertEqual(len(self.transport.calls), 3)
+
+    def test_a_404_when_refreshing_marks_a_server_without_votes(self):
+        runtime = self.voting(error('not_found', 404), Reply(status=204))
+        runtime.refresh_votes()
+        self.assertIs(runtime.votes['server'], False)
+        self.assertTrue(runtime.vote('sfx'))
+        self.assertEqual([c['method'] for c in self.transport.calls[1:]], ['GET', 'POST'])
+        self.assertEqual(runtime.votes['mine'], ['sfx'])
+
+    def test_an_unknown_tool_is_a_failed_vote_not_a_server_without_votes(self):
+        runtime = self.voting(error('unknown_tool', 404))
+        self.assertFalse(runtime.vote('render'))
+        self.assertEqual(len(self.transport.calls), 2, 'no interest event')
+        self.assertEqual((runtime.votes['mine'], runtime.votes['server']), ([], None))
+        self.assertEqual(cloud.vote_notice(), cloud.VOTE_FAILED_NOTICE)
+
+    def test_a_failed_send_puts_the_pick_back_with_a_notice(self):
+        runtime = self.voting(tally(['render'], {'render': 1.0}), OSError('offline'), error('internal', 500))
+        runtime.refresh_votes()
+        for name in ('sfx', 'render'):  # A cast, then a take-back.
+            with self.subTest(name=name):
+                self.assertFalse(runtime.vote(name))
+                self.assertEqual(runtime.votes['mine'], ['render'])
+                self.assertEqual(cloud.vote_notice(), cloud.VOTE_FAILED_NOTICE)
+                self.assertEqual(self.row(runtime, name)['state'], 'ready')
+                self.assertEqual(runtime.vote_states, {})
+        self.assertIs(runtime.votes['server'], True)
+        self.assertEqual(runtime.votes['levels'], {'render': 1.0}, 'the last picture stays')
+
+    def test_a_refused_signed_out_vote_asks_for_a_sign_in(self):
+        """Signed-out votes switched off on the server (401): reached, refused, so not 'couldn't reach'."""
+        from loopcut import credentials
+        config_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__('shutil').rmtree, config_dir, True)
+        with patch.object(sys.modules['bpy'].app, 'background', False, create=True), \
+                patch.object(credentials, 'folder', return_value=config_dir):
+            runtime = self.voting(tally([], {'render': 1.0}), error('invalid_api_key', 401), signed_in=False)
+            runtime.refresh_votes()
+            self.assertFalse(runtime.vote('sfx'))
+        self.assertEqual(self.transport.calls[-1]['method'], 'PUT')
+        self.assertEqual(runtime.votes['mine'], [])
+        self.assertEqual(cloud.vote_notice(), cloud.VOTE_SIGN_IN_NOTICE)
+
+    def test_a_second_click_while_a_vote_is_sending_is_ignored(self):
+        runtime = self.voting(tally(['render'], {'render': 1.0}))
+        runtime.client.client_headers = cloud_http.contract_headers()  # Off the main thread, as a worker has them.
+        entered, release = threading.Event(), threading.Event()
+        original = runtime.client.request
+        def send(*args, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('vote send not released')
+            return original(*args, **kwargs)
+        with patch.object(runtime.client, 'request', side_effect=send):
+            worker = threading.Thread(target=lambda: runtime.vote('render'))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(runtime.vote('render'))
+                self.assertEqual(self.row(runtime, 'render')['state'], 'sending')
+            finally:
+                release.set()
+                worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sum(c['method'] == 'PUT' for c in self.transport.calls), 1)
+        self.assertEqual(runtime.votes['mine'], ['render'])
+
+    def test_an_earlier_answer_never_drops_a_later_pending_vote(self):
+        """Two quick clicks: the first answer, which has not seen the second click, applies while the second waits."""
+        def until(condition):
+            deadline = time.monotonic() + 2
+            while not condition():
+                self.assertLess(time.monotonic(), deadline, 'timed out')
+                time.sleep(0.005)
+        # (the second click, the picks before it, the server's answer to the first click, to the second, picks between)
+        cases = (('sfx', [], tally(['render'], {'render': 1.0}), tally(['render', 'sfx'], {'render': 1.0, 'sfx': 0.5}),
+                  ['render', 'sfx']),
+                 ('lip_sync', ['lip_sync'], tally(['lip_sync', 'render'], {'render': 1.0, 'lip_sync': 0.6}),
+                  tally(['render'], {'render': 1.0}),
+                  ['render']))
+        for second, before, first_answer, second_answer, between in cases:
+            with self.subTest(second=second):
+                runtime = self.voting(tally(before), first_answer, second_answer)
+                runtime.refresh_votes()
+                runtime.client.client_headers = cloud_http.contract_headers()  # Off the main thread, as a worker has them.
+                entered = {name: threading.Event() for name in ('render', second)}
+                release = {name: threading.Event() for name in ('render', second)}
+                original = runtime.client.request
+                def send(method, path, *args, **kwargs):
+                    name = path.split('?')[0].rsplit('/', 1)[-1]
+                    entered[name].set()
+                    if not release[name].wait(2):
+                        raise AssertionError('vote send not released')
+                    return original(method, path, *args, **kwargs)
+                with patch.object(runtime.client, 'request', side_effect=send):
+                    first = threading.Thread(target=lambda: runtime.vote('render'))
+                    first.start()
+                    self.assertTrue(entered['render'].wait(2))
+                    later = threading.Thread(target=lambda: runtime.vote(second))
+                    later.start()
+                    try:
+                        until(lambda: second in runtime.vote_states)  # Clicked, and waiting its turn.
+                        self.assertFalse(entered[second].is_set(), 'one vote request at a time')
+                        release['render'].set()
+                        first.join(timeout=2)
+                        self.assertFalse(first.is_alive())
+                        self.assertEqual(runtime.votes['mine'], between, 'the first answer kept the second click')
+                        self.assertEqual(self.row(runtime, second, 'state', 'voted'),
+                                         {'state': 'sending', 'voted': second not in before})
+                        self.assertEqual(self.row(runtime, 'render')['level'], 1.0, "the first answer's levels apply")
+                        self.assertTrue(entered[second].wait(2))
+                    finally:
+                        release['render'].set()
+                        release[second].set()
+                        first.join(timeout=2)
+                        later.join(timeout=2)
+                self.assertFalse(later.is_alive())
+                self.assertEqual([c['url'].split('?')[0].rsplit('/', 1)[-1] for c in self.transport.calls[2:]],
+                                 ['render', second], 'answers in click order')
+                self.assertEqual(runtime.votes['mine'], between)
+                self.assertEqual((runtime.vote_states, cloud.vote_notice()), ({}, ''))
+
+    def test_the_servers_picture_is_validated_and_clamped(self):
+        runtime = self.voting(Reply({'tools': 'bad'}))
+        good = {'max_votes': 3, 'mine': ['render'], 'tools': [{'tool': 'render', 'level': 1.0, 'badge': 'most_wanted'}]}
+        runtime._apply_votes(good)
+        picture = deepcopy(runtime.votes)
+        self.assertEqual(picture, {'mine': ['render'], 'levels': {'render': 1.0}, 'badges': {'render': 'most_wanted'},
+                                   'max': 3, 'server': True})
+        missing = {key: value for key, value in good.items() if key != 'max_votes'}
+        for bad in ({**good, 'tools': {}}, {**good, 'mine': 'render'}, {**good, 'mine': [1]}, missing,
+                    {**good, 'max_votes': True}, {**good, 'max_votes': 3.0}, {**good, 'max_votes': 0}, {**good, 'max_votes': 11}):
+            with self.subTest(bad=bad), self.assertRaises(cloud_http.CloudError) as caught:
+                runtime._apply_votes(bad)
+            self.assertEqual(caught.exception.code, 'invalid_response')
+        runtime.refresh_votes()  # An invalid reply is dropped quietly.
+        self.assertEqual(runtime.votes, picture, 'a bad picture never replaces the last good one')
+        runtime._apply_votes({'max_votes': 2, 'mine': ['render', 'sfx', 'lip_sync'], 'tools': [
+            {'tool': 'render', 'level': 1.7, 'badge': 'legendary'}, {'tool': 'sfx', 'level': -0.2, 'badge': 'popular'},
+            {'tool': 'lip_sync', 'level': float('nan')}, {'tool': 'auto_rig', 'level': '0.5'}, {'tool': 'x', 'level': True},
+            {'tool': 'y', 'level': float('inf')}, {'tool': 'z', 'level': 1}, 'render', {'level': 0.5}, {'tool': 7, 'level': 0.5}]})
+        self.assertEqual(runtime.votes, {'mine': ['render', 'sfx'], 'levels': {'render': 1.0, 'sfx': 0.0, 'z': 1.0},
+                                         'badges': {'sfx': 'popular'}, 'max': 2, 'server': True})
+
+    def test_counts_from_the_server_are_never_kept_shown_or_cached(self):
+        runtime = self.voting(Reply({'max_votes': 3, 'mine': ['render'], 'total': 4711, 'tools': [
+            {'tool': 'render', 'level': 1.0, 'badge': 'most_wanted', 'count': 4711, 'votes': 4711}]}))
+        runtime.refresh_votes()
+        self.assertNotIn('4711', json.dumps(runtime.votes))
+        self.assertNotIn('4711', json.dumps(runtime.coming_soon()))
+        self.assertEqual(set(self.row(runtime, 'render')),
+                         {'name', 'title', 'summary', 'state', 'category', 'voted', 'level', 'badge'})
+        cache = (Path(self.directory.name) / 'manifest.json').read_text()
+        self.assertNotIn('4711', cache)
+        self.assertEqual(json.loads(cache)['votes_mine'], ['render'])
+
+    def test_picks_survive_a_restart_but_levels_wait_for_the_server(self):
+        runtime = self.voting(tally(['render'], {'render': 1.0}, {'render': 'most_wanted'}))
+        self.assertTrue(runtime.vote('render'))
+        restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
+        self.assertEqual(restarted.votes['mine'], ['render'])
+        self.assertIsNone(restarted.votes['server'])
+        self.assertEqual(self.row(restarted, 'render', 'voted', 'level', 'badge'), {'voted': True, 'level': None, 'badge': None})
+        path = Path(self.directory.name) / 'manifest.json'
+        for cached, mine in ((['render', 'sfx', 'lip_sync', 'auto_rig'], ['render', 'sfx', 'lip_sync']), ('render', [])):
+            with self.subTest(cached=cached):
+                payload = json.loads(path.read_text())
+                payload['votes_mine'] = cached
+                path.write_text(json.dumps(payload))
+                with patch('builtins.print'):
+                    restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
+                self.assertEqual(restarted.votes['mine'], mine)
+                self.assertEqual(len(restarted.coming_soon()), 4, 'a bad pick list never costs the catalog')
+
+    def test_signed_in_votes_add_the_install_id_and_signed_out_votes_send_only_it(self):
+        from loopcut import credentials
+        for signed_in in (True, False):
+            with self.subTest(signed_in=signed_in):
+                config_dir = Path(tempfile.mkdtemp())
+                self.addCleanup(__import__('shutil').rmtree, config_dir, True)
+                with patch.object(sys.modules['bpy'].app, 'background', False, create=True), \
+                        patch.object(credentials, 'folder', return_value=config_dir):
+                    runtime = self.voting(tally(), tally(['render']), tally(), signed_in=signed_in)
+                    runtime.refresh_votes()
+                    self.assertTrue(runtime.vote('render'))
+                    self.assertTrue(runtime.vote('render'))
+                    install_id = credentials.interest_install_id()
+                get, put, delete = self.transport.calls[1:]
+                self.assertEqual(get['url'], 'https://service.test/v1/votes?install_id=' + install_id)
+                self.assertEqual(put['url'], 'https://service.test/v1/votes/render')
+                self.assertEqual(put['body'], {'app_version': config.app_version(), 'install_id': install_id})
+                self.assertEqual(delete['url'], 'https://service.test/v1/votes/render?install_id=' + install_id)
+                for call in (get, put, delete):
+                    self.assertEqual('authorization' in call['headers'], signed_in)
+
+    def test_signed_out_without_an_install_id_never_votes_anonymously(self):
+        runtime = self.voting(signed_in=False)  # Background Blender: no install id.
+        runtime.refresh_votes()
+        self.assertFalse(runtime.vote('render'))
+        self.assertEqual(len(self.transport.calls), 1, 'only the manifest')
+        self.assertEqual((runtime.votes['mine'], cloud.vote_notice()), ([], cloud.VOTE_FAILED_NOTICE))
+
+    def test_module_calls_run_off_the_ui_thread_then_redraw(self):
+        from loopcut import mainthread
+        runtime = self.runtime()
+        done, calls = threading.Event(), []
+        with patch.object(runtime, 'vote', side_effect=lambda name: calls.append((name, threading.current_thread().name))), \
+                patch.object(runtime, 'refresh_votes', side_effect=lambda: calls.append(threading.current_thread().name)), \
+                patch.object(mainthread, 'request_redraw', side_effect=done.set) as redraw:
+            cloud.vote('render')
+            self.assertTrue(done.wait(2))
+            done.clear()
+            cloud.refresh_votes()
+            self.assertTrue(done.wait(2))
+        self.assertEqual(calls, [('render', 'loopcut-vote'), 'loopcut-votes'])
+        self.assertEqual(redraw.call_count, 2)
+        runtime.vote_notice = 'Notice'
+        self.assertEqual(cloud.vote_notice(), 'Notice')
+        cloud._runtime = None
+        cloud.vote('render')
+        cloud.refresh_votes()
+        self.assertEqual(cloud.vote_notice(), '')
+        self.assertEqual(len(calls), 2)
 
 
 class MergeTest(unittest.TestCase):
@@ -388,7 +719,6 @@ class MergeTest(unittest.TestCase):
 
 class SchemaTest(RuntimeFixture):
     def test_eleven_coming_soon_tools_render_but_never_reach_any_model(self):
-        import coming_soon_fixture
         from coming_soon_fixture import manifest as coming_soon_manifest
         from loopcut import agent, chatgpt_responses, codex_app, state
         from loopcut.ui import layout
@@ -403,10 +733,6 @@ class SchemaTest(RuntimeFixture):
         rows = runtime.coming_soon()
         self.assertEqual({r['name'] for r in rows}, expected)
         self.assertEqual(rows[-1]['category'], '')  # Invalid metadata does not hide a tool.
-        labels = {r['name']: r['data_label'] for r in rows}
-        self.assertEqual([labels[n] for n in ('render', 'lip_sync', 'asset_search')],
-                         ['Private (A)', 'Private (A)', 'Longer retention (B)'], "0.6's managed class, no byok route")
-        self.assertEqual(labels['auto_rig'], 'Data class unknown', 'no class at all: still said, never guessed')
         local_names = {d['name'] for d in catalog.descriptors(no_generation=False, private_mode=False, keys_set={})}
         self.assertTrue(expected - local_names)
         flat = agent._tool_schemas()
@@ -421,17 +747,17 @@ class SchemaTest(RuntimeFixture):
         measure = lambda font, size, text: len(text) * size * .6
         for width in (240, 420, 900):
             with self.subTest(width=width):
-                display = layout.build(state.new_session(), width, 800, 1, measure, ui={'coming_soon': rows})
-                self.assertEqual({h['action'][1] for h in display['hits'] if h['action'][0] == 'cloud_interest'}, expected)
-                labels = [p['text'] for p in display['prims'] if p['id'].startswith('cloud.category.')]
-                self.assertEqual(labels, coming_soon_fixture.LABELS)
-                box = next(p for p in display['prims'] if p['id'] == 'cloud.box')
-                for h in display['hits']:
-                    if h['action'][0] == 'cloud_interest':
-                        self.assertGreaterEqual(h['y'], box['y'])
-                        self.assertLessEqual(h['y'] + h['h'], box['y'] + box['h'])
-                        self.assertLessEqual(h['x'] + h['w'], width)
-                self.assertGreaterEqual(box['y'], 0)
+                chat = layout.build(state.new_session(), width, 800, 1, measure, ui={'coming_soon': rows})
+                self.assertEqual(next(h for h in chat['hits'] if h['id'] == 'vote.strip')['action'], ('votes_open', None))
+                display = layout.build(state.new_session(), width, 800, 1, measure, ui={'view': 'vote', 'coming_soon': rows})
+                votes = [h for h in display['hits'] if h['action'][0] == 'vote']
+                self.assertEqual({h['action'][1] for h in votes}, expected)
+                header = next(p for p in display['prims'] if p['id'] == 'header.bg')
+                footer = next(p for p in display['prims'] if p['id'] == 'vote.footer.rule')
+                for h in votes:
+                    self.assertGreaterEqual(h['y'], header['y'] + header['h'])
+                    self.assertLessEqual(h['y'] + h['h'], footer['y'])
+                    self.assertLessEqual(h['x'] + h['w'], width)
 
     def test_category_is_optional_bounded_display_metadata(self):
         runtime = self.runtime()
@@ -831,7 +1157,7 @@ class LifecycleTest(RuntimeFixture):
         runtime.interest('image_generate')
         restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
         self.assertFalse(restarted.interest('image_generate'))
-        self.assertEqual(restarted.coming_soon()[0]['state'], 'thanks')
+        self.assertEqual(restarted.interests, {'image_generate': 'thanks'})
 
     def test_quoted_regex_skill_verifies_original_bytes(self):
         document, entry = served(words=r'\b(?:cloud|asset)\b')
@@ -840,22 +1166,25 @@ class LifecycleTest(RuntimeFixture):
         self.assertEqual(verified['front_matter']['words'], r'\b(?:cloud|asset)\b')
         self.assertIn('Test integration note.', skills.single_notes('cloud', server_skills=[verified], available_tools=['loopcut_cloud.asset_search']))
 
-    def test_coming_soon_layout_actions_and_thank_you(self):
+    def test_coming_soon_rows_and_a_cast_vote_feed_the_vote_view(self):
         from loopcut import state
         from loopcut.ui import layout
         measure = lambda font, size, text: len(text) * size * .6
-        items = [{'name': 'soon_' + str(n), 'title': 'Tool ' + str(n), 'state': 'ready'} for n in range(8)]
-        items[0]['state'] = 'thanks'
-        display = layout.build(state.new_session(), 420, 600, 1, measure, 'fast', None, {'coming_soon': items})
-        actions = {hit['id']: hit['action'] for hit in display['hits']}
-        self.assertEqual(actions['cloud.soon_0'], ('noop', None))
-        self.assertEqual(actions['cloud.soon_1'], ('cloud_interest', 'soon_1'))
-        self.assertEqual(len([name for name in actions if name.startswith('cloud.soon_')]), 8)
-        text = [p.get('text') for p in display['prims']]
-        self.assertIn('Tool 0 · Thank you', text)
+        names = ['soon_' + str(n) for n in range(8)]
+        runtime = self.runtime(Reply(ideas(*names)), tally(['soon_1'], {'soon_1': 1.0, 'soon_0': 0.5}, {'soon_1': 'most_wanted'}))
+        runtime.refresh()
+        self.assertTrue(runtime.vote('soon_1'))
+        display = layout.build(state.new_session(), 420, 600, 1, measure, 'fast', None,
+                               {'view': 'vote', 'coming_soon': runtime.coming_soon()})
+        actions = {hit['id']: hit['action'] for hit in display['hits'] if hit['action'][0] == 'vote'}
+        self.assertEqual(actions, {'vote.' + name: ('vote', name) for name in names})
+        self.assertEqual(list(actions)[:2], ['vote.soon_1', 'vote.soon_0'], 'ranked by level')
+        text = {p['id']: p.get('text') for p in display['prims']}
+        self.assertEqual((text['vote.soon_1.toggle.glyph'], text['vote.soon_0.toggle.glyph']), ('✓', '▲'))
+        self.assertEqual(text['vote.soon_1.badge.label'], 'Most wanted')
+        self.assertEqual(text['vote.footer.status.l0'], '2 votes left')
         for hit in display['hits']:
-            if hit['id'].startswith('cloud.'):
-                self.assertLessEqual(hit['y'] + hit['h'], 600)
+            self.assertLessEqual(hit['y'] + hit['h'], 600)
 
     def test_schema_file_validation_before_export(self):
         descriptor = tool(file_inputs=[{'field': 'reference', 'required': True, 'max_mb': 20, 'accept': ['image/png']}])

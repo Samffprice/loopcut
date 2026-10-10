@@ -84,6 +84,9 @@ def apply_fixture():
     session.update(state.new_session())
     session.update(fixture)
     state.ui.update(ui or {"view": "chat"})
+    if "coming_soon" in state.ui:
+        # No network here: the fixture's rows (and votes) stand in for the manifest's and the server's.
+        host._cloud_panel_state = lambda session: {}
     for row in state.ui.get("history", []):
         if row.get("id") == "CURRENT":
             row["id"] = session["id"]

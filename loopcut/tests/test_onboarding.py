@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import io
 import tempfile
+import threading
 import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 import sys
@@ -250,32 +251,31 @@ class OnboardingTest(unittest.TestCase):
             self.assertEqual(self.onboarding._state['step'], 'connect')
             self.assertTrue(self.account._cancel.is_set())
 
-    def test_eleven_entry_panel_collapse_survives_a_new_session(self):
+    def test_eleven_entries_reach_the_vote_view_from_the_strip_and_back(self):
         from coming_soon_fixture import manifest
+        measure = lambda font, size, text: len(text) * size * .6
         with tempfile.TemporaryDirectory() as directory:
             runtime = self.cloud.Runtime(types.SimpleNamespace(api_key=''), directory)
             runtime.manifest = manifest()
-            with patch.object(self.cloud, '_runtime', runtime):
+            with patch.object(self.cloud, '_runtime', runtime), patch.object(self.cloud, 'refresh_votes') as refresh, \
+                    patch.object(self.cloud, 'vote') as vote:
                 session = self.state.new_session()
-                initial = self.host._cloud_panel_state(session)
-                self.assertEqual(len(initial['coming_soon']), 11)
-                self.assertTrue(initial['coming_soon_expanded'])
+                panel = self.host._cloud_panel_state(session)
+                self.assertEqual(len(panel['coming_soon']), 11)
+                self.assertEqual(panel['vote_notice'], '')
+                display = self.host.layout.build(session, 420, 800, 1, measure, ui={**self.state.ui, **panel})
+                self.host._do_action(session, next(h['action'] for h in display['hits'] if h['id'] == 'vote.strip'))
+                refresh.assert_called_once_with()
+                self.assertEqual(self.state.ui['view'], 'vote')
+                panel = self.host._cloud_panel_state(session)
+                display = self.host.layout.build(session, 420, 800, 1, measure, ui={**self.state.ui, **panel})
+                actions = [h['action'] for h in display['hits'] if h['action'][0] == 'vote']
+                self.assertEqual({name for _, name in actions}, {row['name'] for row in panel['coming_soon']})
+                self.host._do_action(session, actions[0])
+                vote.assert_called_once_with(actions[0][1])
+                self.host._do_action(session, next(h['action'] for h in display['hits'] if h['id'] == 'vote.back'))
+                self.assertEqual(self.state.ui['view'], 'chat')
                 self.fake.ops.wm.save_userpref.assert_not_called()
-                measure = lambda font, size, text: len(text) * size * .6
-                display = self.host.layout.build(session, 420, 800, 1, measure, ui=initial)
-                action = next(h['action'] for h in display['hits'] if h['id'] == 'cloud.toggle')
-                self.host._do_action(session, action)
-                self.assertFalse(self.prefs.coming_soon_expanded)
-                self.fake.ops.wm.save_userpref.assert_called_once()
-                self.state.ui.clear()
-                self.host._runtime.clear()
-                reopened = self.host._cloud_panel_state(self.state.new_session())
-                self.assertFalse(reopened['coming_soon_expanded'])
-                display = self.host.layout.build(session, 420, 800, 1, measure, ui=reopened)
-                self.assertFalse([h for h in display['hits'] if h['action'][0] == 'cloud_interest'])
-                self.host._do_action(session, action)
-                self.state.ui.clear()
-                self.assertTrue(self.host._cloud_panel_state(session)['coming_soon_expanded'])
 
     def test_service_model_cache_can_be_unloaded_on_the_first_turn(self):
         with patch.dict(self.account._state, models=None):
@@ -449,12 +449,10 @@ class OnboardingTest(unittest.TestCase):
             session["busy"] = False
             self.assertEqual(self.host._cloud_panel_state(session)["cloud_message"], "Update Loopcut")
 
-    def test_draw_passes_both_feature_sets_with_one_cloud_snapshot(self):
-        session = self.state.new_session()
-        area = Mock()
-        context = types.SimpleNamespace(area=area, region=types.SimpleNamespace(width=420, height=600),
+    def draw(self, session, runtime, max_scroll=0):
+        """draw_area() with Blender, the cloud and the layout stubbed; returns the mocks it called."""
+        context = types.SimpleNamespace(area=Mock(), region=types.SimpleNamespace(width=420, height=600),
             scene={}, view_layer=None, preferences=types.SimpleNamespace(system=types.SimpleNamespace(ui_scale=1)))
-        runtime = types.SimpleNamespace(signed_in=True)
         with patch.object(self.fake, "context", context), \
                 patch.object(self.cloud, "_runtime", runtime), \
                 patch.object(self.cloud, "panel_seen"), \
@@ -467,10 +465,17 @@ class OnboardingTest(unittest.TestCase):
                 patch.object(self.host.update, "banner", return_value=None), \
                 patch.object(self.host.draw, "measure", Mock(), create=True), \
                 patch.object(self.host.draw, "render", create=True), \
-                patch.object(self.host.layout, "build", return_value={"max_scroll": 0}) as build:
+                patch.object(self.host.layout, "build", return_value={"max_scroll": max_scroll}) as build:
             self.host.draw_area()
+        return build, service, catalog
+
+    def test_draw_passes_both_feature_sets_with_one_cloud_snapshot(self):
+        session = self.state.new_session()
+        runtime = types.SimpleNamespace(signed_in=True, lock=threading.RLock(), vote_notice="All 3 votes used.")
+        build, service, catalog = self.draw(session, runtime)
         ui = build.call_args.args[-1]
         self.assertEqual(ui["cloud_message"], "Saving…")
+        self.assertEqual(ui["vote_notice"], "All 3 votes used.")
         self.assertEqual(ui["credits"], "100 credits")
         self.assertEqual(ui["service_policy"], self.cloud.cloud_account.DEFAULTS)
         self.assertTrue(ui["service_signed_in"])
@@ -484,8 +489,6 @@ class OnboardingTest(unittest.TestCase):
 
     def test_service_actions_keep_settings_project_and_upgrade_routes(self):
         session = self.state.new_session()
-        self.host._do_action(session, ("cloud_page", 4))
-        self.assertEqual(self.state.ui["coming_soon_start"], 4)
         self.state.ui.update(model_menu=True, picker={})
         self.host._do_action(session, ("service_settings", None))
         self.assertTrue(self.state.ui["service_settings"])
@@ -526,17 +529,18 @@ class OnboardingTest(unittest.TestCase):
 
     def test_late_cloud_catalog_and_message_wait_until_the_turn_ends(self):
         session = self.state.new_session()
-        rows = [{"name": "future", "title": "Fixture title", "state": "ready"}]
+        rows = [{"name": "future", "title": "Fixture title", "state": "ready", "voted": False, "level": None, "badge": None}]
+        vote = {"state": "sending", "voted": True, "level": 0.5, "badge": "popular"}
         with patch.object(self.cloud, "coming_soon", return_value=rows) as catalog, \
                 patch.object(self.cloud, "ui_message", return_value="") as message:
             first = self.host._cloud_panel_state(session)
             session["busy"] = True
-            catalog.return_value = [{**rows[0], "state": "thanks", "notify_sign_in": True}, {"name": "late", "title": "Later", "state": "ready"}]
+            catalog.return_value = [{**rows[0], **vote, "title": "Renamed"}, {**rows[0], "name": "late", "title": "Later"}]
             message.return_value = "Update Loopcut"
             during = self.host._cloud_panel_state(session)
             self.assertEqual(len(during["coming_soon"]), len(first["coming_soon"]))
-            self.assertEqual(during["coming_soon"][0]["state"], "thanks")
-            self.assertTrue(during["coming_soon"][0]["notify_sign_in"])
+            self.assertEqual({key: during["coming_soon"][0][key] for key in vote}, vote, "votes update in place")
+            self.assertEqual(during["coming_soon"][0]["title"], "Fixture title", "the catalog waits")
             self.assertEqual(during["cloud_message"], "")
             session["busy"] = False
             after = self.host._cloud_panel_state(session)
@@ -547,6 +551,126 @@ class OnboardingTest(unittest.TestCase):
             dismissed = self.host._cloud_panel_state(session)
             self.assertEqual(dismissed["cloud_message"], "")
             self.assertTrue(dismissed["cloud_message_reserved"])
+
+    def test_opening_the_vote_view_starts_it_fresh_and_asks_for_votes(self):
+        session = self.state.new_session()
+        self.state.ui.update(view="chat", picker={}, model_menu=True, service_settings=True, vote_order=["old"],
+                             vote_scroll=120.0, vote_anim={"old": (0.0, 1.0, 0.0)})
+        with patch.object(self.cloud, "refresh_votes") as refresh:
+            self.host._do_action(session, ("votes_open", None))
+        refresh.assert_called_once_with()
+        keys = ("view", "vote_order", "vote_scroll", "vote_anim", "picker", "model_menu", "service_settings")
+        self.assertEqual({key: self.state.ui[key] for key in keys},
+                         {"view": "vote", "vote_order": None, "vote_scroll": 0.0, "vote_anim": {}, "picker": None,
+                          "model_menu": False, "service_settings": False})
+        with patch.object(self.cloud, "vote") as vote:
+            self.host._do_action(session, ("vote", "render"))
+        vote.assert_called_once_with("render")
+        self.assertEqual(self.state.ui["view"], "vote")
+
+    def test_rows_are_ranked_once_when_levels_arrive_and_never_jump_while_voting(self):
+        session = self.state.new_session()
+        measure = lambda font, size, text: len(text) * size * .6
+        rows = [{"name": name, "title": name.title(), "summary": "", "state": "ready", "voted": False, "level": None,
+                 "badge": None} for name in ("render", "sfx", "rig")]
+        self.state.ui["view"] = "vote"
+        with patch.object(self.cloud, "coming_soon", return_value=rows) as catalog, \
+                patch.object(self.host, "time", types.SimpleNamespace(time=lambda: 100.0)):
+            self.host._cloud_panel_state(session)
+            self.assertFalse(self.state.ui.get("vote_order"), "nothing to rank before the levels")
+            catalog.return_value = [{**rows[0], "level": 0.2}, {**rows[1], "level": 1.0}, {**rows[2], "level": 0.5}]
+            self.host._cloud_panel_state(session)
+            self.assertEqual(self.state.ui["vote_order"], ["sfx", "rig", "render"])
+            catalog.return_value = [{**rows[0], "level": 1.0, "voted": True}, {**rows[1], "level": 0.3}, {**rows[2], "level": 0.5}]
+            panel = self.host._cloud_panel_state(session)
+            self.assertEqual(self.state.ui["vote_order"], ["sfx", "rig", "render"])
+            display = self.host.layout.build(session, 420, 800, 1, measure, ui={**self.state.ui, **panel})
+            self.assertEqual([h["action"][1] for h in display["hits"] if h["action"][0] == "vote"], ["sfx", "rig", "render"])
+            # The chat view's strip neither ranks nor eases.
+            self.state.ui.clear()
+            panel = self.host._cloud_panel_state(session)
+        self.assertNotIn("vote_order", self.state.ui)
+        self.assertNotIn("animate_until", self.state.ui)
+        self.assertEqual([row["level"] for row in panel["coming_soon"]], [1.0, 0.3, 0.5])
+
+    def test_bars_grow_in_rank_order_then_ease_from_where_they_are_drawn(self):
+        clock = [100.0]
+        ease, stagger = self.host.VOTE_EASE_SECONDS, self.host.VOTE_INTRO_STAGGER
+        self.state.ui.update(view="vote", vote_order=["a", "b"], vote_anim={})
+        rows = [{"name": "a", "level": 1.0}, {"name": "b", "level": 0.5}, {"name": "c", "level": None}]
+        with patch.object(self.host, "time", types.SimpleNamespace(time=lambda: clock[0])):
+            levels = lambda: {row["name"]: row["level"] for row in self.host._eased_levels(rows)}
+            self.assertEqual(levels(), {"a": 0.0, "b": 0.0, "c": None}, "grown from nothing")
+            self.assertAlmostEqual(self.state.ui["animate_until"], 100.0 + stagger + ease)
+            clock[0] = 100.0 + stagger
+            self.assertGreater(levels()["a"], 0.0)
+            self.assertEqual(levels()["b"], 0.0, "the second rank starts a beat later")
+            clock[0] = 100.0 + ease / 2
+            halfway = levels()
+            self.assertAlmostEqual(halfway["a"], 0.875, msg="ease out: most of the way at half time")
+            self.assertLess(halfway["b"] / 0.5, halfway["a"])
+            clock[0] = 100.0 + stagger + ease
+            self.assertEqual(levels(), {"a": 1.0, "b": 0.5, "c": None})
+            # A new level from the server eases from the drawn bar, not from zero.
+            clock[0] = 200.0
+            rows[0]["level"] = 0.4
+            self.assertEqual(levels()["a"], 1.0)
+            self.assertAlmostEqual(self.state.ui["animate_until"], 200.0 + ease)
+            clock[0] = 200.0 + ease / 2
+            drawn = levels()["a"]
+            self.assertAlmostEqual(drawn, 1.0 + (0.4 - 1.0) * 0.875)
+            rows[0]["level"] = 0.9  # Another one mid-move: no jump.
+            self.assertAlmostEqual(levels()["a"], drawn)
+            self.assertAlmostEqual(self.state.ui["animate_until"], 200.0 + ease / 2 + ease)
+            clock[0] = 200.0 + ease / 2 + ease
+            self.assertAlmostEqual(levels()["a"], 0.9)
+            self.assertEqual(levels()["b"], 0.5)
+            # Opening the view again (vote_anim cleared) grows the bars once more.
+            self.state.ui["vote_anim"] = {}
+            self.assertEqual(levels()["a"], 0.0)
+
+    def test_the_wheel_reads_down_the_vote_list_and_draw_clamps_it(self):
+        session = self.state.new_session()
+        session["scroll"] = 30.0
+        self.state.ui.update(view="vote", vote_scroll=0.0)
+        event = lambda kind, prev=0, y=0: types.SimpleNamespace(type=kind, mouse_prev_y=prev, mouse_y=y)
+        self.host.scroll(session, event("WHEELDOWNMOUSE"))
+        self.assertEqual(self.state.ui["vote_scroll"], self.host.SCROLL_STEP, "down the list, unlike the chat")
+        self.host.scroll(session, event("TRACKPADPAN", prev=50, y=20))
+        self.assertEqual(self.state.ui["vote_scroll"], self.host.SCROLL_STEP + 30)
+        self.host.scroll(session, event("WHEELUPMOUSE"))
+        self.host.scroll(session, event("WHEELUPMOUSE"))
+        self.assertEqual(self.state.ui["vote_scroll"], 0.0)
+        self.assertEqual(session["scroll"], 30.0, "the chat keeps its place")
+        runtime = types.SimpleNamespace(signed_in=True, lock=threading.RLock(), vote_notice="")
+        self.state.ui["vote_scroll"] = 500.0
+        self.draw(session, runtime, max_scroll=120)
+        self.assertEqual((self.state.ui["vote_scroll"], session["scroll"]), (120, 30.0))
+        self.state.ui["view"] = "chat"
+        self.draw(session, runtime, max_scroll=10)
+        self.assertEqual((self.state.ui["vote_scroll"], session["scroll"]), (120, 10))
+
+    def test_redraws_run_fast_while_bars_ease_then_at_the_thinking_pace(self):
+        mainthread = importlib.import_module(NAME + ".mainthread")
+        session = {"busy": False}
+        with patch.object(mainthread, "time", types.SimpleNamespace(time=lambda: 100.0)), \
+                patch.object(self.state, "session", return_value=session):
+            self.assertIsNone(mainthread._animating())
+            session["busy"] = True
+            self.assertEqual(mainthread._animating(), mainthread.ANIMATE_EVERY)
+            self.state.ui["animate_until"] = 100.5
+            self.assertEqual(mainthread._animating(), mainthread.EASE_EVERY, "easing wins over the thinking pace")
+            session["busy"] = False
+            self.assertEqual(mainthread._animating(), mainthread.EASE_EVERY)
+            self.state.ui["animate_until"] = 100.0
+            self.assertIsNone(mainthread._animating(), "an ended ease stops the redraws")
+        self.assertLess(mainthread.EASE_EVERY, mainthread.ANIMATE_EVERY)
+        for period, redraws in ((None, 0), (mainthread.EASE_EVERY, 1)):
+            with self.subTest(period=period), patch.object(mainthread, "_animating", return_value=period), \
+                    patch.object(mainthread, "_redraw_requested", False), patch.object(mainthread, "_animated_at", 0.0), \
+                    patch.object(self.host, "tag_redraw_all") as tag:
+                mainthread._pump()
+                self.assertEqual(tag.call_count, redraws)
 
 
 if __name__ == "__main__":

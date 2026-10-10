@@ -85,13 +85,13 @@ class InterestTest(fixtures.RuntimeFixture):
 
     def test_signed_out_manifest_and_event_have_no_authorization(self):
         runtime = self.runtime_with_tool(fixtures.Reply(status=204))
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'ready')
-        self.assertFalse(runtime.coming_soon()[0]['notify_sign_in'])
+        self.assertEqual(runtime.interests, {})
         # Even an accidentally retained key must not accompany a signed-out event.
         runtime.client.api_key = 'lc_unused'
         self.assertTrue(runtime.interest('image_generate'))
         event = self.transport.calls[-1]
-        self.assertTrue(runtime.coming_soon()[0]['notify_sign_in'])
+        self.assertEqual(runtime.interests, {'image_generate': 'thanks'})
+        self.assertEqual(runtime.coming_soon()[0]['state'], 'ready', 'rows show votes, not interest states')
         value = credentials.interest_install_id()
         self.assertEqual(event['body'], {'type': 'interest', 'tool': 'image_generate', 'app_version': config.app_version(),
                                         'source': 'coming_soon_button', 'install_id': value})
@@ -101,15 +101,15 @@ class InterestTest(fixtures.RuntimeFixture):
         self.assertEqual(len(self.transport.calls), 2)
         self.assertNotIn(value, (runtime.cache_dir / 'manifest.json').read_text())
         restarted = cloud.Runtime(runtime.client, runtime.cache_dir, signed_in=False)
-        self.assertEqual(restarted.coming_soon()[0]['state'], 'thanks')
+        self.assertEqual(restarted.interests, {'image_generate': 'thanks'})
         self.assertFalse(restarted.interest('image_generate'))
-        self.assertTrue(restarted.coming_soon()[0]['notify_sign_in'])
+        self.assertEqual(len(self.transport.calls), 2)
 
     def test_signed_in_click_keeps_the_bearer_and_adds_install_id_and_app_version(self):
         # Contract 0.6: the bearer identifies the user; install_id and app_version ride along on both paths.
         runtime = self.runtime_with_tool(fixtures.Reply(status=204), signed_in=True)
         self.assertTrue(runtime.interest('image_generate'))
-        self.assertFalse(runtime.coming_soon()[0]['notify_sign_in'])
+        self.assertEqual(runtime.interests, {'image_generate': 'thanks'})
         event = self.transport.calls[-1]
         self.assertEqual(event['headers']['authorization'], 'Bearer lc_demo')
         self.assertEqual(event['body'], {'type': 'interest', 'tool': 'image_generate', 'source': 'coming_soon_button',
@@ -129,11 +129,11 @@ class InterestTest(fixtures.RuntimeFixture):
                     if not signed_in:
                         expected['install_id'] = first['body']['install_id']
                     self.assertEqual(second['body'], expected)
-                    self.assertEqual(runtime.coming_soon()[0]['state'], 'thanks')
+                    self.assertEqual(runtime.interests['image_generate'], 'thanks')
                     (runtime.cache_dir / 'manifest.json').unlink()
         runtime = self.runtime_with_tool(fixtures.Reply(status=400), fixtures.Reply(status=400))
         self.assertFalse(runtime.interest('image_generate'))  # Both shapes refused: the quiet line, no loop.
-        self.assertEqual(runtime.coming_soon()[0]['state'], 'notify')
+        self.assertEqual(runtime.interests['image_generate'], 'notify')
         self.assertEqual(len([c for c in self.transport.calls if c['url'].endswith('/v1/events')]), 2)
 
     def test_old_servers_leave_actionable_state_without_automatic_retry(self):
@@ -144,8 +144,7 @@ class InterestTest(fixtures.RuntimeFixture):
                     self.assertFalse(runtime.interest('image_generate'))
                     refresh.assert_not_called()
                     error.assert_not_called()
-                self.assertEqual(runtime.coming_soon()[0]['state'], 'notify')
-                self.assertTrue(runtime.coming_soon()[0]['notify_sign_in'])
+                self.assertEqual(runtime.interests['image_generate'], 'notify', 'a later click may send again')
                 self.assertEqual(runtime.message, '')
                 self.assertEqual(len(self.transport.calls), 2)
                 self.assertTrue(runtime.interest('image_generate'))  # An explicit second click only.

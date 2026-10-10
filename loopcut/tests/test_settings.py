@@ -124,16 +124,6 @@ class SettingsTest(unittest.TestCase):
             context.start()
             self.addCleanup(context.stop)
 
-    def test_coming_soon_choice_is_saved_hidden_rna_with_expanded_default(self):
-        field = type(self.prefs).__annotations__['coming_soon_expanded']
-        self.assertEqual(field.options['options'], {'HIDDEN'})
-        self.assertTrue(self.prefs.coming_soon_expanded)
-        self.prefs.coming_soon_expanded = False
-        self.assertTrue(self.prefs.is_property_set('coming_soon_expanded'))
-        self.assertFalse(self.prefs.coming_soon_expanded)
-        self.assertFalse([entry for entry in self.draw_preferences('LOOPCUT', True)
-                          if entry[:2] == ('prop', 'coming_soon_expanded')])
-
     def test_signed_out_account_entry_is_visible_with_every_model_provider(self):
         for provider in ('LOOPCUT', 'CHATGPT', 'OPENAI', 'CUSTOM'):
             self.prefs.provider = provider

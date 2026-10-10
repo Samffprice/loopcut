@@ -25,12 +25,16 @@ def request_redraw() -> None:
 
 
 ANIMATE_EVERY = 1 / 15  # Redraws a second while a turn runs, for the thinking animation.
+EASE_EVERY = 1 / 40     # While a panel transition runs (state.ui["animate_until"]): bars easing to a new length.
 _animated_at = 0.0
 
 
-def _animating() -> bool:
+def _animating() -> float | None:
+    """The redraw period wanted now, or None."""
     from . import state
-    return bool(state.session().get("busy"))
+    if time.time() < state.ui.get("animate_until", 0.0):
+        return EASE_EVERY
+    return ANIMATE_EVERY if state.session().get("busy") else None
 
 
 def _pump() -> float:
@@ -47,7 +51,8 @@ def _pump() -> float:
         except BaseException as ex:  # Delivered to the waiting worker, which reports it.
             future.set_exception(ex)
     now = time.monotonic()
-    if _redraw_requested or (now - _animated_at >= ANIMATE_EVERY and _animating()):
+    period = _animating()
+    if _redraw_requested or (period is not None and now - _animated_at >= period):
         _redraw_requested, _animated_at = False, now
         from .ui import host
         host.tag_redraw_all()

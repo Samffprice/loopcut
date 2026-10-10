@@ -4,7 +4,8 @@
     python3 loopcut/harness/beta_servers_check.py --mock [--mock-path PATH]
     python3 loopcut/harness/beta_servers_check.py --base-url URL --key-env NAME
 
-The last mode sends real interest events and small model requests to the named service.
+The last mode sends real votes (interest events on a server without votes) and small model requests
+to the named service.
 Temporary credentials/cache stay isolated. Only Blender's UI/scene boundary is faked;
 configuration, loop selection, HTTP, hosted prompt resolution and panel layout are real.
 """
@@ -142,7 +143,8 @@ def fake_blender(directory):
 
 def wait_for_cloud(modules, errors):
     deadline = time.monotonic() + 15
-    while any(t.name in ('loopcut-manifest', 'loopcut-interest') for t in threading.enumerate()):
+    while any(t.name in ('loopcut-manifest', 'loopcut-interest', 'loopcut-votes', 'loopcut-vote')
+              for t in threading.enumerate()):
         modules.mainthread._pump()
         if time.monotonic() >= deadline:
             raise AssertionError('Cloud background task timed out')
@@ -152,10 +154,70 @@ def wait_for_cloud(modules, errors):
         raise AssertionError('Cloud background task raised') from errors[0]
 
 
+VOTE_WAYS = {'votes': 'PUT /v1/votes (contract 0.7)', 'interest': 'no votes here: the interest event stands in',
+             'refused': 'refused; the pick went back with a notice'}
+
+
+def rendered_hits(host):
+    return {hit['id']: hit['action'] for hit in host.draw.render.call_args.args[0]['hits']}
+
+
+def vote_click(m, host, session, requests, errors, name, signed_in):
+    """Open the vote view from the strip and vote for `name`, as a tester would, then check the request for
+    whichever the server supports: PUT /v1/votes/<name> {app_version, install_id}, or on a server without
+    votes the interest event it stands in for. Signed out, the server may still refuse anonymous calls.
+    Leaves the vote view open; returns 'votes', 'interest' or 'refused'."""
+    who = 'signed in' if signed_in else 'signed out'
+    host.draw_area()
+    check(rendered_hits(host).get('vote.strip') == ('votes_open', None), who + ': the chat view has the vote strip')
+    host._do_action(session, ('votes_open', None))
+    wait_for_cloud(m, errors)
+    host.draw_area()
+    hits = rendered_hits(host)
+    check(hits.get('vote.' + name) == ('vote', name), who + ': the vote view has the vote action')
+    check((hits.get('vote.signin') == ('sign_in', 'loopcut')) != signed_in,
+          who + ': the vote view asks to sign in only when signed out')
+    start = len(requests)
+    host._do_action(session, ('vote', name))
+    wait_for_cloud(m, errors)
+    runtime, install_id = m.cloud._runtime, m.credentials.interest_install_id()
+    sent = requests[start:]
+    puts = [r for r in sent if r['path'] == '/v1/votes/' + name]
+    events = [r for r in sent if r['path'] == '/v1/events']
+    check(sent and all(r['auth'] == signed_in for r in sent),
+          who + (': the vote carries the bearer' if signed_in else ': the vote has no Authorization'))
+    vote_body = {'app_version': m.config.app_version(), 'install_id': install_id}
+    ok = len(puts) <= 1 and all(r['method'] == 'PUT' and r['body'] == vote_body for r in puts)
+    if runtime.votes['server'] is True:
+        way = 'votes'
+        ok = ok and len(puts) == 1 and not events and name in runtime.votes['mine']
+    elif runtime.votes['server'] is False:
+        # One event; a contract 0.5 server refuses the 0.6 fields and gets one 0.5-shaped resend.
+        way = 'interest'
+        ok = ok and 1 <= len(events) <= 2 and name in runtime.votes['mine'] and events[0]['body'] == {
+            'type': 'interest', 'tool': name, 'source': 'coming_soon_button', 'install_id': install_id,
+            'app_version': m.config.app_version()}
+        if ok:
+            print(f'NOTE {who} interest on this server: {runtime.interests.get(name)}', flush=True)
+    else:
+        way = 'refused'
+        ok = (ok and not signed_in and len(puts) == 1 and not events and name not in runtime.votes['mine']
+              and m.cloud.vote_notice() in (m.cloud.VOTE_SIGN_IN_NOTICE, m.cloud.VOTE_FAILED_NOTICE))
+    check(ok, who + ': the vote click sent the right request for this server')
+    print(f'NOTE {who} vote on this server: {VOTE_WAYS[way]}', flush=True)
+    return way
+
+
+def leave_votes(host, session):
+    back = rendered_hits(host).get('vote.back')
+    check(back == ('history_close', None), 'the vote view has a way back to the chat')
+    host._do_action(session, back)
+
+
 def signed_out_click(m, host, requests, errors, mode):
-    """A ChatGPT-plan tester: never signed in to Loopcut. Rows come from the public manifest; a click
-    sends one event without Authorization and with the random install id (the server may still refuse
-    anonymous events until its flag is on: then the row asks to sign in or offers a retry)."""
+    """A ChatGPT-plan tester: never signed in to Loopcut. Rows come from the public manifest; a vote goes
+    out without Authorization and with the random install id (the server may still refuse anonymous calls
+    until its flag is on: then the pick goes back with a notice, and the vote view asks to sign in)."""
     runtime = m.cloud._runtime
     check(not runtime.signed_in, 'signed out before sign-in')
     runtime.refresh()
@@ -168,21 +230,8 @@ def signed_out_click(m, host, requests, errors, mode):
         check(bool(rows), 'signed out: coming-soon rows render from the public manifest')
     if not rows:
         return rows
-    host._do_action(session, ('cloud_interest', rows[0]))
-    wait_for_cloud(m, errors)
-    if runtime.interests[rows[0]] == 'thanks':  # Accepted: a second click sends nothing more.
-        host._do_action(session, ('cloud_interest', rows[0]))
-        wait_for_cloud(m, errors)
-    sent = [r for r in requests if r['path'] == '/v1/events']
-    check(1 <= len(sent) <= 2 and not any(r['auth'] for r in sent),
-          'signed out: one event (plus one 0.5-shaped resend on an older server), without Authorization')
-    install_id = m.credentials.interest_install_id()
-    check(sent[0]['body'] == {'type': 'interest', 'tool': rows[0], 'source': 'coming_soon_button',
-                              'install_id': install_id, 'app_version': m.config.app_version()},
-          'signed out: the body carries the stored install id and the app version')
-    state = runtime.interests[rows[0]]
-    check(state in ('thanks', 'notify', 'retry'), f'signed out: the server answered; row state {state}')
-    print(f'NOTE anonymous interest on this server: {state}', flush=True)
+    vote_click(m, host, session, requests, errors, rows[0], signed_in=False)
+    leave_votes(host, session)
     return rows
 
 
@@ -258,24 +307,31 @@ def exercise(url, key, mode, directory, server_requests=None):
         namespace = next((row['tools'] for row in m.chatgpt_responses.to_tools(flat)
                           if row.get('name') == m.cloud.NAMESPACE), [])
         check(not set(expected).intersection(row['name'] for row in namespace), 'coming-soon tools absent from Responses namespace')
-        hits = {row['id']: row['action'] for row in draw.render.call_args.args[0]['hits']}
         before = runtime.client.request('GET', '/mock/state')['events'] if mode == 'mock' else None
-        target = expected[0] if expected else 'voice_line'
+        start, way = len(requests), None
         if expected:
-            check(hits['cloud.' + target] == ('cloud_interest', target), 'coming-soon row has the interest action')
-        for _ in range(2):
-            host._do_action(session, ('cloud_interest', target))
+            way = vote_click(m, host, session, requests, errors, expected[0], signed_in=True)
+            check(way != 'interest' or runtime.interests[expected[0]] == 'thanks', 'signed in: the interest event was accepted')
+            # A second click takes the vote back: a DELETE on a votes server; without votes it stays here.
+            host._do_action(session, ('vote', expected[0]))
             wait_for_cloud(m, errors)
-        events = [r for r in requests if r['path'] == '/v1/events' and r['auth']]
-        # One click; a contract 0.5 server refuses the 0.6 fields and gets one 0.5-shaped resend.
-        check(len(events) in ((1, 2) if expected else (0,)), 'interest click sends once; absent rows send nothing')
-        if expected:
-            check({k: v for k, v in events[0]['body'].items() if k != 'install_id'}
-                  == {'type': 'interest', 'tool': target, 'source': 'coming_soon_button', 'app_version': m.config.app_version()}
-                  and runtime.interests[target] == 'thanks', 'interest payload accepted and row thanked')
-            print(f"NOTE signed-in interest on this server: {'contract 0.6 fields accepted' if len(events) == 1 else 'resent in the 0.5 shape'}", flush=True)
+            deletes = [r for r in requests[start:] if r['method'] == 'DELETE']
+            check(expected[0] not in runtime.votes['mine'] and len(deletes) == (way == 'votes')
+                  and all(r['auth'] and r['path'] == '/v1/votes/' + expected[0] for r in deletes)
+                  and len([r for r in requests[start:] if r['path'] == '/v1/events']) <= 2,
+                  'signed in: a second click takes the vote back and sends no second event')
+            leave_votes(host, session)
+        else:
+            host._do_action(session, ('votes_open', None))
+            wait_for_cloud(m, errors)
+            host._do_action(session, ('vote', 'voice_line'))
+            wait_for_cloud(m, errors)
+            check(not any(r['path'].startswith('/v1/votes/') or r['path'] == '/v1/events' for r in requests[start:]),
+                  'absent rows send no vote or event')
+            host._do_action(session, ('history_close', None))
         if mode == 'mock':
-            check(runtime.client.request('GET', '/mock/state')['events'] == before + 1, 'mock recorded exactly one event')
+            check(runtime.client.request('GET', '/mock/state')['events'] == before + (way == 'interest'),
+                  'mock recorded exactly one event for an interest fallback')
 
         for model, orchestration in (('fast', 'false'), ('pro', 'true')):
             with patch.dict(os.environ, {'LOOPCUT_MODEL': model, 'LOOPCUT_ORCHESTRATE': orchestration}):

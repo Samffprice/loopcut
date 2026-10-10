@@ -776,92 +776,27 @@ def input_height(f: Frame, session: dict) -> int:
             + _context_row_height(f) + chips + _cloud_height(f) + (f.px(22) if f.ui.get("credits") else 0))
 
 
-_INTEREST_SIGN_IN = 'Sign in to Loopcut to hear when it launches'
+_INTEREST_SIGN_IN = 'Sign in to hear when your picks launch.'
+VOTE_TITLE = 'What should we build next?'
+VOTE_STRIP = 'Vote on what we build next'
+VOTE_SUB = 'Pick up to 3. You can change them any time.'
+VOTE_FOOTNOTE = 'Bars compare ideas against the most wanted one. None of these run yet.'
+VOTE_FOOTNOTE_OFFLINE = 'Your votes go to the Loopcut team. None of these run yet.'
+VOTES_MAX = 3
 
 
-def _cloud_rows(f):
-    """Pack buttons by category in manifest order; uncategorised entries keep their own group."""
-    if not f.ui.get('coming_soon_expanded', True):
-        return []
-    width, size = f.width - 2 * f.px(T.PAD + 6), f.px(T.FONT_SIZE_SMALL)
-    groups = {}
-    for item in f.ui.get('coming_soon') or []:
-        category = item.get('category')
-        groups.setdefault(category if isinstance(category, str) else '', []).append(item)
-    rows = []
-    suffixes = {'ready': '', 'thanks': ' · Thank you', 'sending': '…', 'retry': ' · Retry'}
-    for category, items in groups.items():
-        if category:
-            rows.append({'category': category, 'height': f.line_height(size)})
-        row, used = [], 0
-        for item in items:
-            notify = item.get('notify_sign_in', item['state'] == 'sign_in')
-            suffix = suffixes.get(item['state'], '')
-            title = ' · '.join(filter(None, (item['title'], item.get('data_label'))))
-            # Successful and retry responses keep the same button geometry.
-            button_width = min(width, round(max(f.measure('ui', size, title + response)
-                               for response in suffixes.values())) + f.px(16))
-            if notify:
-                button_width = width
-            title_width = button_width - f.px(16) - f.measure('ui', size, suffix)
-            label = _ellipsize(f, title, size, title_width) + suffix
-            if row and used + button_width > width:
-                rows.append({'items': row, 'group': category, 'height': f.px(25)})
-                row, used = [], 0
-            row.append((item, label, button_width))
-            used += button_width + f.px(6)
-            if notify:
-                # A single quiet reminder below the clicked button, wrapping only at narrow widths.
-                note_width = width - f.px(66)
-                lines = wrap(_INTEREST_SIGN_IN, 'ui', size, note_width, f.measure)
-                note_height = max(f.px(22), len(lines) * f.line_height(size))
-                rows.append({'items': row, 'group': category, 'note': lines, 'height': f.px(30) + note_height})
-                row, used = [], 0
-        if row:
-            rows.append({'items': row, 'group': category, 'height': f.px(25)})
-    return rows
-
-
-def _cloud_page(f):
-    """Keep the composer and collapse control reachable even after many signed-out clicks."""
-    rows = _cloud_rows(f)
-    if not rows:
-        return rows, None, None
-    without_extras = Frame(f.width, f.height, f.scale, f.measure, ui={**f.ui, 'coming_soon': []})
-    header = T.HEADER_HEIGHT + (T.BANNER_HEIGHT if f.ui.get('update') else 0)
-    capacity = max(f.px(100), f.height - input_height(without_extras, f.session) - f.px(header + 34))
-    if sum(row['height'] for row in rows) <= capacity:
-        return rows, None, None
-    start = min(max(0, f.ui.get('coming_soon_start', 0)), len(rows) - 1)
-    # Repeat a category when a page begins in the middle of its group.
-    visible = []
-    if rows[start].get('group'):
-        visible.append({'category': rows[start]['group'], 'height': f.line_height(f.px(T.FONT_SIZE_SMALL))})
-    used = sum(row['height'] for row in visible)
-    end = start
-    while end < len(rows):
-        needed = rows[end]['height']
-        if 'category' in rows[end] and end + 1 < len(rows):
-            needed += rows[end + 1]['height']
-        if end > start and used + needed > capacity:
-            break
-        visible.append(rows[end])
-        used += rows[end]['height']
-        end += 1
-    previous, used = start, 0
-    while previous > 0 and used + rows[previous - 1]['height'] <= capacity:
-        previous -= 1
-        used += rows[previous]['height']
-    return visible, previous if start else None, end if end < len(rows) else None
-
-
-def _cloud_box_height(f, rows):
-    return (f.px(34) + sum(row['height'] for row in rows)) if f.ui.get('coming_soon') else 0
+def _vote_rows(f):
+    """The coming_soon rows in the order the view opened with (most wanted first), new rows after."""
+    rows = {row['name']: row for row in f.ui.get('coming_soon') or []}
+    order = [name for name in f.ui.get('vote_order') or [] if name in rows]
+    rest = sorted((row for name, row in rows.items() if name not in order), key=lambda row: -(row.get('level') or 0))
+    return [rows[name] for name in order] + rest
 
 
 def _cloud_height(f):
-    return _cloud_box_height(f, _cloud_page(f)[0]) + (f.px(24) if
-            f.ui.get('cloud_message') or f.ui.get('cloud_message_reserved') else 0)
+    message = f.px(24) if f.ui.get('cloud_message') or f.ui.get('cloud_message_reserved') else 0
+    strip = f.px(28) if f.ui.get('coming_soon') and f.ui.get('view', 'chat') != 'vote' else 0
+    return message + strip
 
 
 def _cloud_buttons(f, top):
@@ -874,56 +809,149 @@ def _cloud_buttons(f, top):
         f.hit('cloud.dismiss', right, y, f.px(24), f.px(22), ('cloud_dismiss', message), tip=message + '\nDismiss')
     if f.ui.get('cloud_message') or f.ui.get('cloud_message_reserved'):
         y += f.px(24)
-    if not f.ui.get('coming_soon'):
-        return
-    rows, previous, following = _cloud_page(f)
-    width = f.width - 2 * x
-    expanded = f.ui.get('coming_soon_expanded', True)
-    heading = 'Optional extras · Coming soon'
-    f.rect('cloud.box', x, y, width, _cloud_box_height(f, rows), T.CARD, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
-    f.text('cloud.caret', x + f.px(4), y + f.px(5), '▾' if expanded else '▸', size, T.TEXT_MUTED)
-    f.text('cloud.heading', x + f.px(18), y + f.px(5),
-           _ellipsize(f, heading, size, width - f.px(72 if previous is not None or following is not None else 24)),
-           size, T.TEXT_MUTED)
-    f.hit('cloud.toggle', x, y, width, f.px(28), ('cloud_toggle', None), tip=heading)
-    for name, target, offset, glyph in (('previous', previous, 48, '‹'), ('next', following, 24, '›')):
-        if target is not None:
-            left = x + width - f.px(offset)
-            f.text('cloud.' + name + '.label', left + f.px(6), y + f.px(5), glyph, size, T.TEXT_MUTED)
-            f.hit('cloud.' + name, left, y, f.px(24), f.px(28), ('cloud_page', target),
-                  tip='Previous extras' if name == 'previous' else 'More extras')
-    y += f.px(28)
-    x += f.px(6)
+    if f.ui.get('coming_soon') and f.ui.get('view', 'chat') != 'vote':
+        _vote_strip(f, x, y, f.width - 2 * x)
+
+
+def _vote_strip(f, x, y, width):
+    """Under the composer: one quiet line into the vote, naming what leads."""
+    size, height = f.px(T.FONT_SIZE_SMALL), f.px(24)
+    hover = f.ui.get('hover') == 'vote.strip'
+    if hover:
+        f.rect('vote.strip.bg', x, y, width, height, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
+    text_y = y + (height - f.line_height(size)) // 2
+    f.text('vote.strip.glyph', x + f.px(8), text_y, '▲', size, T.ACCENT)
+    label_x = x + f.px(24)
+    f.text('vote.strip.label', label_x, text_y, VOTE_STRIP, size, T.TEXT if hover else T.TEXT_MUTED)
+    rows = _vote_rows(f)
+    leader = rows[0] if rows and rows[0].get('badge') == 'most_wanted' else None
+    used = round(f.measure('ui', size, VOTE_STRIP)) + f.px(24 + 12)
+    tail = (leader['title'] + ' leads  ›') if leader else '›'
+    if f.measure('ui', size, tail) + used > width - f.px(8):
+        tail = '›'
+    tail_w = round(f.measure('ui', size, tail))
+    f.text('vote.strip.tail', x + width - f.px(8) - tail_w, text_y, tail, size, T.TEXT_FAINT)
+    f.hit('vote.strip', x, y, width, height, ('votes_open', None), tip='See what testers want next and add your votes')
+
+
+VOTE_FOOTER_HEIGHT = 52
+
+
+def _vote_tokens(f, id, x, y, used):
+    """VOTES_MAX dots, filled for the votes placed; returns their width."""
+    d, gap = f.px(9), f.px(5)
+    for i in range(VOTES_MAX):
+        filled = i < used
+        f.ring(f'{id}.{i}', x + i * (d + gap), y, d, 1.0, d // 2 if filled else max(1, f.px(1.5)),
+               T.ACCENT if filled else T.INPUT_BORDER)
+    return VOTES_MAX * d + (VOTES_MAX - 1) * gap
+
+
+def _vote_row(f, n, row, x, y, width, left) -> int:
+    """One idea as a poll result: the fill behind it is its demand next to the leader's."""
+    size, small, height = f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL), f.px(38)
+    id, voted, hover = 'vote.' + row['name'], bool(row.get('voted')), f.ui.get('hover') == 'vote.' + row['name']
+    f.rect(id + '.row', x, y, width, height, _mix(T.CARD, T.TEXT, 0.03) if hover else T.CARD, f.px(T.RADIUS), 1,
+           _mix(T.CARD_BORDER, T.ACCENT, 0.55) if voted else T.CARD_BORDER)
+    level = row.get('level')
+    if level is not None:
+        fill_w = max(f.px(T.RADIUS * 2), round(width * max(0.0, min(1.0, level))))
+        f.rect(id + '.fill', x, y, fill_w, height, _mix(T.CARD, T.ACCENT, 0.30 if voted else 0.16), f.px(T.RADIUS))
+    toggle = f.px(24)
+    tx, ty = x + width - f.px(8) - toggle, y + (height - toggle) // 2
+    sending = row.get('state') == 'sending'
+    if voted:
+        f.rect(id + '.toggle', tx, ty, toggle, toggle, T.BUTTON, f.px(T.RADIUS_SMALL))
+    else:
+        f.rect(id + '.toggle', tx, ty, toggle, toggle, T.BUTTON_GHOST if hover else T.NONE, f.px(T.RADIUS_SMALL), 1,
+               T.INPUT_BORDER if left or hover else T.CARD_BORDER)
+    glyph = '…' if sending else '✓' if voted else '▲'
+    glyph_w = round(f.measure('ui', small, glyph))
+    f.text(id + '.toggle.glyph', tx + (toggle - glyph_w) // 2, ty + (toggle - f.line_height(small)) // 2, glyph, small,
+           T.BUTTON_TEXT if voted else T.TEXT if hover else T.TEXT_MUTED if left else T.TEXT_FAINT)
+    text_x = x + f.px(12)
+    room = tx - f.px(10) - text_x
+    badge = {'most_wanted': 'Most wanted', 'popular': 'Popular'}.get(row.get('badge'))
+    badge_w = round(f.measure('ui', small, badge)) + f.px(12) if badge else 0
+    if badge and f.measure('ui', size, row['title']) + f.px(8) + badge_w > room:
+        badge = None  # A narrow panel keeps the whole title; the bar still shows the lead.
+    title = _ellipsize(f, row['title'], size, room - (badge_w + f.px(8) if badge else 0))
+    title_y = y + (height - f.line_height(size)) // 2
+    f.text(id + '.title', text_x, title_y, title, size, T.TEXT)
+    if badge:
+        bx, bh = text_x + round(f.measure('ui', size, title)) + f.px(8), f.px(18)
+        by = y + (height - bh) // 2
+        f.rect(id + '.badge', bx, by, badge_w, bh, _mix(T.CARD, T.WARN, 0.18), bh // 2)
+        f.text(id + '.badge.label', bx + f.px(6), by + (bh - f.line_height(small)) // 2, badge, small, T.WARN)
+    action = 'Click to take your vote back' if voted else 'Click to vote' if left else \
+        f'All {VOTES_MAX} votes are placed. Take one back to move it.'
+    f.hit(id, x, y, width, height, ('vote', row['name']), tip='\n'.join(filter(None, (row.get('summary'), action))))
+    return height
+
+
+def _votes(f, session, top, bottom) -> float:
+    """The vote view: every idea ranked as a poll, the leader's bar full. Never a count."""
+    pad, small, title_size = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL), f.px(T.FONT_SIZE_TITLE)
+    x, width = pad, f.width - 2 * pad
+    first_prim, first_hit, cursor = len(f.prims), len(f.hits), 0
+    rows = _vote_rows(f)
+    left = VOTES_MAX - sum(1 for row in rows if row.get('voted'))
+    f.text('vote.title', x, cursor, VOTE_TITLE, title_size, T.TEXT)
+    cursor += f.line_height(title_size)
+    cursor += f.paragraph('vote.sub', x, cursor, width, VOTE_SUB, small, T.TEXT_MUTED)
+    cursor += f.px(12)
     for n, row in enumerate(rows):
-        if 'category' in row:
-            f.text('cloud.category.' + str(n), x, y, _ellipsize(f, row['category'], size, width - f.px(12)),
-                   size, T.TEXT_FAINT)
-        left = x
-        for item, label, button_width in row.get('items', []):
-            action = ('noop', None) if item['state'] in ('thanks', 'sending') else ('cloud_interest', item['name'])
-            id = 'cloud.' + item['name']
-            f.rect(id, left, y, button_width, f.px(22), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
-            f.text(id + '.label', left + f.px(8), y + f.px(3), label, size, T.TEXT_MUTED)
-            tip = item['title'] + ': ' + {'thanks': 'Thank you for telling us.', 'sending': 'Sending your interest…',
-                  'retry': 'Could not send. Click to try again.'}.get(item['state'], COMING_SOON_TIP if config.BETA
-                                                                       else 'Tell us you want this.')
-            if not config.BETA:  # The beta runs none of these: no data class or credits line to explain.
-                tip = ' · '.join(filter(None, (tip, item.get('data_label'), item.get('reason'))))
-            f.hit(id, left, y, button_width, f.px(22), action, tip=tip)
-            if 'note' in row:
-                note_y = y + f.px(26)
-                for line, (_, text) in enumerate(row['note']):
-                    f.text(id + '.note.' + str(line), left, note_y + line * f.line_height(size),
-                           text.rstrip(), size, T.TEXT_MUTED)
-                sign_x = left + button_width - f.px(60)
-                f.rect(id + '.signin', sign_x, note_y, f.px(60), f.px(22), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
-                f.text(id + '.signin.label', sign_x + f.px(6), note_y + f.px(3), 'Sign in', size, T.TEXT_MUTED)
-                f.hit(id + '.signin', sign_x, note_y, f.px(60), f.px(22), ('sign_in', 'loopcut'), tip=_INTEREST_SIGN_IN)
-            left += button_width + f.px(6)
-        y += row['height']
+        cursor += _vote_row(f, n, row, x, cursor, width, left) + f.px(6)
+    cursor += f.px(6)
+    footnote = VOTE_FOOTNOTE if any(row.get('level') is not None for row in rows) else VOTE_FOOTNOTE_OFFLINE
+    cursor += f.paragraph('vote.footnote', x, cursor, width, footnote, small, T.TEXT_FAINT)
+    if not f.ui.get('service_signed_in', True):
+        # The owner's order: a Loopcut account first. Votes count without one; launch news needs one.
+        label = 'Sign in'
+        button_w = round(f.measure('ui', small, label)) + f.px(20)
+        cursor += f.px(10)
+        note_h = f.paragraph('vote.signin.note', x, cursor + f.px(4), width - button_w - f.px(10), _INTEREST_SIGN_IN,
+                             small, T.TEXT_MUTED)
+        f.button('vote.signin', x + width - button_w, cursor, label, T.BUTTON_GHOST, T.TEXT, ('sign_in', 'loopcut'))
+        cursor += max(note_h + f.px(4), f.px(24))
+    content, view = cursor + 2 * pad, bottom - top
+    max_scroll = max(0.0, content - view)
+    scroll = min(max(f.ui.get('vote_scroll', 0.0), 0.0), max_scroll)
+    shift = top + pad - round(scroll)
+    for prim in f.prims[first_prim:]:
+        prim['y'] += shift
+    for hit in f.hits[first_hit:]:
+        hit['y'] += shift
+    f.prims[first_prim:] = [p for p in f.prims[first_prim:] if p['y'] + p['h'] > top and p['y'] < bottom]
+    f.hits[first_hit:] = [h for h in f.hits[first_hit:] if h['y'] + h['h'] > top and h['y'] < bottom]
+    return max_scroll
 
 
-COMING_SOON_TIP = "Coming soon. Click to tell us you'd use it."
+def _vote_footer(f, top) -> None:
+    """In place of the composer on the vote view: the votes left, and the way back."""
+    pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    f.rect('vote.footer.bg', 0, top, f.width, f.height - top, T.BG)
+    f.rect('vote.footer.rule', 0, top, f.width, 1, T.CARD_BORDER)
+    used = sum(1 for row in f.ui.get('coming_soon') or [] if row.get('voted'))
+    mid = top + (f.height - top) // 2
+    tokens_w = _vote_tokens(f, 'vote.token', pad, mid - f.px(9) // 2, used)
+    left = VOTES_MAX - used
+    notice = f.ui.get('vote_notice')
+    status = notice or (f'{left} vote{"s" if left != 1 else ""} left' if left else 'All votes placed. Thank you!')
+    text_x = pad + tokens_w + f.px(10)
+    label = 'Back to chat'
+    if f.width - pad - text_x - f.measure('ui', small, label) - f.px(30) < f.px(120):
+        label = 'Back'  # A narrow panel keeps room for the status, which says more.
+    button_w = round(f.measure('ui', small, label)) + f.px(20)
+    room = f.width - pad - button_w - f.px(10) - text_x
+    lines = wrap(status, 'ui', small, room, f.measure)
+    if len(lines) > 2:
+        lines = [lines[0], (lines[1][0], _ellipsize(f, lines[1][1].rstrip() + ' ' + lines[2][1], small, room))]
+    line_h = f.line_height(small)
+    for n, (_, line) in enumerate(lines):
+        f.text(f'vote.footer.status.l{n}', text_x, mid - len(lines) * line_h // 2 + n * line_h, line.rstrip(), small,
+               T.WARN if notice else T.TEXT_MUTED if left else T.OK)
+    f.button('vote.back', f.width - pad - button_w, mid - f.px(12), label, T.BUTTON_GHOST, T.TEXT, ('history_close', None))
 
 
 def _context_row(f: Frame, x: int, y: int, width: int) -> None:
@@ -1200,8 +1228,9 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     title_w = round(f.measure("ui", size, "Loopcut"))
     version = config.version_label()
     f.hit("header.title", title_x, 0, title_w, height, ("noop", None), tip=f"Loopcut {version}")
-    if view in {"history", "jobs"} and f.width > f.px(370):
-        f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  " + view.title(), size,
+    crumb = {"history": "History", "jobs": "Jobs", "vote": "What's next"}.get(view)
+    if crumb and f.width > f.px(370):
+        f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  " + crumb, size,
                T.TEXT_MUTED)
     # Icon buttons at the right: the editor's own header is hidden, so close lives here too.
     hover, box, gap = f.ui.get("hover"), f.px(24), f.px(2)
@@ -1362,7 +1391,7 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     view = ui.get("view", "chat")
     f = Frame(width, height, scale, measure, session, checkpoints, ui)
     f.rect("bg", 0, 0, width, height, T.BG)
-    input_top = height - input_height(f, session)
+    input_top = height - (f.px(VOTE_FOOTER_HEIGHT) if view == "vote" else input_height(f, session))
     header_bottom = f.px(T.HEADER_HEIGHT)
     top = header_bottom + (f.px(T.BANNER_HEIGHT) if ui.get("update") else 0)
     if view == "jobs":
@@ -1371,11 +1400,16 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     elif view == "history":
         max_scroll = 0.0
         _history(f, session, ui, top, input_top)
+    elif view == "vote":
+        max_scroll = _votes(f, session, top, input_top)
     else:
         max_scroll = _chat(f, session, top, input_top)
     _header(f, session, view)  # Header, banner and input go last so they paint over scrolled chat content.
     _update_banner(f, header_bottom)
-    _input(f, session, input_top, model)
+    if view == "vote":
+        _vote_footer(f, input_top)
+    else:
+        _input(f, session, input_top, model)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
             "prims": f.prims, "hits": f.hits}
