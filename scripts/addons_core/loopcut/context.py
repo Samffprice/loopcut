@@ -70,10 +70,12 @@ RECORD_LOOK = 300     # Characters of what a dropped capture showed.
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 7945     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 7990     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
-                        # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers).
-WORKSPACE_FIXED_TOKENS = 3845  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09.
+                        # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
+                        # 7,982 on 2026-10-10 with the libraries-first rule).
+WORKSPACE_FIXED_TOKENS = 4025  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09,
+                               # 4,012 on 2026-10-10 with the asset libraries note.
 WORKSPACE_BUDGET = 200_000     # The least budget a workspace turn gets (agent._workspace_config), so a long build
                                # is not folded into records at the 40k default. A model with a smaller window needs
                                # LOOPCUT_WORKSPACE off.

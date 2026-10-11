@@ -396,7 +396,7 @@ class IndexTest(unittest.TestCase):
         events = []
         result = types.SimpleNamespace(ok=True)
         with mock.patch.object(cloud, 'hosted_index', side_effect=lambda: events.append('index')), \
-                mock.patch.object(agent, '_on_main', side_effect=lambda *args: events.append('main') or result):
+                mock.patch.object(agent, '_on_main', side_effect=lambda *args, **kwargs: events.append('main') or result):
             self.assertIs(agent._run_tool_on_main('delegate', '{}'), result)
         self.assertEqual(events, ['index', 'main'])
         with mock.patch.object(cloud, 'hosted_index', side_effect=prompt_index.IndexError('stale index')), \
@@ -554,10 +554,11 @@ class FetchTest(unittest.TestCase):
 
 class ContractMockTest(unittest.TestCase):
     def test_hosted_requests_are_assembled_by_006_mock(self):
-        from mock_service import DEFAULT_CONTRACT, MockTransport
-        contract = Path(os.environ.get('LOOPCUT_CONTRACT_DIR', DEFAULT_CONTRACT))
-        source = contract / 'mock/server.py'
-        if not source.is_file() or '/mock/upstream' not in source.read_text() or '/v1/chat/completions' not in source.read_text():
+        from mock_service import MockTransport
+        import platform_contract
+        source = platform_contract.require('mock', 'server.py')
+        contract = source.parents[1]
+        if '/mock/upstream' not in source.read_text() or '/v1/chat/completions' not in source.read_text():
             self.skipTest('Contract mock does not yet implement proposal 006 chat/upstream routes')
         transport = MockTransport()
         client = cloud_http.Client(base_url='http://127.0.0.1:9999', api_key='lc_test', transport=transport)

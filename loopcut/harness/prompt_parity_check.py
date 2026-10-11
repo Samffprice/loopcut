@@ -5,7 +5,7 @@ the platform's SOURCE.json are applied to old prompts/bodies at comparison time;
 each must match exactly once. Captured bytes remain untouched. Other roles and
 skill bodies still require exact parity with the current platform files.
 
-Private artifacts stay under /private/tmp. No Blender or external model is used.
+Private artifacts stay in SCRATCH, outside the repository. No Blender or external model is used.
 Only scene/tool execution, UI/persistence and nondeterminism are stubbed in the
 production scenarios. The wire fixture is a synthetic unit-test transport check.
 """
@@ -40,6 +40,8 @@ SCRIPT = Path(__file__).resolve()
 OLD_REV = 'a1b09694021'
 ADDON = Path('scripts/addons_core/loopcut')
 PLATFORM = Path('/Volumes/BackupFiles/MasterCoding/BlenderCursor/loopcut-web-platform')
+# /private/tmp on macOS; Linux (the open repository's CI) has no /private, so its temp folder.
+SCRATCH = Path('/private/tmp') if sys.platform == 'darwin' else Path(tempfile.gettempdir()).resolve()
 SCENE = '<scene_context>\nfile: unsaved\nobjects: Camera (CAMERA), Cube (MESH)\n</scene_context>'
 ADDONS = 'Installed add-ons: Parity Probe [parity_probe] bpy.ops.parity_probe.say_* (2)'
 IMAGE = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII='
@@ -113,8 +115,8 @@ def write_json(path, value):
 
 def private_dir(path):
     path = Path(path).resolve()
-    if not path.is_relative_to(Path('/private/tmp')) or path == Path('/private/tmp'):
-        raise ValueError('Parity artifacts must be under /private/tmp')
+    if not path.is_relative_to(SCRATCH) or path == SCRATCH or path.is_relative_to(REPO):
+        raise ValueError(f'Parity artifacts must be under {SCRATCH}, outside the repository')
     return path
 
 
@@ -623,7 +625,7 @@ def verify_sources(old_tree, out, source, edits=()):
 
 
 def check(args):
-    out = private_dir(args.out) if args.out else Path(tempfile.mkdtemp(prefix='loopcut-v1-parity-', dir='/private/tmp'))
+    out = private_dir(args.out) if args.out else Path(tempfile.mkdtemp(prefix='loopcut-v1-parity-', dir=SCRATCH))
     if args.out:
         out.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {'old_revision': OLD_REV, 'new_revision': subprocess.check_output(

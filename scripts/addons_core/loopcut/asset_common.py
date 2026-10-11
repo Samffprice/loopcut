@@ -121,18 +121,103 @@ def rank(query: str, items, text_of, name_of=None, weight_of=None, limit: int = 
     return [item for *_, item in scored[:limit]]
 
 
+def clean(value, limit: int = 90) -> str:
+    """A library's free text (description, tag) on one result row: one line, at most `limit` characters.
+    Not a string, or nothing left: empty."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join("".join(c if c.isprintable() else " " for c in value).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip(" ,.;:") + "…"
+
+
+def size_text(dims) -> str:
+    """'0.51x0.56x0.94 m' from two or three sizes in meters, '' when they are not that."""
+    if not isinstance(dims, (list, tuple)) or len(dims) not in (2, 3):
+        return ""
+    if not all(isinstance(d, (int, float)) and not isinstance(d, bool) and 0 < d < 1e6 for d in dims):
+        return ""
+    return "x".join("%.2f" % d for d in dims) + " m"
+
+
+def measured_line(bounds: list, listed=None) -> str:
+    """What an imported model measures, all its objects' world bounds together, so its scale can be judged
+    against the real thing without adding up per-object rows. `listed` is the size the library states,
+    in meters; a size far from it is pointed out. '' when nothing has bounds."""
+    boxes = [b for b in bounds if isinstance(b, dict)]
+    if not boxes:
+        return ""
+    low = [min(b["min"][i] for b in boxes) for i in range(3)]
+    high = [max(b["max"][i] for b in boxes) for i in range(3)]
+    size = [h - l for l, h in zip(low, high)]
+    line = "Measured: " + "x".join("%.2f" % s for s in size) + f" m (x, y, z), base at z {low[2]:.2f}."
+    stated = size_text(listed)
+    if stated:
+        line += f" The library lists {stated}."
+        ratio = max(size) / max(listed) if max(size) > 0 else 0
+        if ratio and not 1 / 3 <= ratio <= 3:
+            line += f" It arrived at {ratio:.3g}x that: check the units or the scale."
+    return line
+
+
+def measured(objects, listed=None) -> str:
+    """measured_line for objects just imported. Main thread."""
+    import bpy
+    from .tools import _world_bounds
+    bpy.context.view_layer.update()  # Parented children's matrix_world is stale until then.
+    return measured_line([_world_bounds(obj) for obj in objects], listed)
+
+
+def kit_notes(kits: list) -> dict:
+    """{row index: 'kit: <file> (rows 1, 4)'} for results that share a kit, here the same .blend file in
+    the same library: assets made to go together. `kits` holds one (library, file) or None per row."""
+    rows = {}
+    for index, kit in enumerate(kits):
+        if kit:
+            rows.setdefault(kit, []).append(index)
+    notes = {}
+    for (_, file), members in rows.items():
+        if len(members) > 1:
+            note = f"kit: {Path(file).stem} (rows {', '.join(str(m + 1) for m in members)})"
+            notes.update(dict.fromkeys(members, note))
+    return notes
+
+
+def fit_box(width: int, height: int, cell: tuple) -> tuple:
+    """(width, height, dx, dy): an image of width x height scaled to fit whole inside cell (width, height),
+    and its offset there to sit centred."""
+    cell_w, cell_h = cell
+    scale = min(cell_w / width, cell_h / height)
+    w, h = max(1, min(cell_w, round(width * scale))), max(1, min(cell_h, round(height * scale)))
+    return w, h, (cell_w - w) // 2, (cell_h - h) // 2
+
+
+def _fitted(path, cell):
+    """A thumbnail scaled to fit whole inside the cell, over the sheet's grey where it is transparent."""
+    tile = _pixels(path, cell[1])
+    if tile.shape[1] > cell[0]:  # Wider than the cell: scale again by width (one more small load).
+        tile = _pixels(path, fit_box(tile.shape[1], tile.shape[0], cell)[1])
+    tile = tile[:cell[1], :cell[0]].copy()
+    alpha = tile[..., 3:4]
+    tile[..., :3] = tile[..., :3] * alpha + 0.15 * (1 - alpha)
+    tile[..., 3] = 1.0
+    return tile
+
+
 def sheet(paths: list, name: str = "sheet.png", cell: tuple = (TILE, TILE), columns: int = SHEET_COLUMNS,
-          folder: Path | None = None) -> Path | None:
+          folder: Path | None = None, fit: bool = False) -> Path | None:
     """Images as one, in rows of `columns` cells of cell (width, height) px, each scaled to the cell's
     height and cut to its width; None entries are blank cells. Search thumbnails (numbered by
     position in the text beside them) and a wave's contact sheet (waves.contact_sheet). Written to
-    folder, else the scratch folder. Main thread."""
+    folder, else the scratch folder. Main thread.
+    fit (the search sheets): each image whole and centred in its cell instead, on the sheet's grey. Cut to
+    the cell's width, a 2:1 HDRI showed half its sky and a wide Poly Pizza or Poly Haven preview lost the
+    model's right side (offline picking check, 2026-10-10)."""
     import numpy as np
     width_of, height_of = cell
     tiles = []
     for path in paths:
         try:
-            tiles.append(_pixels(path, height_of) if path else None)
+            tiles.append(None if not path else _fitted(path, cell) if fit else _pixels(path, height_of))
         except Exception as ex:  # A preview Blender cannot read is a blank tile, not a failed search.
             print(f"Loopcut: could not read thumbnail {path}: {ex}")
             tiles.append(None)
@@ -148,8 +233,9 @@ def sheet(paths: list, name: str = "sheet.png", cell: tuple = (TILE, TILE), colu
             continue
         row, column = divmod(index, columns)
         tile = tile[:height_of, :width_of]
-        y0 = height - (row + 1) * height_of - row * SHEET_GAP  # Pixel rows run bottom-up in Blender images.
-        x0 = column * (width_of + SHEET_GAP)
+        dx, dy = ((width_of - tile.shape[1]) // 2, (height_of - tile.shape[0]) // 2) if fit else (0, 0)
+        y0 = height - (row + 1) * height_of - row * SHEET_GAP + dy  # Pixel rows run bottom-up in Blender images.
+        x0 = column * (width_of + SHEET_GAP) + dx
         canvas[y0:y0 + tile.shape[0], x0:x0 + tile.shape[1]] = tile
     out = (Path(folder) if folder else scratch.folder()) / name
     out.parent.mkdir(parents=True, exist_ok=True)

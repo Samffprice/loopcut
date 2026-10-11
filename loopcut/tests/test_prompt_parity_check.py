@@ -68,7 +68,7 @@ class PromptParityTest(unittest.TestCase):
                 parity.apply_server_edits(bad, 'worker', edits)
 
     def test_metadata_is_runtime_only_and_invalid_or_missing_is_incomplete(self):
-        with tempfile.TemporaryDirectory(dir='/private/tmp') as temp:
+        with tempfile.TemporaryDirectory(dir=parity.SCRATCH) as temp:
             root = Path(temp)
             source = root / 'SOURCE.json'
             edits = [[f'Old clause {n}', f'New clause {n}'] for n in range(3)]
@@ -92,7 +92,7 @@ class PromptParityTest(unittest.TestCase):
             self.assertIn('INCOMPLETE', (args.out / 'report.md').read_text())
 
     def test_compare_runs_edits_only_old_worker_and_keeps_capture(self):
-        with tempfile.TemporaryDirectory(dir='/private/tmp') as temp:
+        with tempfile.TemporaryDirectory(dir=parity.SCRATCH) as temp:
             root = Path(temp)
             edits = [('Synthetic old clause', 'Synthetic new clause')]
             cases = [{'name': role, 'role': role, 'replies': [None]} for role in assembly.PROMPT_IDS]
@@ -119,7 +119,7 @@ class PromptParityTest(unittest.TestCase):
             self.assertEqual(parity.compare_runs(cases, *runs, edits)['differences'][0]['kind'], 'serialization')
 
     def test_one_tiny_scenario_per_role_through_subprocess_proxy_and_model(self):
-        with tempfile.TemporaryDirectory(prefix='loopcut-parity-test-', dir='/private/tmp') as temp:
+        with tempfile.TemporaryDirectory(prefix='loopcut-parity-test-', dir=parity.SCRATCH) as temp:
             root = Path(temp)
             source, index, cases = fixtures(root)
             old = parity.run_build(parity.REPO, 'old', cases, source, index, root / 'old')

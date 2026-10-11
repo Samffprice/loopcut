@@ -22,11 +22,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 from loopcut import asset_common, asset_libraries as libraries, asset_report, asset_search, assets  # noqa: E402
 from loopcut import cloud, cloud_http, cloud_jobs, indexed_assets, polyhaven, tools  # noqa: E402
-from mock_service import DEFAULT_CONTRACT, MockTransport  # noqa: E402
+from mock_service import MockTransport  # noqa: E402
+import platform_contract  # noqa: E402
 
 
 def fixture(name):
-    return json.loads((DEFAULT_CONTRACT / 'fixtures' / 'asset-search-report' / name).read_text())
+    return json.loads(platform_contract.require('fixtures', 'asset-search-report', name).read_text())
 
 
 def inputs_for(report):
@@ -157,6 +158,7 @@ class MergeTest(FixtureTest):
         self.assertIn('keyword matching only', result.text)
         self.sheet.assert_called_once()
         self.assertEqual(len(self.sheet.call_args.args[0]), 3)
+        self.assertTrue(self.sheet.call_args.kwargs['fit'], 'each thumbnail whole in its tile')
         jobs = [c['body'] for c in self.transport.calls if c['path'] == '/v1/jobs']
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]['input'], {'query': 'foam aluminum', 'kind': 'material', 'limit': 8})
@@ -198,8 +200,9 @@ class MergeTest(FixtureTest):
 
     def test_index_missing_signed_out_off_coming_soon_unavailable_private(self):
         original = copy.deepcopy(self.runtime.manifest)
-        for mode, reason in [('signedout', 'signed out'), ('missing', ''), ('off', 'services are off'),
-                             ('coming', 'coming soon'), ('unavailable', 'disabled'), ('private', 'private mode')]:
+        for mode, reason in [('signedout', 'needs a Loopcut sign-in'), ('missing', ''), ('off', 'services are off'),
+                             ('coming', 'coming soon'), ('unavailable', 'disabled'), ('private', 'private mode'),
+                             ('signin', 'needs a Loopcut sign-in')]:
             with self.subTest(mode=mode):
                 self.runtime.manifest = copy.deepcopy(original)
                 self.runtime.signed_in = mode != 'signedout'
@@ -210,8 +213,9 @@ class MergeTest(FixtureTest):
                     self.runtime.manifest['flags']['services'] = False
                 elif mode == 'coming':
                     descriptor['status'] = 'coming_soon'
-                elif mode in ('unavailable', 'private'):
-                    descriptor.update(available=False, unavailable_reason='private_mode' if mode == 'private' else 'disabled')
+                elif mode in ('unavailable', 'private', 'signin'):
+                    descriptor.update(available=False, unavailable_reason={'private': 'private_mode', 'signin': 'sign_in'}
+                                      .get(mode, 'disabled'))
                 before = len(self.transport.calls)
                 result = self.search()
                 self.assertTrue(result.ok)
@@ -221,6 +225,15 @@ class MergeTest(FixtureTest):
                 if mode == 'missing':
                     self.assertNotIn('asset_search is missing', result.text)
                 self.assertEqual(len(self.transport.calls), before)
+
+    def test_signed_out_note_is_one_line_naming_what_still_works(self):
+        self.runtime.signed_in = False
+        result = self.search()
+        notes = [line for line in result.text.splitlines() if 'sign-in' in line]
+        self.assertEqual(notes, [asset_search.SIGN_IN_NOTE])
+        for words in ('blenderkit', 'polyhaven', "user's libraries"):
+            self.assertIn(words, notes[0])
+        self.assertIn(self.entry.name, result.text, "local libraries are still searched")
 
     def test_free_search_survives_no_generation_and_zero_credits_without_approval(self):
         self.transport.state.balance = 0
@@ -279,7 +292,7 @@ class MergeTest(FixtureTest):
 
     def test_network_is_deferred_and_sheet_runs_on_main(self):
         requests, sheets = [], []
-        self.sheet.side_effect = lambda *a: sheets.append(threading.current_thread())
+        self.sheet.side_effect = lambda *a, **k: sheets.append(threading.current_thread())
         self.transport.before_request = lambda call: requests.append(threading.current_thread())
         prepared = assets.search_assets(query='foam', type='material')
         self.assertEqual(requests, [])
@@ -584,6 +597,17 @@ class ImportTest(FixtureTest):
         self.assertEqual(result.text, 'loaded')
         load.assert_called_once_with(fetched, ['Target'])
 
+    def test_a_models_listed_size_travels_to_the_load_and_other_kinds_send_none(self):
+        row, data = self.remote_asset()
+        with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)):
+            fetched = assets.fetch_asset(source='physicallybased', id='Aluminum')
+        self.assertIsNone(fetched['dimensions_m'])
+        model = {**row, 'kind': 'model', 'dimensions_m': [0.2, 0.1, 0.15]}
+        indexed_assets.remember(model)
+        with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)):
+            fetched = assets.fetch_asset(source='physicallybased', id='Aluminum')
+        self.assertEqual(json.loads(json.dumps(fetched))['dimensions_m'], [0.2, 0.1, 0.15])
+
     def test_remote_wrong_hash_fails_before_load(self):
         row, _ = self.remote_asset()
         with patch.object(asset_common, 'open_url', return_value=io.BytesIO(b'wrong')):
@@ -742,6 +766,119 @@ class ImportTest(FixtureTest):
                                           'blend': '/cache/a.blend', 'reuse': True})
         self.assertIn('Exact Name', result.text)
         self.assertEqual(calls, [('/cache/a.blend', {'link': False, 'reuse_local_id': True})])
+
+
+class RawToolTest(FixtureTest):
+    """loopcut_cloud__asset_search, the managed tool the model also gets, attaches its report as text. Ids
+    taken from that report import like ids from search_assets (platform audit of 0.2.1: ambientCG and
+    Physically Based ids were "Unknown", since only search_assets filled the registry)."""
+
+    asset_jobs, remote_asset = ImportTest.asset_jobs, ImportTest.remote_asset
+
+    def raw_search(self, query, kind):
+        descriptor = next(d for d in self.runtime.descriptors() if d['name'] == 'asset_search')
+        job = cloud_jobs.run({**descriptor, 'latency': 'seconds'}, {'query': query, 'kind': kind, 'limit': 10}, {},
+                             project={'id': 'local', 'no_generation': False}, client=self.client)
+        texts = []
+        class Texts(list):
+            def new(self, name):
+                block = types.SimpleNamespace(name=name, write=texts.append)
+                return block
+        from loopcut import conversations, state
+        with patch.object(sys.modules['bpy'], 'data', types.SimpleNamespace(texts=Texts()), create=True), \
+                patch.object(cloud_jobs, 'stamp_provenance'), \
+                patch.object(state, 'session', return_value=state.new_session()), patch.object(conversations, 'save'):
+            summary = cloud_jobs.apply_result(descriptor, job)
+        self.assertIn('Attached reports', summary)
+        return json.loads(texts[0])
+
+    def test_ids_from_the_raw_report_import_for_every_source(self):
+        ambient, ambient_data = self.remote_asset('ambientcg')
+        based, based_data = self.remote_asset('physicallybased')
+        for row in (ambient, based):
+            self.transport.state.asset_catalog[row['id']] = row
+        indexed_assets._rows.clear()  # Nothing from search_assets: only the raw tool ran.
+        report = self.raw_search('foam aluminum', 'material')
+        found = {(r['import']['source'], r['import']['id']) for r in report['results']}
+        for row, data in ((ambient, ambient_data), (based, based_data)):
+            source, asset_id = row['import']['source'], row['import']['id']
+            with self.subTest(source=source):
+                self.assertIn((source, asset_id), found)
+                with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)), \
+                        patch.object(libraries, 'load_asset', return_value=tools.ToolResult('loaded')) as load:
+                    result = assets.import_asset(source=source, id=asset_id)
+                self.assertEqual(result.text.splitlines()[0], 'loaded', result.text)
+                self.assertEqual(load.call_args.args[0]['name'], row['remote_library']['entries'][0]['name'])
+        haven = self.raw_search('chair', 'model')
+        slug = next(r['import']['id'] for r in haven['results'] if r['source'] == 'polyhaven')
+        with patch.object(polyhaven, 'import_polyhaven', autospec=True, return_value=tools.ToolResult('ok')) as imported:
+            self.assertEqual(assets.import_asset(source='polyhaven', id=slug).text, 'ok')
+        imported.assert_called_once_with(asset_id=slug)
+        self.assertEqual(len(self.asset_jobs()), 2, "no second search: the attached report was enough")
+
+    def test_a_bad_raw_report_registers_nothing(self):
+        rows = [copy.deepcopy(self.rows[0])]
+        bad = copy.deepcopy(rows[0])
+        bad['source'] = 'elsewhere'
+        report = {'schema': asset_report.SCHEMA, 'filters': {'kind': 'material', 'license': 'cc0',
+                  'sources': list(asset_report.PROVIDERS), 'limit': 10, 'max_polycount': None,
+                  'min_resolution': None}, 'results': [bad, *rows]}
+        self.assertEqual([r['id'] for r in asset_report.importable_rows(report)], [rows[0]['id']])
+        for broken in (None, [], {'schema': 'other'}, {**report, 'filters': {'kind': 'boat'}}, {**report, 'results': {}}):
+            self.assertEqual(asset_report.importable_rows(broken), [])
+
+
+class RowsTest(unittest.TestCase):
+    """What a combined-search row says an asset is, beside its thumbnail."""
+
+    def server_row(self, **fields):
+        row = copy.deepcopy(fixture('remote-libraries.json')['results'][0])
+        row.update(fields)
+        return row
+
+    def test_index_rows_show_size_polycount_resolution_description_and_tags(self):
+        row = self.server_row(kind='model', dimensions_m=[0.5, 0.4, 0.9], polycount=1234, max_resolution=4096,
+                              description='Worn oak\nstool,\x07 hand-made ' + 'x' * 200,
+                              tags=['stool', 'oak', 7, 'stool', 'rustic\tfarm'])
+        line = asset_search._line(2, {'entry': None, 'server': row})
+        self.assertNotIn('\n', line)
+        self.assertNotIn('\x07', line)
+        self.assertIn('; kind: model; 0.50x0.40x0.90 m; 1234 polys; 4k maps; Worn oak stool, hand-made x', line)
+        self.assertIn('…; tags: stool, oak, rustic farm; import_asset(', line)
+        flat = asset_search._line(1, {'entry': None, 'server': self.server_row(dimensions_m=[2, 2], polycount=None,
+                                                                              max_resolution=512, description=None,
+                                                                              tags=None)})
+        self.assertIn('2.00x2.00 m tile; import_asset(', flat)
+        odd = asset_search._line(1, {'entry': None, 'server': self.server_row(tags='stone', description=['x'])})
+        self.assertNotIn('tags:', odd, "a tag string is not a list of letters")
+        self.assertNotIn('maps', flat)
+
+    def test_a_local_entry_brings_its_description_and_tags(self):
+        entry = libraries.Entry(library='Mine', file='props.blend', id_type='OBJECT', name='Stool',
+                                tags=['wood', 'stool'], description='My stool')
+        line = asset_search._line(1, {'entry': entry, 'server': None}, 'kit: props (rows 1, 3)')
+        self.assertIn('Stool (Mine); kind: model; My stool; tags: wood, stool; kit: props (rows 1, 3); import_asset(',
+                      line)
+
+    def test_kit_notes_name_rows_from_one_local_file_only(self):
+        def entry(name, file, remote=False):
+            return libraries.Entry(library='Mine', file=file, id_type='OBJECT', name=name,
+                                   files=[{'path': file}] if remote else [])
+        rows = [{'entry': entry('Chair', 'kit/cafe.blend'), 'server': None},
+                {'entry': None, 'server': self.server_row()},
+                {'entry': entry('Table', 'kit/cafe.blend'), 'server': None},
+                {'entry': entry('Lamp', 'lamp.blend'), 'server': None},
+                {'entry': entry('Foam N', 'foam.blend', True), 'server': None},
+                {'entry': entry('Foam D', 'foam.blend', True), 'server': None}]
+        with patch.object(asset_common, 'sheet', return_value=None), patch.object(indexed_assets, 'remember'):
+            text = asset_search._present('cafe', rows, [None] * len(rows), [], []).text
+        lines = text.splitlines()[1:7]
+        self.assertIn('kit: cafe (rows 1, 3)', lines[0])
+        self.assertIn('kit: cafe (rows 1, 3)', lines[2])
+        for i in (1, 3, 4, 5):
+            self.assertNotIn('kit:', lines[i], "one file of its own, an index row, or a remote file's variants")
+        self.assertEqual(asset_common.kit_notes([None, ('A', 'x.blend'), ('B', 'x.blend')]), {},
+                         "the same file name in two libraries is two kits")
 
 
 class WorkerAndPanelTest(unittest.TestCase):

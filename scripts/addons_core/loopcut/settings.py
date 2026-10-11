@@ -35,6 +35,14 @@ PROVIDERS = (
      "Sign in with ChatGPT: requests go from this computer to OpenAI and use your ChatGPT Plus or Pro plan's "
      "usage. Loopcut never sees your ChatGPT tokens; they stay in a private file on this computer. One agent "
      "does the whole job in a working folder of its own, as a coding agent would."),
+    # Anthropic's Messages API, not chat completions (anthropic_messages.py). Data use: Anthropic's Commercial Terms
+    # (anthropic.com/legal/commercial-terms, effective 2025-06-17: no training on customer content) and its API
+    # retention article (privacy.claude.com, 2026-07-01: inputs and outputs deleted within 30 days), so class A
+    # as cloud_account.DATA_LABELS has it, like OpenAI's API.
+    ("ANTHROPIC", "Anthropic (Claude)", config.ANTHROPIC_BASE_URL, config.ANTHROPIC_MODEL,
+     "Private (A): Anthropic does not train on API inputs or outputs and deletes them within 30 days. Requests "
+     "go from this computer to Anthropic with your key; the context repeated on every step is cached, which "
+     "makes it much cheaper."),
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
@@ -149,6 +157,29 @@ def _provider_changed(self, context) -> None:
     _changed()
 
 
+def listed_models(provider: str = "") -> list[str]:
+    """The model menu: what "Fetch models" found, else Anthropic's current models on that provider."""
+    if _models:
+        return list(_models)
+    if not provider:
+        prefs = preferences()
+        provider = prefs.provider if prefs is not None else ""
+    if provider == "ANTHROPIC":
+        from . import anthropic_messages
+        return list(anthropic_messages.MODELS)
+    return []
+
+
+def draw_key(layout, prefs) -> None:
+    """The API key field; on Anthropic, with a button to the console page that hands keys out."""
+    if prefs.provider == "ANTHROPIC":
+        row = layout.row(align=True)
+        row.prop(prefs, "api_key")
+        row.operator("loopcut.anthropic_get_key", text="", icon="URL")
+    else:
+        layout.prop(prefs, "api_key")
+
+
 def _get_key(self) -> str:
     return credentials.api_key(self.base_url)
 
@@ -199,6 +230,9 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     bl_idname = PACKAGE
 
     first_message_sent: bpy.props.BoolProperty(default=False, options={"HIDDEN"})
+    # shaders.default_to_subprocess ran: "subprocess" (it switched Thread to Subprocess) or "kept"
+    # (the user had chosen Subprocess). Set once, so a later switch back to Thread stays.
+    shader_compilation_once: bpy.props.StringProperty(default="", options={"HIDDEN"})
 
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],
@@ -322,11 +356,11 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             if self.provider == "CUSTOM":
                 column.prop(self, "base_url")
             if not self.base_url.startswith("http://127.0.0.1"):
-                column.prop(self, "api_key")
+                draw_key(column, self)
             row = column.row(align=True)
             row.prop(self, "model")
             row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
-            if _models:
+            if listed_models(self.provider):
                 row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
         note = _BY_ID[self.provider][4]
         if note:
@@ -436,6 +470,8 @@ class LOOPCUT_OT_fetch_models(bpy.types.Operator):
         if prefs is None or not prefs.base_url:
             self.report({"ERROR"}, "Set the base URL first")
             return {"CANCELLED"}
+        if config.anthropic(prefs.base_url):
+            return self._anthropic(prefs)
         try:
             config._check_base_url(prefs.base_url, "Base URL")
             request = urllib.request.Request(
@@ -458,6 +494,35 @@ class LOOPCUT_OT_fetch_models(bpy.types.Operator):
         self.report({"INFO"}, f"{len(found)} models; pick one from the menu next to the field")
         return {"FINISHED"}
 
+    def _anthropic(self, prefs):
+        from . import anthropic_messages
+        try:
+            found = anthropic_messages.list_models(prefs.base_url, credentials.api_key(prefs.base_url))
+        except urllib.error.HTTPError as ex:
+            self.report({"ERROR"}, f"Anthropic answered HTTP {ex.code}; check the key")
+            return {"CANCELLED"}
+        except (urllib.error.URLError, ValueError, TimeoutError) as ex:
+            self.report({"ERROR"}, f"Could not list Anthropic's models: {ex}. Retry, or pick one from the menu.")
+            return {"CANCELLED"}
+        if not found:
+            self.report({"WARNING"}, "Anthropic listed no models for this key; pick one from the menu instead")
+            return {"CANCELLED"}
+        _models[:] = found[:200]  # Newest first, as Anthropic lists them.
+        self.report({"INFO"}, f"{len(found)} models; pick one from the menu next to the field")
+        return {"FINISHED"}
+
+
+class LOOPCUT_OT_anthropic_get_key(bpy.types.Operator):
+    """Open Anthropic's console in the browser: create a key under API keys, paste it here"""
+    bl_idname = "loopcut.anthropic_get_key"
+    bl_label = "Get an Anthropic API key"
+
+    def execute(self, context):
+        from . import anthropic_messages
+        account.open_browser(anthropic_messages.KEYS_URL)
+        self.report({"INFO"}, "Anthropic's API keys page is open in your browser")
+        return {"FINISHED"}
+
 
 class LOOPCUT_OT_pick_model(bpy.types.Operator):
     bl_idname = "loopcut.pick_model"
@@ -477,7 +542,7 @@ class LOOPCUT_MT_models(bpy.types.Menu):
     bl_label = "Models"
 
     def draw(self, context):
-        for name in _models:
+        for name in listed_models():
             self.layout.operator("loopcut.pick_model", text=name).model = name
 
 
@@ -513,7 +578,7 @@ def provider_note(provider: str) -> str:
 
 
 def has_models() -> bool:
-    return bool(_models)
+    return bool(listed_models())
 
 
 def preferences():
@@ -534,7 +599,7 @@ def model_options() -> list[tuple[str, str, str, bool]]:
         return [(current, current, "from .env", True)]
     if prefs.provider == "LOOPCUT":
         return [(m["id"], m["label"], m["note"], prefs.tier == m["id"]) for m in account.models()]
-    names = list(_models)
+    names = listed_models(prefs.provider)
     if prefs.model and prefs.model not in names:
         names.insert(0, prefs.model)
     return [(name, name, "", name == prefs.model) for name in names]
@@ -673,8 +738,8 @@ class LOOPCUT_OT_clear_vendor_key(bpy.types.Operator):
         return {"FINISHED"}
 
 
-_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_pick_model, LOOPCUT_MT_models,
-            LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
+_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_pick_model,
+            LOOPCUT_MT_models, LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key, LOOPCUT_OT_clear_vendor_key)
 
 

@@ -37,9 +37,17 @@ base_version="$(grep -Eo '"version": \([0-9]+, [0-9]+, [0-9]+\)' "$base_app/$res
 
 cd "$repo"
 git rev-parse -q --verify "$base_tag^{commit}" >/dev/null || { echo "no tag $base_tag" >&2; exit 1; }
+# release/loopcut/wix-*: the Windows installer's images (and the script that draws them), not in the Mac app.
 native="$(git diff --name-only "$base_tag" HEAD | grep -Ev \
-  '^(scripts/|release/extensions/|loopcut/|README\.md$|LICENSE$|\.gitignore$|\.gitattributes$|source/creator/CMakeLists\.txt$|\.github/workflows/release\.yml$|build_files/cmake/(packaging|loopcut_release_hygiene)\.cmake$|build_files/package_spec/build_archive\.py$)' || true)"
-[ -z "$native" ] || { echo "changed since $base_tag outside the add-on (needs release_mac.sh):" >&2; echo "$native" >&2; exit 1; }
+  '^(scripts/|release/extensions/|loopcut/|README\.md$|LICENSE$|\.gitignore$|\.gitattributes$|source/creator/CMakeLists\.txt$|\.github/workflows/release\.yml$|build_files/cmake/(packaging|loopcut_release_hygiene)\.cmake$|build_files/package_spec/build_archive\.py$|release/loopcut/(wix-banner\.bmp|wix-dialog\.png|make_assets\.py)$)' || true)"
+# LOOPCUT_REPACKAGE_WITHOUT: native changes the owner chose to ship without, as space-separated paths (0.2.2: the
+# ICON_LOOPCUT editor icon; the add-on's Python never names it). Each path must be listed; anything else still refuses.
+without=""; needs_build=""
+for f in $native; do
+  case " ${LOOPCUT_REPACKAGE_WITHOUT:-} " in *" $f "*) without="$without $f" ;; *) needs_build="$needs_build $f" ;; esac
+done
+[ -z "$needs_build" ] || { echo "changed since $base_tag outside the add-on (needs release_mac.sh):" >&2; printf '%s\n' $needs_build >&2; exit 1; }
+[ -z "$without" ] || echo "shipping without these native changes (LOOPCUT_REPACKAGE_WITHOUT):$without" >&2
 # The one allowed CMake change is the install exclusions; anything else in that file needs a build.
 cmake_change="$(git diff -U0 "$base_tag" HEAD -- source/creator/CMakeLists.txt | grep -E '^[-+][^-+]' |
   grep -Ev 'PATTERN "(__pycache__|\*\.pyc|\*\.pyo)" EXCLUDE|^[-+] *#|^[-+] *$' || true)"
@@ -108,6 +116,7 @@ dmg="$out/loopcut-$version-arm64.dmg"
 hdiutil create -quiet -volname "Loopcut $version" -srcfolder "$out/stage" -fs HFS+ -format UDZO -ov "$dmg"
 rm -rf "$out/stage"
 printf '%s\n' "repackaged $version from $base_tag's app and $commit" > "$out/SOURCE.txt"
+[ -z "$without" ] || printf '%s\n' "without native changes:$without" >> "$out/SOURCE.txt"
 "$repo/loopcut/scripts/publish_release.sh" "$version" --dry-run "$dmg" > "$out/update.json"
 echo "Built $dmg"
 cat "$out/update.json"

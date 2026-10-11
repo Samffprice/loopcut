@@ -58,6 +58,30 @@ class BlenderKitTest(unittest.TestCase):
         with self.assertRaises(tools.ToolError):
             blenderkit.pick_file(FILES, "8k")
 
+    def test_rows_read_the_live_apis_parameters(self):
+        # The live search API (2026-10-10) has null top-level sizes: they, the face count and the style are in
+        # dictParameters; the detail endpoint lists them as parameters. Rows used to lose all three.
+        live = {"id": "v1", "name": "Vintage Wooden Chair", "isFree": True, "dimensionX": None, "faceCount": None,
+                "description": "A classic vintage\nwooden chair with a ladder-style backrest, natural wood grain "
+                               "and subtle wear typical of older furniture pieces.",
+                "tags": ["chair", "wooden"], "author": {"fullName": "Ann"},
+                "dictParameters": {"dimensionX": 0.5082, "dimensionY": 0.5558, "dimensionZ": 0.9366,
+                                   "faceCount": 72794, "modelStyle": "realistic"}}
+        row = blenderkit.describe_asset(3, live)
+        self.assertTrue(row.startswith("3. v1: Vintage Wooden Chair; 0.51x0.56x0.94 m; 72794 faces; realistic style; "
+                                       "A classic vintage wooden chair"), row)
+        self.assertIn("…; free; by Ann", row)
+        self.assertNotIn("\n", row)
+        self.assertLessEqual(len(row.split("; ")[5]), 90)
+        detail = {"parameters": [{"parameterType": "dimensionX", "value": 2}, {"parameterType": "dimensionY", "value": 1},
+                                 {"parameterType": "dimensionZ", "value": "0.5"}, {"parameterType": "faceCount", "value": 9}]}
+        self.assertEqual(blenderkit.dimensions(detail), [2.0, 1.0, 0.5])
+        self.assertEqual(blenderkit.parameter(detail, "faceCount"), 9)
+        self.assertIsNone(blenderkit.dimensions({"dictParameters": {"dimensionX": 1, "dimensionY": 0, "dimensionZ": 1}}))
+        self.assertIsNone(blenderkit.dimensions({}))
+        tags_only = blenderkit.describe_asset(1, {**live, "description": "", "dictParameters": {}})
+        self.assertIn("; chair, wooden; free", tags_only)
+
     def test_key_from_env_then_credentials_then_the_blenderkit_addon(self):
         self.assertEqual(blenderkit.api_key(), "")
         addon = types.SimpleNamespace(preferences=types.SimpleNamespace(api_key=" addon-key "))

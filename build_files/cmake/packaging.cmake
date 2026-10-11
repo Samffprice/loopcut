@@ -119,8 +119,9 @@ if(WIN32)
   )
 
   set(CPACK_WIX_TEMPLATE ${CMAKE_SOURCE_DIR}/release/windows/installer_wix/WIX.template)
-  set(CPACK_WIX_UI_BANNER ${CMAKE_SOURCE_DIR}/release/windows/installer_wix/WIX_UI_BANNER.bmp)
-  set(CPACK_WIX_UI_DIALOG ${CMAKE_SOURCE_DIR}/release/windows/installer_wix/WIX_UI_DIALOG.png)
+  # Loopcut's installer images (release/loopcut/make_assets.py --wix), not Blender's in installer_wix/.
+  set(CPACK_WIX_UI_BANNER ${CMAKE_SOURCE_DIR}/release/loopcut/wix-banner.bmp)
+  set(CPACK_WIX_UI_DIALOG ${CMAKE_SOURCE_DIR}/release/loopcut/wix-dialog.png)
   set(CPACK_WIX_EXTRA_SOURCES ${CMAKE_SOURCE_DIR}/release/windows/installer_wix/WixUI_Blender.wxs)
   set(CPACK_WIX_UI_REF "WixUI_Blender")
   set(CPACK_WIX_LIGHT_EXTRA_FLAGS -dcl:medium)

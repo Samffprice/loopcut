@@ -25,7 +25,7 @@ class BetaGatesTest(unittest.TestCase):
     def setUpClass(cls):
         fake = types.ModuleType('bpy')
         fake.types = types.SimpleNamespace(**{name: type(name, (), {}) for name in
-            ('Operator', 'AddonPreferences', 'Menu', 'FileHandler', 'SpaceTextEditor')})
+            ('Operator', 'AddonPreferences', 'Menu', 'FileHandler', 'SpaceTextEditor', 'OperatorFileListElement')})
         fake.types.AddonPreferences = AddonPreferences
         fake.props, fake.ops = Mock(), Mock()
         fake.app = types.SimpleNamespace(version=(5, 2, 0), timers=Mock())
@@ -37,6 +37,7 @@ class BetaGatesTest(unittest.TestCase):
         cls.modules = patch.dict(sys.modules, {'bpy': fake, 'bpy.utils': fake.utils,
             'bpy.utils.previews': fake.utils.previews, NAME + '.ui.draw': types.ModuleType(NAME + '.ui.draw')})
         cls.modules.start()
+        cls.addClassCleanup(cls.modules.stop)  # Runs even when the imports below fail.
         spec = importlib.util.spec_from_file_location(NAME, PACKAGE / '__init__.py',
                                                      submodule_search_locations=[str(PACKAGE)])
         cls.package = importlib.util.module_from_spec(spec)
@@ -45,10 +46,6 @@ class BetaGatesTest(unittest.TestCase):
         for name in ('config', 'state', 'agent', 'account', 'cloud_account', 'cloud_http',
                      'settings', 'update', 'support', 'ui.host', 'ui.layout'):
             setattr(cls, name.replace('ui.', ''), importlib.import_module(NAME + '.' + name))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.modules.stop()
 
     def setUp(self):
         context = patch.object(self.config, 'BETA', True)
@@ -145,7 +142,7 @@ class BetaGatesTest(unittest.TestCase):
             names = [entry[1] for entry in layout.calls if entry[0] == 'operator']
             self.assertEqual('loopcut.blenderkit_get_key' in names, not beta)
             texts = [entry[1] for entry in layout.calls if entry[0] == 'label']
-            self.assertIn('Loopcut 0.2.1' + (' beta' if beta else ''), texts)
+            self.assertIn('Loopcut 0.2.2' + (' beta' if beta else ''), texts)
             if beta:
                 self.assert_no_purchase(texts)
                 self.assertNotIn('Workers and routing run on Loopcut plans', texts)
@@ -204,18 +201,18 @@ class BetaGatesTest(unittest.TestCase):
         self.assertIn('tester@example.test  ·  Pro plan', before)
 
     def test_version_display_and_machine_versions_are_separate(self):
-        self.assertEqual(self.config.version_label(), '0.2.1 beta')
-        self.assertIn('0.2.1 beta', [p.get('text') for p in self.display()['prims']])
-        self.assertEqual(self.update.current_version(), (0, 2, 1))
-        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.1 blender/5.2.0')
-        release = {'version': (0, 2, 2), 'label': '0.2.2', 'asset': None}
+        self.assertEqual(self.config.version_label(), '0.2.2 beta')
+        self.assertIn('0.2.2 beta', [p.get('text') for p in self.display()['prims']])
+        self.assertEqual(self.update.current_version(), (0, 2, 2))
+        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.2 blender/5.2.0')
+        release = {'version': (0, 2, 3), 'label': '0.2.3', 'asset': None}
         status = {'release': release, 'status': 'available', 'dismissed': False, 'error': '', 'progress': 0}
-        self.assertIn('0.2.2 beta', self.update.banner_for(status, False)['text'])
-        self.assertIn('0.2.2 beta', self.update.status_line(status, (0, 2, 1)))
+        self.assertIn('0.2.3 beta', self.update.banner_for(status, False)['text'])
+        self.assertIn('0.2.3 beta', self.update.status_line(status, (0, 2, 2)))
         for state in ('idle', 'current'):
-            self.assertIn('0.2.1 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 1)))
+            self.assertIn('0.2.2 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 2)))
         with patch.object(self.config, 'BETA', False):
-            self.assertEqual(self.config.version_label(), '0.2.1')
+            self.assertEqual(self.config.version_label(), '0.2.2')
             self.assertNotIn('beta', self.update.banner_for(status, False)['text'])
 
     def test_config_environment_switches(self):
@@ -243,7 +240,7 @@ class BetaGatesTest(unittest.TestCase):
                 self.draw_help(expect_loopcut=True)
                 splash = Splash()
                 self.support._draw_info(types.SimpleNamespace(layout=splash), None)
-                self.assertIn(('label', 'Loopcut 0.2.1 beta'), splash.records)
+                self.assertIn(('label', 'Loopcut 0.2.2 beta'), splash.records)
                 self.assertEqual(splash.operators()[0][1], 'loopcut.report_bug')
                 with patch.object(self.config, 'BUG_REPORT_URL', 'https://example.test/form'):
                     self.support.LOOPCUT_OT_report_bug().execute(None)

@@ -71,6 +71,19 @@ def chatgpt_plan(base_url: str) -> bool:
     return (base_url or "").rstrip("/") == "chatgpt-plan" or (base_url or "").startswith("chatgpt-plan:")
 
 
+# The "Anthropic" provider: this pseudo base URL sends requests to Anthropic's Messages API (https:// plus the
+# rest, /messages) with the user's own key, through anthropic_messages.py rather than chat completions; see
+# llm.stream_chat. Not https://api.anthropic.com/v1 itself, which stays free for the Custom provider (Anthropic's
+# OpenAI-compatible endpoint, without prompt caching), and each keeps its own stored key. Kept equal to
+# anthropic_messages.MODELS[0] (test_anthropic).
+ANTHROPIC_BASE_URL = "anthropic://api.anthropic.com/v1"
+ANTHROPIC_MODEL = "claude-opus-5-5"
+
+
+def anthropic(base_url: str) -> bool:
+    return (base_url or "").strip().startswith("anthropic://")
+
+
 # Tokens per request, the system prompt and tool schemas (about 7k) included, before the current
 # turn's older steps are folded early and then the earlier conversation is summarized (context.py).
 # A 25-step history sent whole is about 30k; longer turns fold older steps as needed.
@@ -273,7 +286,7 @@ def run_timeout() -> float:
 
 
 def _check_base_url(base_url: str, key: str) -> None:
-    if base_url == CHATGPT_PLAN_BASE_URL:
+    if base_url == CHATGPT_PLAN_BASE_URL or anthropic(base_url):  # anthropic:// is always sent as https.
         return
     if not base_url.startswith("https://") and not base_url.startswith("http://127.0.0.1"):
         raise ConfigError(f"{key} must be https (http is allowed only for 127.0.0.1)")
@@ -331,8 +344,10 @@ def load() -> Config:
         context_budget=int(context_budget),
         max_output_tokens=max_output_tokens,
         call_max_seconds=float(call_max_seconds),
-        # For a direct provider; on the Loopcut service the model's catalogue entry decides (agent.py).
-        keep_context=_as_bool(get("LOOPCUT_KEEP_CONTEXT", "false"), "LOOPCUT_KEEP_CONTEXT"),
+        # For a direct provider; on the Loopcut service the model's catalogue entry decides (agent.py). On by
+        # default for Anthropic, whose cache and replayed thinking both reward a request that extends the last whole.
+        keep_context=_as_bool(get("LOOPCUT_KEEP_CONTEXT", "true" if anthropic(base_url) else "false"),
+                              "LOOPCUT_KEEP_CONTEXT"),
     )
 
 

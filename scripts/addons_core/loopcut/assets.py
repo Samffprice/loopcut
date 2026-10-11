@@ -51,7 +51,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "stylised or game look or many props cheaply; needs the user's free key."),
         "parameters": {"type": "object", "properties": {
             "source": {"type": "string", "enum": list(SOURCES)},
-            "query": {"type": "string", "description": "Words to match: 'wooden chair', 'brick wall', 'sunset'"},
+            "query": {"type": "string", "description": "Words to match: 'low poly tree', 'oak floor', 'sunset'"},
             "type": {"type": "string", "enum": ["model", "material", "hdri", *asset_libraries.SEARCH_TYPES],
                      "description": "blenderkit, polyhaven (required): model, material or hdri. "
                                     "library (optional): a Blender ID type"},

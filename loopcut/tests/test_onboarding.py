@@ -47,6 +47,9 @@ class Splash:
         self.records.append(("operator", name, kwargs.get("text", ""), props, self))
         return props
 
+    def menu(self, name, **kwargs):
+        self.records.append(("menu", name))
+
     def operators(self):
         return [r for r in self.records if r[0] == "operator"]
 
@@ -56,7 +59,7 @@ class OnboardingTest(unittest.TestCase):
     def setUpClass(cls):
         cls.fake = types.ModuleType("bpy")
         cls.fake.types = types.SimpleNamespace(**{name: type(name, (), {}) for name in
-            ("Operator", "AddonPreferences", "Menu", "FileHandler", "SpaceTextEditor")})
+            ("Operator", "AddonPreferences", "Menu", "FileHandler", "SpaceTextEditor", "OperatorFileListElement")})
         cls.fake.types.AddonPreferences = AddonPreferences
         cls.fake.props = Mock()
         cls.fake.ops = Mock()
@@ -67,6 +70,7 @@ class OnboardingTest(unittest.TestCase):
         cls.modules = patch.dict(sys.modules, {"bpy": cls.fake, "bpy.utils": cls.fake.utils,
             "bpy.utils.previews": cls.fake.utils.previews, NAME + ".ui.draw": types.ModuleType(NAME + ".ui.draw")})
         cls.modules.start()
+        cls.addClassCleanup(cls.modules.stop)  # Runs even when the imports below fail.
         spec = importlib.util.spec_from_file_location(NAME, PACKAGE / "__init__.py",
                                                      submodule_search_locations=[str(PACKAGE)])
         package = importlib.util.module_from_spec(spec)
@@ -74,13 +78,6 @@ class OnboardingTest(unittest.TestCase):
         spec.loader.exec_module(package)
         for name in ("onboarding", "account", "chatgpt_ui", "settings", "state", "cloud", "ui.host"):
             setattr(cls, name.replace("ui.", ""), importlib.import_module(NAME + "." + name))
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in list(sys.modules):
-            if name == NAME or name.startswith(NAME + "."):
-                del sys.modules[name]
-        cls.modules.stop()
 
     def setUp(self):
         self.fake.ops.reset_mock()
@@ -353,6 +350,23 @@ class OnboardingTest(unittest.TestCase):
         another = next(r for r in splash.operators() if r[2] == "Use another ChatGPT account")
         self.assertTrue(another[3].new_account)
         self.assertIn("loopcut.onboarding_own_key", [r[1] for r in splash.operators()])
+
+    def test_own_key_on_anthropic_links_to_its_keys_lists_its_models_and_shows_its_privacy_note(self):
+        self.onboarding._state["own_key"] = True
+        self.prefs.provider, self.prefs.base_url = "ANTHROPIC", "anthropic://api.anthropic.com/v1"
+        splash = Splash()
+        with patch.object(self.onboarding.config, "load", return_value=object()), \
+                patch.object(self.onboarding, "_connected", return_value=True):
+            self.onboarding._draw_connect(splash, self.context)
+        self.assertIn(("prop", "api_key"), splash.records)
+        self.assertIn("loopcut.anthropic_get_key", [r[1] for r in splash.operators()])
+        self.assertIn(("menu", "LOOPCUT_MT_models"), splash.records, "Anthropic's models, before any fetch")
+        self.assertTrue(next(r for r in splash.operators() if r[2] == "Continue")[4].enabled)
+        splash = Splash()
+        self.onboarding._draw_privacy(splash)
+        labels = " ".join(r[1] for r in splash.records if r[0] == "label")
+        self.assertIn("go to Anthropic (Claude)", labels)
+        self.assertIn("Private (A)", labels)
 
     def test_own_key_switches_from_either_sign_in_route_and_can_continue(self):
         for provider in ("LOOPCUT", "CHATGPT"):

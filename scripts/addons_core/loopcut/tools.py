@@ -452,14 +452,34 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
     result = ToolResult(f"{output}\n\n{guarded}{changes}", ok=ok, scene_before=before, scene_after=after,
                         guard_notes=notes)
     if capture:
-        # One request instead of two: the step and the look at what it did.
+        # One request instead of two: the step and the look at what it did. Shaders the code just
+        # made compile first, off the main thread (shaders.py); then the look, in its own task.
+        from . import llm, shaders
         try:
-            shot = capture_viewport(angle=capture)
-            result.text += f"\n\n{shot.text}"
-            result.image_path = shot.image_path
+            shot = shaders.before_look(lambda: capture_viewport(angle=capture), "material", capture,
+                                       name="the run_python tool's capture")
         except ToolError as ex:
             result.text += f"\n\nCapture failed: {ex}"
+            return result
+        if shot.then is None:
+            _add_shot(result, shot)
+        else:
+            def then(is_cancelled, on_main):
+                try:
+                    _add_shot(result, shot.then(is_cancelled, on_main))
+                except llm.Cancelled:  # The code already ran: keep its result, and honor Stop after.
+                    result.text += "\n\nCapture skipped: stopped."
+                return result
+            result.then = then
     return result
+
+
+def _add_shot(result: ToolResult, shot: ToolResult) -> None:
+    if shot.ok:
+        result.text += f"\n\n{shot.text}"
+        result.image_path = shot.image_path
+    else:
+        result.text += f"\n\nCapture failed: {shot.text}"
 
 
 def _round(values, digits=3) -> list:
@@ -809,6 +829,14 @@ def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter
         return _capture_viewport(focus, angle, style)
 
 
+def capture_viewport_tool(focus: list[str] | None = None, angle: str = "three_quarter",
+                          style: str = "material") -> ToolResult:
+    """The capture_viewport tool: capture_viewport, after the shaders it needs have compiled off
+    the main thread (shaders.before_look). Called directly, capture_viewport compiles in the draw."""
+    from . import shaders
+    return shaders.before_look(lambda: capture_viewport(focus, angle, style), style, angle, focus)
+
+
 def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolResult:
     import numpy as np
     angles = [*_VIEW_EULERS, "camera", "user", "sheet"]
@@ -1026,6 +1054,15 @@ def look_at_reference(name: str, region: list | None = None) -> ToolResult:
                       f"(the full image is {width}x{height}).", image_path=out)
 
 
+def compare_with_reference_tool(name: str, focus: list[str] | None = None, angle: str = "three_quarter",
+                                style: str = "material") -> ToolResult:
+    """The compare_with_reference tool; its capture waits for shaders like capture_viewport_tool."""
+    from . import shaders
+    _reference(name)  # An unknown reference fails before any shader work.
+    return shaders.before_look(lambda: compare_with_reference(name, focus, angle, style), style, angle, focus,
+                               name="the compare_with_reference tool")
+
+
 def compare_with_reference(name: str, focus: list[str] | None = None, angle: str = "three_quarter",
                            style: str = "material") -> ToolResult:
     import numpy as np
@@ -1048,8 +1085,8 @@ _DISPATCH = {
     "get_scene_info": get_scene_info,
     "get_object_info": get_object_info,
     "inspect_api": inspect_api,
-    "capture_viewport": capture_viewport,
-    "compare_with_reference": compare_with_reference,
+    "capture_viewport": capture_viewport_tool,
+    "compare_with_reference": compare_with_reference_tool,
     "look_at_reference": look_at_reference,
 }
 

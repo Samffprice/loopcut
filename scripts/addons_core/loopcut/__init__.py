@@ -8,7 +8,7 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
@@ -26,9 +26,10 @@ def register() -> None:
     host.register()
     lifecycle.register()
     if host.NATIVE:  # The Loopcut build: its first run, and its updates. Stock Blender has its own.
-        from . import onboarding, update
+        from . import onboarding, shaders, update
         onboarding.register()
         update.register()
+        shaders.register()  # Subprocess shader compilation on Windows/Linux, once.
     try:
         from . import checkpoints
         checkpoints.remove_stale_sessions()
@@ -52,7 +53,8 @@ def unregister() -> None:
     cloud.unregister()
     account.unregister()
     if host.NATIVE:
-        from . import onboarding, update
+        from . import onboarding, shaders, update
+        shaders.unregister()
         update.unregister()
         onboarding.unregister()
     lifecycle.unregister()

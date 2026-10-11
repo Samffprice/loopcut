@@ -225,6 +225,50 @@ importlib.util.spec_from_file_location("fixture", ROOT / "out" / "evals" / "fixt
         self.assertIn("Cannot parse public test", scanner.errors[0])
 
 
+class LocalPathTest(unittest.TestCase):
+    # Built from parts so this file holds none of the paths it checks for.
+    TMP = "/".join(("", "private", "tmp"))
+
+    def test_private_disk_checkouts_and_macos_temp_are_blocked_and_not_allowlistable(self):
+        contract = (release.PRIVATE_HOME / "loopcut-web-platform" / "contract").as_posix()
+        fixtures = [f'CONTRACT = Path("{contract}")',
+                    f'tempfile.TemporaryDirectory(dir="{self.TMP}")',
+                    *(f'ROOT = "/home/runner/work/{name}/skills"' for name in release.PRIVATE_REPOS)]
+        for code in fixtures:
+            with self.subTest(code=code):
+                scanner = release.Scanner([], {})
+                scanner.local_path("import os\n" + code + "\n", "loopcut/tests/test_fixture.py", "tree")
+                self.assertEqual([(hit.category, hit.line) for hit in scanner.hits], [("local_path", 2)])
+                hit = scanner.hits[0]
+                allowlist = {hit.fingerprint_sha256: "reviewed", hit.line_sha256: "reviewed"}
+                scanner = release.Scanner([], allowlist)
+                scanner.local_path(code, "loopcut/tests/test_fixture.py", "tree")
+                self.assertFalse(scanner.hits[0].allowed)
+
+    def test_urls_relative_names_and_synthetic_paths_pass(self):
+        code = "\n".join((
+            'URL = "https://github.com/Samffprice/loopcut-web-platform"',
+            'contract = folder / "loopcut-web-platform" / "contract"',
+            'install_target("/Volumes/Loopcut/Loopcut.app/Contents/MacOS/Loopcut", "darwin", "/Users/me")',
+            'env = {"TMPDIR": "/var/folders/x", "HOME": "/home/me/loopcut-web-platformer"}',
+            f'other = "{self.TMP}x"'))
+        scanner = release.Scanner([], {})
+        scanner.local_path(code, "loopcut/tests/test_fixture.py", "tree")
+        self.assertEqual(scanner.hits, [])
+
+    def test_public_tests_name_no_local_paths(self):
+        """The release rule, run here too, so a local test run catches what would fail in CI."""
+        patterns = release.exclusions(EXCLUDES)
+        root = SCRIPT.parents[2]
+        for path in sorted(Path(__file__).parent.glob("*.py")):
+            name = path.relative_to(root).as_posix()
+            if release.excluded(name, patterns):
+                continue
+            scanner = release.Scanner([], {})
+            scanner.local_path(path.read_text(encoding="utf-8"), name, "tree")
+            self.assertEqual([hit.line for hit in scanner.hits], [], name)
+
+
 class FingerprintTest(unittest.TestCase):
     def test_every_fifth_physical_line_and_first_line(self):
         lines = ["import unusually_long_module_name_that_is_only_boilerplate", "skip " + private_text(),
@@ -1444,6 +1488,18 @@ class SnapshotTest(unittest.TestCase):
         self.assertIn("private_path: 2 blocking hits", markdown)
         for name in private:
             self.assertIn(name, markdown)
+
+    def test_local_path_in_a_public_test_blocks_the_dry_run(self):
+        self.write("loopcut/tests/test_fixture.py", f'ROOT = "{LocalPathTest.TMP}"\n')
+        self.write("loopcut/harness/fixture_check.py", f'ROOT = "{LocalPathTest.TMP}"\n')  # Not a public test.
+        self.commit("Synthetic local path")
+        out = self.root / "local"
+        self.assertEqual(self.run_main(["--dry-run", "--source", "source", "--exclude", str(self.excludes),
+                                        *self.options(out)]), 1)
+        report = json.loads((out / "report.json").read_text())
+        self.assertEqual([(hit["category"], hit["file"]) for hit in report["hits"]],
+                         [("local_path", "loopcut/tests/test_fixture.py")])
+        self.assertIn("local_path: 1 blocking hits", (out / "report.md").read_text())
 
     def test_private_import_blocks_code_but_not_docstrings(self):
         for label, code, expected in (

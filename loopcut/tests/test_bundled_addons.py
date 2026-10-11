@@ -150,7 +150,7 @@ class BundledTest(unittest.TestCase):
                 checkpoint = mock.Mock()
                 replies = [llm.Completion(tool_calls=[llm.ToolCall('api', 'inspect_api', arguments)]),
                            llm.Completion(text='Described.')]
-                with mock.patch.object(agent, '_on_main', side_effect=lambda fn, *args: fn()) as main, \
+                with mock.patch.object(agent, '_on_main', side_effect=lambda fn, *args, **kwargs: fn()) as main, \
                         mock.patch.object(agent, '_redraw'), mock.patch.object(conversations, 'save'), \
                         mock.patch.object(agent, '_workspace_turn'), \
                         mock.patch.object(agent, '_request', side_effect=replies), \

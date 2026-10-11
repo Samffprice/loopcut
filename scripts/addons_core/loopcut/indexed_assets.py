@@ -156,7 +156,8 @@ def fetch_indexed(asset_id: str, source: str, resolution: str = "1k", apply_to=N
             raise ToolError("This result has no remote-library import metadata; search again")
         library, entry = remote_entry(row, bpy.app.cachedir)
         fetched = {**asset_libraries.fetch_entry(library, entry), "loader": "library"}
-    return {**fetched, "credit": row["attribution"]["text"] if row["attribution"]["required"] else ""}
+    return {**fetched, "credit": row["attribution"]["text"] if row["attribution"]["required"] else "",
+            "dimensions_m": row.get("dimensions_m") if row["kind"] == "model" else None}
 
 
 def load_indexed(fetched: dict, apply_to=None):

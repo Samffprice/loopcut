@@ -165,7 +165,7 @@ def search_polyhaven(query: str, type: str, limit: int = DEFAULT_LIMIT) -> ToolR
     if not found:
         raise ToolError(f"No Poly Haven {type} match {query!r}. Try fewer or more general words.")
     lines = [describe_asset(i, slug, record) for i, (slug, record) in enumerate(found, 1)]
-    image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png")
+    image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png", fit=True)
     text = f"{len(found)} Poly Haven {type} for {query!r}, numbered as on the sheet (left to right, top to bottom):\n" \
            + "\n".join(lines)
     text += "\nPowered by Poly Haven"
@@ -408,8 +408,12 @@ def _import_model(asset_id, info, resolution, blend: Path | None, gltf: Path | N
                             pass
     _tag([*imported, *materials], asset_id, info)
     summaries = [object_summary(obj) for obj in imported]
+    dims = info.get("dimensions")
+    listed = [d / 1000 for d in dims[:3]] if isinstance(dims, list) and len(dims) >= 3 else None
+    size = asset_common.measured(imported, listed)
     return ToolResult(_clip(f"Imported {asset_id} ({resolution}) as {len(imported)} object(s) at the origin, "
-                            f"in meters.{note} Place and scale it now. {_credit(asset_id, info)}\n"
+                            f"in meters.{' ' + size if size else ''}{note} Place and scale it now. "
+                            f"{_credit(asset_id, info)}\n"
                             + json.dumps(summaries, separators=(",", ":"), default=str)))
 
 

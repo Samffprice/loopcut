@@ -6,9 +6,11 @@ size is drawn fresh instead of scaled. source/ holds the render it was traced fr
 Needs numpy, which Blender's Python has:
     tools/Blender.app/Contents/Resources/5.2/python/bin/python3.13 release/loopcut/make_assets.py \
         tools/Blender.app/Contents/Resources/5.2/datafiles/fonts/Inter.woff2
-Writes mark.svg, topbar-icon.svg, mark-<size>.png, app-icon-1024.png, loopcut.ico and, on macOS only (they use
-iconutil and Quick Look), loopcut.icns and splash.png next to this file. The splash's wordmark is
-set in Inter, the OFL-licensed font Blender ships, embedded from the path given as argv[1].
+Writes mark.svg, topbar-icon.svg, editor-icon.svg (copy it to release/datafiles/icons_svg/loopcut.svg),
+mark-<size>.png, app-icon-1024.png, loopcut.ico and, on macOS only (they use iconutil and Quick Look),
+loopcut.icns and splash.png next to this file. With --wix it writes only the Windows installer's
+wix-dialog.png and wix-banner.bmp (macOS only, Quick Look again). The splash's wordmark is set in Inter,
+the OFL-licensed font Blender ships, embedded from the path given as argv[1].
 """
 
 import base64
@@ -205,6 +207,126 @@ def write_dmg_background(here: Path, inter: Path, mono: Path) -> None:
                        capture_output=True)
 
 
+def _mark_at(x: float, y: float, scale: float, opacity: float = 1.0) -> str:
+    """The mark with its top-left corner at (x, y)."""
+    return _mark_paths(scale, x - brand.LEFT * scale, y - brand.TOP * scale, opacity)
+
+
+def wix_dialog_svg(inter: Path, width: float) -> str:
+    """The Windows installer's welcome and finish pages, 493 x 312 like Blender's WIX_UI_DIALOG.png,
+    as the middle band of a 493 square canvas (see write_wix). Windows Installer draws the page text
+    in black right of x = 164, so only the strip left of that carries the brand; the rest stays white."""
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 493" width="{width}" height="{width}">
+<defs>
+<style>{_font_face("LoopcutInter", inter)}</style>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#202024"/><stop offset="1" stop-color="#101012"/></linearGradient>
+<radialGradient id="teal" cx="0.1" cy="0.08" r="0.9"><stop offset="0" stop-color="{PALETTE["teal_light"]}" stop-opacity="0.24"/><stop offset="1" stop-color="{PALETTE["teal_light"]}" stop-opacity="0"/></radialGradient>
+<radialGradient id="orange" cx="0.95" cy="1.0" r="0.9"><stop offset="0" stop-color="{PALETTE["orange"]}" stop-opacity="0.26"/><stop offset="1" stop-color="{PALETTE["orange"]}" stop-opacity="0"/></radialGradient>
+</defs>
+<g transform="translate(0,90.5)" font-family="LoopcutInter">
+<rect width="493" height="312" fill="#ffffff"/>
+<rect width="164" height="312" fill="url(#bg)"/>
+<rect width="164" height="312" fill="url(#teal)"/>
+<rect width="164" height="312" fill="url(#orange)"/>
+{_mark_at(-30, 40, 2.1, opacity=0.06)}
+{_mark_at(22, 262, 0.34)}
+<text x="58" y="285" font-weight="650" font-size="22" letter-spacing="-0.5" fill="#f2efe9">Loopcut</text>
+</g>
+</svg>
+'''
+
+
+def wix_banner_svg(inter: Path, width: float) -> str:
+    """The top banner of the installer's other pages, 493 x 58 like Blender's WIX_UI_BANNER.bmp.
+    Windows Installer draws each page's title and description in black over the left two thirds,
+    so the background stays light and the brand sits right of x = 330."""
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 493" width="{width}" height="{width}">
+<defs>
+<style>{_font_face("LoopcutInter", inter)}</style>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffffff"/><stop offset="0.55" stop-color="#ffffff"/><stop offset="1" stop-color="#eeedea"/></linearGradient>
+<radialGradient id="teal" cx="0.78" cy="0" r="0.35"><stop offset="0" stop-color="{PALETTE["teal_light"]}" stop-opacity="0.16"/><stop offset="1" stop-color="{PALETTE["teal_light"]}" stop-opacity="0"/></radialGradient>
+<radialGradient id="orange" cx="1" cy="1" r="0.3"><stop offset="0" stop-color="{PALETTE["orange"]}" stop-opacity="0.18"/><stop offset="1" stop-color="{PALETTE["orange"]}" stop-opacity="0"/></radialGradient>
+</defs>
+<g transform="translate(0,217.5)" font-family="LoopcutInter">
+<rect width="493" height="58" fill="url(#bg)"/>
+<rect width="493" height="58" fill="url(#teal)"/>
+<rect width="493" height="58" fill="url(#orange)"/>
+{_mark_at(370, 16.5, 0.3)}
+<text x="477" y="36" font-weight="650" font-size="20" letter-spacing="-0.4" text-anchor="end" fill="#1b1b1d">Loopcut</text>
+</g>
+</svg>
+'''
+
+
+def write_wix(here: Path, inter: Path) -> None:
+    """wix-dialog.png and wix-banner.bmp for the Windows installer (build_files/cmake/packaging.cmake).
+    They live here rather than over Blender's files in release/windows/installer_wix/, which are Git LFS
+    objects this repository can't store. Windows Installer wants the banner as a 24-bit BMP."""
+    with tempfile.TemporaryDirectory() as folder:
+        for name, make, height in (("wix-dialog", wix_dialog_svg, 312), ("wix-banner", wix_banner_svg, 58)):
+            source = Path(folder) / f"{name}.svg"
+            source.write_text(make(inter, width=493 / 1.3), encoding="utf-8")  # See write_splash.
+            subprocess.run(["qlmanage", "-t", "-s", "493", "-o", folder, str(source)], check=True, capture_output=True)
+            rendered = Path(folder) / f"{name}.svg.png"
+            cropped = Path(folder) / f"{name}.png"
+            subprocess.run(["sips", "-c", str(height), "493", str(rendered), "--out", str(cropped)],
+                           check=True, capture_output=True)
+            if name == "wix-dialog":
+                (here / "wix-dialog.png").write_bytes(cropped.read_bytes())
+            else:
+                write_bmp24(here / "wix-banner.bmp", read_png_rgb(cropped))
+
+
+def read_png_rgb(path: Path) -> np.ndarray:
+    """An 8-bit RGB or RGBA, non-interlaced PNG (what sips writes) as uint8 RGB rows, top first."""
+    data = path.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", path
+    pos, idat, width = 8, b"", 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height, depth, colour, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            assert depth == 8 and colour in (2, 6) and interlace == 0, (depth, colour, interlace)
+            channels = 4 if colour == 6 else 3
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * channels
+    rows, previous = [], np.zeros(stride, dtype=np.int32)
+    for y in range(height):
+        kind, line = raw[y * (stride + 1)], np.frombuffer(raw, np.uint8, stride, y * (stride + 1) + 1).astype(np.int32)
+        out = np.zeros(stride, dtype=np.int32)
+        for x in range(stride):  # Small images only: a plain loop keeps the five filters readable.
+            a = out[x - channels] if x >= channels else 0
+            b = previous[x]
+            c = previous[x - channels] if x >= channels else 0
+            if kind == 0: predictor = 0
+            elif kind == 1: predictor = a
+            elif kind == 2: predictor = b
+            elif kind == 3: predictor = (a + b) // 2
+            else:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                predictor = a if pa <= pb and pa <= pc else b if pb <= pc else c
+            out[x] = (line[x] + predictor) & 0xFF
+        rows.append(out)
+        previous = out
+    return np.array(rows, dtype=np.uint8).reshape(height, width, channels)[..., :3]
+
+
+def write_bmp24(path: Path, rgb: np.ndarray) -> None:
+    """A bottom-up 24-bit BMP with a BITMAPINFOHEADER, the format Windows Installer reads."""
+    height, width = rgb.shape[:2]
+    row = width * 3
+    pad = (4 - row % 4) % 4
+    pixels = b"".join(rgb[y, :, ::-1].tobytes() + b"\x00" * pad for y in range(height - 1, -1, -1))
+    header = struct.pack("<2sIHHI", b"BM", 54 + len(pixels), 0, 0, 54)
+    info = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(pixels), 2835, 2835, 0, 0)
+    Path(path).write_bytes(header + info + pixels)
+
+
 # The mark as one colour, for Blender's icon set: the outline and the three openings.
 SILHOUETTE = [
     [(20.5, 13.5), (101, 16), (107.5, 28), (65.5, 95.5), (52, 95.5), (14, 24.5)],
@@ -224,10 +346,48 @@ def topbar_icon_svg() -> str:
             f'<path fill="#fff" fill-rule="evenodd" d="{path}"/></svg>\n')
 
 
+def _signed_area(points) -> float:
+    return sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1])) / 2
+
+
+# The mark's three faces, as groups of SHAPES colours.
+EDITOR_ICON_FACES = (("blue_outer blue", 0.5), ("orange orange_light", 1.0),
+                     ("teal teal_light red crimson white", 1.0))
+
+
+def editor_icon_svg() -> str:
+    """The Loopcut editor's icon in the Editor Type menu: release/datafiles/icons_svg/loopcut.svg (ICON_LOOPCUT).
+    Blender's editor icons are white on a 1600 canvas (100 units = 1 px at 16 px) with secondary parts at
+    partial opacity, so the mark's faces become three white shapes and the left face is dimmed. Each face is
+    one path with nonzero filling, so its overlapping polygons don't double up; holes wind the other way."""
+    scale = 15.0  # 93.5 wide -> 14 px, like the other editor icons.
+    tx, ty = 800 - scale * (brand.LEFT + brand.WIDTH / 2), 800 - scale * (brand.TOP + brand.HEIGHT / 2)
+    def d(points, clockwise):
+        if (_signed_area(points) > 0) != clockwise:
+            points = list(reversed(points))
+        return "M" + " L".join(f"{x * scale + tx:.0f},{y * scale + ty:.0f}" for x, y in points) + " Z"
+    paths = []
+    for names, opacity in EDITOR_ICON_FACES:
+        parts = []
+        for colour, polygon, hole in SHAPES:
+            if colour in names.split():
+                parts.append(d(polygon, True))
+                if hole:
+                    parts.append(d(hole, False))
+        alpha = "" if opacity == 1 else f' opacity="{opacity}"'
+        paths.append(f'<path fill="#fff"{alpha} d="{" ".join(parts)}"/>')
+    return ('<svg height="1600" viewBox="0 0 1600 1600" width="1600" xmlns="http://www.w3.org/2000/svg">'
+            + "".join(paths) + "</svg>\n")
+
+
 def main():
     here = Path(__file__).resolve().parent
     (here / "topbar-icon.svg").write_text(topbar_icon_svg(), encoding="utf-8")
+    (here / "editor-icon.svg").write_text(editor_icon_svg(), encoding="utf-8")
     fonts = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    if "--wix" in sys.argv:  # Only the Windows installer's images, which the Mac app doesn't ship.
+        write_wix(here, Path(fonts[0]))
+        return
     if sys.platform == "darwin" and fonts:
         write_splash(here, Path(fonts[0]))
         write_dmg_background(here, Path(fonts[0]), Path(fonts[0]).with_name("DejaVuSansMono.woff2"))

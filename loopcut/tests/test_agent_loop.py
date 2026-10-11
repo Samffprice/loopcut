@@ -725,6 +725,24 @@ class AgentLoopTest(unittest.TestCase):
                 queued[0]()  # Also protected if the pump got to it at the same instant.
             execute.assert_not_called()
 
+    def test_main_thread_tasks_carry_the_tool_name_for_the_freeze_log(self):
+        from concurrent.futures import Future
+        from unittest.mock import patch
+        from loopcut import mainthread
+        queued = []
+        future = Future()
+        future.set_result("ok")
+
+        def enqueue(fn):
+            queued.append(fn)
+            return future
+
+        with patch.object(mainthread, "run_on_main", enqueue):
+            agent._run_tool_on_main("capture_viewport", "{}")
+            agent._ensure_checkpoint_on_main({})
+        self.assertEqual([mainthread.task_name(fn) for fn in queued],
+                         ["the capture_viewport tool", "the turn's checkpoint save"])
+
     def test_a_tool_timeout_is_not_retried_as_a_poll_timeout(self):
         from concurrent.futures import Future
         from unittest.mock import patch
@@ -1829,7 +1847,7 @@ class AgentLoopTest(unittest.TestCase):
                 mock.patch.object(router, "start_turn", side_effect=divert) as routed, \
                 mock.patch('loopcut.cloud.prompt_index_available', return_value=True), \
                 mock.patch.object(agent, "_workspace_turn", side_effect=lambda session, turn: started.append(turn)), \
-                mock.patch.object(agent, "_on_main", side_effect=lambda fn, is_cancelled=None: fn()), \
+                mock.patch.object(agent, "_on_main", side_effect=lambda fn, is_cancelled=None, name="": fn()), \
                 mock.patch.object(agent, "_launch", wraps=agent._launch) as launched:
             self.assertTrue(agent.send("paint the chest"))
             first = launched.call_args.args[1]

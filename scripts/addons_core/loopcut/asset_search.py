@@ -117,10 +117,18 @@ def _route():
                            no_generation=runtime.no_generation()), ""
 
 
+# Signed out (or a sign-in the service no longer accepts): one line, which also says what still works, so the
+# model searches those instead of asking the user to sign in.
+SIGN_IN_NOTE = ("Loopcut index not searched: it needs a Loopcut sign-in. Sources blenderkit and polyhaven, and "
+                "the user's libraries, work without one.")
+
+
 def _index(inputs, is_cancelled, on_main):
     started = time.monotonic()
     route, reason = on_main(_route)
     if route is None:
+        if reason in ("signed out", "sign in"):
+            return [], [], [SIGN_IN_NOTE]
         return [], [], ["Loopcut index not searched: " + reason + "."] if reason else []
     cancel = cloud._Cancel(lambda: is_cancelled() or time.monotonic() - started >= SEARCH_SECONDS)
     try:
@@ -145,7 +153,34 @@ def _index(inputs, is_cancelled, on_main):
         return [], [], ["Loopcut index not searched: invalid or unreadable report."]
 
 
-def _line(number, row):
+def _about(entry, server):
+    """What the libraries say an asset is, for choosing beside its thumbnail: size, polycount, texture
+    resolution, description and tags. The index's free text is untrusted: one line each, clipped."""
+    server = server or {}
+    parts = []
+    dims = server.get("dimensions_m")
+    size = asset_common.size_text(dims)
+    if size:
+        parts.append(size + (" tile" if len(dims) == 2 else ""))
+    polycount = server.get("polycount")
+    if type(polycount) is int and polycount > 0:
+        parts.append(f"{polycount} polys")
+    resolution = server.get("max_resolution")
+    if type(resolution) is int and resolution >= 1024:
+        parts.append(f"{resolution // 1024}k maps")
+    description = asset_common.clean(entry.description if entry is not None else "", 80) \
+        or asset_common.clean(server.get("description"), 90)
+    if description:
+        parts.append(description)
+    listed = server.get("tags")
+    tags = [*(entry.tags if entry is not None else []), *(listed if isinstance(listed, list) else [])]
+    tags = list(dict.fromkeys(t for t in (asset_common.clean(t, 30) for t in tags[:12]) if t))[:5]
+    if tags:
+        parts.append("tags: " + ", ".join(tags))
+    return parts
+
+
+def _line(number, row, kit=""):
     entry, server = row["entry"], row["server"]
     if entry is not None:
         label = entry.name
@@ -156,7 +191,8 @@ def _line(number, row):
         source, asset_id = server["import"]["source"], server["import"]["id"]
     kind = server["kind"] if server else INDEX_TYPES.get(entry.id_type, entry.id_type)
     license_name = server["license"]["id"] if server else entry.license or "license unstated"
-    line = (f"{number}. {label} ({origin}); kind: {kind}; "
+    about = "".join(f"{part}; " for part in [*_about(entry, server), kit] if part)
+    line = (f"{number}. {label} ({origin}); kind: {kind}; {about}"
             f"import_asset(source={json.dumps(source)}, id={json.dumps(asset_id)}); "
             + license_name)
     if server and server["attribution"]["required"]:
@@ -165,7 +201,10 @@ def _line(number, row):
 
 
 def _present(query, rows, paths, sources, notes):
-    lines = [_line(i, row) for i, row in enumerate(rows, 1)]
+    # Local files only: a remote library's file can hold one material's variants, which is no kit.
+    kits = asset_common.kit_notes([(row["entry"].library, row["entry"].file)
+                                   if row["entry"] is not None and not row["entry"].files else None for row in rows])
+    lines = [_line(i, row, kits.get(i - 1, "")) for i, row in enumerate(rows, 1)]
     for row in rows:
         if row["server"]:
             indexed_assets.remember(row["server"])
@@ -173,7 +212,7 @@ def _present(query, rows, paths, sources, notes):
     if any(row["server"] and row["server"]["source"] == "polyhaven" for row in rows):
         if "Powered by Poly Haven" not in credits:
             credits.append("Powered by Poly Haven")
-    image = asset_common.sheet(paths, "assets_sheet.png") if rows else None
+    image = asset_common.sheet(paths, "assets_sheet.png", fit=True) if rows else None
     text = f"{len(rows)} asset(s) for {query!r}, numbered as on the sheet (left to right, top to bottom):\n"
     text += "\n".join([*lines, *credits, *dict.fromkeys(notes)])
     if image:

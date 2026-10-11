@@ -57,12 +57,13 @@ reuses verified frames from the SAME saved revision with a fresh approval of the
 retain their PNG sequence. Do not poll repeatedly while nothing changes. Give the user the job status \
 and output location; never describe a queued/running job as a completed export. Jobs remain in the Jobs \
 view after closing the chat. Previews of jobs show their saved revision, not later scene edits.
-- Libraries, before building a realistic or stylised prop, material or sky from primitives: search_assets, \
-then import_asset from the same source. blenderkit is BlenderKit, the largest (free without an account; a \
-plan key unlocks more); polyhaven is Poly Haven (CC0 scans, PBR materials, HDRIs); library is the user's own \
-Blender asset libraries (their kits, Online Essentials, remote libraries); polypizza is Poly Pizza (low-poly \
-stylised, CC0 or CC-BY: tell the user it came from Poly Pizza with the link, and the attribution line for \
-CC-BY). Choose by thumbnail, then place and scale what arrives; say which library each asset came from.
+- Libraries first: a prop, set dressing, material, HDRI or sky that is not the user's own work usually looks \
+better from a library than built from primitives, so search_assets before building one (a plain shape or flat \
+colour needs no search). Choose with the thumbnail sheet and each row's description, size and polycount; prefer \
+what matches the scene's existing look, though a mix that reads well is fine. After import, check its measured \
+size and its look in the scene, and swap a wrong pick rather than patch it. Build it yourself when nothing fits \
+or the user asks, and never replace what the user made or is modelling unless asked. Say which library each \
+asset came from and pass on the credit an import gives (Poly Pizza: its link, and the attribution line for CC-BY).
 - Never delete or overwrite the user's objects, materials or files unless asked. Name what you create \
 sensibly; real-world scale in meters unless told otherwise.
 - Installed add-ons and extensions, if any, are listed at the end of this prompt with their operator \
@@ -180,8 +181,9 @@ def _redraw() -> None:
     mainthread.request_redraw()
 
 
-def _on_main(fn, is_cancelled=lambda: False):
-    """fn() on the main thread, waited for here; a stop before the pump reaches it means it never runs."""
+def _on_main(fn, is_cancelled=lambda: False, name: str = ""):
+    """fn() on the main thread, waited for here; a stop before the pump reaches it means it never runs.
+    `name` is what a slow-task line calls it (mainthread.note_slow)."""
     from . import mainthread
 
     def guarded():
@@ -189,7 +191,7 @@ def _on_main(fn, is_cancelled=lambda: False):
             raise llm.Cancelled()
         return fn()
 
-    future = mainthread.run_on_main(guarded)
+    future = mainthread.run_on_main(mainthread.named(name or mainthread.task_name(fn), guarded))
     while True:
         try:
             return future.result(timeout=_POLL_SECONDS)
@@ -211,7 +213,11 @@ def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
             cloud.hosted_index()
         except prompt_index.IndexError as ex:
             return tools.ToolResult(f"Could not start the workers: {ex}. Nothing started.", ok=False)
-    result = _on_main(lambda: tools.execute(name, arguments), is_cancelled)
+    def call():
+        from . import shaders
+        with shaders.deferring():  # A look may wait for its shaders in result.then, below.
+            return tools.execute(name, arguments)
+    result = _on_main(call, is_cancelled, name=f"the {name} tool")
     if getattr(result, "pending_job", None):
         from . import inspection
         return inspection.wait_result(result.pending_job, is_cancelled, mainthread.run_on_main)
@@ -303,7 +309,8 @@ def _in_view(step_message: dict) -> bool:
 
 def _ensure_checkpoint_on_main(session: dict) -> None:
     from . import mainthread
-    mainthread.run_on_main(lambda: checkpoints.ensure_for_turn(session)).result()
+    mainthread.run_on_main(mainthread.named("the turn's checkpoint save",
+                                            lambda: checkpoints.ensure_for_turn(session))).result()
 
 
 def _scene_context(text: str, since: dict | None) -> str:
@@ -451,7 +458,8 @@ def _limit_item(ex: llm.LLMError) -> dict:
 
 def _alike_on_main(a, b) -> bool:
     from . import mainthread, tools
-    return mainthread.run_on_main(lambda: tools.images_alike(a, b)).result()
+    return mainthread.run_on_main(mainthread.named("comparing two captures",
+                                                   lambda: tools.images_alike(a, b))).result()
 
 
 SAME_LOOK_NOTE = ("\n\n(Looked again from {angle}: no visible difference from your last capture at this size, so no "

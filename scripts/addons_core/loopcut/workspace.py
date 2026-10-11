@@ -104,9 +104,15 @@ is Blender's Python, with numpy. run_blender does the same and lists the files t
 window: save with bpy. In them // is the workspace; in the live scene it is the .blend's folder.
 - view_image shows you any image: your renders, crops, the references.
 - The user's live Blender: run_python runs bpy code in it, get_scene_info reads it, capture_viewport shows it, and \
-after a step that changed it you get a capture. search_assets and import_asset bring in assets from BlenderKit, \
-Poly Haven, Poly Pizza or the user's own libraries; inspect_api describes its live API and turns on a bundled \
-add-on it names in the live Blender.
+after a step that changed it you get a capture. inspect_api describes its live API and turns on a bundled add-on \
+it names in the live Blender.
+- search_assets and import_asset bring models, materials and HDRIs into the live scene from BlenderKit, Poly Haven, \
+Poly Pizza, the user's own libraries and Loopcut's index. Results come as a thumbnail sheet with each asset's \
+description, size and polycount; an import reports the size it measures and any credit owed. For props, set \
+dressing, materials and skies that are not their own work, the user prefers a fitting library asset to one built \
+from primitives, and a build when nothing fits or when they ask. What they made or are modelling stays theirs. \
+They want assets at real-world size that match the scene's look (a mix that reads well is fine), and to be told \
+which library each came from, with any credit passed on.
 - apply_build brings a result .blend into the live scene in one undo step: what the build created comes in, what \
 you name in owns replaces its live version, and anything else the build changed is reported, not applied. A scene \
 the build made comes in as a scene of its own. Applying after a rebuild replaces what the last apply brought. What \

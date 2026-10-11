@@ -277,7 +277,11 @@ def stream_chat(
     The ChatGPT plan provider (base URL chatgpt_auth.CHATGPT_PLAN_BASE_URL) is not chat completions:
     chatgpt_responses.stream speaks the Responses API with the signed-in account's token instead,
     and returns the same Completion. It reads correlation headers locally and never sends them
-    over the wire. api_key and max_tokens do not apply there."""
+    over the wire. api_key and max_tokens do not apply there.
+
+    The Anthropic provider (base URL config.ANTHROPIC_BASE_URL, anthropic://...) is not chat completions either:
+    anthropic_messages.stream speaks Anthropic's Messages API with the user's key and prompt caching, and returns
+    the same Completion. It never sends the x-loopcut-* headers."""
     if prompt_id is not None and prompt_id not in ("single", "orchestrator", "worker", "router"):
         raise ValueError(f"Unknown Loopcut prompt_id: {prompt_id!r}")
     if base_url.startswith("chatgpt-plan"):
@@ -285,6 +289,12 @@ def stream_chat(
         return chatgpt_responses.stream(
             model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort, on_text=on_text,
             is_cancelled=is_cancelled, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry)
+    if base_url.startswith("anthropic://"):
+        from . import anthropic_messages
+        return anthropic_messages.stream(
+            base_url=base_url, api_key=api_key, model=model, messages=messages, tools=tools,
+            reasoning_effort=reasoning_effort, on_text=on_text, is_cancelled=is_cancelled, timeout=timeout,
+            max_tokens=max_tokens, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry)
     body = {
         "model": model,
         "messages": messages,

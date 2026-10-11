@@ -639,6 +639,24 @@ def _reports(job):
     return reports
 
 
+def _remember_assets(job):
+    """The raw asset_search tool's report: register its rows' import ids the way search_assets does, or
+    import_asset refuses an ambientCG or Physically Based id from it as unknown (Poly Haven's importer
+    looks its ids up itself, so only those worked; platform audit of 0.2.1, 2026-10-10)."""
+    from . import asset_report, indexed_assets
+    for output in job["outputs"]:
+        if output["type"] != "report" or output.get("mime") != "application/json":
+            continue
+        try:
+            with Path(output["path"]).open("rb") as handle:
+                raw = handle.read(asset_report.MAX_BYTES + 1)
+            report = json.loads(raw) if len(raw) <= asset_report.MAX_BYTES else None
+        except (OSError, ValueError, RecursionError):
+            continue
+        for row in asset_report.importable_rows(report):
+            indexed_assets.remember(row)
+
+
 def _add_images(job):
     import bpy
     from . import attachments, conversations, state
@@ -825,6 +843,8 @@ def apply_result(descriptor: dict, job: dict) -> str:
     try:
         names = handlers[handler](job)
         reports = _reports(job) if handler != "none" else []
+        if descriptor.get("name") == "asset_search" and handler == "attach_report":
+            _remember_assets(job)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as ex:
         if isinstance(ex, cloud_http.CloudError):
             raise

@@ -678,7 +678,9 @@ def panel_seen():
                 _runtime.message = str(ex)
             return
     runtime = _runtime
-    if time.monotonic() - runtime.refreshed_at >= REFRESH_SECONDS:
+    # 0 is "stale, refresh now". The monotonic clock starts at boot, so on a machine up for less
+    # than REFRESH_SECONDS the subtraction alone would wait (as on a fresh Linux CI runner).
+    if not runtime.refreshed_at or time.monotonic() - runtime.refreshed_at >= REFRESH_SECONDS:
         runtime.refreshed_at = time.monotonic()  # Throttle offline retries and repeated draws.
         runtime.refresh_async()
 

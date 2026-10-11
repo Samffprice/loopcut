@@ -46,7 +46,7 @@ class CodexAppTest(unittest.TestCase):
                                                 "OPENAI_API_KEY": "sk-should-not-pass", "FAKE_CODEX_SCENARIO": "tool"})
         self.env.start()
         self.patches = [mock.patch.object(agent, name, value) for name, value in (
-            ("_redraw", lambda: None), ("_on_main", lambda fn, is_cancelled=None: fn()),
+            ("_redraw", lambda: None), ("_on_main", lambda fn, is_cancelled=None, name="": fn()),
             ("_workspace_turn", lambda session, turn: None), ("_keeps_context", lambda cfg: False),
             ("_tool_schemas", lambda: tools.SCHEMAS + [{"type": "function", "function": {
                 "name": n, "description": f"{n} tool", "parameters": {"type": "object", "properties": {}}}}

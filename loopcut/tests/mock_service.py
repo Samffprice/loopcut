@@ -1,20 +1,17 @@
 """Canonical contract handlers through in-memory HTTP, including incremental SSE."""
 
-import os
 import importlib.util
 import io
 import json
 import argparse
 import queue
 import threading
-import unittest
-from pathlib import Path
 from email.message import Message
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
-DEFAULT_CONTRACT = Path('/Volumes/BackupFiles/MasterCoding/BlenderCursor/loopcut-web-platform/contract')
+import platform_contract
 
 
 class MockTransport:
@@ -24,10 +21,8 @@ class MockTransport:
     boundary. State is the real mock state, including settings, credits and quote expiry.
     """
     def __init__(self, **options):
-        contract = Path(os.environ.get('LOOPCUT_CONTRACT_DIR', DEFAULT_CONTRACT))
-        source = contract / 'mock' / 'server.py'
-        if not source.is_file():
-            raise unittest.SkipTest('Loopcut contract mock is not installed; set LOOPCUT_CONTRACT_DIR')
+        source = platform_contract.require('mock', 'server.py')  # Skips the test without it.
+        contract = source.parents[1]
         spec = importlib.util.spec_from_file_location('loopcut_contract_mock', source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

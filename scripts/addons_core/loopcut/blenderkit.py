@@ -67,13 +67,44 @@ def search_url(query: str, kind: str, limit: int, free_only: bool) -> str:
     return f"{API}/search/?{urllib.parse.urlencode({'query': ' '.join(terms), 'page_size': limit})}"
 
 
+def parameter(asset: dict, key: str):
+    """One of an asset's parameters. The search API puts sizes, face counts and style in
+    `dictParameters`, the detail endpoint in a `parameters` list of {parameterType, value}; older
+    responses had some at the top level (live API, 2026-10-10: top-level dimensionX is null)."""
+    value = asset.get(key)
+    if value is None and isinstance(asset.get("dictParameters"), dict):
+        value = asset["dictParameters"].get(key)
+    if value is None and isinstance(asset.get("parameters"), list):
+        value = next((p.get("value") for p in asset["parameters"]
+                      if isinstance(p, dict) and p.get("parameterType") == key), None)
+    return value
+
+
+def dimensions(asset: dict) -> list | None:
+    """The size BlenderKit states for a model, [x, y, z] in meters, or None."""
+    dims = [parameter(asset, k) for k in ("dimensionX", "dimensionY", "dimensionZ")]
+    try:
+        dims = [float(d) for d in dims]
+    except (TypeError, ValueError):
+        return None
+    return dims if all(0 < d < 1e6 for d in dims) else None
+
+
 def describe_asset(index: int, asset: dict) -> str:
     parts = [f"{index}. {asset.get('id')}: {asset.get('name', '')}"]
-    dims = [asset.get(k) for k in ("dimensionX", "dimensionY", "dimensionZ")]
-    if all(isinstance(d, (int, float)) and d > 0 for d in dims):
-        parts.append("%.2fx%.2fx%.2f m" % tuple(dims))
-    if asset.get("faceCount"):
-        parts.append(f"{asset['faceCount']} faces")
+    size = asset_common.size_text(dimensions(asset))
+    if size:
+        parts.append(size)
+    faces = parameter(asset, "faceCount")
+    if isinstance(faces, int) and not isinstance(faces, bool) and faces > 0:
+        parts.append(f"{faces} faces")
+    style = asset_common.clean(parameter(asset, "modelStyle"), 30)
+    if style:
+        parts.append(f"{style} style")
+    about = asset_common.clean(asset.get("description"), 90) or ", ".join(
+        t for t in (asset_common.clean(t, 30) for t in (asset.get("tags") or [])[:5]) if t)
+    if about:
+        parts.append(about)
     parts.append("free" if asset.get("isFree") else "Full plan")
     if not asset.get("canDownload", True):
         parts.append("needs a BlenderKit key")
@@ -180,7 +211,7 @@ def search_blenderkit(query: str, type: str, limit: int = DEFAULT_LIMIT) -> Tool
     if not results:
         raise ToolError(f"No BlenderKit {type}s match {query!r}. Try fewer or more general words.")
     lines = [describe_asset(i, asset) for i, asset in enumerate(results, 1)]
-    image = sheet([_thumbnail(asset) for asset in results], "blenderkit_sheet.png")
+    image = sheet([_thumbnail(asset) for asset in results], "blenderkit_sheet.png", fit=True)
     scope = "free assets" if not headers else "free and plan assets"
     text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {query!r} ({scope}), "
             f"numbered as on the sheet (left to right, top to bottom):\n" + "\n".join(lines))
@@ -248,7 +279,7 @@ def fetch_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply_
     return {"id": str(asset_id), "kind": kind, "path": str(path), "file_type": file_type,
             "name": str(asset.get("name") or asset_id),
             "asset": {"id": asset.get("id"), "assetBaseId": asset.get("assetBaseId"), "name": asset.get("name"),
-                      "license": asset.get("license"), "author": author}}
+                      "license": asset.get("license"), "author": author, "dimensions": dimensions(asset)}}
 
 
 def load_blenderkit(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
@@ -300,5 +331,7 @@ def load_blenderkit(fetched: dict, apply_to: list[str] | None = None) -> ToolRes
         raise ToolError(f"{name!r} downloaded but nothing arrived in the scene")
     _tag([*imported, *data_to.collections], asset)
     rows = [object_summary(obj) for obj in imported]
+    size = asset_common.measured(imported, asset.get("dimensions"))
     return ToolResult(_clip(f"Imported {name!r} ({file_type}) as {len(imported)} object(s) at the origin, in meters. "
-                            f"Place it now. {credit_line(asset)}\n" + json.dumps(rows, separators=(",", ":"), default=str)))
+                            f"{size + ' ' if size else ''}Place it now. {credit_line(asset)}\n"
+                            + json.dumps(rows, separators=(",", ":"), default=str)))

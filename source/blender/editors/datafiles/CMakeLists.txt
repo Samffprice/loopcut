@@ -544,6 +544,7 @@ if(WITH_BLENDER)
       longdisplay
       loop_back
       loop_forwards
+      loopcut
       marker
       marker_hlt
       matcloth

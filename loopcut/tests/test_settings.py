@@ -96,6 +96,7 @@ class SettingsTest(unittest.TestCase):
         cls.modules = patch.dict(sys.modules, {"bpy": fake, "bpy.utils": fake.utils,
                                                "bpy.utils.previews": fake.utils.previews})
         cls.modules.start()
+        cls.addClassCleanup(cls.modules.stop)  # Runs even when the imports below fail.
         spec = importlib.util.spec_from_file_location(NAME, PACKAGE / "__init__.py",
                                                      submodule_search_locations=[str(PACKAGE)])
         package = importlib.util.module_from_spec(spec)
@@ -104,13 +105,6 @@ class SettingsTest(unittest.TestCase):
         for name in ("settings", "cloud", "cloud_account"):
             setattr(cls, name, importlib.import_module(NAME + "." + name))
         cls.settings.register()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in list(sys.modules):
-            if name == NAME or name.startswith(NAME + "."):
-                del sys.modules[name]
-        cls.modules.stop()
 
     def setUp(self):
         self.prefs = self.settings.LoopcutPreferences()
@@ -211,7 +205,7 @@ class SettingsTest(unittest.TestCase):
         self.assertIn(call(self.prefs, "private_mode"), layout.prop.call_args_list)
 
     def test_workers_checkbox_is_disabled_with_note_for_each_byok_provider(self):
-        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM"):
+        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "ANTHROPIC"):
             for stored in (True, False):
                 with self.subTest(provider=provider, stored=stored):
                     calls = self.draw_preferences(provider, stored)
@@ -236,6 +230,37 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse([entry for entry in calls if entry[:2] == ("prop", "orchestrate")])
         self.assertFalse([entry for entry in calls if entry[:2] == ("label", "Workers and routing run on Loopcut plans")])
         self.assertIs(self.prefs.orchestrate, True)
+
+    def test_anthropic_is_the_last_provider_with_opus_by_default_and_a_class_a_note(self):
+        self.assertEqual([p[0] for p in self.settings.PROVIDERS],
+                         ["LOOPCUT", "META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "CHATGPT", "ANTHROPIC"],
+                         "appended, so the stored enum values of the others stay what they were")
+        _, label, base_url, model, note = self.settings.PROVIDERS[-1]
+        self.assertEqual((label, base_url, model), ("Anthropic (Claude)", "anthropic://api.anthropic.com/v1", "claude-opus-5-5"))
+        self.assertIn("Private (A)", note)
+        self.assertIn("30 days", note)
+
+    def test_anthropic_draws_the_key_with_a_console_link_and_lists_its_models(self):
+        calls = self.draw_preferences("ANTHROPIC", True)
+        drawn = [entry[:2] for entry in calls]
+        self.assertIn(("prop", "api_key"), drawn)
+        self.assertIn(("operator", "loopcut.anthropic_get_key"), drawn)
+        self.assertIn(("operator", "loopcut.fetch_models"), drawn)
+        self.assertEqual(self.settings.listed_models("ANTHROPIC"),
+                         ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"])
+        self.assertEqual(self.settings.listed_models("OPENAI"), [])
+        self.assertNotIn(("operator", "loopcut.anthropic_get_key"), [e[:2] for e in self.draw_preferences("OPENAI", True)])
+
+    def test_an_anthropic_key_reaches_config_under_its_own_base_url(self):
+        self.prefs.provider, self.prefs.base_url, self.prefs.model = "ANTHROPIC", "anthropic://api.anthropic.com/v1", "claude-opus-5-5"
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value="k-1") as lookup:
+            found = self.settings.values()
+        lookup.assert_called_with("anthropic://api.anthropic.com/v1")
+        self.assertEqual((found["LOOPCUT_BASE_URL"], found["LOOPCUT_MODEL"], found["LOOPCUT_API_KEY"]),
+                         ("anthropic://api.anthropic.com/v1", "claude-opus-5-5", "k-1"))
+        with patch.object(self.settings, "preferences", return_value=self.prefs):
+            self.assertEqual([option[0] for option in self.settings.model_options()][:2], ["claude-opus-5-5", "claude-sonnet-5-5"])
 
     def draw_preferences(self, provider, stored):
         self.prefs.provider = provider

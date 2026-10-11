@@ -125,7 +125,7 @@ def search_polypizza(query: str, category: str = "", licence: str = "", animated
     if not results:
         raise ToolError(f"No Poly Pizza models match {query!r}. Try fewer or more general words.")
     lines = [describe_model(i, model) for i, model in enumerate(results, 1)]
-    image = sheet([_thumbnail(model) for model in results], "polypizza_sheet.png")
+    image = sheet([_thumbnail(model) for model in results], "polypizza_sheet.png", fit=True)
     text = (f"{len(results)} of {data.get('total', len(results))} Poly Pizza models for {query!r}, numbered as on "
             f"the sheet (left to right, top to bottom):\n" + "\n".join(lines))
     if image:
@@ -200,6 +200,7 @@ def load_polypizza(fetched: dict, target_size: float = 0.0) -> ToolResult:
         root["polypizza_attribution"] = attribution
     bpy.context.view_layer.update()
     rows = [object_summary(obj) for obj in roots]
+    size = asset_common.measured(imported)
     return ToolResult(_clip(f"Imported {model.get('Title', model_id)!r} ({model_id}) as {len(imported)} object(s) "
-                            f"at the origin.{scaled} {credit_line(model)}\n"
+                            f"at the origin.{scaled}{' ' + size if size else ''} {credit_line(model)}\n"
                             + json.dumps(rows, separators=(",", ":"), default=str)))

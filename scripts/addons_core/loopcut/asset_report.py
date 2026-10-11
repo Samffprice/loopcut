@@ -161,3 +161,25 @@ def validate_report(report, inputs):
         except (KeyError, TypeError, ValueError):
             notes.append("Dropped invalid index source metadata.")
     return rows, sources, list(dict.fromkeys(notes))
+
+
+def importable_rows(report):
+    """The rows of a report that did not come through search_assets: the raw managed tool
+    (loopcut_cloud__asset_search) attaches it as text, and the model imports its ids. Each row is
+    checked as validate_report checks it, against the report's own resolved filters, since there is
+    no search_assets request to compare with; a bad envelope gives none."""
+    try:
+        require(isinstance(report, dict) and report["schema"] == SCHEMA)
+        filters = report["filters"]
+        require(isinstance(filters, dict))
+        requested_kinds(filters["kind"])
+        require(isinstance(report["results"], list))
+    except (KeyError, TypeError, ValueError):
+        return []
+    rows = []
+    for row in report["results"][:50]:
+        try:
+            rows.append(validate_row(row, filters))
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            pass
+    return rows

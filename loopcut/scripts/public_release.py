@@ -14,8 +14,11 @@ This snapshots the source commit, not uncommitted working-tree changes.
 The eval harness stays private: private_path blocks any harness/evals path
 segment pair in the snapshot. private_import uses ASTs to block public Python
 tests under loopcut/tests/ that add evals directories to sys.path or load modules
-under harness/evals through importlib. Neither category nor withheld-prompt can
-be allowlisted. Comments and docstrings do not count as imports.
+under harness/evals through importlib. local_path blocks public tests that name
+an absolute path only this machine has (the private disk, a private repository
+checkout, macOS /private/tmp); CI clones on Linux and has none of them. None of
+these categories nor withheld-prompt can be allowlisted. Comments and docstrings
+do not count as imports.
 When present, prompts/manifest.json declares open prompt files using validated
 relative paths. These files are not fingerprint sources. Any private-text
 fingerprint found anywhere in an open file's whitespace-normalized text is
@@ -55,6 +58,12 @@ PRIVATE_HOME = Path("/Volumes/BackupFiles/MasterCoding/BlenderCursor")
 PRIVATE_WEB = PRIVATE_HOME / "loopcut-web"
 LEAK_CHECK_PATHS = (PRIVATE_HOME / "loopcut-web-platform/scripts/leak-check.sh",
                     PRIVATE_WEB / "scripts/leak-check.sh")
+PRIVATE_REPOS = ("loopcut-web", "loopcut-web-platform", "loopcut-web-client-shared", "mixar-research")
+# Absolute paths a public test cannot depend on: the private disk, any private repository
+# checkout and macOS's /private folders. URLs and relative names do not match.
+LOCAL_PATH_REGEX = re.compile(r"(?<![\w.:/-])(?:" + re.escape(PRIVATE_HOME.parents[1].as_posix()) +
+                              r"|/private/(?:tmp|var)|(?:/[\w.-]+)*/(?:" +
+                              "|".join(map(re.escape, PRIVATE_REPOS)) + r"))(?![\w.-])")
 ADDON_PATH = "scripts/addons_core/loopcut"
 DRY_RUN_REF = "refs/loopcut-release/dry-run"
 BYTECODE_PATTERNS = ("__pycache__", "*.pyc", "*.pyo")
@@ -100,13 +109,15 @@ POLICY = ("Fingerprints: first line and every fifth physical line, whitespace no
           "obvious placeholder words are skipped. PEM headers and service-role JWTs "
           "are structural checks. .env.example is exempt only from the filename rule; "
           "populated secrets are still checked. Hashes use SHA-256 of normalized text. "
-          "Withheld constants, private_path and private_import cannot be allowlisted. "
+          "Withheld constants, private_path, private_import and local_path cannot be allowlisted. "
           "private_path checks every snapshot path for the segment pair harness/evals. "
           "private_import checks every Python file under loopcut/tests/ with ASTs for "
           "sys.path insert/append/assignment referring to an evals directory and importlib "
           "loads under harness/evals; comments and docstrings are ignored. Literal path "
           "segments, assigned paths and import aliases are followed without executing code; "
-          "runtime-generated paths are not resolved. Binary blobs are searched for text "
+          "runtime-generated paths are not resolved. local_path checks every line of every Python "
+          "file under loopcut/tests/ for an absolute path on the private disk, into a private "
+          "repository checkout or under /private/tmp or /private/var. Binary blobs are searched for text "
           "too; this is not a detector for encoded, encrypted or paraphrased leaks.")
 
 # Context is required for providers that issue otherwise indistinguishable keys.
@@ -477,7 +488,8 @@ class Scanner:
         self.submodules = []
         self.coverage = {category: {"files": set(), "lines": 0} for category in (
             "secret-file", "cost-review", "private-text", "mixar-text", "cost-fingerprint",
-            "withheld-prompt", "private_path", "private_import", "bytecode", *("secret:" + name for name in SECRET_PATTERNS))}
+            "withheld-prompt", "private_path", "private_import", "local_path", "bytecode",
+            *("secret:" + name for name in SECRET_PATTERNS))}
 
     def counted(self, categories, name, scope, lines=0, commit="", side=""):
         for category in categories:
@@ -501,7 +513,8 @@ class Scanner:
     def hit(self, scope, file, line, category, detail, matched, original,
             source="", source_line=0, commit="", side=""):
         fingerprint_hash, line_hash = digest(matched), digest(original)
-        reason = "" if category in ("withheld-prompt", "private_path", "private_import", "bytecode") else (
+        reason = "" if category in ("withheld-prompt", "private_path", "private_import", "local_path",
+                                    "bytecode") else (
             self.allowlist.get(fingerprint_hash) or self.allowlist.get(line_hash, ""))
         self.hits.append(Hit(scope, redact(file), line, category, detail, fingerprint_hash, line_hash,
                              redact(source), source_line, commit, side, bool(reason), redact(reason)))
@@ -540,6 +553,14 @@ class Scanner:
         for node in visitor.nodes:
             self.hit(scope, name, node.lineno, "private_import", "public test imports from the private eval harness",
                      ast.get_source_segment(text, node), lines[node.lineno - 1])
+
+    def local_path(self, text, name, scope):
+        lines = text.splitlines()
+        self.counted(["local_path"], name, scope, len(lines))
+        for number, line in enumerate(lines, 1):
+            for match in LOCAL_PATH_REGEX.finditer(line):
+                self.hit(scope, name, number, "local_path", "public test names a path only this machine has",
+                         match.group(), line)
 
     def text(self, text, name, scope, commit="", side="", first_line=1):
         lines = text.splitlines()
@@ -968,6 +989,7 @@ def scan_tree(repo, base, snapshot, scanner):
                 scanner.withheld(text, name, "tree")
             if public_test:
                 scanner.private_import(text, name, "tree")
+                scanner.local_path(text, name, "tree")
 
     for name, entry in entries.items():
         scanner.check(inspect, name, entry, context=name)
@@ -1514,7 +1536,7 @@ def write_report(out, report, scanner):
             if len(run["passes"]) < 2:
                 lines.append("Pass 2 not run (no explained owners to suppress or pass 1 did not exit 1).")
     lines.extend(["", "## Private harness blockers", ""])
-    for category in ("private_path", "private_import"):
+    for category in ("private_path", "private_import", "local_path"):
         hits = [hit for hit in scanner.hits if hit.category == category]
         examples = ", ".join(json.dumps(name) for name in sorted({hit.file for hit in hits})[:5])
         lines.append(f"- {category}: {len(hits)} blocking hits" + (f"; first paths: {examples}." if hits else ".")

@@ -119,7 +119,10 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(assets.describe("import_asset", {"source": "polyhaven", "id": "oak_01"})[0],
                          "Import Poly Haven asset oak_01 (1k)")
         self.assertIsNone(polyhaven.describe("run_python", {}))
-        self.assertIn("polyhaven is Poly Haven", agent.SYSTEM_PROMPT)
+        # Each source's description lives in the schema the model gets with the tool (C34 moved it out of the
+        # system prompt, which now says when to use libraries at all).
+        self.assertIn("polyhaven: CC0 scanned models, PBR textures and HDRI skies", assets.SCHEMAS[0]["function"]["description"])
+        self.assertIn("search_assets", agent.SYSTEM_PROMPT)
 
     def test_thumbnail_url_asks_the_cdn_for_the_sheet_size(self):
         record = {"thumbnail_url": "https://cdn.polyhaven.com/asset_img/thumbs/ArmChair_01.png?width=256&height=256&v=abbc4732"}

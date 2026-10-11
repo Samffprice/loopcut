@@ -116,7 +116,7 @@ const EnumPropertyItem rna_enum_space_type_items[] = {
     {SPACE_CLIP, "CLIP_EDITOR", ICON_TRACKER, "Movie Clip Editor", "Motion tracking tools"},
     {SPACE_LOOPCUT,
      "LOOPCUT",
-     ICON_SCRIPTPLUGINS,
+     ICON_LOOPCUT,
      "Loopcut",
      "Chat with the AI agent that works in this scene"},
 

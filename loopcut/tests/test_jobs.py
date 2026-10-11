@@ -67,8 +67,10 @@ class JobTests(unittest.TestCase):
         record = {**spec(), "output": str(output), "created": 100.0, "output_identity": jobs.identity(output)}
         jobs.check_output(self.path, record)
         self.assertEqual(list(output.iterdir()), [], "nothing of the job's in the folder")
-        output.rmdir()
-        output.mkdir()  # The same name, another folder: its files are not the job's to replace.
+        # The same name, another folder: its files are not the job's to replace. The old folder is
+        # moved aside, not removed, so Linux cannot hand its inode number to the new one.
+        output.rename(output.with_name("turntable-old"))
+        output.mkdir()
         with self.assertRaisesRegex(jobs.JobError, "no longer belongs"):
             jobs.check_output(self.path, record)
         record["output_identity"] = jobs.identity(output)

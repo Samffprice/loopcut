@@ -42,7 +42,7 @@
 - **It looks at its work.** The agent captures the viewport to check itself, and can put a reference photo you dropped on the panel next to a capture to compare and adjust.
 - **One click back.** Every turn that changes the scene is a checkpoint. *Undo all* restores the scene and the conversation to before it. Your .blend is never written to; a restore lands in place, with the file still yours.
 - **It knows the scene.** File, mode, selection and objects ride with every message, so "make this shinier" works. Type `@Name` to point at an object, material or collection. Installed add-ons are in its view, and it can use them.
-- **Your model or ours.** Bring a key from any OpenAI-compatible provider, run a model on your own GPU, or sign in for hosted models with nothing to set up.
+- **Your model or ours.** Bring a key from Anthropic or any OpenAI-compatible provider, run a model on your own GPU, or sign in for hosted models with nothing to set up.
 - **It's Blender.** Loopcut is Blender 5.2 with a panel and about forty changed files. Import your settings, add-ons, keymap and themes on first launch and carry on. It updates itself.
 
 ## Install
@@ -67,7 +67,7 @@ Later updates install from inside the app ("Restart to update") and never trigge
 
 | | |
 |---|---|
-| **Bring your own key** | Paste a key from any OpenAI-compatible provider. It stays on your machine, in a user-only file, and requests go straight to them. No account needed. |
+| **Bring your own key** | Paste a key from Anthropic (Claude, with prompt caching) or any OpenAI-compatible provider. It stays on your machine, in a user-only file, and requests go straight to them. No account needed. |
 | **Run it locally** | Point Loopcut at a model on your own GPU (Ollama, LM Studio, llama.cpp, vLLM…). Works offline; nothing leaves the building. |
 | **Hosted by Loopcut** | Sign in from the app and start. *Fast* and *Pro* modes on models picked for Blender work. Free tier included; see [pricing](https://loopcut.org/pricing). |
 

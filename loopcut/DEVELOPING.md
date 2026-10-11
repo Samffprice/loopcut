@@ -32,6 +32,21 @@ permissions, never in `userpref.blend` or a .blend.
 Developers: copy `loopcut/.env.example` to `.env` next to the checkout and fill it in. Quote values containing `|`. Never commit
 `.env`. Lookup order per setting: environment, preferences, `.env`.
 
+Model providers (`settings.PROVIDERS`): Loopcut's own models through the gateway; the ChatGPT plan
+(`chatgpt_responses.py`, the Responses API); own keys for OpenAI-compatible chat completions (OpenAI,
+OpenRouter, Meta, Ollama, Custom; `llm.py`); and Anthropic (`anthropic_messages.py`, the Messages API). Two
+providers are pseudo base URLs that `llm.stream_chat` hands to their own adapter: `chatgpt-plan://…` and
+`anthropic://api.anthropic.com/v1` (sent as https). The Anthropic adapter puts `cache_control` on the system
+prompt, the end of the request and the end of the previous request (3 of 4 breakpoints, 5-minute TTL); turns
+Loopcut's reasoning effort into adaptive thinking with `output_config.effort` (Opus 5.5 by default;
+`LOOPCUT_ANTHROPIC_THINKING=off` turns thinking off where the model allows); replays thinking blocks with
+their signatures, asking the API to drop the ones a folded history invalidated (`drop_block`); and shows the
+notes Opus/Sonnet 5.5 write between tool calls (`display: "updates"`). Usage carries `cache_write`, which
+`pricing.py` prices at the cache-write rate. Keep mode (`LOOPCUT_KEEP_CONTEXT`, see Context) is on by default
+for Anthropic. On own keys, Anthropic included, a turn runs the open single loop: workers and the router need
+the gateway's prompts. Details and test list:
+`loopcut/track/ANTHROPIC-PROVIDER.md`.
+
 Model-written code asks before it runs ("Always allow" on the card stops asking for that
 conversation; the preference or `LOOPCUT_AUTO_RUN=true` turns asking off). Renders and bakes
 ask even then; "Always allow renders" on a render's card stops that for the conversation, though
@@ -368,6 +383,7 @@ earlier, UI buttons, timers); geometry built directly with bmesh or `from_pydata
 | `loopcut/scripts/dev.sh` | save → redraw <1s | Blender stays open with the panel; saving any file under `scripts/addons_core/loopcut/` hot-reloads it and keeps the conversation. |
 | `loopcut/scripts/shot.sh <fixture>` | ~10s | Renders `loopcut/harness/fixtures/<fixture>.json` to `../out/`: window PNG, panel-only PNG, and the frame's display list as JSON. No network. |
 | `python3 -m unittest discover -s loopcut/tests` | <1s | Agent loop and layout. |
+| `python3 loopcut/harness/anthropic_check.py [--compat]` | ~20s, a few cents | The Anthropic provider against the real API: a tool call, its result sent back with thinking and read from the cache, the same history without thinking; `--compat` adds Anthropic's OpenAI-compatible endpoint through the Custom path. Key from `ANTHROPIC_API_KEY` or `--env-file`/`--key-name`; never printed. |
 | `Blender --factory-startup --python loopcut/harness/tools_check.py` | ~8s | The real tools against a real scene. |
 | `Blender -b --factory-startup --python loopcut/harness/polyhaven_check.py` | ~30s | Poly Haven search and import against the live API (network; headless is fine). |
 | `Blender -b --factory-startup --python loopcut/harness/asset_libraries_check.py` | ~20s | search_assets / import_asset (source `library`) on a kit made on the spot, then Online Essentials (network; downloads into Blender's own remote-assets cache). |

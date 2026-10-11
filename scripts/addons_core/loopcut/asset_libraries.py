@@ -129,12 +129,14 @@ def index_metadata(index: dict) -> dict[tuple[str, str], dict]:
     return found
 
 
-def describe_entry(index: int, entry: Entry) -> str:
+def describe_entry(index: int, entry: Entry, kit: str = "") -> str:
     parts = [f"{index}. {entry.ref}"]
     if entry.description:
-        parts.append(entry.description[:80])
+        parts.append(asset_common.clean(entry.description, 80))
     if entry.tags:
         parts.append(", ".join(entry.tags[:5]))
+    if kit:
+        parts.append(kit)
     if entry.license:
         parts.append(entry.license)
     return "; ".join(parts)
@@ -296,8 +298,9 @@ def search_assets(query: str, type: str = "", limit: int = DEFAULT_LIMIT) -> Too
     if not found:
         where = ", ".join(f"{lib.name} ({'remote' if lib.remote else 'on disk'})" for lib in registered)
         raise ToolError(f"No asset matches {query!r} in {where}." + (" " + " ".join(notes) if notes else ""))
-    lines = [describe_entry(i, entry) for i, entry in enumerate(found, 1)]
-    image = sheet([_thumbnail(entry) for entry in found], "assets_sheet.png")
+    kits = asset_common.kit_notes([(entry.library, entry.file) if not entry.files else None for entry in found])
+    lines = [describe_entry(i, entry, kits.get(i - 1, "")) for i, entry in enumerate(found, 1)]
+    image = sheet([_thumbnail(entry) for entry in found], "assets_sheet.png", fit=True)
     text = (f"{len(found)} asset(s) for {query!r}, numbered as on the sheet (left to right, top to bottom); "
             f"pass the ref as import_asset's id:\n" + "\n".join(lines))
     if image:
@@ -444,6 +447,8 @@ def load_asset(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
     if not link:
         _pack_images({slot.material for obj in imported for slot in getattr(obj, "material_slots", [])})
     rows = [object_summary(obj) for obj in imported]
+    size = asset_common.measured(imported, fetched.get("dimensions_m"))
     return ToolResult(_clip(f"Imported {id_type.lower()} {block.name!r} from {library_name}: "
-                            f"{len(imported)} object(s) at the origin. Place and scale it now. {credit}.\n"
+                            f"{len(imported)} object(s) at the origin.{' ' + size if size else ''} "
+                            f"Place and scale it now. {credit}.\n"
                             + json.dumps(rows, separators=(",", ":"), default=str)))

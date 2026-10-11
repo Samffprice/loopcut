@@ -1,12 +1,11 @@
 """Check real client payloads against the sibling platform's schemas when available.
 
 The validator stays owned by the platform; no schema copy or dependency enters the add-on.
-LOOPCUT_CONTRACT_DIR lets CI provide the contract at a different location. HTTP is mocked.
+platform_contract finds it (LOOPCUT_CONTRACT_DIR or a sibling checkout). HTTP is mocked.
 """
 
 import importlib.util
 import json
-import os
 import sys
 import tempfile
 import types
@@ -20,15 +19,13 @@ sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 
 from loopcut import blobs, bundles, cloud_http  # noqa: E402
 from fake_blobs import FakeBlobs, Reply  # noqa: E402
+import platform_contract  # noqa: E402
 
 
 class BundleContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        contract = Path(os.environ.get("LOOPCUT_CONTRACT_DIR",
-            "/Volumes/BackupFiles/MasterCoding/BlenderCursor/loopcut-web-platform/contract"))
-        if not contract.is_dir():
-            raise unittest.SkipTest("Loopcut platform contract directory is not present")
+        contract = platform_contract.require()  # Skips the class without the private contract.
         spec = importlib.util.spec_from_file_location("loopcut_contract_validate", contract / "conformance/validate.py")
         cls.validator = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.validator)

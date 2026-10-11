@@ -15,8 +15,7 @@ from unittest import mock
 HARNESS = Path(__file__).resolve().parents[1] / 'harness'
 sys.path.insert(0, str(HARNESS))
 import prompt_assembly as pa
-
-CONTRACT = Path('/Volumes/BackupFiles/MasterCoding/BlenderCursor/loopcut-web-platform/contract')
+import platform_contract
 
 
 def skill_text(skill_id='craft/core', body='seed seed', **fields):
@@ -301,19 +300,20 @@ class LoadTest(unittest.TestCase):
 
 class ContractParityTest(unittest.TestCase):
     def test_all_published_fixtures(self):
-        directories = [CONTRACT / 'fixtures' / name for name in ('prompt-assembly', 'prompt-assembly-case')]
+        contract = platform_contract.require()
+        directories = [contract / 'fixtures' / name for name in ('prompt-assembly', 'prompt-assembly-case')]
         if not any(path.is_dir() for path in directories):
             self.skipTest('Contract 006 prompt-assembly fixtures are not published yet')
         paths = sorted(path for directory in directories for path in directory.rglob('*.json'))
         self.assertTrue(paths, 'Published prompt-assembly directory must contain fixtures')
         # The mock uses base + orchestrator parts without a manifest, unlike the
         # harness's full-text fallback. Mirror mock.read_prompts, not its assembler.
-        texts = {name: (CONTRACT / 'mock/prompts' / f'{name}.md').read_bytes().decode('utf-8').removesuffix('\n')
+        texts = {name: (contract / 'mock/prompts' / f'{name}.md').read_bytes().decode('utf-8').removesuffix('\n')
                  for name in ('base', 'orchestrator', 'worker', 'router')}
         prompts = {'single': texts['base'], 'orchestrator': texts['base'] + '\n\n' + texts['orchestrator'],
                    'worker': texts['worker'], 'router': texts['router']}
         skills = [pa.skill_loader().parse_skill(path.read_bytes().decode('utf-8'), str(path))
-                  for path in (CONTRACT / 'mock/skills').rglob('*.md') if path.name != 'README.md']
+                  for path in (contract / 'mock/skills').rglob('*.md') if path.name != 'README.md']
         src = pa.Source(prompts, {s.id: s for s in skills})
         for path in paths:
             with self.subTest(fixture=path.name):

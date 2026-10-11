@@ -151,7 +151,7 @@ def _draw_connect(layout, context) -> None:
             column.prop(prefs, "base_url")
         local = prefs.base_url.startswith("http://127.0.0.1")
         if not local:
-            column.prop(prefs, "api_key")
+            settings.draw_key(column, prefs)
         row = column.row(align=True)
         row.prop(prefs, "model")
         row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")

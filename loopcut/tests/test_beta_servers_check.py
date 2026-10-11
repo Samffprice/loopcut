@@ -9,7 +9,10 @@ import unittest
 
 HARNESS = Path(__file__).resolve().parents[1] / 'harness'
 sys.path.insert(0, str(HARNESS))
-from beta_servers_check import DEFAULT_MOCK, platform_mock
+from beta_servers_check import platform_mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platform_contract
 
 
 class BetaServersCheckTest(unittest.TestCase):
@@ -24,9 +27,8 @@ class BetaServersCheckTest(unittest.TestCase):
         self.assertIn('PASS pro completed a hosted turn', result.stdout)
 
     def test_existing_server_mode_uses_key_env_and_contract_routes(self):
-        if not DEFAULT_MOCK.is_file():
-            self.skipTest('Platform mock not installed')
-        with tempfile.TemporaryDirectory() as folder, platform_mock(DEFAULT_MOCK, Path(folder)) as url:
+        mock = platform_contract.require('mock', 'server.py')
+        with tempfile.TemporaryDirectory() as folder, platform_mock(mock, Path(folder)) as url:
             result = self.run_check('--base-url', url + '/v1', '--key-env', 'BETA_SMOKE_TEST_KEY',
                                     env={**os.environ, 'BETA_SMOKE_TEST_KEY': 'lc_demo'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
