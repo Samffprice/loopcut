@@ -46,7 +46,7 @@ from . import llm
 PRIVATE_PREFIX = "loopcut_"  # Keys we keep on stored messages. conversations.wire_messages drops them.
 FOLDED = "loopcut_folded"     # On an assistant message with tool calls: the step is sent as its record.
 SUMMARY = "loopcut_summary"   # On a message: a summary of everything before it.
-CAPTURE = "loopcut_capture"   # On a user message that carries a viewport capture; not a turn.
+CAPTURE = "loopcut_capture"   # On a user message carrying a tool image (viewport or file); not a turn.
 CAPTURE_TEXT = "Viewport capture from capture_viewport:"  # Marks captures from before CAPTURE.
 ATTACHED = "loopcut_attached"  # On a user message whose images the user attached.
 STEER = "loopcut_steer"        # On a user message sent while the agent was working; agent._fold_notes.
@@ -70,12 +70,13 @@ RECORD_LOOK = 300     # Characters of what a dropped capture showed.
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 7990     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 8160     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
-                        # 7,982 on 2026-10-10 with the libraries-first rule).
-WORKSPACE_FIXED_TOKENS = 4025  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09,
-                               # 4,012 on 2026-10-10 with the asset libraries note.
+                        # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures).
+WORKSPACE_FIXED_TOKENS = 4060  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09,
+                               # 4,012 on 2026-10-10 with the asset libraries note; 4,044 on 2026-10-15 with
+                               # shell's summary.
 WORKSPACE_BUDGET = 200_000     # The least budget a workspace turn gets (agent._workspace_config), so a long build
                                # is not folded into records at the 40k default. A model with a smaller window needs
                                # LOOPCUT_WORKSPACE off.
@@ -322,6 +323,7 @@ def _call_lines(call: dict, result: dict | None) -> list[str]:
 
 
 CAPTURE_LABEL = "Viewport capture: "  # How a capture message's text starts; the rest says what it shows.
+FILE_PREVIEW_LABEL = "File preview: "
 
 
 def _look_line(message: dict) -> str:
@@ -331,6 +333,8 @@ def _look_line(message: dict) -> str:
     first = text.split("\n", 1)[0]
     if first.startswith(CAPTURE_LABEL):
         return f"- looked: {_clause(first[len(CAPTURE_LABEL):], RECORD_LOOK)}"
+    if first.startswith(FILE_PREVIEW_LABEL):
+        return f"- looked at file: {_clause(first[len(FILE_PREVIEW_LABEL):], RECORD_LOOK)}"
     return "- looked at the viewport"
 
 

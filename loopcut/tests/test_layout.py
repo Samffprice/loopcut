@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
@@ -26,6 +27,86 @@ def ids(display, kind):
 
 def hit(display, id):
     return next(h for h in display["hits"] if h["id"] == id)
+
+
+class InputPointTest(unittest.TestCase):
+    def display(self, text, width=420, scale=1):
+        session = state.new_session()
+        session.update(input=text, cursor=len(text), focused=True)
+        return layout.build(session, width, 600, scale, measure)
+
+    def test_click_tracks_rewrapped_lines_at_two_widths(self):
+        text = "one two three four five six seven eight nine ten"
+        for width, second_start in ((180, 14), (240, 24)):
+            with self.subTest(width=width):
+                display = self.display(text, width)
+                line = prim(display, "input.l1")
+                self.assertTrue(text[second_start:].startswith(line["text"]))
+                x, y = line["x"] + measure("ui", line["size"], "ab"), line["y"] + line["h"] / 2
+                self.assertEqual(layout.input_index(display, x, y, measure), second_start + 2)
+
+    def test_click_uses_glyph_midpoints_and_scaled_font(self):
+        def proportional(font, size, text):
+            self.assertEqual(font, "ui")
+            return sum(0.8 if ch == "W" else 0.2 for ch in text) * size
+
+        session = state.new_session()
+        session.update(input="Wi", cursor=2)
+        display = layout.build(session, 420, 600, 1.5, proportional)
+        line = prim(display, "input.l0")
+        self.assertEqual(line["size"], round(T.FONT_SIZE * 1.5))
+        for dx, expected in ((0.39, 0), (0.41, 1), (0.89, 1), (0.91, 2)):
+            with self.subTest(dx=dx):
+                self.assertEqual(layout.input_index(display, line["x"] + dx * line["size"],
+                                                    line["y"], proportional), expected)
+
+    def test_line_ends_and_points_outside_visible_text_are_clamped(self):
+        display = self.display("one two three four five six seven eight nine ten", 180)
+        first, last = prim(display, "input.l0"), prim(display, "input.l3")
+        self.assertEqual(layout.input_index(display, 1000, first["y"], measure), 13,
+                         "past a wrapped line stops before its hidden trailing space")
+        self.assertEqual(layout.input_index(display, -100, -100, measure), 0)
+        self.assertEqual(layout.input_index(display, last["x"], 1000, measure), 45)
+        self.assertEqual(layout.input_index(display, 1000, 1000, measure), 48)
+        display = self.display("ab  \ncd")
+        self.assertEqual(layout.input_index(display, 1000, prim(display, "input.l0")["y"], measure), 4,
+                         "explicit line endings retain their spaces")
+        self.assertEqual(layout.input_index(self.display(""), 1000, 1000, measure), 0)
+
+    def test_hard_wrap_right_edge_keeps_caret_on_clicked_row(self):
+        text = "abcdefghijklmnopqrstuvwxyz"
+        for width in (180, 240):
+            display = self.display(text, width)
+            first, second = prim(display, "input.l0"), prim(display, "input.l1")
+            edge = first["x"] + measure("ui", first["size"], first["text"])
+            for x in (edge, edge + 100):
+                with self.subTest(width=width, x=x):
+                    index = layout.input_index(display, x, first["y"] + first["h"] / 2, measure)
+                    self.assertEqual(index, len(first["text"]) - 1)
+                    session = state.new_session()
+                    session.update(input=text, cursor=index, focused=True)
+                    caret = prim(layout.build(session, width, 600, 1, measure), "input.caret")
+                    self.assertLessEqual(first["y"], caret["y"])
+                    self.assertLess(caret["y"], first["y"] + first["h"])
+            self.assertEqual(layout.input_index(display, second["x"], second["y"], measure), len(first["text"]))
+            self.assertEqual(layout.input_index(display, 1000, second["y"], measure), len(text))
+
+    def test_scrolled_lines_and_selection_share_drawn_positions(self):
+        text = "\n".join("abc" for _ in range(T.INPUT_MAX_LINES + 3))
+        display = self.display(text)
+        first = prim(display, "input.l0")
+        self.assertEqual(layout.input_index(display, first["x"], -100, measure), 12)
+        session = state.new_session()
+        session.update(input=text, cursor=18, anchor=13, focused=True)
+        display = layout.build(session, 420, 600, 1, measure)
+        selection = prim(display, "input.selection0")
+        self.assertEqual(selection["color"], T.SELECTION)
+        self.assertEqual(layout.input_index(display, selection["x"], selection["y"], measure), 13)
+        self.assertEqual(layout.input_index(display, selection["x"] + selection["w"],
+                                            selection["y"], measure), 15)
+        caret = prim(display, "input.caret")
+        self.assertEqual(layout.input_index(display, caret["x"], caret["y"], measure), 18)
+        self.assertLess(ids(display, "prims").index("input.selection0"), ids(display, "prims").index("input.l0"))
 
 
 class HeaderTest(unittest.TestCase):
@@ -59,6 +140,274 @@ class HeaderTest(unittest.TestCase):
     def test_hovered_button_is_highlighted(self):
         self.assertNotIn("header.settings.bg", ids(build(), "prims"))
         self.assertIn("header.settings.bg", ids(build(hover="header.settings"), "prims"))
+
+
+class JobsTest(unittest.TestCase):
+    def test_live_process_is_visible_without_durable_or_cloud_jobs(self):
+        row = {"id": "process1", "label": "Python script", "elapsed": 125.9,
+               "log": "/workspace/logs/process.log"}
+        display = build(view="jobs", jobs=[], cloud_jobs=[], local_processes=[row])
+        text = " ".join(p["text"] for p in display["prims"] if p["t"] == "text")
+        self.assertIn("Running · Python script", text)
+        self.assertIn("2m 05s", text)
+        self.assertIn("process.log", text)
+        self.assertNotIn("/workspace", text)
+        self.assertNotIn("No background jobs yet", text)
+        log = next(p for p in display["prims"] if p.get("text") == "process.log")
+        self.assertEqual(log["color"], T.TEXT_MUTED)
+
+    def test_empty_jobs_still_show_empty_message(self):
+        display = build(view="jobs", jobs=[], cloud_jobs=[], local_processes=[])
+        text = " ".join(p["text"] for p in display["prims"] if p["t"] == "text")
+        self.assertIn("No background jobs yet", text)
+
+
+class FailureReasonTest(unittest.TestCase):
+    def test_last_exception_skips_warnings_and_trailing_noise(self):
+        output = ("Warning: unavailable device\nValueError: first failure\n"
+                  "Traceback (most recent call last):\n  File \"<string>\", line 1\n"
+                  "AssertionError: invalid result\n<string>:2: UserWarning: cleanup warning\n"
+                  "Time: 00:00.10\nCleanup complete\n\n")
+        self.assertEqual(layout.failure_reason(output), "AssertionError: invalid result")
+
+    def test_error_and_shell_lines_survive_trailing_noise(self):
+        for reason in ("Error: operation failed", "AssertionError", "custom.FailureException: stopped",
+                       "zsh:1: read-only variable: status", "bash: line 1: missing: command not found",
+                       "/bin/sh: missing: not found", "utility: cannot open file"):
+            with self.subTest(reason=reason):
+                self.assertEqual(layout.failure_reason(reason + "\nCleanup complete\n"), reason)
+
+    def test_error_message_can_mention_a_warning(self):
+        reason = "ValueError: warning limit exceeded"
+        self.assertEqual(layout.failure_reason(reason + "\nCleanup complete"), reason)
+
+    def test_unrecognized_output_uses_last_nonempty_line(self):
+        self.assertEqual(layout.failure_reason("Starting\n  Process stopped unexpectedly  \n\n"),
+                         "Process stopped unexpectedly")
+
+    def test_empty_placeholder_and_warning_only_output_use_fallback(self):
+        for output in ("", " \n\t", "(no output)", "\n (no output) \n", "Warning: unavailable device"):
+            with self.subTest(output=output):
+                self.assertEqual(layout.failure_reason(output), "Failed with no error output.")
+
+    def test_fallback_includes_stored_exit_code(self):
+        for code in (1, 2, -9):
+            with self.subTest(code=code):
+                self.assertEqual(layout.failure_reason("(no output)", code),
+                                 f"Failed with no error output (exit {code}).")
+
+    def test_exit_header_is_metadata_not_error_output(self):
+        self.assertEqual(layout.failure_reason("exit 2 in 0.1 s\n(no output)"),
+                         "Failed with no error output (exit 2).")
+        self.assertEqual(layout.failure_reason("exit None in 0.1 s\n(no output)"),
+                         "Failed with no error output.")
+        self.assertEqual(layout.failure_reason("exit 1 in 0.1 s\nError: invalid input"),
+                         "Error: invalid input")
+
+
+class ToolCardLabelTest(unittest.TestCase):
+    def display(self, summary, expanded=False):
+        session = state.new_session()
+        item = state.item_tool("get_scene_info", summary, "")
+        item.update(status="done", expanded=expanded)
+        session["items"].append(item)
+        original = dict(item)
+        display = build(session)
+        self.assertEqual(item, original, "layout must preserve the stored identifier and summary")
+        return display
+
+    def test_duplicate_identifier_is_drawn_once(self):
+        for summary in ("", "get_scene_info"):
+            for expanded in (False, True):
+                with self.subTest(summary=summary, expanded=expanded):
+                    display = self.display(summary, expanded)
+                    labels = [p["text"] for p in display["prims"]
+                              if p["t"] == "text" and p["id"].startswith("item0.tool.")]
+                    self.assertEqual(labels.count("get_scene_info"), 1)
+                    self.assertNotIn("item0.tool.name", ids(display, "prims"))
+
+    def test_collapsed_card_gives_the_title_the_available_width(self):
+        title = "Read the current scene information"
+        display = self.display(title)
+        self.assertEqual(prim(display, "item0.tool.summary")["text"], title)
+        self.assertNotIn("item0.tool.name", ids(display, "prims"))
+
+    def test_expanded_card_retains_the_technical_identifier(self):
+        display = self.display("Scene information", expanded=True)
+        self.assertEqual(prim(display, "item0.tool.summary")["text"], "Scene information")
+        self.assertEqual(prim(display, "item0.tool.name")["text"], "get_scene_info")
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
+
+    def test_awaiting_summary_is_complete_at_panel_sizes(self):
+        summary = "The change is ready for review. Please check the details before continuing."
+        code = "\n".join(["pass"] * (T.CODE_PREVIEW_LINES + 2))
+        for width, scale in ((240, 1), (420, 1), (438, 1), (640, 1.5)):
+            for expanded in (False, True):
+                with self.subTest(width=width, scale=scale, expanded=expanded):
+                    item = state.item_tool("run_python", summary, code)
+                    item.update(status="awaiting", expanded=expanded)
+                    original = deepcopy(item)
+                    frame = layout.Frame(width, 600, scale, measure)
+                    x, y = frame.px(T.PAD), frame.px(9)
+                    height = layout._item_tool(frame, 0, item, x, y, width - 2 * x)
+                    display = {"prims": frame.prims, "hits": frame.hits}
+                    card = prim(display, "item0.tool.card")
+                    rows = [p for p in frame.prims if p["id"].startswith("item0.tool.summary")]
+                    self.assertEqual(" ".join(p["text"] for p in rows), summary)
+                    glyph = prim(display, "item0.tool.glyph")
+                    self.assertEqual(rows[0]["y"], glyph["y"])
+                    for row in rows:
+                        self.assertEqual(row["x"], glyph["x"] + frame.px(18))
+                    for previous, current in zip(rows, rows[1:]):
+                        self.assertEqual(current["y"], previous["y"] + previous["h"])
+
+                    names = [p for p in frame.prims if p["id"].startswith("item0.tool.name")]
+                    self.assertEqual([p["text"] for p in names], ["run_python"])
+                    name = names[0]
+                    self.assertEqual(name["size"], frame.px(T.FONT_SIZE_SMALL))
+                    self.assertGreaterEqual(name["y"], rows[-1]["y"] + rows[-1]["h"])
+                    preview = prim(display, "item0.tool.code.bg")
+                    self.assertGreaterEqual(preview["y"], name["y"] + name["h"])
+                    code_rows = [p for p in frame.prims if p["id"].startswith("item0.tool.code.l")]
+                    self.assertEqual([p["text"] for p in code_rows], ["pass"] * T.CODE_PREVIEW_LINES)
+                    self.assertEqual(prim(display, "item0.tool.code.more")["text"], "… 2 more lines")
+                    self.assertGreaterEqual(hit(display, "item0.tool.run")["y"],
+                                            preview["y"] + preview["h"])
+
+                    self.assertEqual(card["h"], height)
+                    for p in frame.prims:
+                        self.assertGreaterEqual(p["y"], card["y"], p["id"])
+                        self.assertLessEqual(p["y"] + p["h"], card["y"] + height, p["id"])
+                        if p["t"] == "text":
+                            self.assertGreaterEqual(p["x"], card["x"] + frame.px(T.CARD_PAD), p["id"])
+                            self.assertLessEqual(p["x"] + measure(p["font"], p["size"], p["text"]),
+                                                 card["x"] + card["w"] - frame.px(T.CARD_PAD), p["id"])
+                    self.assertEqual(item, original)
+                    actions = [("approve", 0), ("reject", 0)]
+                    if width != 240:
+                        actions.append(("approve_always", 0))
+                    self.assertEqual([h["action"] for h in frame.hits], actions)
+
+
+class ApprovalScopeTest(unittest.TestCase):
+    def display(self, index=0, **flags):
+        session = state.new_session()
+        session["items"] = [state.item_user("Continue.") for _ in range(index)]
+        item = state.item_tool("tool", "Pending approval", "")
+        item.update(status="awaiting", **flags)
+        session["items"].append(item)
+        # Leave room for the longer "Always allow renders" button.
+        return layout.build(session, 640, 600, 1, measure)
+
+    def test_ordinary_allowance_tip_explains_scope_and_exceptions(self):
+        tip = hit(self.display(), "item0.tool.always")["tip"]
+        self.assertTrue(tip)
+        for phrase in ("ordinary steps", "edits", "code", "files", "this chat",
+                       "Renders/bakes ask separately", "installs and paid steps ask",
+                       "reopen this chat", "new chat"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, tip)
+        self.assertLessEqual(len(tip.splitlines()), 3)
+
+    def test_heavy_allowance_tip_explains_separate_scope(self):
+        tip = hit(self.display(heavy=True), "item0.tool.always")["tip"]
+        self.assertTrue(tip)
+        for phrase in ("only renders, bakes and simulations", "this chat",
+                       "Code approval is separate", "installs and paid steps still ask",
+                       "reopen this chat", "new chat"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, tip)
+        self.assertLessEqual(len(tip.splitlines()), 3)
+
+    def test_allowance_buttons_keep_action(self):
+        for heavy in (False, True):
+            for index in (0, 2):
+                with self.subTest(heavy=heavy, index=index):
+                    display = self.display(index, heavy=heavy)
+                    self.assertEqual(hit(display, f"item{index}.tool.always")["action"],
+                                     ("approve_always", index))
+
+    def test_install_and_paid_cards_have_no_allowance(self):
+        for flag in ("install", "paid_approval"):
+            for heavy in (False, True):
+                with self.subTest(flag=flag, heavy=heavy):
+                    display = self.display(heavy=heavy, **{flag: True})
+                    self.assertEqual(hit(display, "item0.tool.run")["action"], ("approve", 0))
+                    self.assertNotIn("item0.tool.always", ids(display, "hits"))
+                    self.assertFalse(any(h["action"][0] == "approve_always" for h in display["hits"]))
+
+
+class ToolFailureCardTest(unittest.TestCase):
+    def display(self, output, width=420, **changes):
+        item = {"kind": "tool", "name": "shell", "summary": "Run command", "code": "",
+                "status": "failed", "expanded": False, "output": output, **changes}
+        session = state.new_session()
+        session["items"].append(item)
+        original = dict(item)
+        display = layout.build(session, width, 600, 1, measure)
+        self.assertEqual(session["items"], [original], "layout must not change the stored card")
+        self.assertEqual(item["output"], output)
+        return display
+
+    def reason(self, display):
+        reasons = [p for p in display["prims"] if p["id"].startswith("item0.tool.reason")]
+        self.assertEqual(len(reasons), 1)
+        reason = reasons[0]
+        self.assertEqual(reason["t"], "text")
+        self.assertEqual(reason["color"], T.TEXT_MUTED)
+        title, card = prim(display, "item0.tool.summary"), prim(display, "item0.tool.card")
+        self.assertGreaterEqual(reason["y"], title["y"] + title["h"])
+        self.assertLessEqual(reason["y"] + reason["h"], card["y"] + card["h"])
+        self.assertFalse(any(p["id"].startswith("item0.tool.output") for p in display["prims"]))
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
+        return reason
+
+    def test_collapsed_traceback_shows_final_exception(self):
+        output = ("Warning: unavailable device\nTraceback (most recent call last):\n"
+                  "  File \"<string>\", line 1\nAssertionError: invalid result\nCleanup complete\n")
+        reason = self.reason(self.display(output))
+        self.assertEqual(reason["text"], "AssertionError: invalid result")
+
+    def test_collapsed_shell_failure_shows_error_line(self):
+        error = "zsh:1: read-only variable: status"
+        self.assertEqual(self.reason(self.display("exit 1 in 0.1 s\n" + error))["text"], error)
+
+    def test_collapsed_empty_output_shows_honest_fallback(self):
+        for output in ("", "(no output)"):
+            with self.subTest(output=output):
+                self.assertEqual(self.reason(self.display(output))["text"], "Failed with no error output.")
+        self.assertEqual(self.reason(self.display("", exit_code=2))["text"],
+                         "Failed with no error output (exit 2).")
+
+    def test_long_reason_is_ellipsized_to_narrow_card_width(self):
+        for output in ("Error: " + "invalid input " * 20, "Error:" + "x" * 200):
+            with self.subTest(output=output):
+                display = self.display(output, width=180)
+                reason = self.reason(display)
+                card = prim(display, "item0.tool.card")
+                self.assertTrue(reason["text"].endswith("…"))
+                self.assertTrue(output.startswith(reason["text"][:-1]))
+                self.assertNotIn("\n", reason["text"])
+                self.assertLessEqual(right(reason), card["x"] + card["w"] - T.CARD_PAD)
+
+    def test_collapsed_success_and_running_cards_keep_only_the_title(self):
+        for status in ("done", "running"):
+            with self.subTest(status=status):
+                display = self.display("Error: old output", status=status)
+                tool_ids = [p["id"] for p in display["prims"] if p["id"].startswith("item0.tool.")]
+                self.assertEqual(tool_ids, ["item0.tool.card", "item0.tool.glyph", "item0.tool.summary"])
+                self.assertEqual(prim(display, "item0.tool.card")["h"],
+                                 prim(display, "item0.tool.summary")["h"] + 14)
+
+    def test_expanded_failure_keeps_full_output_without_reason_line(self):
+        output = "Warning: unavailable device\nError: invalid input\nCleanup complete"
+        display = self.display(output, expanded=True, code="pass")
+        self.assertFalse(any(p["id"].startswith("item0.tool.reason") for p in display["prims"]))
+        lines = [p for p in display["prims"] if p["id"].startswith("item0.tool.output")]
+        self.assertEqual([p["text"] for p in lines], output.splitlines())
+        self.assertTrue(all(p["color"] == T.ERROR and p["font"] == "mono" for p in lines))
+        self.assertEqual(prim(display, "item0.tool.code.l0")["text"], "pass")
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
 
 
 class FooterTest(unittest.TestCase):
@@ -150,6 +499,80 @@ class QueuedTest(unittest.TestCase):
         self.assertIn("item0.queued", ids(build(session), "prims"))
         del item["queued"]
         self.assertNotIn("item0.queued", ids(build(session), "prims"))
+
+
+class StreamingIndicatorTest(unittest.TestCase):
+    def setUp(self):
+        self.session = state.new_session()
+        self.session["busy"] = True
+        self.reply = state.item_assistant()
+        self.reply["text"] = "Reply in progress."
+        self.session["items"].append(self.reply)
+
+    def queue_note(self):
+        note = state.item_user("Another note.")
+        note["queued"] = True
+        self.session["items"].append(note)
+
+    def assert_indicator(self, display, prefix, word="Thinking"):
+        self.assertEqual([id for id in ids(display, "prims") if id.endswith(".dots")],
+                         [prefix + ".dots"])
+        self.assertEqual("".join(p["text"] for p in display["prims"]
+                                 if p["id"].startswith(prefix + ".")), word + ".")
+
+    def assert_no_indicator(self, display):
+        self.assertFalse([id for id in ids(display, "prims") if id.endswith(".dots")])
+
+    def test_streaming_reply_with_text_shows_one_indicator(self):
+        display = build(self.session)
+        self.assertEqual(prim(display, "item0.p0.l0")["text"], self.reply["text"])
+        self.assert_indicator(display, "item0.thinking")
+
+    def test_queued_note_preserves_streaming_indicator(self):
+        self.queue_note()
+        display = build(self.session)
+        self.assertIn("item1.queued", ids(display, "prims"))
+        self.assert_indicator(display, "item0.thinking")
+        self.assertFalse([id for id in ids(display, "prims") if id.startswith("chat.working.")])
+
+    def test_completed_reply_with_text_has_no_indicator(self):
+        self.reply["streaming"] = False
+        self.session["busy"] = False
+        display = build(self.session)
+        self.assertIn("item0.p0.l0", ids(display, "prims"))
+        self.assert_no_indicator(display)
+
+    def test_pending_approval_takes_precedence_over_stream(self):
+        tool = state.item_tool("tool", "Pending approval", "")
+        tool["status"] = "awaiting"
+        self.session["items"].append(tool)
+        display = build(self.session)
+        self.assertEqual(prim(display, "item1.tool.glyph")["color"], T.WARN)
+        self.assertEqual(hit(display, "item1.tool.run")["action"], ("approve", 1))
+        self.assert_no_indicator(display)
+
+    def test_empty_stream_shows_one_indicator_with_or_without_queued_note(self):
+        self.reply["text"] = ""
+        self.assert_indicator(build(self.session), "item0.thinking")
+        self.queue_note()
+        self.assert_indicator(build(self.session), "item0.thinking")
+
+    def test_stopped_session_has_no_indicator_even_with_stale_stream_flag(self):
+        self.session["busy"] = False
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.reply["streaming"] = streaming
+                self.assert_no_indicator(build(self.session))
+
+    def test_tool_status_takes_precedence_with_queued_note(self):
+        tool = state.item_tool("tool", "Tool activity", "")
+        self.session["items"].append(tool)
+        self.queue_note()
+        self.assert_indicator(build(self.session), "chat.working", "Working")
+        tool["status"] = "awaiting"
+        display = build(self.session)
+        self.assertEqual(hit(display, "item1.tool.run")["action"], ("approve", 1))
+        self.assert_no_indicator(display)
 
 
 class GuardNoticeTest(unittest.TestCase):
@@ -651,6 +1074,81 @@ class WaveCardTest(unittest.TestCase):
         self.assertLessEqual(detail["x"] + measure("ui", T.FONT_SIZE_SMALL, detail["text"]), cancel["x"])
 
 
+class SceneChangesPreviewTest(unittest.TestCase):
+    SIZES = ((240, 1), (420, 1), (640, 1.5))
+    LONG_ENTRY = "~ " + " ".join(f"value{n}" for n in range(60))
+
+    def display(self, item, width=420, scale=1):
+        frame = layout.Frame(width, 600, scale, measure, session=chat(item))
+        layout._item_changes(frame, 0, item, 0, 0, width)
+        return {"prims": frame.prims, "hits": frame.hits}
+
+    def details(self, display):
+        return [p for p in display["prims"] if p["id"].startswith("item0.changes.l")]
+
+    def test_collapsed_long_entry_reserves_a_row_for_show_more(self):
+        for width, scale in self.SIZES:
+            with self.subTest(width=width, scale=scale):
+                item = state.item_changes("1 changed", [self.LONG_ENTRY], "cp1")
+                display = self.display(item, width, scale)
+                rows = self.details(display)
+                self.assertEqual(len(rows), layout.CHANGES_PREVIEW_LINES - 1)
+                more = prim(display, "item0.changes.more")
+                self.assertRegex(more["text"], r"^Show \d+ more$")
+                self.assertGreaterEqual(more["y"], rows[-1]["y"] + rows[-1]["h"])
+                self.assertEqual(hit(display, "item0.changes.more")["action"], ("toggle", 0))
+
+    def test_expanded_long_entry_shows_complete_text_and_show_less(self):
+        for width, scale in self.SIZES:
+            with self.subTest(width=width, scale=scale):
+                item = state.item_changes("1 changed", [self.LONG_ENTRY], "cp1")
+                item["expanded"] = True
+                display = self.display(item, width, scale)
+                rows = self.details(display)
+                self.assertGreater(len(rows), layout.CHANGES_PREVIEW_LINES)
+                self.assertEqual(" ".join(p["text"] for p in rows), self.LONG_ENTRY[2:])
+                for row in rows:
+                    self.assertEqual(row["font"], "mono")
+                    self.assertEqual(row["size"], round(T.FONT_SIZE_CODE * scale))
+                    self.assertLessEqual(right(row), width - round(T.CARD_PAD * scale))
+                self.assertIn("item0.changes.more", ids(display, "prims"))
+                self.assertEqual(prim(display, "item0.changes.more")["text"], "Show less")
+                self.assertEqual(hit(display, "item0.changes.more")["action"], ("toggle", 0))
+
+    def test_short_entries_within_budget_have_no_toggle(self):
+        for count in (0, 3, layout.CHANGES_PREVIEW_LINES):
+            for expanded in (False, True):
+                with self.subTest(count=count, expanded=expanded):
+                    lines = [f"~ value{n}" for n in range(count)]
+                    item = state.item_changes(f"{count} changed", lines, "cp1")
+                    item["expanded"] = expanded
+                    display = self.display(item)
+                    self.assertEqual([p["text"] for p in self.details(display)],
+                                     [line[2:] for line in lines])
+                    self.assertNotIn("item0.changes.more", ids(display, "prims"))
+                    self.assertNotIn("item0.changes.more", ids(display, "hits"))
+
+    def test_stored_changes_prefixes_and_keep_undo_are_preserved(self):
+        lines = ["+ " + self.LONG_ENTRY[2:], "- Previous value", "~ Updated value"]
+        item = state.item_changes("3 changed", lines, "cp1")
+        for expanded in (False, True, False):
+            with self.subTest(expanded=expanded):
+                item["expanded"] = expanded
+                original = deepcopy(item)
+                display = self.display(item)
+                self.assertEqual(item, original)
+                self.assertIs(item["lines"], lines)
+                self.assertEqual(hit(display, "item0.changes.keep")["action"], ("keep_changes", 0))
+                self.assertEqual(hit(display, "item0.changes.undo")["action"], ("restore", "cp1"))
+                self.assertEqual(prim(display, "item0.changes.keep.label")["text"], "Keep")
+                self.assertEqual(prim(display, "item0.changes.undo.label")["text"], "Undo all")
+                signs = [p for p in display["prims"] if p["id"].startswith("item0.changes.sign")]
+                first_rows = [p for p in self.details(display) if p["id"].endswith(".l0")]
+                self.assertEqual([p["text"] for p in signs], [line[:1] for line in lines[:len(first_rows)]])
+                for n, sign in enumerate(signs):
+                    self.assertEqual(sign["y"], prim(display, f"item0.changes.l{n}.l0")["y"])
+
+
 class MergeCardTest(unittest.TestCase):
     def test_what_came_in_with_accept_and_restore(self):
         display = build(chat(merge()))
@@ -684,6 +1182,48 @@ class MergeCardTest(unittest.TestCase):
         many = build(chat(merge(lines=[f"+ Box{k}" for k in range(10)])))
         self.assertEqual(texts(many)["item0.merge.more"], "Show 5 more")
         self.assertEqual(hit(many, "item0.merge.more")["action"], ("toggle", 0))
+
+
+class InputScrollAndEditTest(unittest.TestCase):
+    LONG = " ".join(f"word{n}" for n in range(120))
+
+    def session(self, text, cursor, anchor=None, **extra):
+        session = state.new_session()
+        session.update(input=text, cursor=cursor, anchor=anchor, focused=True, **extra)
+        return session
+
+    def shown(self, display):
+        return [p["text"] for p in display["prims"] if p["id"].startswith("input.l")]
+
+    def test_the_box_scrolls_to_the_caret_not_always_to_the_tail(self):
+        session = self.session(self.LONG, 0)
+        display = build(session)
+        lines, _ = layout.input_rows(display, self.LONG, measure)
+        self.assertGreater(len(lines), T.INPUT_MAX_LINES)
+        self.assertEqual(self.shown(display)[0], lines[0][1].rstrip())
+        self.assertEqual(len(self.shown(display)), T.INPUT_MAX_LINES)
+        self.assertIn("input.caret", ids(display, "prims"))
+        self.assertEqual(layout.input_index(display, display["input"]["x"], display["input"]["y"] + 1, measure), 0)
+        session["cursor"] = len(self.LONG)
+        self.assertEqual(self.shown(build(session))[-1], lines[-1][1].rstrip())
+
+    def test_a_selection_from_a_row_start_draws_nothing_past_the_row_above(self):
+        text = "a long request that will wrap differently at each width of the panel"
+        lines, _ = layout.input_rows(build(self.session(text, 0)), text, measure)
+        display = build(self.session(text, len(text), anchor=lines[1][0]))
+        box = display["input"]
+        rows_hit = sorted({round((p["y"] - box["y"]) // box["line_height"])
+                           for p in display["prims"] if p["id"].startswith("input.selection")})
+        self.assertEqual(rows_hit[0], 1)
+
+    def test_a_user_message_offers_edit_and_confirms_in_edit_wording(self):
+        items = [{"kind": "user", "text": "make it red", "checkpoint": "c1"}]
+        display = build(self.session("", 0, items=items))
+        self.assertEqual(hit(display, "item0.checkpoint.edit")["action"], ("edit_ask", 0))
+        display = build(self.session("", 0, items=items, confirm_restore=0, confirm_edit=True))
+        ask = " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item0.checkpoint.ask"))
+        self.assertIn("the conversation from here is set aside", ask)
+        self.assertEqual(hit(display, "item0.checkpoint.confirm")["action"], ("restore_confirm", 0))
 
 
 if __name__ == "__main__":

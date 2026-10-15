@@ -239,6 +239,36 @@ class CodexAppTest(unittest.TestCase):
         self.session["messages"][-1][codex_app.SENT] = True
         self.assertEqual(codex_app.turn_input(self.session, self.ws)[0]["text"], codex_app.RESUME)
 
+    def test_tool_images_keep_their_origin(self):
+        image = Path(self.tmp.name) / "preview.png"
+        image.write_bytes(b"\x89PNG preview")
+        self.session["auto_run"] = True
+        self.session["auto_heavy"] = True
+        dynamic = mock.patch.object(codex_app, "DYNAMIC", (*codex_app.DYNAMIC, "view_image", "inspect_scene"))
+        dynamic.start()
+        self.addCleanup(dynamic.stop)
+
+        def run_tool(name, arguments):
+            if name == "view_image":
+                return tools.ToolResult(text="Image attached: image.", image_path=image, file_image=True)
+            return types.SimpleNamespace(text="Image attached: image.", ok=True, image_path=image)
+
+        driver = codex_app.CodexTurn(self.session, agent.Turn(), config.load(), None, self.ws, None,
+                                    run_tool, lambda session: None)
+        for name, arguments, prefix in (("view_image", {"path": str(image)}, "File preview: "),
+                                        ("search_assets", {}, "Viewport capture: "),
+                                        ("inspect_scene", {}, "Viewport capture: "),
+                                        ("capture_viewport", {}, "Viewport capture: "),
+                                        ("run_python", {}, "Viewport capture: "),
+                                        ("run_python", {"capture": "front"}, "Viewport capture: ")):
+            with self.subTest(tool=name):
+                reply = driver.tool_call({"tool": name, "arguments": arguments, "callId": name})
+                self.assertTrue(reply["success"])
+                self.assertTrue(reply["contentItems"][1]["imageUrl"].startswith("data:image/png;base64,"))
+                message = self.session["messages"][-1]
+                self.assertTrue(message[context.CAPTURE])
+                self.assertTrue(message["content"][0]["text"].startswith(prefix))
+
     def test_a_tool_image_goes_back_as_a_data_url(self):
         image = Path(self.tmp.name) / "capture.png"
         image.write_bytes(b"\x89PNG\r\n")

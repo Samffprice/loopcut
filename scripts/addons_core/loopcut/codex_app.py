@@ -445,7 +445,13 @@ class CodexTurn:
             self.card(key, "edit_file", f"Edit {', '.join(paths) or 'files'}", "")
         elif kind == "imageView":
             path = str(item.get("path") or "")
-            self.card(key, "view_image", f"View {Path(path).name}", path, "done")
+            card = self.card(key, "view_image", f"View {Path(path).name}", path, "done")
+            if path:
+                from .files import resolve
+                try:
+                    conversations.store_image(self.session, resolve(path, base=self.ws), card)
+                except (OSError, ValueError):
+                    pass  # An unavailable preview must not interrupt the turn.
         elif kind in ("webSearch", "mcpToolCall", "collabAgentToolCall", "imageGeneration"):
             self.card(key, kind, kind, "")
 
@@ -454,6 +460,7 @@ class CodexTurn:
         if kind == "agentMessage":
             reply = self.replies.pop(key, None) or state.item_assistant()
             reply["text"], reply["streaming"] = item.get("text") or reply["text"], False
+            agent.finish_reply(reply, self.ws)
             if not reply["text"].strip():
                 if reply in self.items:
                     self.items.remove(reply)
@@ -529,19 +536,19 @@ class CodexTurn:
         self.items.append(card)
         self.messages.append({"role": "assistant", "content": None, "tool_calls": [
             {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]})
-        text, ok, image = self.run_dynamic(card, name, arguments)
+        text, ok, image, file_image = self.run_dynamic(card, name, arguments)
         if card["status"] != "rejected":
             card["status"] = "done" if ok else "failed"
         card["output"] = text
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
         if image is not None:
-            self.messages.append(agent._image_message(conversations.store_image(self.session, image),
-                                                      agent._image_what(text)))
+            self.messages.append(agent._image_message(conversations.store_image(self.session, image, card),
+                                                      agent._image_what(text), file_preview=file_image))
         conversations.save(self.session)
         agent._redraw()
         return _reply(text, ok, image)
 
-    def run_dynamic(self, card: dict, name: str, arguments: str) -> tuple[str, bool, Path | None]:
+    def run_dynamic(self, card: dict, name: str, arguments: str) -> tuple[str, bool, Path | None, bool]:
         approval = agent._approval(name, arguments, self.turn.roots)
         if agent._asks(approval, name, self.session, self.cfg):
             self.turn.decided.clear()
@@ -551,7 +558,7 @@ class CodexTurn:
             agent._redraw()
             if not agent._wait_for_approval(self.turn):
                 card["status"] = "rejected"
-                return "The user rejected this action. Ask what they want instead.", False, None
+                return "The user rejected this action. Ask what they want instead.", False, None, False
         card["status"] = "running"
         agent._redraw()
         if agent._changes_scene(name, arguments):
@@ -559,7 +566,7 @@ class CodexTurn:
                 self.ensure_checkpoint(self.session)
             except checkpoints.CheckpointError as ex:  # No way back means no going forward.
                 return (f"This step was NOT run, because a checkpoint could not be saved first: {ex} Tell the user; "
-                        f"do not retry."), False, None
+                        f"do not retry."), False, None, False
         from . import cloud_account
         with cloud_account.approval_context(lambda details: agent._cloud_consent(self.turn, card, True, details,
                 files_allowed=self.cfg.auto_run or self.session['auto_run'])):
@@ -571,7 +578,8 @@ class CodexTurn:
         for guard in getattr(result, "guard_notes", None) or ():
             self.items.append(state.item_guard(guard["text"], guard["modifiers"]))
         image = getattr(result, "image_path", None)
-        return result.text, result.ok, Path(image) if image and Path(image).is_file() else None
+        return (result.text, result.ok, Path(image) if image and Path(image).is_file() else None,
+                getattr(result, "file_image", False))
 
 
 def _reply(text: str, ok: bool, image: Path | None = None) -> dict:

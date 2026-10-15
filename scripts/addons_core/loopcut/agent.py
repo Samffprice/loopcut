@@ -7,6 +7,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable
 
 from . import checkpoints, config, context, conversations, llm, repeats, state
+from .ui.markdown import finish_reply
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
 run_python runs bpy code; get_scene_info and get_object_info read the scene; inspect_api is this Blender's \
@@ -234,13 +235,14 @@ def _inspection_current(token: dict) -> bool:
 def _fresh_images(images: list) -> list:
     """A later tool in one model batch can invalidate an earlier asynchronous inspection."""
     fresh = []
-    for reference, what, token, card, message in images:
+    for reference, what, file_preview, token, card, message in images:
         if token is not None and not _inspection_current(token):
             note = "\nInspection image omitted: the scene changed later in this tool batch. Inspect the new revision."
             card["status"], card["output"] = "failed", card["output"] + note
+            card.pop("image_path", None)  # Not the picture the model got: none on the card either.
             message["content"] += note
         else:
-            fresh.append((reference, what))
+            fresh.append((reference, what, file_preview))
     return fresh
 
 
@@ -486,13 +488,25 @@ def _tool_schemas() -> list[dict]:
             + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + cloud.tool_schemas())
 
 
-def _describe(call: llm.ToolCall) -> tuple[str, str]:
+def _tool_title(name: str, schemas: Callable | None = None) -> str:
+    """A card label from registered metadata, or readable words for an unknown tool."""
+    for schema in (schemas or _tool_schemas)():
+        function = schema["function"]
+        if function["name"] == name:
+            title = str(function.get("title") or "").strip()
+            description = " ".join(str(function.get("description") or "").split())
+            if title or description:
+                return title or description.split(". ", 1)[0].rstrip(".")
+    return " ".join(name.replace("_", " ").replace(".", " ").split()).capitalize()
+
+
+def _describe(call: llm.ToolCall, schemas: Callable | None = None) -> tuple[str, str]:
     try:
         arguments = json.loads(call.arguments) if call.arguments.strip() else {}
     except ValueError:
-        return call.name, call.arguments
+        return _tool_title(call.name, schemas), call.arguments
     if not isinstance(arguments, dict):
-        return call.name, call.arguments
+        return _tool_title(call.name, schemas), call.arguments
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
@@ -506,7 +520,7 @@ def _describe(call: llm.ToolCall) -> tuple[str, str]:
         described = module.describe(name, arguments)
         if described:
             return described
-    return str(arguments.get("summary") or call.name), str(arguments.get("code") or "")
+    return str(arguments.get("summary") or _tool_title(name, schemas)), str(arguments.get("code") or "")
 
 
 def _arguments(arguments: str) -> dict:
@@ -532,7 +546,7 @@ def _asked_angle(call_name: str, arguments: str) -> str:
 
 
 def _image_what(text: str) -> str:
-    """What a capture shows, from the tool's own words: the last 'Image attached: ...' line."""
+    """What an image shows, from the tool's own words: the last 'Image attached: ...' line."""
     line = next((ln for ln in reversed(text.splitlines()) if ln.startswith("Image attached: ")), "")
     what = line[len("Image attached: "):].split(" Nearest to the viewpoint", 1)[0]
     return what.rstrip(".")
@@ -583,11 +597,14 @@ def _cloud_consent(turn, card, asks, details, *, files_allowed=False):
     return approved
 
 
-def _image_message(reference: str, what: str) -> dict:
-    """A capture as a message: a reference to a file in the conversation's folder, expanded when a
-    request is sent. `what` it shows is text, so it outlives the image."""
+def _image_message(reference: str, what: str, *, file_preview: bool = False) -> dict:
+    """An image reference, expanded when a request is sent. Its origin and what it shows are
+    text, so they outlive the image."""
+    text = (f"{context.FILE_PREVIEW_LABEL}{what or 'image'}. "
+            "This is an image file; viewing it does not change the open scene." if file_preview else
+            f"{context.CAPTURE_LABEL}{what or 'the scene'} (after the step above).")
     return {"role": "user", context.CAPTURE: True, "content": [
-        {"type": "text", "text": f"{context.CAPTURE_LABEL}{what or 'the scene'} (after the step above)."},
+        {"type": "text", "text": text},
         {"type": "image_url", "image_url": {"url": reference}},
     ]}
 
@@ -744,8 +761,8 @@ SINGLE_SPEC = LoopSpec(role="single", system=lambda session: _system_prompt(sess
 
 
 def _orchestrator_schemas() -> list[dict]:
-    from . import orchestrator
-    return _tool_schemas() + orchestrator.SCHEMAS
+    from . import orchestrator, uv_tools
+    return [s for s in _tool_schemas() if s["function"]["name"] not in uv_tools.SINGLE_ONLY] + orchestrator.SCHEMAS
 
 
 def _acceptance_run(checks: list, spawn=None) -> list:
@@ -1035,6 +1052,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
             raise llm.LLMError(f"{spec.role.capitalize()} step stopped at {reason} twice in a row, "
                                f"without a usable reply or tool call.")
     reply["streaming"] = False
+    finish_reply(reply, turn.roots[0] if turn.roots else None)
     if not reply["text"].strip():
         items.remove(reply)
     return completion
@@ -1127,7 +1145,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     messages.append({"role": "user", context.STEP_LIMIT: True, "content": text})
                     if getattr(bounce, "image_path", None):  # The late workers' contact sheet.
                         messages.append(_image_message(conversations.store_image(session, bounce.image_path),
-                                                       _image_what(text)))
+                                                       _image_what(text), file_preview=True))
                     spec.save(session)
                     _redraw()
                     continue
@@ -1145,7 +1163,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             for number, call in enumerate(completion.tool_calls, 1):
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
-                summary, code = _describe(call)
+                summary, code = _describe(call, spec.schemas)
                 card = state.item_tool(call.name, summary, code)
                 items.append(card)
                 key = repeats.call_key(call.name, call.arguments)
@@ -1258,8 +1276,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if result.image_path:
                     # Stored now: every capture is written to the same file, so a second capture in
                     # this batch would otherwise replace the first before it is read.
-                    images.append((conversations.store_image(session, result.image_path), _image_what(result.text),
-                                   getattr(result, "evidence_token", None), card, messages[-1]))
+                    images.append((conversations.store_image(session, result.image_path, card), _image_what(result.text),
+                                   getattr(result, "file_image", False), getattr(result, "evidence_token", None),
+                                   card, messages[-1]))
                 if getattr(result, "scene_before", None) is not None:
                     turn.scene_before = turn.scene_before or result.scene_before
                     turn.scene_after = result.scene_after
@@ -1276,13 +1295,14 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 card["output"] += text
                 message["content"] += text
                 if path:
-                    images.append((conversations.store_image(session, path), _image_what(text), None, card, message))
+                    images.append((conversations.store_image(session, path, card), _image_what(text), False, None, card, message))
             if not stalled and cfg.max_steps and cfg.max_steps - step == STEPS_LEFT_NOTICE:
                 note = spec.steps_left_note.format(left=STEPS_LEFT_NOTICE)
                 last[0]["output"] += note
                 last[1]["content"] += note
             # Tool messages must directly follow the assistant message, so images go after them all.
-            messages.extend(_image_message(reference, what) for reference, what in _fresh_images(images))
+            messages.extend(_image_message(reference, what, file_preview=file_preview)
+                            for reference, what, file_preview in _fresh_images(images))
             spec.save(session)  # The history is consistent here: every call has its result.
             _redraw()
             if stalled:
@@ -1335,6 +1355,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         for item in items:
             if item.get("streaming"):
                 item["streaming"] = False
+                finish_reply(item, turn.roots[0] if turn.roots else None)
             if item.get("status") in ("awaiting", "running"):
                 item["status"] = "rejected"
         session["turn_outcome"] = turn.outcome

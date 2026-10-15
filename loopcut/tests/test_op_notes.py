@@ -227,11 +227,12 @@ class WorkspaceNotes(unittest.TestCase):
         for output in (NOTICE + "\n" + "output\n" * 80, "output\n" + NOTICE + "\n",
                        "x" * 5000 + "\n" + NOTICE + "\n" + "x" * 5000):
             with self.subTest(length=len(output)):
-                def run(command, ws, env, seconds, log, is_cancelled):
+                def run(command, ws, env, seconds, log, is_cancelled, label=""):
                     self.assertEqual(command, ["/fixture/Blender", "-b", "--factory-startup",
                                                str(self.ws / "source.blend"), "--python-exit-code", "1",
                                                "--python", str(workspace.SHAPE_KEY_GUARD),
                                                "--python", str(workspace.OP_NOTES),
+                                               "--python", str(workspace.RENDER_PATH_GUARD),
                                                "--python", str(self.ws / "pack.py"), "--", "extra"])
                     log.write_text(output, encoding="utf-8")
                     return 0, 0.1, False
@@ -248,7 +249,8 @@ class WorkspaceNotes(unittest.TestCase):
                 with self.subTest(platform=platform), mock.patch.object(workspace.os, "name", platform):
                     workspace._shims(self.ws)
                 text = (self.ws / ".loopcut" / "bin" / filename).read_text()
-                self.assertIn(f'--python "{workspace.SHAPE_KEY_GUARD}" --python "{workspace.OP_NOTES}" {arguments}', text)
+                self.assertIn(f'--python "{workspace.SHAPE_KEY_GUARD}" --python "{workspace.OP_NOTES}" '
+                              f'--python "{workspace.RENDER_PATH_GUARD}" {arguments}', text)
 
 
 if __name__ == "__main__":

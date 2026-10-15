@@ -1219,7 +1219,7 @@ class PromptTest(unittest.TestCase):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
-        fixed = context.fixed_tokens("", TOOL_SCHEMAS() + orchestrator.SCHEMAS, prompt_id="orchestrator", index=index)
+        fixed = context.fixed_tokens("", agent._orchestrator_schemas(), prompt_id="orchestrator", index=index)
         self.assertLessEqual(fixed, 10511)
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
 

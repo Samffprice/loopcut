@@ -51,12 +51,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 
-from . import chatgpt_auth, cloud, llm
+from . import chatgpt_auth, cloud, context, llm
 
 NAMESPACE = "loopcut"
 NAMESPACE_DESCRIPTION = ("Loopcut's tools. They act on the user's open Blender scene and, when one is set up, "
                          "the workspace folder.")
-CAPTURE_PREFIXES = ("Viewport capture: ", "Viewport capture from capture_viewport:")
+CAPTURE_PREFIXES = (context.CAPTURE_LABEL, context.CAPTURE_TEXT, context.FILE_PREVIEW_LABEL)
 DEFAULT_READ_TIMEOUT = 600.0  # xhigh reasoning can be silent for minutes; cancel is handled by a watchdog.
 _OPTIONAL = ("prompt_cache_key", "reasoning_summary", "include", "tool_images", "replay_ids", "replay")
 _disabled: set[str] = set()   # Optional features the route refused this session.

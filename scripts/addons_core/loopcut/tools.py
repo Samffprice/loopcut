@@ -42,6 +42,7 @@ class ToolResult:
     then: Callable | None = None
     evidence_token: dict | None = None  # Rechecked if later tools in the same batch change the scene.
     guard_notes: list | None = None  # cost_guard.take: modifiers it switched off, shown in the panel too.
+    file_image: bool = False  # The image is a file preview, not a look at the open scene.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -159,10 +160,11 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # need the user's go-ahead unless auto-run is on.
 # apply_build brings a workspace build into it (workspace.py, the single agent in workspace mode).
 # delegate starts workers whose results merge into the scene (orchestrator.py); accept_quarantine
-# moves what a merge kept aside into it; uv_unwrap writes UV maps (uv_tools.py); bake_paint_masks
-# makes images and stylize_material rebuilds a material (paint_tools.py, offered to workers only).
+# moves what a merge kept aside into it; uv_unwrap writes UV maps and transfer_textures bakes images and
+# repoints materials (uv_tools.py); bake_paint_masks makes images and stylize_material rebuilds a material
+# (paint_tools.py, offered to workers only).
 CHANGES_SCENE = {"run_python", "import_asset", "frame_camera", "delegate", "accept_quarantine", "uv_unwrap",
-                 "bake_paint_masks", "stylize_material", "apply_build"}
+                 "transfer_textures", "bake_paint_masks", "stylize_material", "apply_build"}
 NEEDS_APPROVAL = CHANGES_SCENE
 # Tools since merged into one with a `source` or an `action`: old name -> (current name, the
 # arguments the old name implied, the old name of its `id` argument). Saved conversations still
@@ -248,7 +250,7 @@ def is_heavy(name: str, arguments: dict) -> bool:
         return bool(HEAVY_CODE.search(str(arguments.get("code", ""))))
     if name == "render_job":
         return arguments.get("action") in ("start", "resume")  # Not a set: the model may send a list.
-    if name in ("inspect_scene", "bake_paint_masks"):
+    if name in ("inspect_scene", "bake_paint_masks", "transfer_textures"):
         return True
     return name == "see_render" and bool(arguments.get("render"))
 
@@ -306,6 +308,47 @@ def _editor_matches(area, editor: str) -> bool:
     return area.type == editor or (editor in _TREE_EDITORS and area.ui_type == editor)
 
 
+def _panel_host():
+    """UI registration is unavailable in background Blender and lightweight tests."""
+    if getattr(bpy.app, "background", False):
+        return None
+    try:
+        from .ui import host
+        return host
+    except (ImportError, AttributeError):
+        return None
+
+
+@contextlib.contextmanager
+def _preserve_host_areas():
+    """Keep the panel reachable even when executed code changes its editor type."""
+    host = _panel_host()
+    saved = [(w, a.as_pointer(), a.type, a.ui_type)
+             for w in bpy.context.window_manager.windows for a in w.screen.areas
+             if host.is_host(a)] if host else []
+    notices = []
+    try:
+        yield notices
+    finally:
+        restored = False
+        for window, pointer, saved_type, saved_ui in saved:
+            try:
+                area = next((a for a in window.screen.areas if a.as_pointer() == pointer), None)
+                if area is None or (area.type, area.ui_type) == (saved_type, saved_ui):
+                    continue
+                with bpy.context.temp_override(window=window, screen=window.screen, area=area):
+                    area.type = saved_type
+                    area.ui_type = saved_ui
+                    if not host.NATIVE:
+                        host.hosts().add(pointer)
+                    area.tag_redraw()
+                restored = True
+            except (ReferenceError, RuntimeError):
+                continue  # The code may have closed the area or its window.
+        if restored:
+            notices.append("Loopcut panel's area was restored; show previews in another editor.")
+
+
 @contextlib.contextmanager
 def _editor_context(editor: str):
     """bpy.context for one step. The 3D viewport by default; another open editor of the asked
@@ -316,8 +359,11 @@ def _editor_context(editor: str):
         with _background_context(editor):
             yield
         return
+    host = _panel_host()
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
+            if host and host.is_host(area):
+                continue
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
             if region and _editor_matches(area, editor):
                 with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
@@ -327,6 +373,7 @@ def _editor_context(editor: str):
     # Borrow a regular editor only for this synchronous step and restore its exact UI type.
     candidates = [(w, a) for w in bpy.context.window_manager.windows for a in w.screen.areas
                   if a.type not in ("LOOPCUT", "TOPBAR", "STATUSBAR")
+                  and not (host and host.is_host(a))
                   and any(r.type == "WINDOW" for r in a.regions)]
     if not candidates:
         raise ToolError("No editor area is available for this operation.")
@@ -415,7 +462,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
     shape_key_guard.install()
     cost_guard.begin()
     before = scene_diff.snapshot()
-    with _editor_context(editor):
+    with _preserve_host_areas() as host_notices, _editor_context(editor):
         bpy.ops.ed.undo_push(message=f"Before Loopcut: {summary or 'run_python'}"[:60])
         previous_trace = sys.gettrace()
         try:
@@ -438,6 +485,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
             sys.settrace(previous_trace)
             shape_key_guard.check()
             notices = shape_key_guard.take() + op_notes.take() + live_file.take()
+    notices.extend(host_notices)
     after = scene_diff.snapshot(guard=cost_guard.check)  # The guard runs before it evaluates.
     guarded, notes = cost_guard.take()
     output = _clip(stdout.getvalue().strip()) or "OK (no output)"

@@ -38,6 +38,7 @@ def new_session() -> dict:
         "id": uuid.uuid4().hex,          # Names this conversation's checkpoint folder.
         "pending_checkpoint": None,      # Set per turn; see checkpoints.begin_turn.
         "confirm_restore": None,         # Index of the user item whose restore is being confirmed.
+        "confirm_edit": False,           # That confirmation is for editing the message (a restore that says so).
         "projects": [],                  # conversations.project_key of every file this has worked in.
         "title": "",
         "created": time.time(),

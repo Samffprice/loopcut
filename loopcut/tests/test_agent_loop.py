@@ -22,7 +22,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, context, conversations, llm, state, workspace  # noqa: E402
+from loopcut import agent, checkpoints, context, conversations, llm, state, tools, workspace  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
 
 
@@ -885,6 +885,75 @@ class AgentLoopTest(unittest.TestCase):
         images = [p for m in sent if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image_url"]
         self.assertEqual(len(images), 1, "only the newest look is still an image")
         self.assertTrue(any("- looked" in (m.get("content") or "") for m in sent), "older looks folded")
+
+    def test_file_preview_preserves_origin(self):
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "preview.png"
+        shot.write_bytes(b"\x89PNG preview")
+
+        def run_tool(name, arguments):
+            what = shot.name if name == "view_image" else "the scene"
+            return tools.ToolResult(text=f"Image attached: {what}.", image_path=shot, file_image=name == "view_image")
+
+        self.run_tool = run_tool
+        SCRIPT.replies += [tool_reply("view_image", {"path": str(shot)}),
+                           tool_reply("capture_viewport", {}), text_reply("Seen.")]
+        turn = self.start("check the image")
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        preview = next(m for m in SCRIPT.requests[1]["messages"] if isinstance(m.get("content"), list))
+        label = preview["content"][0]["text"]
+        self.assertTrue(label.startswith("File preview: preview.png."), label)
+        self.assertNotIn("Viewport capture:", label)
+        self.assertIn("viewing it does not change the open scene", label)
+        self.assertTrue(preview["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        stored = [m for m in self.session["messages"] if m.get(context.CAPTURE)]
+        self.assertEqual(len(stored), 2)
+        self.assertFalse(context.is_turn_start(stored[0]))
+        self.assertEqual(stored[0]["content"][0]["text"], label)
+        self.assertTrue(stored[0]["content"][1]["image_url"]["url"].startswith(conversations.IMAGE_SCHEME))
+
+        # Once another look replaces the preview, pruning and next-turn folding retain its origin.
+        SCRIPT.replies.append(text_reply("Ready."))
+        self.start("continue").thread.join(5)
+        for request in SCRIPT.requests[2:]:
+            records = "\n".join(m["content"] for m in request["messages"]
+                                if m["role"] == "assistant" and isinstance(m.get("content"), str))
+            self.assertIn("- looked at file: preview.png.", records)
+            self.assertNotIn("- looked: preview.png", records)
+            images = [p for m in request["messages"] if isinstance(m.get("content"), list)
+                      for p in m["content"] if p["type"] == "image_url"]
+            self.assertEqual(len(images), 1)
+
+    def test_viewport_capture_preserves_label(self):
+        shot = Path(self.data_dir.name) / "viewport.png"
+        shot.write_bytes(b"\x89PNG viewport")
+        self.run_tool = lambda name, arguments: tools.ToolResult(text="Image attached: the scene.", image_path=shot)
+        SCRIPT.replies += [tool_reply("capture_viewport", {}), text_reply("Seen.")]
+        self.start("check the scene").thread.join(5)
+        capture = next(m for m in SCRIPT.requests[1]["messages"] if isinstance(m.get("content"), list))
+        self.assertEqual(capture["content"][0]["text"], "Viewport capture: the scene (after the step above).")
+        self.assertTrue(capture["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_scene_inspection_image_preserves_viewport_label(self):
+        self.session["auto_run"] = True
+        self.session["auto_heavy"] = True
+        shot = Path(self.data_dir.name) / "inspection.png"
+        shot.write_bytes(b"\x89PNG inspection")
+        token = {"generation": 1}
+        # Neither result declares file_image; run_python also has no requested capture.
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(
+            text="Image attached: scene inspection.", ok=True, image_path=shot, evidence_token=token)
+        SCRIPT.replies += [tool_reply("inspect_scene", {}), tool_reply("run_python", {}), text_reply("Seen.")]
+        with mock.patch.object(agent, "_inspection_current", return_value=True) as current:
+            turn = self.start("check the scene")
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        current.assert_has_calls([mock.call(token), mock.call(token)])
+        self.assertEqual(len(SCRIPT.requests), 3)
+        for request in SCRIPT.requests[1:]:
+            capture = next(m for m in request["messages"] if isinstance(m.get("content"), list))
+            self.assertEqual(capture["content"][0]["text"], "Viewport capture: scene inspection (after the step above).")
 
     def test_after_a_change_the_agent_looks_by_itself_at_the_angle_last_asked_for(self):
         from loopcut import conversations, context
@@ -1889,6 +1958,57 @@ class FakeJob:
 
     def write(self):
         pass
+
+
+class ToolCardLabelTest(unittest.TestCase):
+    def test_undescribed_tool_uses_registered_description(self):
+        for name in ("get_scene_info", "inspect_api"):
+            with self.subTest(name=name):
+                call = llm.ToolCall("c1", name, "{}")
+                title, code = agent._describe(call)
+                description = next(s["function"]["description"] for s in tools.SCHEMAS
+                                   if s["function"]["name"] == name)
+                self.assertNotEqual(title, name)
+                self.assertNotIn("_", title)
+                self.assertTrue(description.startswith(title))
+                self.assertEqual(code, "")
+                self.assertEqual((call.name, call.arguments), (name, "{}"))
+
+    def test_explicit_summary_is_preserved(self):
+        for name in ("get_scene_info", "run_python"):
+            with self.subTest(name=name):
+                arguments = {"summary": "Read the current scene", "code": "pass"}
+                call = llm.ToolCall("c1", name, json.dumps(arguments))
+                self.assertEqual(agent._describe(call), (arguments["summary"], "pass"))
+
+    def test_described_tool_keeps_its_title(self):
+        call = llm.ToolCall("c1", "see_render", "{}")
+        self.assertEqual(agent._describe(call), ("Show the last render", ""))
+
+    def test_registered_title_takes_precedence_over_description(self):
+        schema = {"type": "function", "function": {"name": "get_scene_info",
+                  "title": "Scene information", "description": "Read the current scene."}}
+        with mock.patch.object(agent, "_tool_schemas", return_value=[schema]):
+            self.assertEqual(agent._describe(llm.ToolCall("c1", "get_scene_info", "{}")),
+                             ("Scene information", ""))
+
+    def test_missing_metadata_uses_readable_identifier(self):
+        with mock.patch.object(agent, "_tool_schemas", return_value=[]):
+            self.assertEqual(agent._describe(llm.ToolCall("c1", "read_custom_data", "{}")),
+                             ("Read custom data", ""))
+
+    def test_active_registry_supplies_the_description(self):
+        schema = {"type": "function", "function": {"name": "read_custom_data",
+                  "description": "Read additional data. Returns the stored values."}}
+        self.assertEqual(agent._describe(llm.ToolCall("c1", "read_custom_data", "{}"), lambda: [schema]),
+                         ("Read additional data", ""))
+
+    def test_invalid_arguments_keep_the_title_and_technical_detail(self):
+        title = agent._describe(llm.ToolCall("c1", "get_scene_info", "{}"))[0]
+        for arguments in ("{", "[]"):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(agent._describe(llm.ToolCall("c1", "get_scene_info", arguments)),
+                                 (title, arguments))
 
 
 class LayoutTest(unittest.TestCase):

@@ -479,6 +479,7 @@ class OnboardingTest(unittest.TestCase):
                 patch.object(self.host.update, "banner", return_value=None), \
                 patch.object(self.host.draw, "measure", Mock(), create=True), \
                 patch.object(self.host.draw, "render", create=True), \
+                patch.object(self.host.draw, "retain_images", create=True), \
                 patch.object(self.host.layout, "build", return_value={"max_scroll": max_scroll}) as build:
             self.host.draw_area()
         return build, service, catalog

@@ -8,6 +8,58 @@ import contextlib
 import sys
 
 NOTICE_PREFIX = "Loopcut note:"
+
+
+def _upstream(socket):
+    """(node, output name) feeding a socket, through reroutes; (None, "") when nothing does."""
+    seen = set()
+    while socket.is_linked:
+        link = socket.links[0]
+        node = link.from_node
+        if node.type != "REROUTE" or node.as_pointer() in seen:
+            return node, link.from_socket.name
+        seen.add(node.as_pointer())
+        socket = node.inputs[0]
+    return None, ""
+
+
+def _painted_map(kwargs) -> bool:
+    """A mesh in Edit Mode whose materials read image textures through the UV map the operator writes."""
+    import bmesh
+    import bpy
+    for obj in bpy.context.objects_in_mode_unique_data or ():
+        if obj.type != "MESH":
+            continue
+        layers = bmesh.from_edit_mesh(obj.data).loops.layers.uv
+        layer = layers.active
+        if layer is None:
+            continue
+        # An image node with no UV Map node reads the rendering map, which Edit Mode does not show here
+        # (the mesh's own layers are empty meanwhile): it counts only when there is one map.
+        default = len(layers) == 1
+        for slot in obj.material_slots:
+            tree = getattr(slot.material, "node_tree", None)
+            for node in tree.nodes if tree else ():
+                if node.type != "TEX_IMAGE" or node.image is None:
+                    continue
+                source, output = _upstream(node.inputs["Vector"])
+                if source is not None and source.type == "MAPPING":
+                    source, output = _upstream(source.inputs["Vector"])
+                reads_default = source is None or (source.type == "TEX_COORD" and output == "UV") or (
+                    source.type == "UVMAP" and not source.uv_map)
+                if (reads_default and default) or (source is not None and source.type == "UVMAP"
+                                                   and source.uv_map == layer.name):
+                    return True
+    return False
+
+
+PAINTED = (
+    _painted_map,
+    "The mesh's materials read image textures through the UV map this writes: a new layout moves that "
+    "artwork on the surface. To keep the look, unwrap into a new UV map, keep the old one, and bake each "
+    "image from the old map onto the new one (transfer_textures does it in one call where it is offered). "
+    "A texture that tiles needs nothing.",
+)
 NOTES = {
     "uv.pack_islands": ((
         lambda kwargs: kwargs.get("margin_method") == "FRACTION",
@@ -16,7 +68,10 @@ NOTES = {
         "tile-border distance is about margin x texture size. At 2048 px, margin=8/2048 "
         "leaves about 16 px between islands and 8 px at the border. A gap of g px "
         "at size R corresponds to margin=g/(2R).",
-    ),),
+    ), PAINTED),
+    **{f"uv.{name}": (PAINTED,) for name in ("unwrap", "smart_project", "lightmap_pack", "cube_project",
+                                             "cylinder_project", "sphere_project", "project_from_view", "reset",
+                                             "follow_active_quads")},
 }
 # Python values only. A module reload and take() both preserve once-per-process delivery.
 _seen = globals().get("_seen", set())

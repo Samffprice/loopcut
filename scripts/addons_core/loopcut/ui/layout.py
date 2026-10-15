@@ -7,11 +7,13 @@ background.
 """
 
 import re
+from pathlib import Path
 
 from .. import config, state
+from . import textedit
 from . import theme as T
+from .markdown import REFERENCE_LIMIT, split_markdown
 
-_FENCE = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 _TOKEN = re.compile(r"\S+\s*|\s+")
 
 STATUS_GLYPH = {
@@ -49,21 +51,6 @@ def wrap(text: str, font: str, size: int, max_width: float, measure) -> list[tup
     return lines
 
 
-def split_markdown(text: str) -> list[tuple[str, str]]:
-    """[('p', prose) | ('code', source)], split on fenced code blocks."""
-    segments, last = [], 0
-    for match in _FENCE.finditer(text):
-        prose = text[last:match.start()].strip("\n")
-        if prose:
-            segments.append(("p", prose))
-        segments.append(("code", match.group(1).rstrip("\n")))
-        last = match.end()
-    tail = text[last:].strip("\n")
-    if tail:
-        segments.append(("p", tail))
-    return segments
-
-
 class Frame:
     def __init__(self, width: int, height: int, scale: float, measure, session=None, checkpoints=None,
                  ui=None):
@@ -74,6 +61,7 @@ class Frame:
 
         self.prims: list[dict] = []
         self.hits: list[dict] = []
+        self.input: dict | None = None
 
     def px(self, value: float) -> int:
         return round(value * self.scale)
@@ -146,14 +134,23 @@ def _checkpoint_row(f: Frame, n: int, item: dict, x, y, width) -> int:
         f.text(f"item{n}.checkpoint.restore", label_x, y + f.px(6), label, small, T.TEXT_MUTED)
         f.hit(f"item{n}.checkpoint.restore", label_x - f.px(4), y, x + width - label_x + f.px(8),
               row + f.px(10), ("restore_ask", n))
+        edit_x = label_x - f.px(16) - round(f.measure("ui", small, "Edit"))
+        f.text(f"item{n}.checkpoint.edit", edit_x, y + f.px(6), "Edit", small, T.TEXT_MUTED)
+        f.hit(f"item{n}.checkpoint.edit", edit_x - f.px(4), y, label_x - edit_x - f.px(4), row + f.px(10),
+              ("edit_ask", n))
         return row + f.px(6)
     cursor = y + f.px(8)
-    cursor += f.paragraph(f"item{n}.checkpoint.ask", x, cursor, width,
-                          "Restore the scene to before this message? Your current state is saved first, "
-                          "so this can be undone.", small, T.TEXT_MUTED)
+    # Editing a sent message is a restore to before it: the conversation is cut there and the message comes
+    # back into the box; Undo restore brings it all back.
+    ask = ("Edit this message? The scene goes back to before it, the conversation from here is set aside, and "
+           "the message returns to the box to change and send. Your current state is saved first, so Undo "
+           "restore brings it all back."
+           if f.session.get("confirm_edit") else
+           "Restore the scene to before this message? Your current state is saved first, so this can be undone.")
+    cursor += f.paragraph(f"item{n}.checkpoint.ask", x, cursor, width, ask, small, T.TEXT_MUTED)
     cursor += f.px(6)
-    used = f.button(f"item{n}.checkpoint.confirm", x, cursor, "Restore", T.BUTTON, T.BUTTON_TEXT,
-                    ("restore_confirm", n))
+    used = f.button(f"item{n}.checkpoint.confirm", x, cursor, "Edit" if f.session.get("confirm_edit") else "Restore",
+                    T.BUTTON, T.BUTTON_TEXT, ("restore_confirm", n))
     f.button(f"item{n}.checkpoint.cancel", x + used + f.px(8), cursor, "Cancel", T.BUTTON_GHOST, T.TEXT,
              ("restore_cancel", n))
     return cursor + f.px(24) - y
@@ -211,8 +208,6 @@ def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
 def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
     size, cursor = f.px(T.FONT_SIZE), y
     segments = split_markdown(item["text"])
-    if not segments and item.get("streaming"):
-        return thinking(f, f"item{n}.thinking", x, y, size)
     for k, (kind, body) in enumerate(segments):
         if k:
             cursor += f.px(6)
@@ -220,12 +215,80 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
             cursor += f.code_block(f"item{n}.code{k}", x, cursor, width, body)
         else:
             cursor += f.paragraph(f"item{n}.p{k}", x, cursor, width, body, size, T.TEXT)
+    if not item.get("streaming"):
+        cursor += _reference_rows(f, n, item.get("file_references", []), x, cursor, width)
+    return cursor - y
+
+
+def _reference_rows(f: Frame, n, references, x, y, width) -> int:
+    small, gap, cursor = f.px(T.FONT_SIZE_SMALL), f.px(6), y
+    for k, ref in enumerate(references[:REFERENCE_LIMIT]):
+        id = f"item{n}.ref{k}"
+        target = ref["target"]
+        missing = target in f.ui.get("missing_paths", ())
+        buttons = [] if missing else [("Open", "reference_url" if ref["kind"] == "url" else "reference_open")]
+        if not missing and ref["kind"] == "file":
+            buttons.append(("Show in folder", "reference_folder"))
+        actions_width = sum(round(f.measure("ui", small, label)) + f.px(20) + gap for label, _ in buttons)
+        stacked = width - actions_width < f.px(70)
+        name_width = width if stacked else width - actions_width
+        label = wrap(ref["name"], "ui", small, max(1, name_width - f.px(12)), f.measure)[0][1].rstrip()
+        if len(label) < len(ref["name"]):
+            label += "…"
+        cursor += gap
+        f.text(id + ".name", x, cursor + f.px(3), label, small, T.TEXT_FAINT if missing else T.TEXT_MUTED)
+        if stacked and buttons:
+            cursor += f.line_height(small) + gap
+        button_x = x if stacked else x + width - actions_width
+        for label, action in buttons:
+            button_width = round(f.measure("ui", small, label)) + f.px(20)
+            if button_x > x and button_x + button_width > x + width:
+                button_x, cursor = x, cursor + f.px(28)
+            used = f.button(id + "." + action, button_x, cursor, label, T.BUTTON_GHOST, T.TEXT,
+                            (action, target))
+            f.hits[-1]["tip"] = target
+            button_x += used + gap
+        cursor += f.px(24)
+    if len(references) > REFERENCE_LIMIT:
+        cursor += f.paragraph(f"item{n}.refs.more", x, cursor + gap, width,
+                              f"+{len(references) - REFERENCE_LIMIT} more", small, T.TEXT_FAINT) + gap
     return cursor - y
 
 
 # On a step that installs packages or runs downloaded code (agent._approval "install"): why it asks
 # although auto-run is on, and why it has no "Always allow".
 INSTALL_NOTE = "This installs software from the internet. Loopcut asks every time."
+
+
+def failure_reason(output: str, exit_code=None) -> str:
+    """Pick a diagnostic for a collapsed card without changing its stored output."""
+    lines = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or line == "(no output)":
+            continue
+        if re.match(r"^(?:[^:]+:\d+:\s*)?\[?(?:\w*warning|warn)\b", line, re.IGNORECASE):
+            continue
+        # Shell results store the exit code in a header rather than on the card.
+        header = re.fullmatch(r"exit (-?\d+|None) in [\d.]+ s(?:;.*)?", line)
+        if header:
+            if exit_code is None and header[1] != "None":
+                exit_code = int(header[1])
+            continue
+        lines.append(line)
+    # Prefer explicit errors over log footers, including footers with a colon.
+    for line in reversed(lines):
+        if (re.search(r"\b(?:[\w.]*Error|[\w.]*Exception|SystemExit|KeyboardInterrupt)(?::|$)",
+                      line, re.IGNORECASE)
+                or re.match(r"^(?:\S*/)?(?:bash|dash|fish|ksh|sh|zsh):", line)):
+            return line
+    for line in reversed(lines):
+        if re.match(r"^[\w./-]+:\s+\S", line):  # Other command diagnostics: "command: message".
+            return line
+    if lines:
+        return lines[-1]
+    suffix = f" (exit {exit_code})" if exit_code is not None else ""
+    return f"Failed with no error output{suffix}."
 
 
 def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
@@ -239,17 +302,32 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
 
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + f.px(7)
     f.text(f"item{n}.tool.glyph", inner_x, cursor, glyph, size, glyph_color)
-    name_width = round(f.measure("ui", small, item["name"]))
     label_x = inner_x + f.px(18)
     summary = item["summary"] or item["name"]
-    label = wrap(summary, "ui", size, inner_w - f.px(18) - name_width - pad - f.px(10),
-                 f.measure)[0][1].rstrip()
-    if len(label) < len(summary.strip()):
-        label += "…"
-    f.text(f"item{n}.tool.summary", label_x, cursor, label, size, T.TEXT if awaiting else T.TEXT_MUTED)
-    f.text(f"item{n}.tool.name", x + width - pad - name_width, cursor + (row - f.line_height(small)) // 2,
-           item["name"], small, T.TEXT_FAINT)
-    cursor += row
+    show_name = expanded and item["name"].strip().casefold() != summary.strip().casefold()
+    if awaiting:
+        label_width = inner_w - f.px(18)
+        cursor += f.paragraph(f"item{n}.tool.summary", label_x, cursor, label_width, summary, size, T.TEXT)
+        if show_name:
+            cursor += f.paragraph(f"item{n}.tool.name", label_x, cursor, label_width,
+                                  item["name"], small, T.TEXT_FAINT)
+    else:
+        name_width = round(f.measure("ui", small, item["name"])) if show_name else 0
+        detail_width = name_width + pad + f.px(10) if show_name else 0
+        label = wrap(summary, "ui", size, inner_w - f.px(18) - detail_width, f.measure)[0][1].rstrip()
+        if len(label) < len(summary.strip()):
+            label += "…"
+        f.text(f"item{n}.tool.summary", label_x, cursor, label, size, T.TEXT_MUTED)
+        if show_name:
+            f.text(f"item{n}.tool.name", x + width - pad - name_width, cursor + (row - f.line_height(small)) // 2,
+                   item["name"], small, T.TEXT_FAINT)
+        cursor += row
+
+    if status == "failed" and not expanded:
+        reason = failure_reason(item.get("output") or "", item.get("exit_code"))
+        f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
+               small, T.TEXT_MUTED)
+        cursor += f.line_height(small)
 
     # Provider credit must remain visible beside the search summary when its card is collapsed.
     if "Powered by Poly Haven" in item.get("output", "") and item["name"] in {
@@ -262,6 +340,17 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
                                T.CODE_PREVIEW_LINES if awaiting else None)
+    image_path = item.get("image_path")
+    # An image shows until the user collapses its card; the code and output stay behind the toggle.
+    if item.get("expanded", True) and image_path and image_path not in f.ui.get("missing_paths", ()):
+        cursor += f.px(6)
+        height = min(inner_w, f.px(220))
+        f.prims.append({"t": "image", "id": f"item{n}.tool.image", "path": image_path,
+                        "x": inner_x, "y": cursor, "w": inner_w, "h": height})
+        cursor += height + f.px(6)
+        f.button(f"item{n}.tool.image.open", inner_x, cursor, "Open image", T.BUTTON_GHOST, T.TEXT,
+                 ("reference_open", image_path))
+        cursor += f.px(24)
     if expanded and item["output"]:
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
@@ -288,6 +377,14 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         if not item.get("paid_approval") and not item.get("install") and always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
             f.button(f"item{n}.tool.always", always_x, cursor, always, T.BUTTON_GHOST, T.TEXT_MUTED,
                      ("approve_always", n))
+            f.hits[-1]["tip"] = (
+                "Allow only renders, bakes and simulations in this chat.\n"
+                "Code approval is separate; installs and paid steps still ask.\n"
+                "Resets when you reopen this chat or start a new chat."
+                if item.get("heavy") else
+                "Allow ordinary steps (edits, code, files) in this chat.\n"
+                "Renders/bakes ask separately; installs and paid steps ask.\n"
+                "Resets when you reopen this chat or start a new chat.")
         cursor += f.px(24)
     cursor += f.px(7)
 
@@ -398,15 +495,20 @@ def _item_changes(f: Frame, n: int, item: dict, x, y, width) -> int:
     cursor += f.line_height(size) + f.px(4)
 
     lines, expanded = item.get("lines", []), item.get("expanded", False)
-    shown = lines if expanded or len(lines) <= CHANGES_PREVIEW_LINES else lines[:CHANGES_PREVIEW_LINES - 1]
     code = f.px(T.FONT_SIZE_CODE)
-    for k, line in enumerate(shown):
-        f.text(f"item{n}.changes.sign{k}", inner_x, cursor, line[:1], code, _CHANGE_COLORS.get(line[:1], T.TEXT_MUTED),
-               "mono")
-        cursor += f.paragraph(f"item{n}.changes.l{k}", inner_x + f.px(14), cursor, inner_w - f.px(14), line[2:],
-                              code, T.TEXT if line[:1] in "+-" else T.TEXT_MUTED, "mono")
-    if len(shown) < len(lines) or expanded and len(lines) > CHANGES_PREVIEW_LINES:
-        label = "Show less" if expanded else f"Show {len(lines) - len(shown)} more"
+    rows = [(k, row, line[:1], text) for k, line in enumerate(lines)
+            for row, (_, text) in enumerate(wrap(line[2:], "mono", code, inner_w - f.px(14), f.measure))]
+    overflow = len(rows) > CHANGES_PREVIEW_LINES
+    shown = rows if expanded or not overflow else rows[:CHANGES_PREVIEW_LINES - 1]
+    for k, row, sign, text in shown:
+        if row == 0:
+            f.text(f"item{n}.changes.sign{k}", inner_x, cursor, sign, code,
+                   _CHANGE_COLORS.get(sign, T.TEXT_MUTED), "mono")
+        f.text(f"item{n}.changes.l{k}.l{row}", inner_x + f.px(14), cursor, text.rstrip(), code,
+               T.TEXT if sign in "+-" else T.TEXT_MUTED, "mono")
+        cursor += f.line_height(code)
+    if overflow:
+        label = "Show less" if expanded else f"Show {len(rows) - len(shown)} more"
         f.text(f"item{n}.changes.more", inner_x + f.px(14), cursor + f.px(2), label, small, T.ACCENT)
         f.hit(f"item{n}.changes.more", inner_x, cursor, inner_w, f.line_height(small) + f.px(4), ("toggle", n))
         cursor += f.line_height(small) + f.px(4)
@@ -652,9 +754,15 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     for n, item in enumerate(items):
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
     cursor = _cloud_jobs(f, cursor)
-    last = items[-1] if items else None
-    if session["busy"] and not (last and (last.get("streaming") or last.get("status") == "awaiting")):
-        cursor += thinking(f, "chat.working", x, cursor, f.px(T.FONT_SIZE), "Working") + gap
+    # Queued notes do not replace the active stream or tool as the source of activity.
+    tool_statuses = {item["status"] for item in items if item["kind"] == "tool"}
+    if session["busy"] and "awaiting" not in tool_statuses:
+        stream = next((n for n in reversed(range(len(items)))
+                       if items[n]["kind"] == "assistant" and items[n].get("streaming")), None)
+        if stream is not None and "running" not in tool_statuses:
+            cursor += thinking(f, f"item{stream}.thinking", x, cursor, f.px(T.FONT_SIZE)) + gap
+        else:
+            cursor += thinking(f, "chat.working", x, cursor, f.px(T.FONT_SIZE), "Working") + gap
 
     empty = not items and not f.ui.get("cloud_jobs") and not session["busy"]
     if empty:
@@ -722,6 +830,36 @@ def _input_lines(f: Frame, session: dict, width: int):
     return size, lines, visible
 
 
+def input_rows(display: dict | None, text: str, measure):
+    """The input's wrapped rows for this text at the width the last draw used, and a prefix measure;
+    (None, None) before the box was drawn. Rewrapped from the text, so edits since the draw count."""
+    box = (display or {}).get("input")
+    if not box:
+        return None, None
+    size = box["size"]
+    return wrap(text, "ui", size, box["width"], measure), (lambda prefix: measure("ui", size, prefix))
+
+
+def input_index(display: dict, x: float, y_top: float, measure) -> int | None:
+    """Nearest caret in the drawn input's visible lines, clamped at their edges."""
+    box = display.get("input")
+    if box is None:
+        return None
+    lines = box["lines"]
+    row = max(0, min(len(lines) - 1, int((y_top - box["y"]) // box["line_height"])))
+    start, line = lines[row]
+    if row + 1 < len(lines) and lines[row + 1][0] == start + len(line):
+        # The shared offset belongs to the next row: stop before hidden spaces or the last character.
+        line = line.rstrip() if line[-1:].isspace() else line[:-1]
+    left = 0.0
+    for column in range(len(line)):
+        right = measure("ui", box["size"], line[:column + 1])
+        if x - box["x"] < (left + right) / 2:
+            return start + column
+        left = right
+    return start + len(line)
+
+
 def _context_row_height(f: Frame) -> int:
     return f.px(26)
 
@@ -765,15 +903,26 @@ def _chip_rows(f: Frame, id: str, x: int, y: int, width: int, session: dict) -> 
     return height
 
 
+def _input_notice(f: Frame, y: int) -> int:
+    """Transient feedback above the controls; the host's regular poll redraws it at expiry."""
+    notice = f.ui.get("action_notice")
+    if not notice or f.ui.get("now", 0.0) >= notice["until"]:
+        return 0
+    pad = f.px(T.PAD)
+    return f.paragraph("input.notice", pad, y, f.width - 2 * pad, notice["text"],
+                       f.px(T.FONT_SIZE_SMALL), T.OK) + f.px(6)
+
+
 def input_height(f: Frame, session: dict) -> int:
     pad, card_pad = f.px(T.PAD), f.px(T.CARD_PAD)
     inner_w = f.width - 2 * pad - 2 * card_pad
     size, _, visible = _input_lines(f, session, inner_w)
-    measuring = Frame(f.width, f.height, f.scale, f.measure)  # Chips wrap, so their height is laid out to be known.
+    measuring = Frame(f.width, f.height, f.scale, f.measure, ui=f.ui)  # Measure wrapped chips and notice.
     chips = _chip_rows(measuring, "measure", 0, 0, inner_w, session)
     chips += f.px(6) if chips else 0
     return (visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad
-            + _context_row_height(f) + chips + _cloud_height(f) + (f.px(22) if f.ui.get("credits") else 0))
+            + _context_row_height(f) + chips + _cloud_height(f) + (f.px(22) if f.ui.get("credits") else 0)
+            + _input_notice(measuring, 0))
 
 
 _INTEREST_SIGN_IN = 'Sign in to hear when your picks launch.'
@@ -1137,8 +1286,10 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     hover = f.ui.get("hover")
 
     f.rect("input.zone", 0, top, f.width, f.height - top, T.BG)
+    notice_height = _input_notice(f, top + pad)
     cloud_height = _cloud_height(f)
-    card_y, card_h = top + pad, f.height - top - 2 * pad - cloud_height
+    card_y = top + pad + notice_height
+    card_h = f.height - top - 2 * pad - cloud_height - notice_height
     f.rect("input.card", x, card_y, width, card_h, T.INPUT_BG, f.px(T.RADIUS), 1,
            T.ACCENT if focused else T.INPUT_BORDER)
     f.hit("input.card", x, card_y, width, card_h, ("focus", None))
@@ -1148,19 +1299,26 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     text_y += _context_row_height(f)
     chips = _chip_rows(f, "input.image", inner_x, text_y, inner_w, session)
     text_y += chips + (f.px(6) if chips else 0)
-    first = max(0, len(lines) - visible)  # Keep the tail in view once the box is full.
+    # Keep the caret's row in view (the tail while typing at the end); only the rows in view are drawn.
+    caret_row = textedit.locate(lines, session["cursor"])[0]
+    first = textedit.first_row(session.get("input_first", len(lines)), caret_row, visible, len(lines))
+    session["input_first"] = first
+    shown = lines[first:first + visible]
+    f.input = {"x": inner_x, "y": text_y, "size": size, "line_height": line_height, "lines": shown,
+               "width": inner_w}
     anchor = session.get("anchor")
     if focused and anchor is not None and anchor != session["cursor"]:
         low, high = sorted((anchor, session["cursor"]))
-        for n, (start, line) in enumerate(lines[first:]):
+        for n, (start, line) in enumerate(shown):
             a, b = max(low, start), min(high, start + len(line))
-            if a < b or (a == b == start + len(line) and low <= a < high):  # The second: a selected newline.
+            # The second: a selected newline (a real one; a soft wrap's row end is the next row's start).
+            if a < b or (a == b == start + len(line) and low <= a < high and session["input"][a:a + 1] == "\n"):
                 left = inner_x + round(f.measure("ui", size, line[:a - start]))
                 right = inner_x + round(f.measure("ui", size, line[:b - start])) + (f.px(4) if a == b else 0)
                 f.rect(f"input.selection{n}", left, text_y + n * line_height + f.px(1), right - left,
                        line_height - f.px(2), T.SELECTION)
     if session["input"]:
-        for n, (_, line) in enumerate(lines[first:]):
+        for n, (_, line) in enumerate(shown):
             f.text(f"input.l{n}", inner_x, text_y + n * line_height, line.rstrip(), size, T.TEXT)
     else:
         placeholder = "Say what to do with these" if session.get("attachments") else \
@@ -1168,11 +1326,9 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
         f.text("input.placeholder", inner_x, text_y, placeholder, size, T.TEXT_FAINT)
 
     if focused:
-        cursor = session["cursor"]
-        row = max((n for n, (start, _) in enumerate(lines) if start <= cursor), default=0)
-        start, line = lines[row]
-        caret_x = inner_x + round(f.measure("ui", size, line[:cursor - start]))
-        if row >= first:
+        row, column = textedit.locate(lines, session["cursor"])
+        caret_x = inner_x + round(f.measure("ui", size, lines[row][1][:column]))
+        if first <= row < first + visible:
             f.rect("input.caret", caret_x, text_y + (row - first) * line_height + f.px(2),
                    max(1, f.px(1.5)), line_height - f.px(4), T.ACCENT)
 
@@ -1346,12 +1502,25 @@ def _cloud_jobs(f: Frame, cursor):
 def _jobs(f: Frame, top, bottom):
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
     cursor = _cloud_jobs(f, top + pad)
+    for row in f.ui.get("local_processes", []):
+        id = row["id"]
+        minutes, seconds = divmod(int(row["elapsed"]), 60)
+        elapsed = f"{minutes}m {seconds:02d}s"
+        elapsed_w = round(f.measure("ui", small, elapsed))
+        f.text(f"process.{id}.elapsed", f.width - pad - elapsed_w, cursor + f.px(3), elapsed, small, T.TEXT_MUTED)
+        title_w = f.width - pad * 2 - elapsed_w - f.px(8)
+        f.text(f"process.{id}.title", pad, cursor + f.px(3),
+               _ellipsize(f, f"Running · {row['label']}", small, title_w), small, T.TEXT)
+        cursor += f.px(26)
+        f.text(f"process.{id}.log", pad, cursor,
+               _ellipsize(f, Path(row["log"]).name, small, f.width - pad * 2), small, T.TEXT_MUTED)
+        cursor += f.line_height(small) + pad
     error = f.ui.get("job_error")
     if error:
         cursor += f.paragraph("jobs.error", pad, cursor, f.width - 2 * pad, error, small, T.ERROR) + pad
     rows = f.ui.get("jobs", [])
     if not rows:
-        if f.ui.get("cloud_jobs"):
+        if f.ui.get("cloud_jobs") or f.ui.get("local_processes"):
             return
         f.paragraph("jobs.empty", pad, cursor, f.width - 2 * pad,
                     "No background jobs yet. Ask Loopcut to render or export a scene.", small, T.TEXT_MUTED)
@@ -1412,7 +1581,7 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
         _input(f, session, input_top, model)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
-            "prims": f.prims, "hits": f.hits}
+            "prims": f.prims, "hits": f.hits, "input": f.input}
 
 
 def hit_at(display: dict, x: float, y_top: float) -> dict | None:

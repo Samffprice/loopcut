@@ -80,6 +80,9 @@ CHECKER = "lc_uv_checker"
 CAP = 0.7                # A cylinder's face whose normal is at least this much along Z is a cap.
 POLE = 0.999             # A sphere's corner this close to its axis takes its longitude from the others.
 
+# Offered to the single loop only: the orchestrator and workers keep their fixed-token caps, and an orchestrator
+# does not rework a worker's prop (a worker re-UVing a painted import would need it added there too).
+SINGLE_ONLY = {"transfer_textures"}
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "inspect_uv",
@@ -113,6 +116,17 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "density": {"type": "number", "description": "px/m, if it fits"},
             "atlas": {"type": "boolean", "description": "One layout for all (one texture)"},
         }, "required": ["objects", "method"]},
+    }},
+    {"type": "function", "function": {
+        "name": "transfer_textures",
+        "description": (
+            "Images follow the UV map they read: a new layout moves the artwork. Bakes the images the materials "
+            "read through from_uv (the painted layout) onto to_uv, same size and colour space, normal maps for "
+            "to_uv's tangents; repoints the materials; keeps from_uv; skips tiling ones."),
+        "parameters": {"type": "object", "properties": {
+            "objects": {"type": "array", "items": {"type": "string"}},
+            "from_uv": {"type": "string"}, "to_uv": {"type": "string"},
+        }, "required": ["objects", "from_uv", "to_uv"]},
     }},
 ]
 
@@ -541,13 +555,15 @@ def project(method: str, corners: list, normal, centre, step: float) -> list[tup
 
 def describe(name: str, arguments: dict) -> tuple[str, str] | None:
     """(summary, code) for the tool card."""
-    if name not in ("inspect_uv", "uv_unwrap"):
+    if name not in ("inspect_uv", "uv_unwrap", "transfer_textures"):
         return None
     objects = arguments.get("objects")
     subject = ", ".join(map(str, objects[:3])) + (f", +{len(objects) - 3} more" if len(objects) > 3 else "") \
         if isinstance(objects, list) and objects else "?"
     if name == "uv_unwrap":
         return f"UV unwrap {subject} ({arguments.get('method', '?')})", ""
+    if name == "transfer_textures":
+        return f"Move the textures of {subject} onto {arguments.get('to_uv', '?')}", ""
     if arguments.get("plan"):
         return f"Plan a texture atlas for {subject}", ""
     return f"Measure the UVs of {subject}" + (" with a checker" if arguments.get("checker") else ""), ""
@@ -799,7 +815,7 @@ def _checker_look(objects):
     return path
 
 
-def _not_yours(objects) -> str:
+def _not_yours(objects, tool: str = "uv_unwrap") -> str:
     """Why an orchestrator may not unwrap these, or "": what a worker built goes back to that worker
     (the orchestrator fixing a worker's prop is a failure), and a running worker's objects are its
     own until they merge. A single agent and a worker's child have no workers to ask."""
@@ -819,9 +835,9 @@ def _not_yours(objects) -> str:
         if wid:
             problems.append(f"{obj.name} is running worker {wid}'s until it merges")
         elif obj.name in built:
-            problems.append(f"worker {built[obj.name]} built {obj.name}: send the unwrap back to it (continues "
-                            f"{built[obj.name]})")
-    return ("uv_unwrap refused: " + "; ".join(problems) + ".") if problems else ""
+            problems.append(f"worker {built[obj.name]} built {obj.name}: send the {'unwrap' if tool == 'uv_unwrap' else 'job'} "
+                            f"back to it (continues {built[obj.name]})")
+    return (f"{tool} refused: " + "; ".join(problems) + ".") if problems else ""
 
 
 def _ancestors(obj) -> list:
@@ -880,6 +896,10 @@ def uv_unwrap(objects: list, method: str, angle: float | None = None, uv_map: st
                 if layer is None:
                     raise ToolError(f"{obj.name} has as many UV maps as Blender allows; name one of them as uv_map.")
                 notes.append(f"Made UV map {layer.name} on {obj.name}.")
+            else:
+                name = layer.name
+                notes += _keep_painted_layout(obj, name)
+                layer = obj.data.uv_layers[name]  # Adding a map reallocates the layers: never hold one across it.
             obj.data.uv_layers.active = layer  # The operators write to the active map.
             layers[obj] = layer.name
         for group in ([unique] if atlas else [[o] for o in unique]):
@@ -1101,4 +1121,488 @@ def _to_density(group, layers: dict, target: float, resolution: int, margin: flo
     return [f"{target:g} px/m did not pack into one tile after all; packed to fill it instead."]
 
 
-DISPATCH = {"inspect_uv": inspect_uv, "uv_unwrap": uv_unwrap}
+def _keep_painted_layout(obj, layer_name: str) -> list[str]:
+    """Before an unwrap rewrites a map that image textures read, a copy of it keeps the layout they
+    were painted for, so transfer_textures can move them across (the unwrap alone scrambles them)."""
+    import numpy as np
+    from .texture_tools import _bindings
+    mesh = obj.data
+    layer = mesh.uv_layers[layer_name]
+    renders = layer.active_render
+    images = sorted({b["image"].name for slot in obj.material_slots if slot.material is not None
+                     for b in _bindings(slot.material) if "groups" not in b and b["image"] is not None
+                     and (b["uv_map"] == layer.name or (b["uv_map"] == "" and renders))})
+    if not images:
+        return []
+    uv = np.empty(len(obj.data.loops) * 2, np.float32)
+    layer.uv.foreach_get("vector", uv)
+    if not len(uv) or np.ptp(uv) == 0:
+        return []  # No layout to keep.
+    name = f"{layer_name} before unwrap"[:63]
+    if mesh.uv_layers.get(name) is not None:
+        return [f"{obj.name}'s images ({', '.join(images[:4])}) were painted for {name}, kept from an earlier unwrap."]
+    kept = mesh.uv_layers.new(name=name, do_init=False)
+    if kept is not None:  # Copied by name: do_init does not copy the active map once there are several.
+        kept_name = kept.name
+        mesh.uv_layers[kept_name].uv.foreach_set("vector", uv)
+    if kept is None:
+        return [f"{obj.name}'s materials read {', '.join(images[:4])} through {layer_name}: this unwrap moves that "
+                f"artwork on the surface, and its old layout could not be kept (too many UV maps)."]
+    mesh.uv_layers[kept_name].active_render = False
+    mesh.uv_layers[layer_name].active_render = renders
+    mesh.uv_layers.active = mesh.uv_layers[layer_name]
+    return [f"{obj.name}'s materials read {', '.join(images[:4])} through {layer_name}, so its old layout is kept as "
+            f"{kept_name}: transfer_textures from {kept_name} to {layer_name} moves the artwork onto the new layout "
+            f"(until then it no longer lines up)."]
+
+
+# ------------------------------------------------------------------ Blender: transfer_textures
+
+TRANSFER_SAMPLES = 4   # Per texel: a little antialiasing where the new layout shrinks an island.
+TILING = 1.02          # Source UVs reaching past 0-1 by this much, or a Mapping scale above it: a texture that tiles.
+
+
+def _feeds_tangent_normal(node) -> bool:
+    """The image's Color goes (through reroutes) into a tangent-space Normal Map node."""
+    stack, seen = [link.to_node for link in node.outputs["Color"].links], set()
+    while stack:
+        target = stack.pop()
+        if target.as_pointer() in seen:
+            continue
+        seen.add(target.as_pointer())
+        if target.type == "NORMAL_MAP":
+            return target.space == "TANGENT"
+        if target.type == "REROUTE":
+            stack += [link.to_node for link in target.outputs[0].links]
+    return False
+
+
+def _tangent_normal_maps(node) -> list:
+    found, stack, seen = [], [link.to_node for link in node.outputs["Color"].links], set()
+    while stack:
+        target = stack.pop()
+        if target.as_pointer() in seen:
+            continue
+        seen.add(target.as_pointer())
+        if target.type == "NORMAL_MAP" and target.space == "TANGENT":
+            found.append(target)
+        elif target.type == "REROUTE":
+            stack += [link.to_node for link in target.outputs[0].links]
+    return found
+
+
+def uv_reach(obj, uv_map: str, slot: int) -> float:
+    """How far past 0-1 the slot's faces reach on a UV map (0 inside the tile)."""
+    import numpy as np
+    mesh = obj.data
+    layer = mesh.uv_layers.get(uv_map)
+    if layer is None or not len(mesh.loops):
+        return 0.0
+    uv = np.empty(len(mesh.loops) * 2, np.float32)
+    layer.uv.foreach_get("vector", uv)
+    materials = np.empty(len(mesh.polygons), np.int32)
+    mesh.polygons.foreach_get("material_index", materials)
+    starts = np.empty(len(mesh.polygons), np.int32)
+    totals = np.empty(len(mesh.polygons), np.int32)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    mine = np.zeros(len(mesh.loops), bool)
+    for start, total in zip(starts[materials == slot], totals[materials == slot]):
+        mine[start:start + total] = True
+    if not mine.any():
+        return 0.0
+    points = uv.reshape(-1, 2)[mine]
+    return float(max(0.0, -points.min(), points.max() - 1.0))
+
+
+def _transfer_plan(targets, from_uv: str, to_uv: str) -> tuple[dict, list, list, list]:
+    """({image name: job}, skipped lines, skipped images that read the rendering map, problems). A job is
+    one image to bake onto to_uv: its kind (color or normal), whether its alpha is used, and every
+    (object, slot, material, node) that reads it through the old layout."""
+    import bpy
+    from .texture_tools import _bindings
+    jobs, skipped, skipped_render, problems, seen = {}, [], [], [], set()
+    users = {}
+    for obj in targets:
+        for index, slot in enumerate(obj.material_slots):
+            if slot.material is not None:
+                users.setdefault(slot.material.name, []).append((obj, index))
+    for name, places in users.items():
+        material = bpy.data.materials[name]
+        for binding in _bindings(material):
+            if "groups" in binding:
+                skipped.append(f"{name} has node groups ({', '.join(binding['groups'])}): images inside them are not moved")
+                skipped_render.append(f"images in {name}'s node groups")
+                continue
+            node, image = binding["node"], binding["image"]
+            if image is None or node.as_pointer() in seen:
+                continue
+            seen.add(node.as_pointer())
+            where = f"{image.name} in {name}"
+            uv_map, transform = binding["uv_map"], binding["transform"]
+            if uv_map is None:
+                skipped.append(f"{where}: not read through a UV map{binding['note']}; left as it is")
+                continue
+            if uv_map not in ("", from_uv, to_uv):
+                skipped.append(f"{where} reads through {uv_map}; left as it is")
+                continue
+            if image.source == "TILED" or not all(image.size):
+                skipped.append(f"{where} " + ("is a UDIM image" if image.source == "TILED" else
+                                              "has no pixels (is its file missing?)") + "; not moved")
+                if uv_map == "":
+                    skipped_render.append(image.name)
+                continue
+            scale = max(abs(v) for v in transform["scale"]) if transform else 1.0
+            reach = max(uv_reach(obj, from_uv, index) for obj, index in places)
+            if node.extension == "REPEAT" and (scale > TILING or reach > TILING - 1):
+                skipped.append(f"{where} repeats (" + (f"Mapping scale {scale:g}" if scale > TILING else
+                               f"its UVs reach {1 + reach:.2g} on {from_uv}") + "): left to tile on the new layout")
+                continue
+            kind = "normal" if _feeds_tangent_normal(node) else "color"
+            transform = {k: v for k, v in transform.items() if k != "name"} if transform else None
+            job = jobs.setdefault(image.name, {"image": image, "kind": kind, "alpha": False, "uses": [],
+                                               "transform": transform})
+            if job["kind"] != kind or job["transform"] != transform:
+                problems.append(f"{image.name} is read two ways (as colour and as a normal map, or through different "
+                                f"Mapping nodes): one image can't be moved for both")
+                continue
+            job["alpha"] = job["alpha"] or node.outputs["Alpha"].is_linked
+            job["uses"] += [(obj, index, material, node) for obj, index in places]
+    moving = {m.name for job in jobs.values() for _, _, m, _ in job["uses"]}
+    for name in sorted(moving):  # Repointing a material changes it everywhere it is used.
+        others = sorted({o.name for o in bpy.data.objects if o not in targets and o.users_scene
+                         and any(s.material is not None and s.material.name == name for s in o.material_slots)})
+        if others:
+            problems.append(f"material {name} is also on {', '.join(others)}, which would show the moved images on "
+                            f"their old layout: add {'them' if len(others) > 1 else 'it'} to objects (same layouts), "
+                            f"or give {'them' if len(others) > 1 else 'it'} a copy of {name} first")
+    return jobs, skipped, skipped_render, problems
+
+
+class _TransferBake:
+    """The objects alone selected and visible, to_uv active and rendering (the bake writes into the active
+    map, and tangent-space normals follow the rendering one), Cycles: put back after, with the slots'
+    materials and every temporary image and material removed."""
+
+    def __init__(self, targets, to_uv: str):
+        self.targets, self.to_uv = targets, to_uv
+
+    def __enter__(self):
+        import bpy
+        scene, layer = bpy.context.scene, bpy.context.view_layer
+        self.scene, self.layer = scene, layer
+        self.selected = [o for o in layer.objects if o.select_get()]
+        self.active = layer.objects.active
+        bake = scene.render.bake
+        self.render = (scene.render.engine, scene.cycles.samples, bake.margin, bake.margin_type, bake.use_clear,
+                       bake.target, bake.use_selected_to_active, bake.normal_space)
+        self.uv, self.shown, self.slots, self.temporary = {}, [], [], []
+        for obj in self.targets:
+            self.shown.append((obj, obj.hide_get(), obj.hide_viewport, obj.hide_select))
+            obj.hide_viewport = obj.hide_select = False
+            if obj.hide_get():
+                obj.hide_set(False)
+            mesh = obj.data
+            if mesh not in self.uv:
+                render = next((l.name for l in mesh.uv_layers if l.active_render), None)
+                self.uv[mesh] = (mesh.uv_layers.active.name if mesh.uv_layers.active else None, render)
+                mesh.uv_layers.active = mesh.uv_layers[self.to_uv]
+                mesh.uv_layers[self.to_uv].active_render = True
+            for index, slot in enumerate(obj.material_slots):
+                self.slots.append((obj, index, slot.material, slot.link))
+        for obj in self.selected:
+            obj.select_set(False)
+        scene.render.engine = "CYCLES"
+        scene.cycles.samples = TRANSFER_SAMPLES
+        bake.target, bake.use_selected_to_active, bake.margin_type = "IMAGE_TEXTURES", False, "EXTEND"
+        return self
+
+    def material(self, name: str):
+        import bpy
+        material = bpy.data.materials.new(name)
+        self.temporary.append(material)
+        return material
+
+    def image(self, name: str, width: int, height: int):
+        import bpy
+        image = bpy.data.images.new(name, width, height, alpha=False, float_buffer=True)
+        image.colorspace_settings.name = "Non-Color"
+        self.temporary.append(image)
+        return image
+
+    def __exit__(self, *exc):
+        import bpy
+        scene, layer = self.scene, self.layer
+        for obj, index, material, link in reversed(self.slots):
+            obj.material_slots[index].link = link
+            obj.material_slots[index].material = material
+        for item in self.temporary:
+            (bpy.data.materials if isinstance(item, bpy.types.Material) else bpy.data.images).remove(item)
+        for mesh, (active, render) in self.uv.items():
+            if active is not None and mesh.uv_layers.get(active) is not None:
+                mesh.uv_layers.active = mesh.uv_layers[active]
+            if render is not None and mesh.uv_layers.get(render) is not None:
+                mesh.uv_layers[render].active_render = True
+        for obj in layer.objects:
+            obj.select_set(obj in self.selected)
+        for obj, hidden, viewport, unselectable in self.shown:
+            obj.hide_viewport, obj.hide_select = viewport, unselectable
+            if hidden:
+                obj.hide_set(True)
+        layer.objects.active = self.active
+        bake = scene.render.bake
+        (scene.render.engine, scene.cycles.samples, bake.margin, bake.margin_type, bake.use_clear, bake.target,
+         bake.use_selected_to_active, bake.normal_space) = self.render
+        return False
+
+
+def _bake_source(tree, job: dict, from_uv: str, alpha: bool = False):
+    """Old image read through the old layout (and its Mapping): the socket to bake, and the Alpha socket
+    when the material uses it (an image node's Color is premultiplied unless its Alpha is used)."""
+    from .paint_tools import _node
+    coords = _node(tree, "ShaderNodeUVMap")
+    coords.uv_map = from_uv
+    vector = coords.outputs["UV"]
+    transform = job["transform"]
+    if transform:
+        mapping = _node(tree, "ShaderNodeMapping")
+        mapping.vector_type = transform["kind"]
+        for socket in ("Location", "Rotation", "Scale"):
+            if socket in mapping.inputs:
+                mapping.inputs[socket].default_value = transform[socket.lower()]
+        tree.links.new(vector, mapping.inputs["Vector"])
+        vector = mapping.outputs["Vector"]
+    texture = _node(tree, "ShaderNodeTexImage")
+    texture.image, texture.interpolation, texture.extension = job["image"], job["uses"][0][3].interpolation, \
+        job["uses"][0][3].extension
+    tree.links.new(vector, texture.inputs["Vector"])
+    return texture.outputs["Alpha" if alpha else "Color"], texture.outputs["Alpha"]
+
+
+def _bake_job(bake: "_TransferBake", job: dict, target, from_uv: str, alpha: bool = False) -> None:
+    """One bake of one image: every slot that reads it gets a material sampling it on the old layout,
+    every other slot of those objects bakes black into a throwaway image."""
+    import bpy
+    from .paint_tools import _node
+    from .tools import ToolError
+    reading = {(obj.name, index) for obj, index, _, _ in job["uses"]}
+    objects = list(dict.fromkeys(obj for obj, _, _, _ in job["uses"]))
+    spare = bake.image("lc_transfer_spare", 8, 8)
+    for obj in objects:
+        for index, slot in enumerate(obj.material_slots):
+            material = bake.material("lc_transfer_bake")
+            material.use_nodes = True
+            tree = material.node_tree
+            tree.nodes.clear()
+            output = _node(tree, "ShaderNodeOutputMaterial")
+            image = _node(tree, "ShaderNodeTexImage")
+            if (obj.name, index) in reading:
+                source, alpha_out = _bake_source(tree, job, from_uv, alpha)
+                if job["kind"] == "normal" and not alpha:
+                    normal = _node(tree, "ShaderNodeNormalMap")
+                    normal.space, normal.uv_map = "TANGENT", from_uv
+                    tree.links.new(source, normal.inputs["Color"])
+                    shader = _node(tree, "ShaderNodeBsdfDiffuse")
+                    tree.links.new(normal.outputs["Normal"], shader.inputs["Normal"])
+                    tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+                else:
+                    emission = _node(tree, "ShaderNodeEmission")
+                    tree.links.new(source, emission.inputs["Color"])
+                    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+                    if job["alpha"] and not alpha:
+                        # Use the Alpha (strength max(alpha, 1) is 1) so the Color stays straight, as the material reads it.
+                        one = _node(tree, "ShaderNodeMath", operation="MAXIMUM")
+                        one.inputs[1].default_value = 1.0
+                        tree.links.new(alpha_out, one.inputs[0])
+                        tree.links.new(one.outputs["Value"], emission.inputs["Strength"])
+                image.image = target
+            else:
+                image.image = spare
+            tree.nodes.active = image
+            slot.material = material
+        obj.select_set(True)
+    unselected = [o.name for o in objects if not o.select_get()]
+    if unselected:  # A bake leaves out what is not selected: its islands would stay empty.
+        raise ToolError(f"{', '.join(unselected)} can't be selected here (in a hidden or excluded collection?); "
+                        f"show it, then move the textures again")
+    bpy.context.view_layer.objects.active = objects[0]
+    size = max(target.size)
+    try:
+        bpy.ops.object.bake(type="NORMAL" if job["kind"] == "normal" and not alpha else "EMIT",
+                            normal_space="TANGENT", normal_r="POS_X", normal_g="POS_Y", normal_b="POS_Z",
+                            margin=max(4, size // 128), margin_type="EXTEND", use_clear=True,
+                            target="IMAGE_TEXTURES", use_selected_to_active=False)
+    except RuntimeError as ex:
+        raise ToolError(f"The bake of {job['image'].name} failed: {str(ex).strip()}") from None
+    finally:
+        for obj in objects:
+            obj.select_set(False)
+
+
+def _new_image(job: dict, to_uv: str):
+    import bpy
+    old = job["image"]
+    width, height = old.size
+    image = bpy.data.images.new(f"{old.name} {to_uv}"[:63], width, height, alpha=job["alpha"],
+                                float_buffer=old.is_float)
+    image.colorspace_settings.name = old.colorspace_settings.name
+    # The baked colour is straight whatever the source stored (a premultiplied source would be divided again).
+    image.alpha_mode = "CHANNEL_PACKED" if old.alpha_mode == "CHANNEL_PACKED" else "STRAIGHT"
+    return image
+
+
+def _repoint(job: dict, image, to_uv: str) -> None:
+    """The materials read the new image through to_uv; the old Mapping is baked in, so it is bypassed."""
+    from .paint_tools import _node
+    done = set()
+    for _, _, material, node in job["uses"]:
+        if node.as_pointer() in done:
+            continue
+        done.add(node.as_pointer())
+        tree = material.node_tree
+        coords = _node(tree, "ShaderNodeUVMap", location=(node.location.x - 220, node.location.y - 120))
+        coords.uv_map = to_uv
+        tree.links.new(coords.outputs["UV"], node.inputs["Vector"])
+        node.image = image
+        for normal in _tangent_normal_maps(node):
+            normal.uv_map = to_uv
+
+
+def _layout_clashes(jobs: dict, to_uv: str) -> list[str]:
+    """Several meshes baking one image must keep apart on to_uv: islands of two meshes in the same place
+    would bake over each other, and one of them would show the other's artwork."""
+    problems = []
+    for name, job in jobs.items():
+        by_mesh = {}
+        for obj, index, _, _ in job["uses"]:
+            by_mesh.setdefault(obj.data.name, (obj.data, set()))[1].add(index)
+        if len(by_mesh) < 2:
+            continue
+        triangles = {}
+        for mesh_name, (mesh, slots) in by_mesh.items():
+            mesh.calc_loop_triangles()
+            uv = mesh.uv_layers[to_uv].uv
+            triangles[mesh_name] = [tuple(tuple(uv[loop].vector) for loop in t.loops) for t in mesh.loop_triangles
+                                    if t.material_index in slots]
+        found = overlap(triangles, grid=128)
+        if found["pairs"] and found["shared"] > 0.01 * max(1, found["cells"]):
+            a, b = found["pairs"][0]
+            problems.append(f"{name} would be baked by {a} and {b}, whose {to_uv} layouts overlap: unwrap them into "
+                            f"one atlas (uv_unwrap atlas) first, or give each its own copy of the material")
+    return problems
+
+
+def _settle_maps(targets, from_uv: str, to_uv: str, jobs: dict, skipped_render: list) -> list[str]:
+    """to_uv becomes the active map; also the rendering one unless an image left as it is still reads the
+    rendering map. A copy uv_unwrap kept ('<to_uv> before unwrap') is spent once moved from: renamed, so the
+    next unwrap of to_uv keeps the layout these new images were baked for."""
+    notes = []
+    for mesh in {o.data for o in targets}:
+        mesh.uv_layers.active = mesh.uv_layers[to_uv]
+        if not skipped_render:
+            mesh.uv_layers[to_uv].active_render = True
+        kept = mesh.uv_layers.get(from_uv)
+        if jobs and kept is not None and from_uv == f"{to_uv} before unwrap"[:63]:
+            # A free name: renaming a map onto an existing map's name replaces that map (Blender 5.2, measured).
+            base, number = f"{to_uv} painted"[:60], 1
+            name = base
+            while mesh.uv_layers.get(name) is not None:
+                number += 1
+                name = f"{base} {number}"
+            kept.name = name
+            notes.append(f"{from_uv} is renamed {name} on {mesh.name}: the next unwrap of {to_uv} keeps its "
+                         f"current layout instead.")
+    if skipped_render:
+        notes.append(f"The rendering map stays as it was: {', '.join(skipped_render[:3])} read it and were left as "
+                     f"they are.")
+    return notes
+
+
+def transfer_textures(objects: list, from_uv: str, to_uv: str):
+    """The tool (see SCHEMAS). In Object Mode for the call (Edit Mode keeps UV maps out of the mesh data),
+    one undo step before it; selection, engine, slots, hiding and active maps put back after the bakes,
+    then to_uv made the active map, and the rendering one when nothing left behind reads that."""
+    import time
+    import bpy
+    import numpy as np
+    from . import scene_diff, tools
+    from .camera import _undo_push
+    from .tools import ToolError, ToolResult
+    targets = _named(objects)
+    if not all(isinstance(v, str) and v for v in (from_uv, to_uv)) or from_uv == to_uv:
+        raise ToolError("from_uv and to_uv: the names of two different UV maps, the old layout and the new one")
+    problems = [f"{o.name} is not a mesh ({o.type})" for o in targets if o.type != "MESH"]
+    problems += [f"{o.name}'s mesh is linked from a library" for o in targets
+                 if o.type == "MESH" and (o.library is not None or o.data.library is not None)]
+    problems += [f"{o.name} is not in this view layer" for o in targets if o.name not in bpy.context.view_layer.objects]
+    if problems:
+        raise ToolError("transfer_textures refused: " + "; ".join(problems) + ".")
+    refusal = _not_yours(targets, "transfer_textures")
+    if refusal:
+        raise ToolError(refusal)
+    with tools._editor_context("VIEW_3D"), _ObjectMode():
+        for obj in targets:
+            missing = [n for n in (from_uv, to_uv) if obj.data.uv_layers.get(n) is None]
+            if missing:
+                have = ", ".join(l.name for l in obj.data.uv_layers) or "none"
+                problems.append(f"{obj.name} has no UV map {' or '.join(missing)} (its maps: {have})")
+        if not problems:
+            jobs, skipped, skipped_render, problems = _transfer_plan(targets, from_uv, to_uv)
+            problems += _layout_clashes(jobs, to_uv)
+        if problems:
+            raise ToolError("transfer_textures refused: " + "; ".join(problems) + ".")
+        before = scene_diff.snapshot()
+        _undo_push("Before Loopcut: transfer textures")
+        started, made = time.perf_counter(), {}
+        with _TransferBake(targets, to_uv) as bake:
+            for name, job in jobs.items():
+                image = _new_image(job, to_uv)
+                made[name] = image
+                _bake_job(bake, job, image, from_uv)
+                if job["alpha"]:
+                    width, height = image.size
+                    alpha = bake.image("lc_transfer_alpha", width, height)
+                    _bake_job(bake, job, alpha, from_uv, alpha=True)
+                    pixels = np.empty(width * height * 4, np.float32)
+                    image.pixels.foreach_get(pixels)
+                    values = np.empty(width * height * 4, np.float32)
+                    alpha.pixels.foreach_get(values)
+                    pixels[3::4] = values[0::4]
+                    if image.is_float:  # Float buffers hold premultiplied colour; byte ones straight.
+                        for channel in range(3):
+                            pixels[channel::4] *= pixels[3::4]
+                    image.pixels.foreach_set(pixels)
+        for name, job in jobs.items():
+            image = made[name]
+            image.file_format = "OPEN_EXR" if image.is_float else "PNG"
+            image.pack()
+            _repoint(job, image, to_uv)
+        notes = _settle_maps(targets, from_uv, to_uv, jobs, skipped_render)
+        for obj in {o.data: o for o in targets}.values():  # Stacked islands share texels: one face's paint shows.
+            stacked = audit(*_gather(obj, to_uv))["overlapping"]
+            if stacked and jobs:
+                notes.append(f"{obj.name}'s {to_uv} has {len(stacked)} pair{'s' * (len(stacked) != 1)} of overlapping "
+                             f"islands (faces {stacked[0][0]}/{stacked[0][1]}...): where islands share texels only one "
+                             f"face's paint can show. Unwrap without overlaps to keep the look everywhere.")
+    seconds = time.perf_counter() - started
+    names = ", ".join(o.name for o in targets)
+    if jobs:
+        renders = "the active and rendering map" if not skipped_render else "the active map"
+        lines = [f"Moved {len(jobs)} image{'s' * (len(jobs) != 1)} of {names} from {from_uv} onto {to_uv} in "
+                 f"{seconds:.1f} s; {to_uv} is now {renders}, {from_uv} is kept (it can go once the result looks "
+                 f"right). New images are packed into the .blend:"]
+        for name, job in jobs.items():
+            old, new = job["image"], made[name]
+            what = "normal map, re-baked for the new tangents" if job["kind"] == "normal" else \
+                old.colorspace_settings.name + (", with alpha" if job["alpha"] else "")
+            places = sorted({m.name for _, _, m, _ in job["uses"]})
+            lines.append(f"- {old.name} -> {new.name} ({old.size[0]}x{old.size[1]}, {what}) in {', '.join(places)}")
+    else:
+        lines = [f"Nothing to move: no image on {names}'s materials reads through {from_uv}."]
+    if skipped:
+        lines.append("Left as they are: " + "; ".join(skipped) + ".")
+    lines += notes
+    return ToolResult("\n".join(lines), scene_before=before, scene_after=scene_diff.snapshot())
+
+
+DISPATCH = {"inspect_uv": inspect_uv, "uv_unwrap": uv_unwrap, "transfer_textures": transfer_textures}

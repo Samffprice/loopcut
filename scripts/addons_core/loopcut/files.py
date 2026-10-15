@@ -335,7 +335,7 @@ def _read_image(path: Path) -> ToolResult:
         width, height = attachments._to_png(path, out, IMAGE_SIDE)
     except attachments.AttachmentError as ex:
         raise ToolError(str(ex)) from ex
-    return ToolResult(f"Image attached: the file {path.name}, {width}x{height} px.", image_path=out)
+    return ToolResult(f"Image attached: the file {path.name}, {width}x{height} px.", image_path=out, file_image=True)
 
 
 def read_file(path: str, lines: list | None = None) -> ToolResult:
@@ -481,7 +481,7 @@ def see_render(render: bool = False, full: bool = False) -> ToolResult:
         width, height = attachments._to_png(out, shown, IMAGE_SIDE)
     except attachments.AttachmentError as ex:
         raise ToolError(str(ex)) from ex
-    return ToolResult(f"Image attached: {what}, {width}x{height} px.", image_path=shown)
+    return ToolResult(f"Image attached: {what}, {width}x{height} px.", image_path=shown, file_image=True)
 
 
 DISPATCH = {

@@ -1,5 +1,5 @@
-"""The file tools' rules and behaviour on a temp folder. No Blender needed: the image branch and
-see_render need bpy and are covered by harness/tools_check.py."""
+"""The file tools' rules and behaviour on a temp folder. Image I/O is mocked here;
+harness/tools_check.py covers it with Blender."""
 
 import json
 import os
@@ -116,6 +116,18 @@ class FileToolsTest(unittest.TestCase):
             files.read_file(str(self.project / "blob.bin"))
         with self.assertRaisesRegex(tools.ToolError, "use list_files"):
             files.read_file(str(self.project))
+
+    def test_image_file_and_render_results_declare_file_origin(self):
+        from loopcut import attachments
+        with patch.object(attachments, "_to_png", return_value=(640, 480)), \
+                patch.object(tools.bpy, "context", types.SimpleNamespace(scene=object()), create=True), \
+                patch.object(files, "_last_render", return_value="last render"), \
+                patch.object(files, "_render_now", return_value="render"), \
+                patch.object(files.cost_guard, "render_refusal", return_value=""):
+            for result in (files.read_file(str(self.project / "render.png")),
+                           files.see_render(), files.see_render(render=True)):
+                self.assertIsNotNone(result.image_path)
+                self.assertTrue(result.file_image)
 
     def test_write_file_never_replaces_unless_told(self):
         target = self.project / "new.txt"

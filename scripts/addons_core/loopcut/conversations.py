@@ -83,6 +83,18 @@ def save(session: dict) -> None:
         _write_atomic(folder / "meta.json", json.dumps(meta))
 
 
+def _own_image_path(value) -> bool:
+    """"" or a path store_image makes: <a conversation's folder>/images/<sha256>.png (a worker's conversation
+    folder is named after the worker, so the folder's own name is not checked)."""
+    if value == "":
+        return True
+    if not isinstance(value, str):
+        return False
+    path = Path(value)
+    return (path.is_absolute() and _IMAGE_NAME.match(path.name) is not None and path.parent.name == "images"
+            and ".." not in path.parts)
+
+
 def _validate(body) -> dict:
     """The file is outside our control once written; do not trust its shape."""
     if not isinstance(body, dict) or not _ID.match(str(body.get("id", ""))):
@@ -107,6 +119,14 @@ def _validate(body) -> dict:
         required = ("name", "summary", "code", "status", "output") if item["kind"] == "tool" else ("text",)
         if any(not isinstance(item.get(key), str) for key in required):
             raise ConversationError(f"malformed {item['kind']} item")
+        refs = item.get("file_references", [])
+        if not isinstance(refs, list) or any(
+                not isinstance(ref, dict) or ref.get("kind") not in ("file", "url")
+                or any(not isinstance(ref.get(key), str) for key in ("name", "target")) for ref in refs):
+            raise ConversationError("malformed file references")
+        if not _own_image_path(item.get("image_path", "")):
+            # The panel loads this file: only a capture stored in this conversation's own images folder.
+            raise ConversationError("malformed image path")
         lines = item.get("lines", []) if item["kind"] in ("changes", "merge") else item.get("images", [])
         if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
             raise ConversationError(f"malformed {item['kind']} item")
@@ -232,7 +252,7 @@ def add_project(session: dict, filepath: str) -> None:
         session["projects"].append(project)
 
 
-def store_image(session: dict, source: Path) -> str:
+def store_image(session: dict, source: Path, card: dict | None = None) -> str:
     """Copy a capture into the conversation and return the reference to put in a message."""
     data = source.read_bytes()
     name = hashlib.sha256(data).hexdigest() + ".png"
@@ -241,6 +261,8 @@ def store_image(session: dict, source: Path) -> str:
     target = folder / name
     if not target.is_file():
         target.write_bytes(data)
+    if card is not None:
+        card["image_path"] = str(target)
     return IMAGE_SCHEME + name
 
 

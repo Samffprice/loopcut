@@ -50,7 +50,9 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import op_notes, shape_key_guard
@@ -64,6 +66,7 @@ STATE = "state.json"
 CHILD_SCRIPT = Path(__file__).with_name("workspace_child.py")
 SHAPE_KEY_GUARD = Path(shape_key_guard.__file__).resolve()
 OP_NOTES = Path(op_notes.__file__).resolve()
+RENDER_PATH_GUARD = Path(__file__).with_name("render_path_guard.py").resolve()
 SNAPSHOT_PROP = "lc_snapshot"   # On every scene of a snapshot: its number, so a build says what it came from.
 SHELL_TIMEOUT, BLENDER_TIMEOUT, MAX_TIMEOUT = 600, 900, 3600
 CHILD_TIMEOUT = 600             # Stamping a snapshot, preparing a result.
@@ -137,8 +140,9 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
             "past 8,000 characters (the whole of it then saved under logs/). No input; set a timeout for long jobs."),
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
+            "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
             "timeout": {"type": "integer", "description": f"Seconds, default {SHELL_TIMEOUT}, at most {MAX_TIMEOUT}"},
-        }, "required": ["command"]},
+        }, "required": ["command", "summary"]},
     }},
     {"type": "function", "function": {
         "name": "run_blender",
@@ -200,6 +204,8 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
 _ROOTS: set = set()     # Every workspace this Blender has used: files.check lets the model in there.
 _BLENDER: list = []     # This Blender's binary, read on the main thread (ensure) for the agent thread.
 _UIDS: dict = {}        # Conversation id -> {key: live session_uid}: identity across renames this session.
+_LIVE_PROCESSES: dict = {}
+_PROCESS_LOCK = threading.Lock()
 
 
 # ------------------------------------------------------------------ where things are
@@ -265,10 +271,10 @@ def _shims(ws: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     binary, python = _binary(), _python()
     if os.name == "nt":
-        shims = {"blender.cmd": f'@"{binary}" --factory-startup --python-exit-code 1 --python "{SHAPE_KEY_GUARD}" --python "{OP_NOTES}" %*\r\n',
+        shims = {"blender.cmd": f'@"{binary}" --factory-startup --python-exit-code 1 --python "{SHAPE_KEY_GUARD}" --python "{OP_NOTES}" --python "{RENDER_PATH_GUARD}" %*\r\n',
                  "python3.cmd": f'@"{python}" %*\r\n', "python.cmd": f'@"{python}" %*\r\n'}
     else:
-        shims = {"blender": f'#!/bin/sh\nexec "{binary}" --factory-startup --python-exit-code 1 --python "{SHAPE_KEY_GUARD}" --python "{OP_NOTES}" "$@"\n',
+        shims = {"blender": f'#!/bin/sh\nexec "{binary}" --factory-startup --python-exit-code 1 --python "{SHAPE_KEY_GUARD}" --python "{OP_NOTES}" --python "{RENDER_PATH_GUARD}" "$@"\n',
                  "python3": f'#!/bin/sh\nexec "{python}" "$@"\n', "python": f'#!/bin/sh\nexec "{python}" "$@"\n'}
     for name, text in shims.items():
         path = bin_dir / name
@@ -459,6 +465,13 @@ def set_settings(scene, wanted: dict) -> list[str]:
 
 # ------------------------------------------------------------------ processes (agent thread)
 
+def live_rows() -> list[dict]:
+    """Snapshot of running children for the panel; no mutable registry entries escape."""
+    with _PROCESS_LOCK:
+        now = time.monotonic()
+        return [{**row, "elapsed": max(0.0, now - row["started"])} for row in _LIVE_PROCESSES.values()]
+
+
 def _kill(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -474,33 +487,46 @@ def _kill(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def run_process(command: list, cwd: Path, env: dict, timeout: float, log: Path, is_cancelled) -> tuple:
+def run_process(command: list, cwd: Path, env: dict, timeout: float, log: Path, is_cancelled,
+                label: str = "") -> tuple:
     """Run to the end, the time limit or a Stop; stdout and stderr into log. Returns (exit code or None,
     seconds, "timeout" | ""). A Stop kills it and raises llm.Cancelled."""
     from . import llm
     log.parent.mkdir(parents=True, exist_ok=True)
+    id = uuid.uuid4().hex
+    label = (label.strip() or Path(command[0]).name).splitlines()[0][:80]
     started = time.monotonic()
+    stopped = ""
     with log.open("wb") as out:
         process = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=out,
                                    stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
-        while True:
+        try:
+            with _PROCESS_LOCK:
+                _LIVE_PROCESSES[id] = {"id": id, "label": label, "started": started, "log": str(log)}
+            while True:
+                try:
+                    process.wait(timeout=POLL)
+                    break
+                except subprocess.TimeoutExpired:
+                    if is_cancelled():
+                        raise llm.Cancelled()
+                    if time.monotonic() - started > timeout:
+                        stopped = "timeout"
+                        break
+        finally:
             try:
-                process.wait(timeout=POLL)
-                break
-            except subprocess.TimeoutExpired:
-                if is_cancelled():
+                if process.poll() is None:
                     _kill(process)
-                    raise llm.Cancelled()
-                if time.monotonic() - started > timeout:
-                    _kill(process)
-                    return None, time.monotonic() - started, "timeout"
-    return process.returncode, time.monotonic() - started, ""
+            finally:
+                with _PROCESS_LOCK:
+                    _LIVE_PROCESSES.pop(id, None)
+    return None if stopped else process.returncode, time.monotonic() - started, stopped
 
 
 def _shell_command(command: str) -> list:
     if os.name == "nt":
         return ["cmd", "/c", command]
-    for shell in ("/bin/zsh", "/bin/bash", "/bin/sh"):
+    for shell in ("/bin/bash", "/bin/sh"):
         if os.path.exists(shell):
             return [shell, "-c", command]
     return ["sh", "-c", command]
@@ -768,7 +794,7 @@ def _path(raw: str, must_exist: bool = True) -> Path:
     return target
 
 
-def shell(command: str, timeout: int | None = None) -> ToolResult:
+def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolResult:
     if not str(command or "").strip():
         raise ToolError("command must not be empty")
     seconds = _timeout(timeout, SHELL_TIMEOUT)
@@ -778,7 +804,8 @@ def shell(command: str, timeout: int | None = None) -> ToolResult:
     def then(is_cancelled, on_main):
         number = _next_run(ws)
         log = _own(ws) / "tmp" / f"shell-{number:04d}.txt"
-        code, took, stopped = run_process(_shell_command(command), ws, env, seconds, log, is_cancelled)
+        code, took, stopped = run_process(_shell_command(command), ws, env, seconds, log, is_cancelled,
+                                         label=command.strip().splitlines()[0][:80])
         output = _read(log)
         head = _exit_text(code, took, stopped, seconds)
         if len(output) > MAX_OUTPUT_CHARS:
@@ -810,9 +837,10 @@ def run_blender(script: str, blend: str = SOURCE, args: list | None = None, time
         log = ws / LOGS / f"{number:04d}-{script_path.stem}.log"
         command = [env["BLENDER"], "-b", "--factory-startup", *([str(blend_path)] if blend_path else []),
                    "--python-exit-code", "1", "--python", str(SHAPE_KEY_GUARD),
-                   "--python", str(OP_NOTES), "--python", str(script_path), "--", *extra]
+                   "--python", str(OP_NOTES), "--python", str(RENDER_PATH_GUARD),
+                   "--python", str(script_path), "--", *extra]
         before = files_state(ws)
-        code, took, stopped = run_process(command, ws, env, seconds, log, is_cancelled)
+        code, took, stopped = run_process(command, ws, env, seconds, log, is_cancelled, label=script_path.name)
         text = _read(log)
         tail, noise = log_tail(text)
         on = blend_path.name if blend_path else "an empty scene"
@@ -884,7 +912,7 @@ def view_image(path: str, region: list | None = None) -> ToolResult:
     out.parent.mkdir(exist_ok=True)
     shown = tools._save_pixels(pixels, out, VIEW_MAX_SIDE)
     return ToolResult(f"Image attached: {target.name}, {what}, {shown[0]}x{shown[1]} px "
-                      f"(the file is {width}x{height}).", image_path=out)
+                      f"(the file is {width}x{height}).", image_path=out, file_image=True)
 
 
 # ------------------------------------------------------------------ apply_build
@@ -1168,6 +1196,9 @@ def installs(name: str, arguments: dict, roots_) -> bool:
 def describe(name: str, arguments: dict) -> tuple[str, str] | None:
     if name == "shell":
         command = str(arguments.get("command", ""))
+        summary = " ".join(str(arguments.get("summary") or "").split())
+        if summary:
+            return summary, command
         first = command.strip().splitlines()[0] if command.strip() else ""
         return f"$ {first[:80]}", command
     if name == "run_blender":

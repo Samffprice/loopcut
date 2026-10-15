@@ -630,6 +630,21 @@ class MappingTest(unittest.TestCase):
         self.assertEqual(items[4]["role"], "developer")
         self.assertNotIn("system", json.dumps([i.get("role") for i in items]))
 
+    def test_file_preview_is_routed_into_tool_output(self):
+        messages = conversation()
+        messages[2]["tool_calls"][0]["function"] = {"name": "view_image", "arguments": '{"path":"preview.png"}'}
+        label = "File preview: preview.png. This is an image file; viewing it does not change the open scene."
+        messages[4]["content"][0]["text"] = label
+        _, items = chatgpt_responses.to_input(messages)
+        self.assertEqual(items[3], {"type": "function_call_output", "call_id": "call_1", "output": [
+            {"type": "input_text", "text": "Captured."},
+            {"type": "input_text", "text": label},
+            {"type": "input_image", "image_url": IMAGE, "detail": "high"}]})
+        self.assertEqual(items[4]["role"], "developer")
+        _, fallback = chatgpt_responses.to_input(messages, tool_images=False)
+        self.assertEqual(fallback[4]["role"], "user")
+        self.assertEqual(fallback[4]["content"][0]["text"], label)
+
     def test_without_tool_images_the_capture_stays_a_user_message(self):
         _, items = chatgpt_responses.to_input(conversation(), tool_images=False)
         self.assertEqual(items[3], {"type": "function_call_output", "call_id": "call_1", "output": "Captured."})

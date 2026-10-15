@@ -22,6 +22,7 @@ HOST_KEYMAP = ("Loopcut", "LOOPCUT") if NATIVE else ("Text", "TEXT_EDITOR")
 SCROLL_STEP = 60
 DOCK_FACTOR = 0.72           # Share of the 3D viewport's width that stays a viewport.
 CONFIG_TTL = 2.0             # Seconds the model label is trusted before config is read again.
+PATH_TTL = 3.0               # File availability is refreshed by the lifecycle poll, never by drawing.
 COMMAND = "oskey" if sys.platform == "darwin" else "ctrl"
 
 _displays: dict[int, dict] = {}
@@ -39,6 +40,8 @@ def is_host(area) -> bool:
 
 
 def tag_redraw_all() -> None:
+    _refresh_missing_paths(state.session())
+    _prune_images()  # lifecycle's regular poll also catches panels closed through Blender's UI.
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if is_host(area):
@@ -82,18 +85,29 @@ def _checkpoint_statuses(session: dict) -> dict:
     return _runtime["checkpoint_statuses"]
 
 
-def _restore_later(checkpoint_id: str) -> None:
+def _restore_later(checkpoint_id: str, edit: bool = False) -> None:
     """Loading a file from inside a running operator frees that operator under its own feet,
-    so the restore runs from a timer, after the click has been fully handled."""
+    so the restore runs from a timer, after the click has been fully handled. After an Edit the
+    message is back in the box: the box takes the keys, as after a dropped photo."""
+    window = bpy.context.window
+
     def run():
         session = state.session()
         try:
             checkpoints.restore(session, checkpoint_id)
+            restored = True
         except checkpoints.CheckpointError as ex:
             session["items"].append(state.item_error(str(ex)))
+            restored = False
         session["confirm_restore"] = None
         _runtime.pop("checkpoint_stamp", None)
         tag_redraw_all()
+        if edit and restored and window is not None:
+            try:
+                with bpy.context.temp_override(window=window):
+                    bpy.ops.loopcut.focus()
+            except (RuntimeError, ReferenceError):
+                pass  # The window closed meanwhile: the message is in the box all the same.
     state.session()["focused"] = False
     bpy.app.timers.register(run, first_interval=0.01)
 
@@ -107,20 +121,23 @@ def draw_area() -> None:
     cloud.panel_seen()
     prefs = settings.preferences()
     session = state.session()
+    draw.retain_images(_image_paths(session))
     model, needs_setup, budget = _config_cached()
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
-    from .. import cloud_jobs
+    from .. import cloud_jobs, workspace
     from .. import chatgpt_ui, onboarding
     if any(item["kind"] == "user" for item in session["items"]):
         onboarding.dismiss_hints()
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
+                            "missing_paths": _missing_paths(session),
                             "context_budget": budget, "model_options": options, "model_label": settings.model_label(model),
                             "hints_dismissed": onboarding.hints_dismissed(),
                             "sign_in": {"loopcut": account.status(), "chatgpt": chatgpt_ui.status()},
                             "update": update.banner(), "cloud_jobs": cloud_jobs.ui_rows(),
+                            "local_processes": workspace.live_rows(),
                             "service_policy": {key: getattr(prefs, key, default) for key, default in cloud_account.DEFAULTS.items()},
                             "service_signed_in": bool(cloud._runtime and cloud._runtime.signed_in),
                             "project_override": cloud_account.project_override(context.scene),
@@ -131,6 +148,41 @@ def draw_area() -> None:
         session["scroll"] = min(max(session["scroll"], 0.0), display["max_scroll"])
     draw.render(display)
     _displays[area.as_pointer()] = display
+
+
+def _image_paths(session):
+    return {item["image_path"] for item in session["items"] if item.get("image_path")}
+
+
+def _missing_paths(session):
+    cached = _runtime.get("paths")
+    return cached[3] if cached is not None and cached[0] == session["id"] else frozenset()
+
+
+def _refresh_missing_paths(session, *, force=False):
+    """Called outside draw on lifecycle ticks, conversation changes and file actions."""
+    paths = _image_paths(session)
+    for item in session["items"]:
+        paths.update(ref["target"] for ref in item.get("file_references", [])[:layout.REFERENCE_LIMIT]
+                     if ref["kind"] == "file")
+    now = time.monotonic()
+    cached = _runtime.get("paths")
+    if not force and cached is not None and cached[:2] == (session["id"], paths) and now - cached[2] < PATH_TTL:
+        return
+    missing = set()
+    for path in paths:
+        try:
+            if not Path(path).exists():
+                missing.add(path)
+        except (OSError, ValueError):
+            missing.add(path)
+    _runtime["paths"] = (session["id"], paths, now, frozenset(missing))
+
+
+def _prune_images():
+    # Also handles panels closed by joining areas or switching editor type, with no further draw.
+    visible = any(is_host(area) for window in bpy.context.window_manager.windows for area in window.screen.areas)
+    draw.retain_images(_image_paths(state.session()) if visible else ())
 
 
 def _cloud_panel_state(session: dict) -> dict:
@@ -303,7 +355,37 @@ def _open_settings() -> None:
 
 def _do_action(session: dict, action) -> None:
     kind, index = action
-    if kind == "approve":
+    if kind == "reference_url":
+        account.open_browser(index)
+    elif kind in {"reference_open", "reference_folder"}:
+        state.ui.pop("action_notice", None)
+        error = ""
+        try:
+            target = Path(index)
+            if not target.exists():
+                error = f"Could not open {target.name or target}: the file is no longer at {target}."
+            else:
+                if kind == "reference_folder" and not target.is_dir():
+                    target = target.parent
+                if "FINISHED" not in bpy.ops.wm.path_open(filepath=str(target)):
+                    error = f"Could not open {target.name or target}: Blender could not hand it to another app."
+                else:
+                    app = "your default app"
+                    if kind == "reference_folder":
+                        app = "Finder" if sys.platform == "darwin" else "your file manager"
+                    # UI only: never saved with the conversation or sent to the model.
+                    state.ui["action_notice"] = {
+                        "text": f"Opened {target.name or target} in {app} (outside Blender).",
+                        "until": time.time() + 6.0,
+                    }
+        except (OSError, ValueError, RuntimeError) as ex:
+            error = f"Could not open {index}: {ex}"
+        finally:
+            _refresh_missing_paths(session, force=True)
+        if error:
+            session["items"].append(state.item_error(error))
+            session["scroll"] = 0.0
+    elif kind == "approve":
         agent.decide(True)
     elif kind == "approve_always":
         agent.decide(True, always=True)
@@ -423,12 +505,12 @@ def _do_action(session: dict, action) -> None:
     elif kind == "toggle":
         item = session["items"][index]
         item["expanded"] = not item.get("expanded", False)
-    elif kind == "restore_ask":
-        session["confirm_restore"] = index
+    elif kind in {"restore_ask", "edit_ask"}:
+        session["confirm_restore"], session["confirm_edit"] = index, kind == "edit_ask"
     elif kind == "restore_cancel":
-        session["confirm_restore"] = None
+        session["confirm_restore"], session["confirm_edit"] = None, False
     elif kind == "restore_confirm":
-        _restore_later(session["items"][index]["checkpoint"])
+        _restore_later(session["items"][index]["checkpoint"], edit=bool(session.get("confirm_edit")))
     elif kind == "restore":
         _restore_later(index)
     elif kind == "history_open":
@@ -687,8 +769,16 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         return is_host(context.area)
 
     def invoke(self, context, event):
+        if not self.keyboard and event.shift:
+            display = _displays.get(context.area.as_pointer())
+            x, y, inside = _local(_window_region(context.area), event)
+            action = layout.hit_test(display, x, y) if inside and display else None
+            if not action or action[0] != "focus":
+                return {"PASS_THROUGH"}
         session = state.session()
         self.area_pointer = context.area.as_pointer()
+        self._selecting = False
+        self._input_click = None
         if not self.keyboard:
             self._click(session, context.area, event)
         session["focused"] = True
@@ -697,6 +787,9 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def _click(self, session, area, event) -> bool:
+        previous_click = self._input_click if not self._selecting else None
+        self._selecting = False
+        self._input_click = None
         display = _displays.get(area.as_pointer())
         x, y, inside = _local(_window_region(area), event)
         if inside and display:
@@ -704,11 +797,39 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             kind = action[0] if action else None
             if kind not in POPUP_ACTIONS and kind not in ("picker_open", "model_menu"):
                 _close_popups()  # A click anywhere else puts a menu away.
-            if action and kind != "focus":
+            if kind == "focus":
+                index = layout.input_index(display, x, y, draw.measure)
+                if index is not None:
+                    double_click = event.value == "DOUBLE_CLICK"
+                    count, now = 2 if double_click else 1, time.monotonic()
+                    if event.value == "PRESS" and not event.shift:
+                        if previous_click:
+                            # Blender downgrades DOUBLE_CLICK to PRESS for modal operators.
+                            then, click_x, click_y, before = previous_click
+                            prefs = bpy.context.preferences.inputs
+                            if (now - then < prefs.mouse_double_click_time / 1000 and
+                                    max(abs(x - click_x), abs(y - click_y)) <= prefs.drag_threshold_mouse):
+                                count = before + 1
+                    double_click = count >= 2
+                    if count < 3:
+                        self._input_click = (now, x, y, count)  # A third click in time selects the line.
+                    if count >= 3:
+                        textedit.select_line(session, index)
+                    elif double_click:
+                        textedit.select_word(session, index)
+                    elif event.shift:
+                        textedit.extend_selection(session, index)
+                    else:
+                        textedit.place_caret(session, index)
+                    self._selecting = event.value == "PRESS" and not double_click
+                    _update_mentions(session)
+            elif action:
                 _do_action(session, action)
         return inside
 
     def _finish(self, session, area):
+        self._selecting = False
+        self._input_click = None
         session["focused"] = False
         state.ui["mentions"] = []
         if area:
@@ -753,6 +874,12 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             target = f"line_{'home' if side == 'left' else 'end'}" if event.oskey else \
                 (f"word_{side}" if by_word else side)
             textedit.move(session, target, select=shift)
+        elif kind in {"UP_ARROW", "DOWN_ARROW"} and session["input"]:
+            area = _find_area(context, self.area_pointer)
+            lines, width = layout.input_rows(_displays.get(area.as_pointer()) if area else None, session["input"],
+                                             draw.measure)
+            if lines is not None:
+                textedit.vertical(session, lines, width, down=kind == "DOWN_ARROW", select=shift)
         elif kind == "UP_ARROW" and not session["input"]:
             previous = next((i["text"] for i in reversed(session["items"]) if i["kind"] == "user"), "")
             textedit.set_text(session, previous)
@@ -785,20 +912,44 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             return self._finish(session, area)
 
         kind = event.type
-        if kind in {"WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"}:
+        if kind == "WINDOW_DEACTIVATE":
+            self._selecting = False
+            self._input_click = None
+            return {"PASS_THROUGH"}
+        elif kind in {"WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"}:
             if not _local(_window_region(area), event)[2]:
                 return {"PASS_THROUGH"}
             scroll(session, event)
         elif kind == "LEFTMOUSE":
-            if event.value != "PRESS":
+            if event.value == "RELEASE":
+                selecting = self._selecting
+                self._selecting = False
+                return {"RUNNING_MODAL"} if selecting else {"PASS_THROUGH"}
+            if event.value not in {"PRESS", "DOUBLE_CLICK"}:
                 return {"PASS_THROUGH"}
             if not self._click(session, area, event):
                 return self._finish(session, area)
-        elif event.value != "PRESS" or kind in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE", "TIMER", "RIGHTMOUSE",
-                                                "MIDDLEMOUSE"}:
+        elif kind in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            # Recover a missed release without mistaking a modifier release for the mouse button.
+            if (self._selecting and getattr(event, "type_prev", None) == "LEFTMOUSE" and
+                    getattr(event, "value_prev", None) == "RELEASE"):
+                self._selecting = False
+                self._input_click = None
+            if not self._selecting:
+                return {"PASS_THROUGH"}
+            x, y, _ = _local(_window_region(area), event)
+            index = layout.input_index(_displays.get(area.as_pointer(), {}), x, y, draw.measure)
+            if index is not None:
+                if index != session["cursor"]:
+                    self._input_click = None  # Dragging must not turn the next click into a double-click.
+                textedit.extend_selection(session, index)
+                _update_mentions(session)
+        elif event.value != "PRESS" or kind in {"TIMER", "RIGHTMOUSE", "MIDDLEMOUSE"}:
             return {"PASS_THROUGH"}
-        elif not self._key(context, session, event):
-            return self._finish(session, area)
+        else:
+            self._input_click = None
+            if not self._key(context, session, event):
+                return self._finish(session, area)
         area.tag_redraw()
         return {"RUNNING_MODAL"}
 
@@ -893,7 +1044,7 @@ def register() -> None:
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig:  # None in background mode.
         keymap = keyconfig.keymaps.new(name=HOST_KEYMAP[0], space_type=HOST_KEYMAP[1])
-        items = [keymap.keymap_items.new(LOOPCUT_OT_interact.bl_idname, "LEFTMOUSE", "PRESS", head=True)]
+        items = [keymap.keymap_items.new(LOOPCUT_OT_interact.bl_idname, "LEFTMOUSE", "PRESS", shift=-1, head=True)]
         for wheel in ("WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"):
             value = "ANY" if wheel == "TRACKPADPAN" else "PRESS"
             items.append(keymap.keymap_items.new(LOOPCUT_OT_scroll.bl_idname, wheel, value, head=True))
@@ -906,6 +1057,7 @@ def register() -> None:
 
 
 def unregister() -> None:
+    draw.retain_images(())
     state.session()["focused"] = False
     if "keymap" in _runtime:
         for keymap, items in _runtime.pop("keymap"):

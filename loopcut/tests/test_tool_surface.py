@@ -32,7 +32,7 @@ OFFERED = [
     ("check_contact", "read"), ("list_files", ""), ("read_file", ""), ("write_file", ""), ("move_file", ""),
     ("see_render", ""), ("render_job", ""), ("inspect_scene", ""), ("search_assets", "read"),
     ("import_asset", "change"), ("frame_camera", "change"), ("inspect_uv", "read"), ("uv_unwrap", "change"),
-    ("inspect_texture", "read"),
+    ("transfer_textures", "change"), ("inspect_texture", "read"),
 ]
 
 
@@ -57,6 +57,14 @@ class OfferedTest(unittest.TestCase):
         for old, (current, implied, _) in tools.RENAMED.items():
             for key, value in implied.items():
                 self.assertIn(value, schemas[current]["parameters"]["properties"][key]["enum"], old)
+
+    def test_transfer_textures_is_the_single_loops_only(self):
+        from loopcut import workers
+        names = lambda schemas: {s["function"]["name"] for s in schemas}  # noqa: E731
+        self.assertIn("transfer_textures", names(TOOL_SCHEMAS()))
+        self.assertNotIn("transfer_textures", names(agent._orchestrator_schemas()))
+        self.assertNotIn("transfer_textures", names(workers.schemas()))
+        self.assertIn("uv_unwrap", names(agent._orchestrator_schemas()) & names(workers.schemas()))
 
     def test_the_fixed_cost_default_covers_what_is_sent(self):
         self.assertLessEqual(context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()), context.FIXED_TOKENS)

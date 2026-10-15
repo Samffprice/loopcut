@@ -253,7 +253,7 @@ def _status(row: dict, preview: bool, waited: float | None = None) -> ToolResult
             image = scratch.folder() / f"job-{row['id']}-{jobs.digest(source)[:12]}.png"
             attachments._to_png(source, image, files.IMAGE_SIDE)
     return ToolResult(json.dumps(_summary(row)) + "\nAny preview is from this job's SAVED revision, not the live scene."
-                      + progress_note(row, waited), image_path=image)
+                      + progress_note(row, waited), image_path=image, file_image=True)
 
 
 def render_job_status(job_id: str | None = None, preview: bool = False, wait: int = 0) -> ToolResult:

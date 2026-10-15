@@ -246,6 +246,7 @@ def exercise(url, key, mode, directory, server_requests=None):
     draw = ModuleType('loopcut.ui.draw')
     draw.measure = lambda font, size, text: len(text) * size * .6
     draw.render = Mock()
+    draw.retain_images = Mock()
     requests, errors = [], []
     sys.path.insert(0, str(REPO / 'scripts/addons_core'))
     with ExitStack() as stack:

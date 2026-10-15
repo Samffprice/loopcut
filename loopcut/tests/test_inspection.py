@@ -62,15 +62,16 @@ class InspectionTests(unittest.TestCase):
         card = {"status": "done", "output": "inspection from revision 1"}
         message = {"role": "tool", "content": "inspection from revision 1"}
         with patch.object(agent, "_inspection_current", return_value=False):
-            images = agent._fresh_images([("image", "look", {"generation": 1}, card, message)])
+            images = agent._fresh_images([("image", "look", False, {"generation": 1}, card, message)])
         self.assertEqual(images, [])
         self.assertEqual(card["status"], "failed")
         self.assertIn("omitted", message["content"])
 
     def test_fresh_and_historical_noninspection_images_are_kept(self):
         with patch.object(agent, "_inspection_current", return_value=True):
-            self.assertEqual(agent._fresh_images([("a", "look", {}, {}, {}), ("b", "last render", None, {}, {})]),
-                             [("a", "look"), ("b", "last render")])
+            self.assertEqual(agent._fresh_images([("a", "look", False, {}, {}, {}),
+                                                 ("b", "last render", True, None, {}, {})]),
+                             [("a", "look", False), ("b", "last render", True)])
 
     def test_inspection_does_not_change_automatic_viewport_angle(self):
         self.assertEqual(agent._asked_angle("inspect_scene", '{"cameras":["Side"]}'), "")

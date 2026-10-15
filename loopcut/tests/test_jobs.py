@@ -251,6 +251,18 @@ class StatusWaitTests(unittest.TestCase):
                                                        "reused": 0, "elapsed_seconds": 6.0, "files": []})
         self.set_state("complete", elapsed_seconds=7.5)
 
+    def test_render_job_preview_declares_file_origin(self):
+        from loopcut import attachments
+        source = self.path / "preview.png"
+        source.write_bytes(png())
+        self.finish()
+        with patch.object(self.job_tools, "preview_path", return_value=source), \
+                patch.object(attachments, "_to_png", return_value=(8, 8)):
+            result, _ = self.status(preview=True, wait=1)
+        self.assertTrue(result.ok, result.text)
+        self.assertIsNotNone(result.image_path)
+        self.assertTrue(result.file_image)
+
     def test_returns_when_the_job_ends(self):
         self.later(.3, self.finish)
         result, took = self.status(wait=120)

@@ -80,7 +80,11 @@ class ConversationsTest(unittest.TestCase):
                          ("import_asset", {"source": "polyhaven", "id": "chair_01"}))
         display = layout.build(loaded, 420, 700, 1.0, lambda f, s, t: len(t) * s * 0.5, "m", {}, {})
         texts = [p["text"] for p in display["prims"] if p["t"] == "text"]
-        self.assertIn("import_polyhaven", texts)
+        self.assertIn("Import Poly Haven asset chair_01 (1k)", texts)
+        loaded["items"][-1]["expanded"] = True
+        display = layout.build(loaded, 420, 700, 1.0, lambda f, s, t: len(t) * s * 0.5, "m", {}, {})
+        texts = [p["text"] for p in display["prims"] if p["t"] == "text"]
+        self.assertIn("import_polyhaven", texts, "the expanded card names the tool that ran then")
 
     def test_close_open_tool_calls_answers_only_the_unanswered_in_place(self):
         messages = [
@@ -270,6 +274,36 @@ class HistoryLayoutTest(unittest.TestCase):
         self.assertIn("3 messages · just now  ·  open now", texts)
         self.assertIn("1 message · 2 h ago", texts)
         self.assertIn("Untitled conversation", texts)
+
+
+class CardImagePathTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.environ["LOOPCUT_DATA_DIR"] = self.tmp.name
+
+    def test_a_saved_card_may_only_point_at_a_stored_capture(self):
+        session = state.new_session()
+        card = state.item_tool("capture_viewport", "Look", "")
+        session["items"].append(card)
+        good = f"/data/conversations/{session['id']}/images/" + "c" * 64 + ".png"
+        for value, ok in ((good, True), ("", True), ("/etc/passwd", False), ("images/" + "c" * 64 + ".png", False),
+                          (f"/x/images/../../etc/{'c' * 64}.png", False), ("/x/images/photo.png", False)):
+            card["image_path"] = value
+            cv.save(session)
+            if ok:
+                self.assertEqual(cv.load(session["id"])["items"][0]["image_path"], value)
+            else:
+                with self.assertRaises(cv.ConversationError, msg=value):
+                    cv.load(session["id"])
+
+    def test_an_omitted_stale_inspection_takes_its_picture_off_the_card(self):
+        from unittest import mock
+        from loopcut import agent
+        card, message = {"status": "done", "output": "", "image_path": "/x/images/" + "d" * 64 + ".png"}, {"content": ""}
+        with mock.patch.object(agent, "_inspection_current", lambda token: False):
+            self.assertEqual(agent._fresh_images([("ref", "scene", False, "token", card, message)]), [])
+        self.assertNotIn("image_path", card)
 
 
 if __name__ == "__main__":

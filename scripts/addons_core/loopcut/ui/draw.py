@@ -44,6 +44,8 @@ void main()
 """
 
 _cache: dict = {}
+_image_cache: dict = {}  # path -> (owned Blender image, GPU texture), or None after a failed load; last drawn last.
+IMAGES_KEPT = 16  # Pictures kept loaded at once: a long conversation's captures would otherwise all stay in memory.
 _measure_cache: dict = {}
 _MEASURE_CACHE_LIMIT = 20000
 
@@ -113,6 +115,66 @@ def _draw_mark(prim: dict, height: int) -> None:
     draw_texture_2d(_mark_texture(prim["w"]), (prim["x"], height - prim["y"] - prim["h"]), prim["w"], prim["h"])
 
 
+def _release_image(entry) -> None:
+    if entry is not None:
+        try:
+            # from_image shares this image's GPU storage; removing our image frees it too.
+            bpy.data.images.remove(entry[0])
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+def retain_images(paths) -> None:
+    """Keep textures while their paths belong to the conversation, including collapsed cards."""
+    for path in set(_image_cache).difference(paths):
+        _release_image(_image_cache.pop(path))
+
+
+def _image_texture(path):
+    entry = _image_cache.get(path)
+    if entry is not None:
+        try:
+            entry[0].size
+            _image_cache[path] = _image_cache.pop(path)  # Most recently drawn last.
+        except ReferenceError:  # Opening a .blend can free images while retaining this conversation.
+            del _image_cache[path]
+    if path not in _image_cache:
+        loaded = None
+        try:
+            loaded = bpy.data.images.load(path, check_existing=False)
+            loaded.name = "." + Path(path).name  # A leading dot keeps it out of the user's image lists.
+            texture = gpu.texture.from_image(loaded)
+            if min(loaded.size) <= 0:
+                raise ValueError("empty image")
+            _image_cache[path] = (loaded, texture)
+            loaded_paths = [p for p, e in _image_cache.items() if e is not None]
+            for old in loaded_paths[:max(0, len(loaded_paths) - IMAGES_KEPT)]:
+                _release_image(_image_cache.pop(old))  # Reloaded from its file if it is drawn again.
+        except Exception:
+            _release_image((loaded, None) if loaded is not None else None)
+            _image_cache[path] = None  # Do not retry an unreadable file on every frame.
+    return _image_cache[path]
+
+
+def _draw_image(prim: dict, height: int) -> None:
+    try:
+        entry = _image_texture(prim["path"])
+        if entry is None:
+            return  # The card's original output text is still drawn below the preview.
+        loaded, texture = entry
+        width, image_height = loaded.size
+        scale = min(prim["w"] / width, prim["h"] / image_height)
+        width, image_height = width * scale, image_height * scale
+        from gpu_extras.presets import draw_texture_2d
+        gpu.state.blend_set("ALPHA_PREMULT" if loaded.alpha_mode == "PREMUL" else "ALPHA")
+        draw_texture_2d(texture, (prim["x"] + (prim["w"] - width) / 2,
+                                height - prim["y"] - image_height), width, image_height,
+                        is_scene_linear_with_rec709_srgb_target=True)
+    except Exception:
+        _release_image(_image_cache.pop(prim["path"], None))
+        _image_cache[prim["path"]] = None
+
+
 def render(display: dict) -> None:
     height = display["height"]
     shader, batch = _rect_shader()
@@ -139,6 +201,8 @@ def render(display: dict) -> None:
             batch.draw(shader)
         elif prim["t"] == "mark":
             _draw_mark(prim, height)
+        elif prim["t"] == "image":
+            _draw_image(prim, height)
         else:
             fid, size = font_id(prim["font"]), prim["size"]
             blf.size(fid, size)

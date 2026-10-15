@@ -71,7 +71,7 @@ class LayoutTest(Folder):
         for name in ("logs", ".loopcut/tmp", ".loopcut/bin/blender", ".loopcut/bin/python3"):
             self.assertTrue((self.ws / name).exists(), name)
         self.assertIn(f'--factory-startup --python-exit-code 1 --python "{workspace.SHAPE_KEY_GUARD}" '
-                      f'--python "{workspace.OP_NOTES}" "$@"',
+                      f'--python "{workspace.OP_NOTES}" --python "{workspace.RENDER_PATH_GUARD}" "$@"',
                       (self.ws / ".loopcut/bin/blender").read_text())
         self.assertEqual(files.resolve("build.py"), self.ws / "build.py")
         with mock.patch.object(files, "blend_base", return_value=(self.root / "project", "")):
@@ -82,7 +82,7 @@ class LayoutTest(Folder):
         with mock.patch.object(workspace.os, "name", "nt"):
             workspace._shims(self.ws)
         self.assertIn(f'--factory-startup --python-exit-code 1 --python "{workspace.SHAPE_KEY_GUARD}" '
-                      f'--python "{workspace.OP_NOTES}" %*',
+                      f'--python "{workspace.OP_NOTES}" --python "{workspace.RENDER_PATH_GUARD}" %*',
                       (self.ws / ".loopcut/bin/blender.cmd").read_text())
 
     def test_outside_workspace_mode_relative_paths_are_as_before(self):
@@ -122,6 +122,79 @@ class LayoutTest(Folder):
             self.assertNotIn(name, env)
 
 
+class ProcessTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.log = self.root / "process.log"
+
+    def run_process(self, is_cancelled, timeout=2, **kwargs):
+        return workspace.run_process([sys.executable, "-c", "import time; time.sleep(0.4)"],
+                                     self.root, os.environ.copy(), timeout, self.log, is_cancelled, **kwargs)
+
+    def test_live_rows_show_process_until_exit(self):
+        for kwargs, label in (({"label": "Python script"}, "Python script"), ({}, Path(sys.executable).name)):
+            with self.subTest(kwargs=kwargs):
+                seen = []
+
+                def observe():
+                    seen.append(workspace.live_rows())
+                    return False
+
+                code, seconds, stopped = self.run_process(observe, **kwargs)
+                self.assertEqual((code, stopped), (0, ""))
+                self.assertTrue(seen)
+                first = seen[0][0]
+                self.assertTrue(first["id"])
+                for rows in seen:
+                    self.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    self.assertEqual(row["id"], first["id"])
+                    self.assertEqual(row["label"], label)
+                    self.assertEqual(row["log"], str(self.log))
+                    self.assertEqual(row["started"], first["started"])
+                    self.assertGreaterEqual(row["elapsed"], 0)
+                    self.assertLessEqual(row["elapsed"], seconds)
+                    json.dumps(row)  # UI snapshots contain only plain data.
+                self.assertEqual(workspace.live_rows(), [])
+
+    def test_live_rows_removed_after_cancel(self):
+        from loopcut import llm
+        seen = []
+
+        def cancel():
+            seen.extend(workspace.live_rows())
+            return True
+
+        with self.assertRaises(llm.Cancelled):
+            self.run_process(cancel, label="Python script")
+        self.assertEqual([row["label"] for row in seen], ["Python script"])
+        self.assertEqual(workspace.live_rows(), [])
+
+    def test_live_rows_removed_after_timeout(self):
+        seen = []
+
+        def observe():
+            seen.extend(workspace.live_rows())
+            return False
+
+        code, _, stopped = self.run_process(observe, timeout=0, label="Python script")
+        self.assertEqual((code, stopped), (None, "timeout"))
+        self.assertEqual([row["label"] for row in seen], ["Python script"])
+        self.assertEqual(workspace.live_rows(), [])
+
+    def test_live_rows_removed_after_exception(self):
+        seen = []
+
+        def fail():
+            seen.extend(workspace.live_rows())
+            raise RuntimeError("callback failed")
+
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            self.run_process(fail, label="Python script")
+        self.assertEqual([row["label"] for row in seen], ["Python script"])
+        self.assertEqual(workspace.live_rows(), [])
+
+
 class ShellTest(Folder):
     def test_a_command_runs_in_the_workspace_and_says_its_exit_code(self):
         result = self.then(workspace.shell("pwd; echo out; echo err >&2"))
@@ -135,6 +208,29 @@ class ShellTest(Folder):
         self.assertIn("exit 3", failed.text)
         self.assertIn("(no output)", failed.text)
 
+    @unittest.skipIf(os.name == "nt", "POSIX shell syntax")
+    def test_status_variable_preserves_exit_code_and_output(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                result = self.then(workspace.shell(
+                    f"(exit {code}); status=$?; echo completed; exit $status"))
+                self.assertIn("completed", result.text.splitlines())
+                self.assertTrue(result.text.startswith(f"exit {code} in "), result.text)
+                self.assertEqual(result.ok, code == 0, result.text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell glob expansion")
+    def test_unmatched_glob_does_not_hide_matching_files(self):
+        (self.ws / "matched.txt").write_text("match")
+        result = self.then(workspace.shell("ls missing-*.txt matched*.txt 2>/dev/null"))
+        self.assertIn("matched.txt", result.text.splitlines())
+
+    def test_bash_is_preferred_when_zsh_is_also_available(self):
+        with mock.patch.object(workspace.os, "name", "posix"), \
+                mock.patch.object(workspace.os.path, "exists", side_effect=lambda path: path in {
+                    "/bin/zsh", "/bin/bash", "/bin/sh"}):
+            self.assertEqual(workspace._shell_command("echo completed"),
+                             ["/bin/bash", "-c", "echo completed"])
+
     def test_python3_is_blenders_own(self):
         result = self.then(workspace.shell("python3 -c 'import sys; print(sys.executable)'"))
         self.assertIn(sys.executable, result.text)
@@ -142,7 +238,7 @@ class ShellTest(Folder):
     def test_blender_shim_forwards_version_and_background_expression_arguments(self):
         # /bin/echo stands in for Blender; the GUI driver owns checks against the actual binary.
         prefix = (f'--factory-startup --python-exit-code 1 --python {workspace.SHAPE_KEY_GUARD} '
-                  f'--python {workspace.OP_NOTES} ')
+                  f'--python {workspace.OP_NOTES} --python {workspace.RENDER_PATH_GUARD} ')
         for arguments, forwarded in (("--version", "--version"),
                                      ('-b --python-expr "print(1 + 1)"', '-b --python-expr print(1 + 1)')):
             with self.subTest(arguments=arguments):
@@ -175,6 +271,61 @@ class ShellTest(Folder):
                 workspace.shell(**kwargs)
 
 
+class ShellSummaryTest(Folder):
+    def test_describe_uses_normalized_summary(self):
+        command = "echo first\necho second\n"
+        for summary in ("  List the installed fonts  ", " \tList  the\ninstalled\tfonts\r\n"):
+            with self.subTest(summary=summary):
+                self.assertEqual(workspace.describe("shell", {"command": command, "summary": summary}),
+                                 ("List the installed fonts", command))
+
+    def test_describe_without_summary_keeps_first_line(self):
+        for command, title in (("  echo first\necho second\n", "$ echo first"),
+                               ("echo " + "x" * 100 + "\necho second", "$ echo " + "x" * 75),
+                               (" \n\t", "$ ")):
+            for extra in ({}, {"summary": ""}, {"summary": " \n\t"}, {"summary": None}):
+                with self.subTest(command=command, extra=extra):
+                    self.assertEqual(workspace.describe("shell", {"command": command, **extra}), (title, command))
+
+    def test_schema_requires_summary(self):
+        schema = next(s["function"] for s in workspace.SCHEMAS if s["function"]["name"] == "shell")
+        parameters = schema["parameters"]
+        self.assertIn("summary", parameters["properties"])
+        self.assertEqual(parameters["properties"]["summary"]["type"], "string")
+        self.assertIn("summary", parameters["required"])
+        self.assertIn("command", parameters["required"])
+
+    def test_dispatch_preserves_command_and_timeout(self):
+        command = "echo first\necho second\n"
+        for timeout in ({}, {"timeout": 3}):
+            for extra in ({}, {"summary": "Print two lines"}):
+                with self.subTest(timeout=timeout, extra=extra), \
+                        mock.patch.object(workspace, "run_process", wraps=workspace.run_process) as run:
+                    result = self.then(tools.execute("shell", json.dumps({"command": command, **timeout, **extra})))
+                    self.assertTrue(result.ok, result.text)
+                    self.assertEqual(result.text.splitlines()[1:], ["first", "second"])
+                    run.assert_called_once()
+                    self.assertEqual(run.call_args.args[0], workspace._shell_command(command))
+                    self.assertEqual(run.call_args.args[3], timeout.get("timeout", workspace.SHELL_TIMEOUT))
+
+    def test_agent_card_uses_summary(self):
+        from loopcut import llm
+        command = "echo first\necho second\n"
+        call = llm.ToolCall(id="call", name="shell", arguments=json.dumps({
+            "command": command, "summary": "  List  the\ninstalled fonts  "}))
+        card = state.item_tool(call.name, *agent._describe(call))
+        self.assertEqual(card["summary"], "List the installed fonts")
+        self.assertEqual(card["code"], command)
+
+    def test_summary_preserves_approval(self):
+        for command, approval in (("echo first", "gate"), ("python3 -m pip install --upgrade pip", "install")):
+            for extra in ({}, {"summary": "List the installed fonts"}):
+                with self.subTest(command=command, extra=extra):
+                    arguments = {"command": command, **extra}
+                    self.assertTrue(workspace.needs_approval("shell", arguments, (self.ws,)))
+                    self.assertEqual(agent._approval("shell", json.dumps(arguments), (self.ws,)), approval)
+
+
 class RunBlenderTest(Folder):
     def test_validation(self):
         (self.ws / "build.py").write_text("print('hi')")
@@ -195,7 +346,8 @@ class RunBlenderTest(Folder):
         self.assertIn("build.py on an empty scene: exit 0", result.text)
         self.assertIn("-b --factory-startup --python-exit-code 1 --python", result.text)
         self.assertIn(f'--python-exit-code 1 --python {workspace.SHAPE_KEY_GUARD} '
-                      f'--python {workspace.OP_NOTES} --python {self.ws / "build.py"} -- --final', result.text)
+                      f'--python {workspace.OP_NOTES} --python {workspace.RENDER_PATH_GUARD} '
+                      f'--python {self.ws / "build.py"} -- --final', result.text)
         self.assertIn("-- --final", result.text)
         self.assertNotIn("Wrote:", result.text, "nothing was written")
         self.assertEqual(len(list((self.ws / "logs").glob("*-build.log"))), 1)
@@ -209,11 +361,13 @@ class RunBlenderTest(Folder):
                        "output\n" + notice + "\n",
                        "x" * 5000 + "\n" + notice + "\n" + "x" * 5000):
             with self.subTest(length=len(output)):
-                def run(command, ws, env, seconds, log, is_cancelled):
+                def run(command, ws, env, seconds, log, is_cancelled, label=""):
+                    self.assertEqual(label, "build.py")
                     self.assertEqual(command, ["/bin/echo", "-b", "--factory-startup",
                                                str(self.ws / "source.blend"), "--python-exit-code", "1",
                                                "--python", str(workspace.SHAPE_KEY_GUARD),
                                                "--python", str(workspace.OP_NOTES),
+                                               "--python", str(workspace.RENDER_PATH_GUARD),
                                                "--python", str(self.ws / "build.py"), "--"])
                     log.write_text(output)
                     return 0, 0.1, False
@@ -265,9 +419,11 @@ class ImageTest(Folder):
                 mock.patch.object(tools.bpy, "data", types.SimpleNamespace(images=images), create=True):
             result = workspace.view_image("hero.png")
         self.assertIn("1920x1080 px", result.text)
+        self.assertTrue(result.file_image)
         image.scale.assert_not_called()
         reference = conversations.store_image(self.session, result.image_path)
-        messages = [{"role": "user", "content": "Review this render."}, agent._image_message(reference, result.text)]
+        messages = [{"role": "user", "content": "Review this render."},
+                    agent._image_message(reference, result.text, file_preview=result.file_image)]
         body = chatgpt_responses.request_body(
             model="gpt-6.1-sol", messages=conversations.wire_messages(self.session["id"], messages, keep=True),
             tools=[], reasoning_effort="xhigh", disabled=set())
@@ -289,6 +445,7 @@ class ImageTest(Folder):
                         mock.patch.object(tools.bpy, "data", types.SimpleNamespace(images=images), create=True):
                     result = workspace.view_image("texture.png", region=[0, 0, 1, 1])
                 self.assertEqual(workspace.image_size(result.image_path), shown)
+                self.assertTrue(result.file_image)
                 self.assertIn(f"{shown[0]}x{shown[1]} px", result.text)
                 images.remove.assert_called_once_with(image)
 

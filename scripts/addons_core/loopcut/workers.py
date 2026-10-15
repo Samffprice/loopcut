@@ -63,7 +63,8 @@ def schemas() -> list[dict]:
     """The worker's tools: the same for every role and every worker, for the cache."""
     own = {s["function"]["name"]: s for s in tools.SCHEMAS}
     return ([own[name] for name in _SHARED_TOOLS] + [_CAPTURE] + contact.SCHEMAS + camera.SCHEMAS + assets.SCHEMAS
-            + uv_tools.SCHEMAS + texture_tools.SCHEMAS + paint_tools.SCHEMAS + SCHEMAS_OWN)
+            + [s for s in uv_tools.SCHEMAS if s["function"]["name"] not in uv_tools.SINGLE_ONLY]
+            + texture_tools.SCHEMAS + paint_tools.SCHEMAS + SCHEMAS_OWN)
 
 
 def tool_names() -> set[str]:

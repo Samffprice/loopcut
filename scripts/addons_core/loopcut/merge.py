@@ -483,6 +483,12 @@ def _settle(to_remove: list, live: set, successors: dict, missing: dict, uid2spa
     return extra
 
 
+def _set_name(idb, name: str) -> None:
+    """Keep Blender's assigned name when RNA forbids renaming (for example, built-in fonts)."""
+    if not idb.is_property_readonly("name"):
+        idb.name = name
+
+
 def _drop_weak_references(path: str) -> None:
     """Appending gives every datablock of a kind Blender can reuse on a later append (mesh,
     material, light, camera, world, image, node group, collection...) a weak reference to the file
@@ -490,8 +496,8 @@ def _drop_weak_references(path: str) -> None:
     user's file, and everything that walks the file's paths (bpy.utils.blend_paths) finds a missing
     file: every inspect_scene and render_job after the perfume_ad eval's merge refused the scene.
     Python can't clear one (read-only; emptying the path leaves "" behind), but a copy never
-    carries it, so each such datablock is swapped for its copy, which takes its users and name. A
-    mesh's copy has a copy of its shape keys, which takes their users too (_replace)."""
+    carries it, so each such datablock is swapped for its copy, which takes its users and, when
+    editable, its name. A mesh's copy has a copy of its shape keys, which takes their users too (_replace)."""
     import bpy
     source = os.path.realpath(path)
     marked = [idb for idb in _datablocks() if idb.library_weak_reference is not None
@@ -502,9 +508,9 @@ def _drop_weak_references(path: str) -> None:
         doomed += _replace(old, new)
     bpy.data.batch_remove(doomed)
     for _old, new, name, keys in swaps:
-        new.name = name
+        _set_name(new, name)
         if keys:  # The copy's own shape keys, named after the original's.
-            new.shape_keys.name = keys
+            _set_name(new.shape_keys, keys)
 
 
 def _append(path: str) -> list:
@@ -622,7 +628,7 @@ def _name_meshes(created: list) -> None:
         if data.session_uid not in made or data.users - int(data.use_fake_user) != 1 or data.name == ob.name:
             continue
         if bpy.data.meshes.get(ob.name) in (None, data):
-            data.name = ob.name
+            _set_name(data, ob.name)
 
 
 def _wants_collections(brief: dict) -> bool:
@@ -954,11 +960,11 @@ def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeRepo
     replaced = {f"{idb.id_type}:{idb[STAMP]}": idb.session_uid for idb in owned_new}
     for idb in owned_new:
         if idb.name != names[idb.session_uid]:
-            idb.name = names[idb.session_uid]  # The live name: a rename the user made mid-wave stays.
+            _set_name(idb, names[idb.session_uid])  # The live name: a rename the user made mid-wave stays.
             if idb.name != names[idb.session_uid]:
                 report.errors.append(f"{worker}: could not restore the name {names[idb.session_uid]} (got {idb.name})")
         if idb.session_uid in key_names and getattr(idb, "shape_keys", None) is not None:
-            idb.shape_keys.name = key_names[idb.session_uid]  # The live shape keys' name, theirs gone with them.
+            _set_name(idb.shape_keys, key_names[idb.session_uid])  # The live shape keys' name, theirs gone with them.
     moved.update(replaced)
     _rename_created(created, before_names, worker, report)
     _name_meshes(created)
