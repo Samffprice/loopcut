@@ -17,6 +17,10 @@ sys.modules.setdefault("bpy", fake_bpy)
 from loopcut import tools  # noqa: E402
 
 
+ANGLES = ("three_quarter", "front", "side", "top", "camera", "sheet", "user")
+CAPTIONS = {angle.replace("_", " ") for angle in tools.SHEET_ANGLES}  # A sheet tile's view, not an object.
+
+
 class Shading:
     """The dynamic RNA enum: Workbench alone has no Material Preview."""
 
@@ -62,7 +66,7 @@ class CaptureTest(unittest.TestCase):
         self.enterContext(mock.patch.object(tools, "_editor_context", return_value=contextlib.nullcontext()))
         self.enterContext(mock.patch.object(tools, "_view3d_override", return_value=override))
         self.enterContext(mock.patch.object(tools, "_framed_view", return_value=(None, None, mock.Mock())))
-        self.enterContext(mock.patch.object(tools, "_labels", return_value=[]))
+        self.labels = self.enterContext(mock.patch.object(tools, "_labels", return_value=[("Cube", 10.0, 20.0)]))
         self.enterContext(mock.patch.object(tools, "_nearest_first", return_value=""))
         self.enterContext(mock.patch.object(tools.scratch, "folder", return_value=self.folder))
         self.draw = self.enterContext(mock.patch.object(tools, "_draw_offscreen", return_value=pixels))
@@ -148,6 +152,112 @@ class CaptureTest(unittest.TestCase):
         self.draw.side_effect = draw_user
         tools.capture_viewport(angle="user")
         self.assertEqual(self.state(), before)
+
+    # Object names are drawn only when asked: on a close shot through the camera they covered the hands
+    # and pistol being pose-matched (2026-10-17), and the owner wants every look the model works from clean.
+    def names(self):
+        return [text for call in self.draw.call_args_list for text, _, _ in call.args[7] if text not in CAPTIONS]
+
+    def look(self, **kwargs):
+        self.draw.reset_mock()
+        self.labels.reset_mock()
+        result = tools.capture_viewport(**kwargs)
+        self.assertTrue(result.ok, result.text)
+        return result
+
+    def test_no_capture_draws_names_unless_asked(self):
+        for angle in ANGLES:
+            for asked in ({}, {"labels": False}):
+                with self.subTest(angle=angle, **asked):
+                    result = self.look(angle=angle, **asked)
+                    self.assertEqual(self.names(), [])
+                    self.labels.assert_not_called()
+                    self.assertNotIn("labelled", result.text)
+
+    def test_labels_true_draws_names_and_says_so(self):
+        for angle in ANGLES:
+            with self.subTest(angle=angle):
+                result = self.look(angle=angle, labels=True)
+                self.assertEqual(self.names(), ["Cube"] * (4 if angle == "sheet" else 1))
+                self.assertIn("; objects are labelled with their names", result.text)
+
+    def test_sheet_tiles_keep_their_view_captions(self):
+        for asked in (False, True):
+            with self.subTest(labels=asked):
+                self.look(angle="sheet", labels=asked)
+                self.assertEqual([call.args[7][0][0] for call in self.draw.call_args_list],
+                                 ["three quarter", "front", "side", "top"])
+
+    def test_labels_must_be_true_or_false(self):
+        with self.assertRaisesRegex(tools.ToolError, "labels must be true or false"):
+            tools.capture_viewport(labels="yes")
+        self.draw.assert_not_called()
+
+    def test_the_tool_passes_labels_through(self):
+        from loopcut import shaders
+        with mock.patch.object(shaders, "before_look", side_effect=lambda fn, *args, **kwargs: fn()):
+            self.assertNotIn("labelled", tools.capture_viewport_tool(angle="camera").text)
+            self.assertIn("labelled", tools.capture_viewport_tool(angle="camera", labels=True).text)
+
+    def compare(self, **kwargs):
+        from loopcut import shaders, video_attach
+        self.draw.reset_mock()
+        reference = self.folder / "reference.png"
+        fake_numpy = types.SimpleNamespace(ones=lambda *args, **kwargs: mock.MagicMock(), float32="float32")
+        clip_frame = (reference, 34, "take.mp4 clip frame 94 (3.10 s)")
+        self.scene.frame_current, self.scene.frame_set = 1, mock.Mock()
+        with mock.patch.object(tools, "_reference", return_value=({"name": "pose.png"}, reference)), \
+                mock.patch.object(tools, "_pixels", return_value=types.SimpleNamespace(shape=(480, 640, 4))), \
+                mock.patch.object(video_attach, "frame_for", return_value=clip_frame), \
+                mock.patch.object(shaders, "before_look", side_effect=lambda fn, *args, **kwargs: fn()), \
+                mock.patch.dict(sys.modules, {"numpy": fake_numpy}):
+            result = tools.compare_with_reference_tool("pose.png", **kwargs)
+        self.assertTrue(result.ok, result.text)
+        self.assertIn(" on the right, at the same height.", result.text)
+        return result
+
+    def test_compare_draws_no_names_unless_asked(self):
+        for angle in ("three_quarter", "front", "side", "top", "camera", "user"):
+            for extra in ({}, {"frame": 94}):
+                with self.subTest(angle=angle, **extra):
+                    result = self.compare(angle=angle, **extra)
+                    self.assertEqual(self.names(), [])
+                    self.assertNotIn("labelled", result.text)
+                    result = self.compare(angle=angle, labels=True, **extra)
+                    self.assertEqual(self.names(), ["Cube"])
+                    self.assertIn("; objects are labelled with their names", result.text)
+                    self.assertFalse(self.compare(angle=angle, labels=False, **extra).text.count("labelled"))
+
+
+class LabelsSchemaTest(unittest.TestCase):
+    def properties(self, schemas, name):
+        return next(s for s in schemas if s["function"]["name"] == name)["function"]["parameters"]["properties"]
+
+    def test_capture_and_compare_offer_labels_default_off(self):
+        for name in ("capture_viewport", "compare_with_reference"):
+            with self.subTest(name=name):
+                labels = self.properties(tools.SCHEMAS, name)["labels"]
+                self.assertEqual(labels["type"], "boolean")
+                self.assertTrue(labels["description"].endswith("default off"), labels["description"])
+        capture = next(s for s in tools.SCHEMAS if s["function"]["name"] == "capture_viewport")
+        self.assertNotIn("names", capture["function"]["description"], "the description no longer promises names")
+
+    def test_the_clip_variant_of_compare_keeps_labels(self):
+        from loopcut import video_attach
+        session = {"references": [{"name": "take.mp4", "video": {"id": "c1"}}]}
+        with mock.patch.object(video_attach.state, "session", return_value=session):
+            properties = self.properties(video_attach.with_clip_tools(tools.SCHEMAS), "compare_with_reference")
+        self.assertEqual((properties["frame"]["type"], properties["labels"]["type"]), ("integer", "boolean"))
+
+    def test_a_workers_capture_offers_labels_default_off(self):
+        from loopcut import workers
+        capture = next(s for s in workers.schemas() if s["function"]["name"] == "capture_viewport")["function"]
+        self.assertEqual(capture["parameters"]["properties"]["labels"]["type"], "boolean")
+        self.assertNotIn("names", capture["description"])
+
+    def test_the_prompt_does_not_promise_names_on_the_automatic_look(self):
+        from loopcut import agent
+        self.assertNotIn("names drawn on", agent.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

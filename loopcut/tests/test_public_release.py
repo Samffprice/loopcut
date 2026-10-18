@@ -164,7 +164,7 @@ class SourceTest(unittest.TestCase):
     def test_own_source_has_no_leak_hits(self):
         path = Path(__file__)
         text = path.read_text(encoding="utf-8")
-        samples = [sample for category in ("private-text", "mixar-text", "cost-fingerprint")
+        samples = [sample for category in ("private-text", "research-text", "cost-fingerprint")
                    for value in (private_text(), "Another " + private_text())
                    for sample in release.fingerprints(value, category, "fixture.txt")]
         self.assertEqual(len(samples), 6)
@@ -303,7 +303,7 @@ class FingerprintTest(unittest.TestCase):
         self.assertTrue(all(hit.source == "private/fixture" for hit in scanner.hits))
 
     def test_common_api_lines_never_produce_prompt_or_skill_hits(self):
-        for category in ("private-text", "mixar-text"):
+        for category in ("private-text", "research-text"):
             for suffix in (".md", ".py", ".js", ".txt"):
                 for line in api_lines():
                     with self.subTest(category=category, suffix=suffix, line=line):
@@ -313,7 +313,7 @@ class FingerprintTest(unittest.TestCase):
                         self.assertEqual(scanner.hits, [])
 
     def test_markdown_fences_skip_even_prose_and_keep_source_locations(self):
-        for category in ("private-text", "mixar-text"):
+        for category in ("private-text", "research-text"):
             for fence in ("```", "~~~~"):
                 text = fence + "python\n\n\n\n" + private_text() + "\n" + fence + "\n\n\n\n" + private_text()
                 with self.subTest(category=category, fence=fence):
@@ -337,7 +337,7 @@ class FingerprintTest(unittest.TestCase):
             ("fixture.js", 'const prompt = `' + private_text() + '`;'),
             ("fixture.js", 'const description = "' + private_text() + '";'),
         )
-        for category in ("private-text", "mixar-text"):
+        for category in ("private-text", "research-text"):
             for source, text in fixtures:
                 with self.subTest(category=category, source=source, text=text):
                     samples = release.fingerprints(text, category, source)
@@ -356,7 +356,7 @@ class FingerprintTest(unittest.TestCase):
             "widget.configure(one, two, three, four, five, six, seven, eight)",
             "value = one + two + three + four + five + six + seven + eight",
         )
-        for category in ("private-text", "mixar-text"):
+        for category in ("private-text", "research-text"):
             for text in negatives:
                 with self.subTest(category=category, text=text):
                     self.assertEqual(release.fingerprints(text, category, "fixture.txt"), [])
@@ -378,7 +378,7 @@ class PrivateSamplesTest(unittest.TestCase):
         self.skills.mkdir()
         self.args = release.parser(True).parse_args([
             "base..source", "--prompts-dir", str(self.prompts), "--skills-dir", str(self.skills),
-            "--mixar-dir", str(self.root / "missing-mixar"),
+            "--research-dir", str(self.root / "missing-research"),
             "--economics-file", str(self.root / "missing-economics")])
 
     def test_open_text_at_any_offset_filters_prompts_and_skills(self):
@@ -635,7 +635,7 @@ class SnapshotTest(unittest.TestCase):
     def options(self, out):
         return ["--base", "base", "--out", str(out), "--allowlist", str(self.allowlist),
                 "--skills-dir", str(self.skills), "--prompts-dir", str(self.root / "missing-prompts"),
-                "--mixar-dir", str(self.root / "missing-mixar"),
+                "--research-dir", str(self.root / "missing-research"),
                 "--economics-file", str(self.root / "missing-economics")]
 
     def run_main(self, argv):
@@ -1735,22 +1735,42 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual({hit["category"] for hit in report["hits"]},
                          {"private-text", "secret:openai", "secret-file", "withheld-prompt"})
 
-    def test_runtime_cost_docs_mixar_nested_captures_and_env_defaults(self):
-        mixar = self.root / "mixar"
-        (mixar / "session/system_prompts").mkdir(parents=True)
-        (mixar / "session/system_prompts/fixture.txt").write_text(private_text())
-        (mixar / "irrelevant.txt").write_text(private_text())
+    def test_runtime_cost_docs_research_nested_captures_and_env_defaults(self):
+        research = self.root / "research"
+        (research / "session/system_prompts").mkdir(parents=True)
+        (research / "session/system_prompts/fixture.txt").write_text(private_text())
+        (research / "irrelevant.txt").write_text(private_text())
         cost = self.root / "cost.txt"
         cost.write_text(private_text())
         env = {"LOOPCUT_RELEASE_SKILLS_DIR": str(self.skills),
                "LOOPCUT_RELEASE_PROMPTS_DIR": str(self.root / "missing"),
-               "LOOPCUT_RELEASE_MIXAR_DIR": str(mixar), "LOOPCUT_RELEASE_ECONOMICS_FILE": str(cost)}
+               "LOOPCUT_RELEASE_RESEARCH_DIR": str(research), "LOOPCUT_RELEASE_ECONOMICS_FILE": str(cost)}
         with patch.dict(os.environ, env):
             args = release.parser(True).parse_args(["base..source", "--cost-doc", str(cost)])
         samples, coverage = release.private_samples(args)
-        self.assertEqual({sample.category for sample in samples}, {"mixar-text", "cost-fingerprint"})
-        self.assertEqual(next(item for item in coverage if item["path"] == str(mixar))["files"], 1)
+        self.assertEqual({sample.category for sample in samples}, {"research-text", "cost-fingerprint"})
+        self.assertEqual(next(item for item in coverage if item["path"] == str(research))["files"], 1)
         self.assertEqual(len(samples), 3)
+
+    def test_research_folders_come_from_the_private_file_and_stay_out_of_snapshots(self):
+        listing = self.root / "research_folders.txt"
+        self.assertEqual(release.research_folders(listing), ((), ""))  # Public checkouts have no such file.
+        listing.write_text("# private\nfolder rival-captures\nfolder rival-app  # the app\n"
+                           "sources rival-captures/sources\n")
+        folders, sources = release.research_folders(listing)
+        self.assertEqual((folders, sources), (("rival-captures", "rival-app"), "rival-captures/sources"))
+        rules = release.research_exclusions(folders)
+        for name in ("rival-captures/sources/a.txt", "rival-app", "loopcut/vendor/rival-app/b.py"):
+            self.assertTrue(release.excluded(name, rules), name)
+        self.assertFalse(release.excluded("loopcut/rival-apps.md", rules))
+        for bad in ("folder a/b\n", "folder /abs\n", "sources ../up\n", "dir x\n", "folder\n"):
+            listing.write_text(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                release.research_folders(listing)
+        args = release.parser(True).parse_args(["base..source", "--research-dir", ""])
+        self.assertIn({"path": "(research folder not configured)", "status": "missing", "files": 0,
+                       "binary_files": 0, "fingerprints": 0, "open_fingerprints_dropped": 0},
+                      release.private_samples(args)[1])
 
     def test_reviewed_line_hash_clears_tree_and_history_findings(self):
         line = " ".join(("Synthetic", "gross", "margin", "fixture for reviewing the allowlist behavior."))

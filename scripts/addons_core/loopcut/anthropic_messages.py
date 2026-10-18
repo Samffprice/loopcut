@@ -58,7 +58,7 @@ import urllib.request
 from collections import OrderedDict
 from typing import Callable
 
-from . import llm
+from . import image_budget, llm
 
 API_VERSION = "2023-06-01"
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
@@ -734,9 +734,10 @@ def _post(url: str, body: dict, betas: list[str], api_key: str, timeout: float):
 
 
 def _open(build: Callable[[], tuple[dict, list[str]]], url: str, api_key: str, timeout: float, host: str,
-          model: str, state: dict, is_cancelled: Callable[[], bool]):
+          model: str, state: dict, is_cancelled: Callable[[], bool], on_drop: Callable[[], bool] = lambda: False):
     """Open the stream: retries for 429 (honouring retry-after, capped), 529 and 5xx; one retry per
-    optional feature a 400 refuses; one without thinking blocks after a signature 400."""
+    optional feature a 400 refuses; one without thinking blocks after a signature 400; smaller images
+    after a dropped connection (on_drop is image_budget.Sized.tighten)."""
     attempt, refused = 0, set()
     while True:
         body, betas = build()
@@ -770,7 +771,8 @@ def _open(build: Callable[[], tuple[dict, list[str]]], url: str, api_key: str, t
                   f"({attempt + 1}/{len(llm.RETRY_DELAYS)}, waiting {delay:g}s)")
         except (urllib.error.URLError, TimeoutError, ConnectionError) as ex:
             if attempt >= len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Could not reach {host}: {getattr(ex, 'reason', ex)}") from None
+                raise llm.LLMError(f"Could not reach {host}: {getattr(ex, 'reason', ex)}", code=llm.CONNECTION_LOST) from None
+            on_drop()
             delay = llm.RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the Anthropic request after {getattr(ex, 'reason', ex)!r} "
                   f"({attempt + 1}/{len(llm.RETRY_DELAYS)}, waiting {delay:g}s)")
@@ -789,13 +791,14 @@ def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], too
     deadline = time.monotonic() + call_max_seconds if call_max_seconds else None
     state = {"strip": False}
     before_content, retried_partial = 0, False
+    sized = image_budget.Sized(messages)
 
     def build() -> tuple[dict, list[str]]:
-        return request_body(model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort,
+        return request_body(model=model, messages=sized.messages(), tools=tools, reasoning_effort=reasoning_effort,
                             max_tokens=max_tokens, strip_thinking=state["strip"])
 
     while True:
-        response = _open(build, url, api_key, read_timeout(timeout), host, model, state, is_cancelled)
+        response = _open(build, url, api_key, read_timeout(timeout), host, model, state, is_cancelled, sized.tighten)
         meta = {"model": model, "request_id": _request_id(response.headers)}
         try:
             return _read(response, on_text, is_cancelled, deadline, meta)
@@ -803,13 +806,15 @@ def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], too
             cause = ex.__cause__ or "the stream ended before message_stop"
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise llm.LLMError(f"Connection lost while streaming the reply: {cause!r}") from ex.__cause__
+                    raise llm.LLMError(f"Connection lost while streaming the reply: {cause!r}",
+                                       code=llm.CONNECTION_LOST) from ex.__cause__
                 retried_partial = True
                 print(f"Loopcut: retrying the Anthropic request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Connection lost before any reply arrived: {cause!r}") from ex.__cause__
+                raise llm.LLMError(f"Connection lost before any reply arrived: {cause!r}",
+                                   code=llm.CONNECTION_LOST) from ex.__cause__
             delay = llm.RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the Anthropic request after {cause!r} "
                   f"({before_content + 1}/{len(llm.RETRY_DELAYS)}, waiting {delay:g}s)")

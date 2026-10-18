@@ -19,13 +19,12 @@ PACKAGE = __package__
 PROVIDERS = (
     ("LOOPCUT", "Loopcut", account.BASE_URL, "fast",
      "Sign in with your Loopcut account. The Loopcut service picks the model behind Fast and Pro and meters "
-     "usage per 5-hour session and per week." if config.BETA else
-     "Sign in with your Loopcut account. Fast and Pro are included in your plan; the Loopcut "
-     "service picks the model behind each and meters usage per 5-hour session and per week."),
+     "usage per 5-hour session and per week."),
     ("META", "Meta", "https://api.meta.ai/v1", "muse-spark-1.3-contributor",
      "On Meta's contributor tier your prompts, scene descriptions and viewport captures may be "
      "used for training. Pick another tier or provider for confidential work."),
-    ("OPENAI", "OpenAI", "https://api.openai.com/v1", "", ""),
+    ("OPENAI", "OpenAI", "https://api.openai.com/v1", "",
+     "Chats are billed to this key's OpenAI account, not your ChatGPT plan or Loopcut credits."),
     ("OPENROUTER", "OpenRouter", "https://openrouter.ai/api/v1", "", ""),
     ("OLLAMA", "Ollama (this computer)", "http://127.0.0.1:11434/v1", "",
      "Nothing leaves this computer. The model needs tool calling and image input."),
@@ -46,11 +45,15 @@ PROVIDERS = (
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
+# (key name, label, key field, note, "Use this key instead of credits" checkbox). Tool vendors only: the
+# model's own key (Anthropic, OpenAI chat) is the provider's API key above, which credits never replace.
 VENDOR_ROWS = (
-    ("OPENAI_API_KEY", "OpenAI", "openai_vendor_key", "Image generation and editing · Private (A)"),
-    ("FAL_KEY", "fal", "fal_vendor_key", "Image to 3D · Private (A); retopology · Longer retention (B)"),
-    ("GEMINI_API_KEY", "Google Gemini", "gemini_vendor_key", "Voice lines · Paid API only, kept 55 days (B); free tier may train (D)"),
-    ("ELEVENLABS_API_KEY", "ElevenLabs", "elevenlabs_vendor_key", "Sound effects · May train (C); disable training and SFX sharing in your vendor account"),
+    ("OPENAI_API_KEY", "OpenAI", "openai_vendor_key", "Image generation and editing · Private (A)", "openai_key_first"),
+    ("FAL_KEY", "fal", "fal_vendor_key", "Image to 3D · Private (A); retopology · Longer retention (B)", "fal_key_first"),
+    ("GEMINI_API_KEY", "Google Gemini", "gemini_vendor_key",
+     "Voice lines · Paid API only, kept 55 days (B); free tier may train (D)", "gemini_key_first"),
+    ("ELEVENLABS_API_KEY", "ElevenLabs", "elevenlabs_vendor_key",
+     "Sound effects · May train (C); disable training and SFX sharing in your vendor account", "elevenlabs_key_first"),
 )
 
 
@@ -72,14 +75,60 @@ _get_gemini_key, _set_gemini_key = _vendor_callbacks("GEMINI_API_KEY")
 _get_elevenlabs_key, _set_elevenlabs_key = _vendor_callbacks("ELEVENLABS_API_KEY")
 
 
+def _key_first_changed(self, context) -> None:
+    from . import cloud
+    cloud.sync_settings()  # config.service_backends: the tools' routes change with the checkbox.
+    _changed()
+
+
+SPENDING_NOTE = ("Paid steps at or under \"Ask above\" run on their own; bigger ones ask first. Once a chat has "
+                 "spent its budget without asking, the next paid step asks before going on. Own keys ask once per "
+                 "chat for each vendor. Workers spend from the same chat budget.")
+
+
+def draw_spending(layout, prefs) -> None:
+    """Credits (C47): when a paid step asks first. One setting a row, so it reads in a narrow window."""
+    box = layout.box()
+    box.label(text="Spending", icon="FUND")
+    column = box.column()
+    column.prop(prefs, "ask_above_credits")
+    column.prop(prefs, "chat_budget_credits")
+    flags = box.column()
+    flags.use_property_split = False
+    flags.prop(prefs, "ask_every_paid_call")
+    info = box.column(align=True)
+    info.scale_y = 0.85
+    for n, line in enumerate(wrap(SPENDING_NOTE, 70)):
+        info.label(text=line, icon="INFO" if n == 0 else "BLANK1")
+    from . import cloud
+    runtime = cloud._runtime
+    today = ""
+    if runtime is not None:
+        with runtime.lock:
+            today = cloud_account.today_label(runtime.manifest, runtime.signed_in)
+    row = box.row(align=True)
+    if today:
+        row.label(text=today)
+    row.operator("wm.url_open", text="Set a daily limit", icon="URL").url = config.credits_url("daily_limit")
+
+
 def draw_vendor_keys(layout, prefs):
-    """PASSWORD/SKIP_SAVE fields use the same credentials callbacks as the endpoint key."""
+    """PASSWORD/SKIP_SAVE fields use the same credentials callbacks as the endpoint key. A key's
+    "Use this key instead of credits" box shows only once that key is set (here or in the environment)."""
     box = layout.box()
     box.label(text="Your own keys", icon="KEYINGSET")
-    for key, label, prop, note in VENDOR_ROWS:
+    keys_set = credentials.vendor_keys_set()
+    for key, label, prop, note, first in VENDOR_ROWS:
         row = box.row(align=True)
         row.prop(prefs, prop, text=label)
         row.operator("loopcut.clear_vendor_key", text="Clear").key_name = key
+        if keys_set.get(key):
+            box.prop(prefs, first)
+            # Who pays, right under the choice (F0286): the box is on by default, so say it plainly.
+            billed = box.column(align=True)
+            billed.scale_y = 0.85
+            billed.label(text=f"Charges go to your {label} account, not your Loopcut credits." if getattr(prefs, first, True)
+                         else "Loopcut credits first, then this key.")
         info = box.column(align=True)
         info.scale_y = 0.85
         info.label(text=note, icon="INFO")
@@ -93,7 +142,6 @@ def draw_vendor_keys(layout, prefs):
     flags.prop(prefs, "private_mode")
     flags.prop(prefs, "project_no_generation")
     flags.label(text="Project Off cannot lift account No generation.")
-    flags.prop(prefs, "byok_tools")
     status = cloud_account.panel_data(cloud._runtime)["message"]
     if status:
         flags.label(text=status, icon="INFO")
@@ -239,9 +287,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         default="LOOPCUT", update=_provider_changed)
     tier: bpy.props.StringProperty(
         name="Model", default="fast", update=_tier_changed,
-        description="Which Loopcut model answers; the menu says how much usage each takes against the default"
-        if config.BETA else
-        "Which of the models your Loopcut plan offers answers; the menu says what each costs against the default")
+        description="Which Loopcut model answers; the menu says how much usage each takes against the default")
     base_url: bpy.props.StringProperty(
         name="Base URL", default=PROVIDERS[0][2], update=_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
@@ -260,8 +306,20 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         default=config.CHATGPT_PLAN_EFFORT, update=_changed)
     auto_run: bpy.props.BoolProperty(
         name="Run without asking", default=False, update=_changed,
-        description="Run code and file changes without the Run / Reject step. Renders and bakes still ask. "
-                    "Every turn still gets a checkpoint you can restore")
+        description="Run code and file changes without the Run / Reject step. Renders and bakes still ask, and "
+                    "paid steps follow Spending. Every turn still gets a checkpoint you can restore")
+    # Spending (spending.py, C47): when a paid step asks first.
+    ask_above_credits: bpy.props.IntProperty(
+        name="Ask above", default=25, min=0, max=100_000, update=_changed,
+        description="Credits a single paid step may cost before it asks you first (the service may ask lower). "
+                    "0 asks for every paid step")
+    chat_budget_credits: bpy.props.IntProperty(
+        name="Chat budget", default=150, min=1, max=100_000, update=_changed,
+        description="Credits one chat may spend without asking, workers included. Then the next paid step asks "
+                    "whether to allow this much more")
+    ask_every_paid_call: bpy.props.BoolProperty(
+        name="Ask before every paid call", default=False, update=_changed,
+        description="Every step that costs credits, or uses your own vendor key, asks first")
     auto_look: bpy.props.BoolProperty(
         name="Look after every change", default=True, update=_changed,
         description="After each step that changes the scene, the agent gets a picture of the result. "
@@ -312,16 +370,25 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     elevenlabs_vendor_key: bpy.props.StringProperty(
         name="ElevenLabs", subtype="PASSWORD", options={"SKIP_SAVE"}, get=_get_elevenlabs_key, set=_set_elevenlabs_key,
         description="Set or replace your SFX key; environment ELEVENLABS_API_KEY takes precedence")
+    # "Use this key instead of credits", per vendor key (config.service_backends). On by default.
+    openai_key_first: bpy.props.BoolProperty(
+        name="Use this key instead of credits", default=True, update=_key_first_changed,
+        description="On: OpenAI tools use this key even with Loopcut credits. Off: credits first, then this key")
+    fal_key_first: bpy.props.BoolProperty(
+        name="Use this key instead of credits", default=True, update=_key_first_changed,
+        description="On: fal tools use this key even with Loopcut credits. Off: credits first, then this key")
+    gemini_key_first: bpy.props.BoolProperty(
+        name="Use this key instead of credits", default=True, update=_key_first_changed,
+        description="On: Gemini tools use this key even with Loopcut credits. Off: credits first, then this key")
+    elevenlabs_key_first: bpy.props.BoolProperty(
+        name="Use this key instead of credits", default=True, update=_key_first_changed,
+        description="On: ElevenLabs tools use this key even with Loopcut credits. Off: credits first, then this key")
     # AddonPreferences has no IDProperty mapping; saved RNA fields back local callbacks.
     local_no_generation: bpy.props.BoolProperty(default=cloud_account.DEFAULTS["no_generation"], options={"HIDDEN"})
     local_private_mode: bpy.props.BoolProperty(default=cloud_account.DEFAULTS["private_mode"], options={"HIDDEN"})
     no_generation: bpy.props.BoolProperty(
         name="No generation", default=False, get=_get_no_generation, set=_set_no_generation,
         description="Hide and refuse generative service tools. Retopology remains available")
-    byok_tools: bpy.props.StringProperty(
-        name="Use own keys for tools", default="",
-        description="Comma-separated tool names, such as image_generate,voice_line"
-        + ("" if config.BETA else ". Otherwise funded accounts use credits"))
     private_mode: bpy.props.BoolProperty(
         name="Private mode", default=True, get=_get_private_mode, set=_set_private_mode,
         description="Hide and refuse service vendors whose data class is C or D")
@@ -362,7 +429,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
             if listed_models(self.provider):
                 row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
-        note = _BY_ID[self.provider][4]
+        note = provider_note(self.provider)
         if note:
             lines = wrap(note, 90)
             info = box.column(align=True)
@@ -370,12 +437,11 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             for n, line in enumerate(lines):
                 info.label(text=line, icon="INFO" if n == 0 else "BLANK1")
 
-        if self.provider != "LOOPCUT" and not account.signed_in():
-            box = layout.box()
-            box.label(text="Loopcut account")
-            account.draw(box.column(align=True))
+        draw_connections(layout, self)
 
         draw_vendor_keys(layout, self)
+
+        draw_spending(layout, self)
 
         split = layout.split(factor=0.5)
         agent = split.box()
@@ -391,8 +457,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             row.enabled = self.provider == "LOOPCUT"
             row.prop(self, "orchestrate")
             if self.provider != "LOOPCUT":
-                flags.label(text="Workers and routing use the Loopcut service" if config.BETA else
-                            "Workers and routing run on Loopcut plans")
+                flags.label(text="Workers and routing run on Loopcut plans" if config.billing_open() else
+                            "Workers and routing use the Loopcut service")
         flags.prop(self, "dock_on_startup")
         limits = split.box()
         limits.label(text="Limits", icon="TIME")
@@ -406,7 +472,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         column = box.column()
         row = column.row(align=True)
         row.prop(self, "blenderkit_key")
-        if not config.BETA:
+        if config.billing_open():
             row.operator("loopcut.blenderkit_get_key", text="", icon="URL")
         row = column.row(align=True)
         row.prop(self, "polypizza_key")
@@ -414,8 +480,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         info = column.column(align=True)
         info.scale_y = 0.85
         info.label(text="BlenderKit's free assets, Poly Haven and the asset libraries in Preferences > File Paths", icon="INFO")
-        info.label(text=("need no key. Poly Pizza's key is free; its" if config.BETA else
-                         "need no key. A BlenderKit plan key adds its paid assets. Poly Pizza's key is free; its"), icon="BLANK1")
+        info.label(text=("need no key. A BlenderKit plan key adds its paid assets. Poly Pizza's key is free; its"
+                         if config.billing_open() else "need no key. Poly Pizza's key is free; its"), icon="BLANK1")
         info.label(text="terms ask for attribution and allow no commercial use by anyone earning over $50,000 a year.", icon="BLANK1")
 
         from .ui import host
@@ -524,6 +590,51 @@ class LOOPCUT_OT_anthropic_get_key(bpy.types.Operator):
         return {"FINISHED"}
 
 
+BOTH_NOTE = ("Best setup: both. Your ChatGPT plan runs the conversation; your Loopcut account adds asset search "
+             "and cloud tools. Loopcut credits never pay for ChatGPT.")
+
+
+def draw_connections(layout, prefs) -> None:
+    """Both connections, whichever is the model (M9). Connection above draws the chosen provider in full; this
+    box shows the other one, so signing in to one never hides the other."""
+    box = layout.box()
+    box.label(text="Your connections", icon="LINKED")
+    info = box.column(align=True)
+    info.scale_y = 0.85
+    for n, line in enumerate(wrap(BOTH_NOTE, 90)):
+        info.label(text=line, icon="INFO" if n == 0 else "BLANK1")
+    if prefs.provider != "CHATGPT":
+        column = box.column(align=True)
+        column.label(text="ChatGPT plan", icon="USER")
+        info = chatgpt_auth.status()
+        if info.get("signed_in") and info.get("plan_usage"):
+            row = column.row(align=True)
+            row.label(text=f"{info.get('email') or 'Signed in'} · not the model now", icon="CHECKMARK")
+            row.operator("loopcut.use_provider", text="Use ChatGPT plan").provider = "CHATGPT"
+        else:
+            column.label(text="ChatGPT Plus or Pro runs the agent, with no charge from Loopcut.")
+            column.operator("loopcut.chatgpt_sign_in", text="Sign in with ChatGPT")
+    if prefs.provider != "LOOPCUT":
+        column = box.column(align=True)
+        column.label(text="Loopcut account", icon_value=account.mark_icon())
+        account.draw(column)
+
+
+class LOOPCUT_OT_use_provider(bpy.types.Operator):
+    """Make this connection the model"""
+    bl_idname = "loopcut.use_provider"
+    bl_label = "Use"
+    bl_options = {"INTERNAL"}
+
+    provider: bpy.props.StringProperty()
+
+    def execute(self, context):
+        prefs = preferences()
+        if prefs is not None and self.provider in _BY_ID:
+            prefs.provider = self.provider
+        return {"FINISHED"}
+
+
 class LOOPCUT_OT_pick_model(bpy.types.Operator):
     bl_idname = "loopcut.pick_model"
     bl_label = "Use Model"
@@ -573,7 +684,14 @@ def provider_label(provider: str) -> str:
     return _BY_ID[provider][1]
 
 
+LOOPCUT_PLAN_NOTE = ("Sign in with your Loopcut account. Fast is free with a daily allowance; the Pro model comes "
+                     "with the Pro plan. The Loopcut service picks the model behind each and meters usage per "
+                     "5-hour session and per week.")
+
+
 def provider_note(provider: str) -> str:
+    if provider == "LOOPCUT" and config.billing_open():
+        return LOOPCUT_PLAN_NOTE  # Plan words only while the server sells plans.
     return _BY_ID[provider][4]
 
 
@@ -670,8 +788,12 @@ def values() -> dict[str, str]:
         "LOOPCUT_CHECKPOINT_BUDGET_MB": str(prefs.checkpoint_budget_mb),
         "LOOPCUT_NO_GENERATION": "true" if prefs.no_generation else "false",
         "LOOPCUT_PRIVATE_MODE": "true" if prefs.private_mode else "false",
-        "LOOPCUT_BYOK_TOOLS": getattr(prefs, "byok_tools", ""),
+        "LOOPCUT_ASK_ABOVE_CREDITS": str(getattr(prefs, "ask_above_credits", 25)),
+        "LOOPCUT_CHAT_BUDGET_CREDITS": str(getattr(prefs, "chat_budget_credits", 150)),
+        "LOOPCUT_ASK_EVERY_PAID_CALL": "true" if getattr(prefs, "ask_every_paid_call", False) else "false",
     }
+    for key, _, _, _, first in VENDOR_ROWS:
+        found[config.OWN_KEY_FIRST + key] = "true" if getattr(prefs, first, True) else "false"
     if callable(getattr(prefs, "is_property_set", None)) and not prefs.is_property_set("local_no_generation"):
         # Until the user sets a project/local override, the manifest's account default applies.
         found.pop("LOOPCUT_NO_GENERATION")
@@ -709,10 +831,10 @@ class LOOPCUT_OT_blenderkit_get_key(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return not config.BETA
+        return config.billing_open()
 
     def execute(self, context):
-        if config.BETA:
+        if not config.billing_open():
             return {"CANCELLED"}
         from . import blenderkit
         account.open_browser(blenderkit.PLANS)
@@ -725,7 +847,7 @@ class LOOPCUT_OT_clear_vendor_key(bpy.types.Operator):
     bl_label = "Clear Vendor Key"
     bl_options = {"INTERNAL"}
 
-    key_name: bpy.props.EnumProperty(items=[(key, label, "") for key, label, _, _ in VENDOR_ROWS])
+    key_name: bpy.props.EnumProperty(items=[(key, label, "") for key, label, *_ in VENDOR_ROWS])
 
     def execute(self, context):
         try:
@@ -738,7 +860,8 @@ class LOOPCUT_OT_clear_vendor_key(bpy.types.Operator):
         return {"FINISHED"}
 
 
-_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_pick_model,
+_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_use_provider,
+            LOOPCUT_OT_pick_model,
             LOOPCUT_MT_models, LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key, LOOPCUT_OT_clear_vendor_key)
 

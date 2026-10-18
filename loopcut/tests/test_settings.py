@@ -7,6 +7,7 @@ descriptors so reading UI properties calls their getters, just as Blender does.
 import importlib
 import importlib.util
 import io
+import os
 import sys
 import threading
 import types
@@ -212,7 +213,7 @@ class SettingsTest(unittest.TestCase):
                     checkbox = next(n for n, entry in enumerate(calls) if entry[:2] == ("prop", "orchestrate"))
                     row = calls[checkbox][2]
                     self.assertIs(row.enabled, False)
-                    self.assertEqual(calls[checkbox + 1][:2], ("label", "Workers and routing use the Loopcut service" if self.settings.config.BETA else
+                    self.assertEqual(calls[checkbox + 1][:2], ("label", "Workers and routing use the Loopcut service" if not self.settings.config.billing_open() else
                                                           "Workers and routing run on Loopcut plans"))
                     self.assertIs(calls[checkbox + 1][2], row.parent, "the note is directly under the checkbox row")
                     self.assertIs(self.prefs.orchestrate, stored)
@@ -261,6 +262,63 @@ class SettingsTest(unittest.TestCase):
                          ("anthropic://api.anthropic.com/v1", "claude-opus-5-5", "k-1"))
         with patch.object(self.settings, "preferences", return_value=self.prefs):
             self.assertEqual([option[0] for option in self.settings.model_options()][:2], ["claude-opus-5-5", "claude-sonnet-5-5"])
+
+    # "Use this key instead of credits", per tool-vendor key (owner, 2026-10-16).
+    def draw_vendor_keys(self, keys):
+        layout = Layout()
+        with patch.object(self.settings.credentials, "vendor_key", side_effect=lambda name: "set" if name in keys else ""), \
+                patch.object(self.cloud, "_runtime", None):
+            self.settings.draw_vendor_keys(layout, self.prefs)
+        return [entry[1] for entry in layout.calls if entry[0] == "prop"]
+
+    def test_key_first_checkbox_shows_only_once_its_key_is_set(self):
+        boxes = {row[4] for row in self.settings.VENDOR_ROWS}
+        self.assertFalse(boxes & set(self.draw_vendor_keys(())))
+        drawn = self.draw_vendor_keys(("FAL_KEY",))
+        self.assertEqual(boxes & set(drawn), {"fal_key_first"})
+        self.assertEqual(drawn[drawn.index("fal_vendor_key") + 1], "fal_key_first", "right under its key")
+        self.assertEqual(boxes & set(self.draw_vendor_keys({row[0] for row in self.settings.VENDOR_ROWS})), boxes)
+        self.assertNotIn("byok_tools", drawn, "the old per-tool list is folded into the checkboxes")
+
+    def test_key_first_says_who_pays_right_under_it(self):
+        """F0286: the box comes ticked, with no line saying the key's own account is charged."""
+        def drawn():
+            layout = Layout()
+            with patch.object(self.settings.credentials, "vendor_key", side_effect=lambda name: "set" if name == "OPENAI_API_KEY" else ""), \
+                    patch.object(self.cloud, "_runtime", None):
+                self.settings.draw_vendor_keys(layout, self.prefs)
+            entries = [entry[:2] for entry in layout.calls]
+            return entries[entries.index(("prop", "openai_key_first")) + 1]
+        self.assertEqual(drawn(), ("label", "Charges go to your OpenAI account, not your Loopcut credits."))
+        self.prefs.openai_key_first = False
+        self.assertEqual(drawn(), ("label", "Loopcut credits first, then this key."))
+
+    def test_key_first_is_on_by_default_short_and_only_for_tool_vendors(self):
+        self.assertEqual([row[0] for row in self.settings.VENDOR_ROWS], list(self.settings.credentials.VENDOR_KEY_NAMES))
+        for row in self.settings.VENDOR_ROWS:
+            field = type(self.prefs).__annotations__[row[4]]
+            self.assertIs(field.options["default"], True)
+            self.assertEqual(field.options["name"], "Use this key instead of credits")
+            self.assertIs(getattr(self.prefs, row[4]), True)
+        self.assertNotIn("byok_tools", type(self.prefs).__annotations__)
+        self.assertFalse([name for name in type(self.prefs).__annotations__ if "anthropic" in name and "first" in name])
+
+    def test_key_first_reaches_the_tool_routes(self):
+        self.prefs.provider = "OPENAI"
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value=""), \
+                patch.object(self.settings.config, "_find_env_file", return_value=None), \
+                patch.dict(os.environ):
+            for name in self.settings.credentials.VENDOR_KEY_NAMES:
+                os.environ.pop(self.settings.config.OWN_KEY_FIRST + name, None)  # The environment would win.
+            keys = {"OPENAI_API_KEY": True}
+            self.assertEqual(self.settings.values()["LOOPCUT_OWN_KEY_FIRST_OPENAI_API_KEY"], "true")
+            self.assertEqual(self.settings.config.service_backends(keys), {"image_generate": "byok", "image_edit": "byok"})
+            self.prefs.openai_key_first = False
+            self.assertEqual(self.settings.values()["LOOPCUT_OWN_KEY_FIRST_OPENAI_API_KEY"], "false")
+            self.assertEqual(self.settings.config.service_backends(keys), {})
+        self.settings._key_first_changed(self.prefs, None)
+        self.cloud.sync_settings.assert_called_once_with()
 
     def draw_preferences(self, provider, stored):
         self.prefs.provider = provider

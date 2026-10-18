@@ -41,12 +41,14 @@ _TOOLS = (
           "gen", "fal", "FAL_KEY", "A", {}, [],
           [_file("reference", ["image/png", "image/jpeg"], 20)],
           "model_3d", ["glb"], "import_model", "minutes"),
-    _tool("retopology", "Retopology", "Remesh a GLB or OBJ at a target face count; optional quads.",
+    _tool("retopology", "Retopology",
+          "Remesh a GLB or OBJ at a target face count (500-20000 triangles; 500-10000 with quad). "
+          "Triangles come back as a GLB; quad returns an FBX, since GLB cannot hold quads.",
           "assist", "fal", "FAL_KEY", "B",
           {"face_limit": {"type": "integer", "minimum": 500, "maximum": 20000},
            "quad": {"type": "boolean"}}, [],
           [_file("model", ["model/gltf-binary", "model/obj"], 150)],
-          "model_3d", ["glb"], "import_model", "minutes"),
+          "model_3d", ["glb", "fbx"], "import_model", "minutes"),
     _tool("voice_line", "Voice line", "Speak one text line using a Gemini prebuilt voice. Requires paid Gemini API.",
           "gen", "gemini", "GEMINI_API_KEY", "B",
           {"text": {"type": "string", "minLength": 1, "maxLength": 8000},
@@ -79,11 +81,19 @@ def descriptors(*, no_generation=None, private_mode=None, keys_set=None) -> list
     return found
 
 
+def tool_keys() -> dict[str, str]:
+    """{tool name: vendor key name} for every tool that has an own-key adapter."""
+    return {tool["name"]: tool["byok"]["key_name"] for tool in _TOOLS}
+
+
 def choose_backend(descriptor, *, signed_in_with_credits, preferred_backend, has_key) -> dict:
     """Return {backend: managed|byok|None, unavailable_reason: contract enum|None} (§1.6).
 
-    The local catalog's disabled/sign_in/credits availability is route-specific. Generation,
-    Private mode, plan and region refusals remain binding.
+    preferred_backend "byok" (config.service_backends: the key is set and "Use this key instead of
+    credits" is on) takes the own-key route even with credits, and never falls back to credits.
+    Otherwise credits come first when the account has them, then the key. The local catalog's
+    disabled/sign_in/credits availability is route-specific. Generation, Private mode, plan and
+    region refusals remain binding.
     """
     reason = descriptor.get("unavailable_reason")
     if reason in ("no_generation", "private_mode", "plan", "region") or descriptor.get("status") == "coming_soon":

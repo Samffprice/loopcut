@@ -9,7 +9,7 @@ background.
 import re
 from pathlib import Path
 
-from .. import config, state
+from .. import config, spending, state
 from . import textedit
 from . import theme as T
 from .markdown import REFERENCE_LIMIT, split_markdown
@@ -112,12 +112,14 @@ class Frame:
         return height
 
     def button(self, id, x, y, label, fill, color, action) -> int:
+        """`action` None draws a disabled button: no hit area."""
         size, pad_x = self.px(T.FONT_SIZE_SMALL), self.px(10)
         height = self.px(24)
         width = round(self.measure("ui", size, label)) + 2 * pad_x
         self.rect(id, x, y, width, height, fill, self.px(T.RADIUS_SMALL))
         self.text(f"{id}.label", x + pad_x, y + (height - self.line_height(size)) // 2, label, size, color)
-        self.hit(id, x, y, width, height, action)
+        if action is not None:
+            self.hit(id, x, y, width, height, action)
         return width
 
 
@@ -336,6 +338,10 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                               "Powered by Poly Haven", small, T.TEXT_MUTED)
     if item.get("cost"):
         cursor += f.paragraph(f"item{n}.tool.cost", inner_x, cursor, inner_w, item["cost"], small, T.TEXT)
+    if awaiting and item.get("ask"):  # A paid step's ask (spending.py): what was hit, the balance before → after.
+        for k, line in enumerate(item.get("ask_lines") or ()):
+            cursor += f.paragraph(f"item{n}.tool.ask{k}", inner_x, cursor, inner_w, line, small,
+                                  T.TEXT_MUTED if k == 0 and item.get("worker") else T.TEXT)
     if expanded and item["code"]:
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
@@ -358,14 +364,35 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     if expanded and (item.get("cloud_error") or {}).get("message"):
         cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
                               item["cloud_error"]["message"], small, T.ERROR)
-    if not config.BETA and expanded and (item.get("cloud_error") or {}).get("upgrade"):
-        f.button(f"item{n}.tool.upgrade", inner_x, cursor, "Add credits / upgrade", T.BUTTON, T.BUTTON_TEXT,
-                 ("cloud_upgrade", n))
-        cursor += f.px(28)
+    if config.billing_open() and expanded and (item.get("cloud_error") or {}).get("upgrade"):
+        cursor += _button_row(f, inner_x, cursor, inner_w, [  # Out of credits (M6): buying happens on the site.
+            (f"item{n}.tool.upgrade", "Get credits ↗", T.BUTTON, T.BUTTON_TEXT, ("cloud_upgrade", n)),
+            (f"item{n}.tool.plans", "See plans ↗", T.BUTTON_GHOST, T.TEXT,
+             ("open_web", config.pricing_url("out_of_credits", "pro")))]) + f.px(4)
+    error = item.get("cloud_error") or {}
+    if expanded and not awaiting and (error.get("link") or error.get("stop") and f.session.get("busy")):
+        buttons = []  # A server limit's card: the account page for the daily limit; Stop for the burst guard.
+        if error.get("link"):
+            buttons.append((f"item{n}.tool.link", error.get("link_label") or "Account ↗", T.BUTTON_GHOST, T.TEXT,
+                            ("open_web", error["link"])))
+        if error.get("stop") and f.session.get("busy"):
+            buttons.append((f"item{n}.tool.stop", "Stop", T.BUTTON_GHOST, T.TEXT, ("stop_turn", n)))
+        cursor += f.px(4) + _button_row(f, inner_x, cursor + f.px(4), inner_w, buttons) + f.px(4)
     if awaiting and item.get("install"):
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.install", inner_x, cursor, inner_w, INSTALL_NOTE, small, T.TEXT)
-    if awaiting:
+    if awaiting and item.get("ask"):
+        # Every limit pauses here (owner, 2026-10-16): Approve / Allow runs this call; "Skip this" declines only
+        # this call and the turn goes on. The panel's Stop still stops the whole turn.
+        cursor += f.px(8)
+        buttons = [(f"item{n}.tool.run", f"{item.get('ask_label') or 'Approve'}  ⏎", T.BUTTON, T.BUTTON_TEXT,
+                    ("approve", n)),
+                   (f"item{n}.tool.reject", f"{spending.SKIP}  esc", T.BUTTON_GHOST, T.TEXT, ("reject", n))]
+        if item.get("ask_link"):
+            buttons.append((f"item{n}.tool.link", "Change daily limit ↗", T.BUTTON_GHOST, T.TEXT,
+                            ("open_web", item["ask_link"])))
+        cursor += _button_row(f, inner_x, cursor, inner_w, buttons)
+    if awaiting and not item.get("ask"):
         cursor += f.px(8)
         run_width = f.button(f"item{n}.tool.run", inner_x, cursor, "Run  ⏎", T.BUTTON, T.BUTTON_TEXT,
                              ("approve", n))
@@ -401,13 +428,82 @@ def _item_error(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size = f.px(T.CARD_PAD), f.px(T.FONT_SIZE)
     mark = len(f.prims)
     height = f.paragraph(f"item{n}.error", x + pad, y + pad, width - 2 * pad, item["text"], size, T.ERROR) + 2 * pad
+    # A dropped connection: Try again sends the same request (agent.resume), while it is the newest item.
+    if item.get("retry") and n == len(f.session["items"]) - 1 and not f.session.get("busy"):
+        height += _button_row(f, x + pad, y + height - pad, width - 2 * pad,
+                              [(f"item{n}.error.retry", "Try again", T.BUTTON_GHOST, T.TEXT, ("resume", n))]) + f.px(4)
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.error.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.ERROR_BG, "radius": f.px(T.RADIUS), "border": 1,
                           "border_color": T.ERROR_BORDER})
     return height
 
 
+def _clock(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _waveform(f: Frame, id: str, x, y, width, peaks: list, share: float, muted: bool) -> int:
+    """A sound's peaks as bars, the played `share` in the accent color; a plain progress bar without peaks."""
+    if not peaks:
+        height = f.px(4)
+        f.rect(f"{id}.track", x, y, width, height, T.CARD_BORDER, height // 2)
+        if share > 0:
+            f.rect(f"{id}.played", x, y, max(height, round(width * share)), height, T.ACCENT, height // 2)
+        return height
+    height, step = f.px(28), width / len(peaks)
+    bar = max(1, round(step * 0.6))
+    for k, peak in enumerate(peaks):
+        bar_h = max(f.px(2), round(peak * height))
+        color = T.CARD_BORDER if muted else T.ACCENT if k < share * len(peaks) else T.TEXT_FAINT
+        f.rect(f"{id}.b{k}", round(x + k * step), y + (height - bar_h) // 2, bar, bar_h, color)
+    return height
+
+
+def _item_audio(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """A generated sound under the call that made it (state.item_audio): Play / Stop, its name and length, and
+    a waveform that fills in as it plays. One sound plays at a time (playback.py); a file that is gone is a
+    disabled Play with a note."""
+    audio = item["audio"]
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    missing = audio["path"] in f.ui.get("missing_paths", ())
+    now = f.ui.get("audio_playing") or {}
+    playing = not missing and now.get("path") == audio["path"]
+    if playing:
+        used = f.button(f"item{n}.audio.stop", inner_x, cursor, "■ Stop", T.BUTTON, T.BUTTON_TEXT,
+                        ("audio_stop", audio["path"]))
+    else:
+        used = f.button(f"item{n}.audio.play", inner_x, cursor, "▶ Play", T.BUTTON_GHOST,
+                        T.TEXT_FAINT if missing else T.TEXT, None if missing else ("audio_play", audio["path"]))
+    button_h = f.px(24)
+    length = f"{_clock(now['position'])} / {_clock(audio['seconds'])}" if playing else _clock(audio["seconds"])
+    length_w = round(f.measure("ui", small, length))
+    f.text(f"item{n}.audio.length", inner_x + inner_w - length_w, cursor + (button_h - f.line_height(small)) // 2,
+           length, small, T.TEXT_MUTED)
+    name_x = inner_x + used + f.px(10)
+    name_w = inner_x + inner_w - length_w - f.px(10) - name_x
+    if name_w < f.px(48):  # A narrow panel: the name gets its own row under the button.
+        cursor += button_h + f.px(4)
+        name_x, name_w, button_h = inner_x, inner_w, f.line_height(size)
+    f.text(f"item{n}.audio.name", name_x, cursor + (button_h - f.line_height(size)) // 2,
+           _ellipsize(f, audio["name"], size, name_w), size, T.TEXT_FAINT if missing else T.TEXT)
+    cursor += button_h + f.px(8)
+    share = min(1.0, now["position"] / audio["seconds"]) if playing and audio["seconds"] > 0 else 0.0
+    cursor += _waveform(f, f"item{n}.audio.wave", inner_x, cursor, inner_w, audio["peaks"], share, missing)
+    if missing:
+        cursor += f.px(6) + f.paragraph(f"item{n}.audio.missing", inner_x, cursor + f.px(6), inner_w,
+                                        "The sound file is no longer on disk.", small, T.TEXT_FAINT)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.audio.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
+
+
 def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
+    if item.get("audio"):
+        return _item_audio(f, n, item, x, y, width)
     item = state.notice_for_display(item)
     pad, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
@@ -435,7 +531,57 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 
 _LIMIT_TITLES = {"session_limit": "Session allowance used", "week_limit": "Weekly allowance used",
-                 "model_not_in_plan": "Pro is not in your plan"}
+                 "model_not_in_plan": "Pro is not in your plan", "free_daily_limit": "Free Fast is used up for today"}
+HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit"}  # Loopcut's allowance, not the user's plan.
+
+
+def _button_row(f: Frame, x, y, width, buttons) -> int:
+    """Buttons left to right, wrapping onto another row when the panel is too narrow; one too wide for
+    the panel on its own is shortened. buttons: (id, label, fill, color, action). Returns the height."""
+    size, gap, row_h = f.px(T.FONT_SIZE_SMALL), f.px(8), f.px(30)
+    bx, by = x, y
+    for id, label, fill, color, action in buttons:
+        if round(f.measure("ui", size, label)) + f.px(20) > width:
+            label = _ellipsize(f, label, size, width - f.px(20))
+        used = round(f.measure("ui", size, label)) + f.px(20)
+        if bx > x and bx + used > x + width:
+            bx, by = x, by + row_h
+        bx += f.button(id, bx, by, label, fill, color, action) + gap
+    return by - y + f.px(24)
+
+
+def _item_offer(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """A conversion card (nudges.py): what the account adds at this moment, and its buttons. A button with
+    "when" shows only for that sign-in state, so the card follows a sign-in made while it is open."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
+    cursor += f.paragraph(f"item{n}.offer.title", inner_x, cursor, inner_w, item["title"], size, T.TEXT)
+    if item.get("text"):
+        cursor += f.px(2) + f.paragraph(f"item{n}.offer.text", inner_x, cursor + f.px(2), inner_w, item["text"],
+                                        small, T.TEXT_MUTED)
+    if item.get("resolved"):
+        cursor += f.px(4) + f.paragraph(f"item{n}.offer.resolved", inner_x, cursor + f.px(4), inner_w,
+                                        item["resolved"], small, T.OK)
+    else:
+        signed_in, busy = bool(f.ui.get("loopcut_signed_in")), f.session.get("busy")
+        buttons = []
+        for i, action in enumerate(item.get("actions", [])):
+            when = action.get("when", "")
+            if (when == "loopcut_in" and not signed_in) or (when == "loopcut_out" and signed_in):
+                continue
+            if busy and action["do"] in {"continue_loopcut", "prompt"}:
+                continue  # These start or fill the next turn; they wait for this one to end.
+            primary = not buttons and action["do"] != "dismiss"
+            buttons.append((f"item{n}.offer.a{i}", action["label"], T.BUTTON if primary else T.BUTTON_GHOST,
+                            T.BUTTON_TEXT if primary else T.TEXT_MUTED if action["do"] == "dismiss" else T.TEXT,
+                            ("offer", (n, i))))
+        if buttons:
+            cursor += f.px(8) + _button_row(f, inner_x, cursor + f.px(8), inner_w, buttons)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": f"item{n}.offer.card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
 
 
 def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
@@ -445,8 +591,8 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
     status, upgrade = item.get("status", ""), item.get("upgrade")
-    if config.BETA:
-        status, upgrade = "", None  # Saved pre-beta cards cannot offer a purchase either.
+    if not config.billing_open():
+        status, upgrade = "", None  # Saved cards cannot offer a purchase while billing is closed.
         item = state.item_limit(item["text"], item["reason"], item["plan"], item["resets_at"], None)
     if status == "done":
         title, body, color = "Upgraded", item["text"], T.OK
@@ -455,24 +601,32 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
         body = "Finish in the browser. Loopcut picks this conversation up by itself once the plan is active."
     else:
         title, color = _LIMIT_TITLES.get(item["reason"], "Allowance used"), T.WARN
-        if config.BETA and item["reason"] == "model_not_in_plan":
+        if not config.billing_open() and item["reason"] == "model_not_in_plan":
             title = "Model unavailable"
         body = item["text"] + (f"\n{upgrade['note']}" if upgrade and upgrade.get("note") else "")
+        if item["reason"] in HOSTED_LIMITS:  # M7: a ChatGPT plan can carry on where Loopcut's allowance stopped.
+            if f.ui.get("chatgpt_plan"):
+                body += "\nYour ChatGPT plan can carry on now."
+            elif item["reason"] != "free_daily_limit":  # The server's free_daily_limit text already says it.
+                body += "\nHave ChatGPT Plus or Pro? It can run Loopcut now."
     f.text(f"item{n}.limit.title", inner_x, cursor, title, size, color)
     cursor += f.line_height(size) + f.px(4)
     cursor += f.paragraph(f"item{n}.limit.text", inner_x, cursor, inner_w, body, small, T.TEXT)
     newest = n == len(f.session["items"]) - 1
     if newest and status != "done" and not f.session.get("busy"):
         cursor += f.px(8)
-        bx = inner_x
+        buttons = []
         if status == "" and upgrade:
-            bx += f.button(f"item{n}.limit.upgrade", bx, cursor, upgrade.get("label") or "Upgrade", T.BUTTON,
-                           T.BUTTON_TEXT, ("limit_upgrade", n)) + f.px(8)
+            buttons.append((f"item{n}.limit.upgrade", upgrade.get("label") or "Upgrade", T.BUTTON, T.BUTTON_TEXT,
+                            ("limit_upgrade", n)))
+        if item["reason"] in HOSTED_LIMITS and status == "":
+            buttons.append((f"item{n}.limit.chatgpt", "Switch to ChatGPT plan", T.BUTTON_GHOST, T.TEXT, ("limit_chatgpt", n))
+                           if f.ui.get("chatgpt_plan") else
+                           (f"item{n}.limit.chatgpt", "Sign in with ChatGPT", T.BUTTON_GHOST, T.TEXT, ("sign_in", "chatgpt")))
         if item["reason"] == "model_not_in_plan":
-            bx += f.button(f"item{n}.limit.fast", bx, cursor, "Use Fast instead", T.BUTTON_GHOST, T.TEXT,
-                           ("limit_fast", n)) + f.px(8)
-        f.button(f"item{n}.limit.retry", bx, cursor, "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("resume", n))
-        cursor += f.px(24)
+            buttons.append((f"item{n}.limit.fast", "Use Fast instead", T.BUTTON_GHOST, T.TEXT, ("limit_fast", n)))
+        buttons.append((f"item{n}.limit.retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("resume", n)))
+        cursor += _button_row(f, inner_x, cursor, inner_w, buttons)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.limit.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
@@ -662,7 +816,7 @@ def _item_merge(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 _ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant,
                 "tool": _item_tool, "error": _item_error, "limit": _item_limit, "wave": _item_wave,
-                "merge": _item_merge}
+                "merge": _item_merge, "offer": _item_offer}
 
 
 EXAMPLE_REQUESTS = (
@@ -670,6 +824,11 @@ EXAMPLE_REQUESTS = (
     "Add a floor and soft studio lighting.",
     "Explain the modifiers on the selected object.",
 )
+
+
+SETUP_BOTH = "Best setup: both. ChatGPT runs the chat; Loopcut adds assets and cloud tools."
+SETUP_TIPS = {"loopcut": "Free Loopcut account: asset search and cloud tools.\nIts Fast model also runs the agent.",
+              "chatgpt": "Runs the agent on your ChatGPT Plus or Pro plan,\nwith no charge from Loopcut."}
 
 
 def _setup_routes(f: Frame, x, cursor, width) -> int:
@@ -698,6 +857,7 @@ def _setup_routes(f: Frame, x, cursor, width) -> int:
                  ("sign_in_cancel", "chatgpt"))
         cursor += f.px(30)
     else:
+        cursor += f.paragraph("chat.signin.both", x, cursor, width, SETUP_BOTH, small, T.TEXT_MUTED) + f.px(6)
         labels = (("loopcut", "Sign in to Loopcut"), ("chatgpt", "Sign in with ChatGPT"))
         button_w = max(round(f.measure("ui", small, label)) for _, label in labels) + f.px(20)
         stacked = 2 * button_w + f.px(8) > width
@@ -708,7 +868,7 @@ def _setup_routes(f: Frame, x, cursor, width) -> int:
             f.rect(id, left, y, button_w, f.px(24), T.BUTTON_GHOST, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
             f.text(id + ".label", left + f.px(10), y + f.px(3),
                    _ellipsize(f, label, small, button_w - f.px(20)), small, T.TEXT)
-            f.hit(id, left, y, button_w, f.px(24), ("sign_in", route), tip=label)
+            f.hit(id, left, y, button_w, f.px(24), ("sign_in", route), tip=SETUP_TIPS[route])
         cursor += f.px(60 if stacked else 30)
         for route, status in (("loopcut", loopcut), ("chatgpt", chatgpt)):
             if status.get("error"):
@@ -726,6 +886,20 @@ def _setup_routes(f: Frame, x, cursor, width) -> int:
     f.hit("chat.setup", x, cursor, width, f.px(24), ("own_key", None),
           tip="Preferences: choose a model provider, enter its API key and model name. Cloud tool keys are separate.")
     return cursor + f.px(30)
+
+
+def _key_prompt(f: Frame, x, cursor, width) -> int:
+    """An own-key provider chosen without its key (F0287): ask for that key, and offer the connected accounts back.
+    Not the first-run sign-in card, which read as if both accounts had been disconnected."""
+    small, provider = f.px(T.FONT_SIZE_SMALL), f.ui["key_needed"]
+    text = f"{provider} is chosen as the model provider and needs its API key. Chats then bill that key's account."
+    cursor += f.paragraph("chat.key.text", x, cursor, width, text, small, T.TEXT_MUTED) + f.px(6)
+    buttons = [("chat.key.add", f"Add your {provider} key", T.BUTTON, T.BUTTON_TEXT, ("own_key", None))]
+    if f.ui.get("chatgpt_plan"):
+        buttons.append(("chat.key.chatgpt", "Use ChatGPT plan", T.BUTTON_GHOST, T.TEXT, ("use_provider", "CHATGPT")))
+    if f.ui.get("loopcut_signed_in"):
+        buttons.append(("chat.key.loopcut", "Use Loopcut", T.BUTTON_GHOST, T.TEXT, ("use_provider", "LOOPCUT")))
+    return cursor + _button_row(f, x, cursor, width, buttons) + f.px(6)
 
 
 def _first_run(f: Frame, x, cursor, width) -> int:
@@ -769,7 +943,7 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
         cursor += f.paragraph("chat.empty0", x, cursor, width, "Ask for anything in your scene.",
                               f.px(T.FONT_SIZE), T.TEXT_MUTED) + gap
     if f.ui.get("needs_setup") and not session["busy"]:
-        cursor = _setup_routes(f, x, cursor, width)
+        cursor = _key_prompt(f, x, cursor, width) if f.ui.get("key_needed") else _setup_routes(f, x, cursor, width)
     if empty and not f.ui.get("hints_dismissed"):
         cursor = _first_run(f, x, cursor, width)
 
@@ -921,8 +1095,26 @@ def input_height(f: Frame, session: dict) -> int:
     chips = _chip_rows(measuring, "measure", 0, 0, inner_w, session)
     chips += f.px(6) if chips else 0
     return (visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad
-            + _context_row_height(f) + chips + _cloud_height(f) + (f.px(22) if f.ui.get("credits") else 0)
+            + _context_row_height(f) + chips + _cloud_height(f) + _credit_height(f, _credit_lines(f, inner_w))
             + _input_notice(measuring, 0))
+
+
+def _credit_lines(f: Frame, width: int) -> list[str]:
+    """The credits block above the input footer (C47): the balance, then this chat's spend and today's (server
+    account.spend), on one line when they fit and one each when the panel is narrow."""
+    small = f.px(T.FONT_SIZE_SMALL)
+    spend = f.session.get("spend")
+    chat = spending.chat_label(spend) if f.ui.get("credits") or (
+        spending.valid_ledger(spend) and spend.get("credits")) else ""
+    extras = [part for part in (chat, f.ui.get("today") or "") if part]
+    lines = [f.ui["credits"]] if f.ui.get("credits") else []
+    if extras and f.measure("ui", small, " · ".join(extras)) <= width:
+        return lines + [" · ".join(extras)]
+    return lines + extras
+
+
+def _credit_height(f: Frame, lines: list[str]) -> int:
+    return f.px(22) + f.px(16) * (len(lines) - 1) if lines else 0
 
 
 _INTEREST_SIGN_IN = 'Sign in to hear when your picks launch.'
@@ -1176,7 +1368,8 @@ def usage_note(account: dict | None) -> tuple[str, float]:
 def _list_popup(f: Frame, id: str, x: int, bottom: int, width: int, rows: list, active: int,
                 header: str | None = None, query: str = "", placeholder: str = "") -> None:
     """A card floating above `bottom`. With `header`, a title and a search field come first.
-    Rows are (label, right label, action); `active` is the keyboard-highlighted one."""
+    Rows are (label, right label, action[, tip]); `active` is the keyboard-highlighted one. A row whose action
+    is None is a faint caption for the rows under it, not a button."""
     size, small = f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     row_height, pad = f.px(24), f.px(4)
     head_height = f.px(30) if header is not None else 0
@@ -1196,18 +1389,21 @@ def _list_popup(f: Frame, id: str, x: int, bottom: int, width: int, rows: list, 
         y += head_height
     if not rows:
         f.text(f"{id}.empty", x + f.px(12), y + (row_height - f.line_height(size)) // 2, "No matches", size, T.TEXT_FAINT)
-    for n, (label, right, action) in enumerate(rows):
+    for n, (label, right, action, *tip) in enumerate(rows):
         row_y = y + n * row_height
         if n == active:
             f.rect(f"{id}.row{n}.bg", x + pad, row_y, width - 2 * pad, row_height, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
         right_width = round(f.measure("ui", small, right)) if right else 0
-        line = wrap(label, "ui", size, width - right_width - f.px(40), f.measure)[0][1].rstrip()
-        f.text(f"{id}.row{n}.name", x + f.px(12), row_y + (row_height - f.line_height(size)) // 2,
-               line + ("…" if len(line) < len(label) else ""), size, T.TEXT)
+        caption = action is None
+        font = small if caption else size
+        line = wrap(label, "ui", font, width - right_width - f.px(40), f.measure)[0][1].rstrip()
+        f.text(f"{id}.row{n}.name", x + f.px(12), row_y + (row_height - f.line_height(font)) // 2,
+               line + ("…" if len(line) < len(label) else ""), font, T.TEXT_FAINT if caption else T.TEXT)
         if right:
             f.text(f"{id}.row{n}.kind", x + width - f.px(12) - right_width,
                    row_y + (row_height - f.line_height(small)) // 2, right, small, T.TEXT_FAINT)
-        f.hit(f"{id}.row{n}", x, row_y, width, row_height, action)
+        if not caption:
+            f.hit(f"{id}.row{n}", x, row_y, width, row_height, action, tip=tip[0] if tip else "")
 
 
 def _mention_list(f: Frame, session: dict, x: int, bottom: int, width: int) -> None:
@@ -1243,16 +1439,24 @@ def _service_settings(f, x, bottom, width):
     if not f.ui.get("service_settings"):
         return
     policy = f.ui.get("service_policy") or {}
-    rows = [(("✓  " if policy.get(key) else "     ") + label,
-             "Account default" if f.ui.get("service_signed_in") else "Local preference", ("service_toggle", key))
-            for key, label in (("no_generation", "No generation"), ("private_mode", "Private mode"))]
-    for value, label in (("inherit", "Inherit"), ("on", "On"), ("off", "Off")):
+    # Short labels and right labels, so every row reads in full in a narrow panel (about 260 px); the longer
+    # explanations are tooltips. The project's three choices sit under a caption, not a repeated prefix.
+    signed_in = f.ui.get("service_signed_in")
+    rows = [(("✓  " if policy.get(key) else "     ") + label, "Account" if signed_in else "Local", ("service_toggle", key),
+             tip + (" Your Loopcut account's default." if signed_in else " This computer's default."))
+            for key, label, tip in (("no_generation", "No generation", "Hide and refuse generative tools. Retopology stays."),
+                                    ("private_mode", "Private mode", "Hide vendors that may train on your data (C or D)."))]
+    rows.append(("This .blend file", "", None))
+    for value, label, tip in (("inherit", "Use the default", "Follow the No generation setting above."),
+                              ("on", "No generation", "Saved in this .blend: no generation in this file."),
+                              ("off", "Allow generation", "Saved in this .blend. Account restrictions still apply.")):
         checked = "✓  " if f.ui.get("project_override", "inherit") == value else "     "
-        rows.append((checked + "Project no generation: " + label,
-                     "Account restrictions still apply" if value == "off" else "Saved in this .blend",
-                     ("project_generation", value)))
+        rows.append((checked + label, "", ("project_generation", value), tip))
     if not f.ui.get("service_signed_in"):
         rows.append(("Sign in to Loopcut", "", ("sign_in", "loopcut")))
+    if config.billing_open():  # The switch for every soft card (nudges.py); blocking cards are not tips.
+        rows.append((("     " if f.ui.get("tips_off") else "✓  ") + "Tips about Loopcut tools", "",
+                     ("tips_toggle", None)))
     rows.append(("All settings…", "", ("open_settings", None)))
     _list_popup(f, "service.settings", x, bottom, min(width, f.px(320)), rows, -1)
 
@@ -1349,10 +1553,14 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))
     f.text("input.hint", hint_x, text_y, hint, small, T.TEXT_FAINT)
     _rings(f, session, hint_x - f.px(16), button_y, button_h)
-    if f.ui.get("credits"):
-        credit_y = button_y - f.px(22)
-        f.text("input.credits", inner_x, credit_y, _ellipsize(f, f.ui["credits"], small, inner_w), small, T.TEXT_MUTED)
-        f.hit("input.credits", inner_x, credit_y, inner_w, f.px(20), ("open_account", None), tip=f.ui["credits"])
+    credit_lines = _credit_lines(f, inner_w)
+    if credit_lines:
+        credit_y = button_y - _credit_height(f, credit_lines)
+        for k, line in enumerate(credit_lines):
+            f.text("input.credits" + (str(k) if k else ""), inner_x, credit_y + f.px(16) * k,
+                   _ellipsize(f, line, small, inner_w), small, T.TEXT_MUTED)
+        f.hit("input.credits", inner_x, credit_y, inner_w, f.px(16) * (len(credit_lines) - 1) + f.px(20),
+              ("open_account", None), tip="\n".join(credit_lines))
 
     if f.ui.get("picker") is not None:
         _picker(f, x, card_y, width)
@@ -1495,6 +1703,8 @@ def _cloud_jobs(f: Frame, cursor):
         f.text(f"cloud.{id}.title", pad, cursor + f.px(3), _ellipsize(f, row['title'], small, title_w), small, T.TEXT)
         cursor += f.px(26)
         cursor += f.paragraph(f"cloud.{id}.progress", pad, cursor, f.width - pad * 2, row["message"], small, T.TEXT_MUTED)
+        if row.get("note"):  # "80 credits held. Cancel returns them." or why it can't be canceled now (C47).
+            cursor += f.paragraph(f"cloud.{id}.note", pad, cursor, f.width - pad * 2, row["note"], small, T.TEXT_FAINT)
         cursor += pad
     return cursor
 

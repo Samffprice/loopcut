@@ -410,6 +410,24 @@ class ToolFailureCardTest(unittest.TestCase):
         self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
 
 
+class ErrorCardTest(unittest.TestCase):
+    def test_a_dropped_connection_offers_try_again_while_it_is_the_newest_item(self):
+        session = state.new_session()
+        session["items"].append(state.item_error("The connection to ChatGPT dropped before it could answer.", retry=True))
+        hits = {h["id"]: h for h in build(session)["hits"]}
+        self.assertEqual(hits["item0.error.retry"]["action"], ("resume", 0))
+        session["busy"] = True
+        self.assertNotIn("item0.error.retry", ids(build(session), "hits"))
+        session["busy"] = False
+        session["items"].append(state.item_user("next"))
+        self.assertNotIn("item0.error.retry", ids(build(session), "hits"))
+
+    def test_other_errors_have_no_button(self):
+        session = state.new_session()
+        session["items"].append(state.item_error("HTTP 400: bad model"))
+        self.assertFalse([h for h in build(session)["hits"] if h["id"].startswith("item0.error")])
+
+
 class FooterTest(unittest.TestCase):
     def test_model_button_opens_the_menu_not_the_settings(self):
         display = build()
@@ -689,6 +707,21 @@ class FirstRunTest(unittest.TestCase):
         session["items"].append(state.item_user("Make it red"))
         self.assertFalse([h for h in build(session)["hits"] if h["action"][0] == "example_request"])
 
+    def test_own_key_provider_without_its_key_asks_for_the_key_not_a_sign_in(self):
+        """F0287: picking OpenAI with no key brought back the first-run sign-in card, both accounts connected."""
+        display = build(needs_setup=True, key_needed="OpenAI", chatgpt_plan=True, loopcut_signed_in=True)
+        actions = {h["id"]: h["action"] for h in display["hits"]}
+        self.assertNotIn("chat.signin.loopcut", actions)
+        self.assertNotIn("chat.signin.chatgpt", actions)
+        self.assertEqual(actions["chat.key.add"], ("own_key", None))
+        self.assertEqual(actions["chat.key.chatgpt"], ("use_provider", "CHATGPT"))
+        self.assertEqual(actions["chat.key.loopcut"], ("use_provider", "LOOPCUT"))
+        self.assertIn("Add your OpenAI key", texts(display).values())
+        alone = {h["id"] for h in build(needs_setup=True, key_needed="OpenAI")["hits"]}
+        self.assertIn("chat.key.add", alone)
+        self.assertFalse({"chat.key.chatgpt", "chat.key.loopcut"} & alone, "no route back that is not connected")
+        self.assertIn("chat.signin.chatgpt", ids(build(needs_setup=True), "hits"), "first run: the setup card")
+
     def test_failed_first_message_still_has_routes_forward(self):
         session = state.new_session()
         session["items"].append(state.item_error("No connection. Sign in or choose a model provider."))
@@ -720,6 +753,29 @@ class CloudPanelTest(unittest.TestCase):
         self.assertIn(('sign_in', 'loopcut'), [h['action'] for h in display['hits']])
         signed_in = build(service_settings=True, service_signed_in=True)
         self.assertNotIn('Sign in to Loopcut', texts(signed_in).values())
+
+    def test_settings_menu_reads_in_full_in_a_narrow_panel(self):
+        """F0284: at panel width the rows read "Project no generation:…" twice and "Project no…"."""
+        for width in (260, 420):
+            for signed_in in (False, True):
+                with self.subTest(width=width, signed_in=signed_in):
+                    session = state.new_session()
+                    display = layout.build(session, width, 600, 1.0, measure, "fast", None,
+                                           {"selection": [], "context_budget": 24_000, "account": None,
+                                            "service_settings": True, "service_signed_in": signed_in,
+                                            "project_override": "on", "service_policy": {"private_mode": True}})
+                    rows = [p for p in display["prims"] if p["id"].startswith("service.settings.row")]
+                    names = [p["text"] for p in rows if p["id"].endswith(".name")]
+                    self.assertFalse([n for n in names if n.endswith("…") and n != "All settings…"], names)
+                    for p in rows:
+                        self.assertLessEqual(right(p), width, p["id"])
+                    self.assertIn("This .blend file", names)
+                    self.assertIn("✓  No generation", names, "the file's choice that is on")
+                    self.assertIn("✓  Private mode", names)
+                    actions = {h["action"]: h for h in display["hits"] if h["id"].startswith("service.settings.row")}
+                    self.assertEqual({a[1] for a in actions if a[0] == "project_generation"}, {"inherit", "on", "off"})
+                    self.assertIn("Account restrictions still apply", actions[("project_generation", "off")]["tip"])
+                    self.assertNotIn(None, [h["action"] for h in display["hits"]], "the caption is not a button")
 
     def test_signed_out_vote_view_has_a_sign_in_note_that_wraps_short_of_the_button(self):
         rows = [idea("future", "Future tool", 0.5)]

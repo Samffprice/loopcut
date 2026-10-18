@@ -58,7 +58,43 @@ PRIVATE_HOME = Path("/Volumes/BackupFiles/MasterCoding/BlenderCursor")
 PRIVATE_WEB = PRIVATE_HOME / "loopcut-web"
 LEAK_CHECK_PATHS = (PRIVATE_HOME / "loopcut-web-platform/scripts/leak-check.sh",
                     PRIVATE_WEB / "scripts/leak-check.sh")
-PRIVATE_REPOS = ("loopcut-web", "loopcut-web-platform", "loopcut-web-client-shared", "mixar-research")
+# Competitor-research folders beside the repository are named only in a private file: loopcut/track/ never
+# enters a snapshot (public_release_exclude.txt), so no public file spells them. A checkout without that file
+# (CI, the public repository) has no such folders to protect.
+RESEARCH_FILE = REPO / "loopcut/track/research_folders.txt"
+
+
+def research_folders(path=RESEARCH_FILE):
+    """(folder names under PRIVATE_HOME, the comparison captures path or "") from the private file's
+    `folder NAME` and `sources RELATIVE/PATH` lines; nothing when the file is absent."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return (), ""
+    folders, sources = [], ""
+    for raw in text.splitlines():
+        key, _, value = raw.split("#", 1)[0].strip().partition(" ")
+        value = value.strip()
+        if not key:
+            continue
+        parts = PurePosixPath(value).parts
+        if (key not in ("folder", "sources") or not value or value.startswith("/") or ".." in parts or
+                "\\" in value or (key == "folder" and len(parts) != 1)):
+            raise ValueError(f"{path.name}: expected 'folder NAME' or 'sources RELATIVE/PATH' lines")
+        if key == "folder":
+            folders.append(value)
+        else:
+            sources = value
+    return tuple(folders), sources
+
+
+def research_exclusions(folders):
+    """Snapshot exclusions for the research folders, at the root and at any depth."""
+    return [pattern for name in folders for pattern in (f"{name}/", f"*/{name}/*")]
+
+
+RESEARCH_FOLDERS, RESEARCH_SOURCES = research_folders()
+PRIVATE_REPOS = ("loopcut-web", "loopcut-web-platform", "loopcut-web-client-shared", *RESEARCH_FOLDERS)
 # Absolute paths a public test cannot depend on: the private disk, any private repository
 # checkout and macOS's /private folders. URLs and relative names do not match.
 LOCAL_PATH_REGEX = re.compile(r"(?<![\w.:/-])(?:" + re.escape(PRIVATE_HOME.parents[1].as_posix()) +
@@ -86,8 +122,8 @@ BUILD_INPUT_PATTERNS = {
 }
 BUILD_INPUT_FILES = ("scripts/site/sitecustomize.py",)
 OPTIONAL_BUILD_INPUTS = ("assets",)
-MIXAR_KINDS = ("system_prompts", "skills", "skill_listings", "tools",
-               "context_messages", "tool_results", "backend_scripts")
+RESEARCH_KINDS = ("system_prompts", "skills", "skill_listings", "tools",
+                  "context_messages", "tool_results", "backend_scripts")
 WITHHELD = {"orchestrator.py": "PROMPT", "workers.py": "PROMPT",
             "ownership.py": "MATERIALS_RULE", "router.py": "PROMPT"}
 WITHHELD_DETAIL = ("withheld prompt still in tree (server-held-prompts plan "
@@ -242,7 +278,7 @@ def prose_lines(text, source):
 
 def fingerprints(text, category, source):
     result = []
-    prose_only = category in ("private-text", "mixar-text")
+    prose_only = category in ("private-text", "research-text")
     lines = prose_lines(text, source) if prose_only else enumerate(text.splitlines(), 1)
     for number, line in lines:
         if number != 1 and number % 5:
@@ -487,7 +523,7 @@ class Scanner:
         self.incomplete = False
         self.submodules = []
         self.coverage = {category: {"files": set(), "lines": 0} for category in (
-            "secret-file", "cost-review", "private-text", "mixar-text", "cost-fingerprint",
+            "secret-file", "cost-review", "private-text", "research-text", "cost-fingerprint",
             "withheld-prompt", "private_path", "private_import", "local_path", "bytecode",
             *("secret:" + name for name in SECRET_PATTERNS))}
 
@@ -860,21 +896,22 @@ def private_samples(args):
     prompts = Path(args.prompts_dir)
     open_text = open_prompt_texts(prompts)
     roots = [(Path(args.skills_dir), "private-text"), (prompts, "private-text")]
-    mixar = Path(args.mixar_dir)
-    # Captures may be stored by type or nested below a session directory.
-    roots.append((mixar, "mixar-text"))
+    # Captures may be stored by type or nested below a session directory. No research folder configured
+    # (a checkout without loopcut/track/research_folders.txt) is reported as missing coverage.
+    roots.append((Path(args.research_dir) if args.research_dir else None, "research-text"))
     roots.append((Path(args.economics_file), "cost-fingerprint"))
     roots.extend((Path(path), "cost-fingerprint") for path in args.cost_docs)
     samples, coverage = [], []
     for root, category in roots:
-        if not root.exists():
-            coverage.append({"path": str(root), "status": "missing", "files": 0, "binary_files": 0,
+        if root is None or not root.exists():
+            coverage.append({"path": str(root) if root else "(research folder not configured)",
+                             "status": "missing", "files": 0, "binary_files": 0,
                              "fingerprints": 0, "open_fingerprints_dropped": 0})
             continue
         files = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
-        if category == "mixar-text":
+        if category == "research-text":
             files = [path for path in files if any(kind in path.relative_to(root).parts or
-                     path.stem == kind for kind in MIXAR_KINDS)]
+                     path.stem == kind for kind in RESEARCH_KINDS)]
         if root == prompts and root.is_dir():
             files = [path for path in files if path.relative_to(root).as_posix() not in open_text and
                      path != prompts / "manifest.json"]
@@ -1591,7 +1628,8 @@ def parser(leak_only):
     command.add_argument("--allowlist", type=Path, default=HERE / "public_release_allowlist.txt")
     command.add_argument("--skills-dir", default=os.getenv("LOOPCUT_RELEASE_SKILLS_DIR", str(PRIVATE_WEB / "skills")))
     command.add_argument("--prompts-dir", default=os.getenv("LOOPCUT_RELEASE_PROMPTS_DIR", str(PRIVATE_WEB / "prompts")))
-    command.add_argument("--mixar-dir", default=os.getenv("LOOPCUT_RELEASE_MIXAR_DIR", str(PRIVATE_HOME / "mixar-research/sources")))
+    command.add_argument("--research-dir", default=os.getenv(
+        "LOOPCUT_RELEASE_RESEARCH_DIR", str(PRIVATE_HOME / RESEARCH_SOURCES) if RESEARCH_SOURCES else ""))
     command.add_argument("--economics-file", default=os.getenv("LOOPCUT_RELEASE_ECONOMICS_FILE", str(PRIVATE_WEB / "scripts/economics.mts")))
     command.add_argument("--cost-doc", dest="cost_docs", action="append", default=[], help="additional private cost document (repeatable)")
     return command
@@ -1622,7 +1660,8 @@ def main(argv=None, repo=REPO):
                 base, revision = parts
             base, snapshot = resolve(repo, base), resolve(repo, revision)
         else:
-            base, source, snapshot, dropped = build_snapshot(repo, args.source, args.base, exclusions(args.exclude))
+            rules = exclusions(args.exclude) + research_exclusions(RESEARCH_FOLDERS)
+            base, source, snapshot, dropped = build_snapshot(repo, args.source, args.base, rules)
             report.update(source=source, excluded_paths=dropped, private_ref=DRY_RUN_REF)
             print(f"Snapshot: {snapshot} ({DRY_RUN_REF})", flush=True)
         report.update(base=base, snapshot=snapshot)

@@ -252,6 +252,52 @@ class RetryReviewTest(unittest.TestCase):
                 self.call()
         self.assertEqual(self.posts[0]['idempotency_key'], self.posts[1]['idempotency_key'])
 
+    def test_retry_after_a_failed_job_gets_a_new_key_even_when_the_model_resends_it(self):
+        # A key names one job (SPEC §3.4): resent, it replays the failure or is refused for other inputs.
+        failed = cloud_http.CloudError('Vendor failed', 'vendor_failed', None, {'refunded': True, 'job': job('failed')})
+        outcomes = [failed, failed, job(), job()]
+        def run(descriptor, arguments, files, **kwargs):
+            self.posts.append(dict(arguments))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        self.module.run = run
+        with self.assertRaises(cloud_http.CloudError):
+            self.call()
+        spent = self.posts[0]['idempotency_key']
+        with self.assertRaises(cloud_http.CloudError):
+            self.call({'prompt': 'prop', 'idempotency_key': spent})
+        self.runtime = cloud.Runtime(self.client, self.temp.name, signed_in=True)  # Remembered across a restart.
+        self.call({'prompt': 'prop, louder', 'idempotency_key': spent})
+        self.call({'prompt': 'prop', 'idempotency_key': spent})
+        keys = [post['idempotency_key'] for post in self.posts]
+        self.assertEqual(len(set(keys)), 4, keys)
+        self.assertEqual(json.loads((self.runtime.cache_dir / 'pending.json').read_text()), {})
+        for path in Path(self.temp.name).rglob('*.json'):
+            self.assertNotIn(spent, path.read_text())  # Kept as a hash only.
+
+    def test_retry_of_a_lost_or_succeeded_request_keeps_its_key_and_other_inputs_never_borrow_it(self):
+        with self.assertRaises(cloud_http.CloudError):
+            self.call({'prompt': 'prop', 'idempotency_key': 'model-key'})
+        self.lose_reply = False
+        self.call()  # The pending key: the server replays the job the lost reply was for.
+        self.call({'prompt': 'prop', 'idempotency_key': 'model-key'})  # Succeeded: replayed, not charged again.
+        self.call({'prompt': 'other prop', 'idempotency_key': 'model-key'})
+        keys = [post['idempotency_key'] for post in self.posts]
+        self.assertEqual(keys[:3], ['model-key'] * 3)
+        self.assertNotEqual(keys[3], 'model-key')
+        # A key the service refused as another request's is spent too, even one this client never sent.
+        refused = cloud_http.CloudError('This key was already used for a different request.', 'invalid_input', 422,
+                                        {'field': 'idempotency_key'})
+        self.module.run = Mock(side_effect=[refused, job()])
+        with self.assertRaises(cloud_http.CloudError):
+            self.call({'prompt': 'third prop', 'idempotency_key': 'elsewhere'})
+        self.call({'prompt': 'third prop', 'idempotency_key': 'elsewhere'})
+        sent = [call.args[1]['idempotency_key'] for call in self.module.run.call_args_list]
+        self.assertEqual(sent[0], 'elsewhere')
+        self.assertNotEqual(sent[1], 'elsewhere')
+
     def test_invalid_retry_key_is_rejected_before_persisting_or_submitting(self):
         with self.assertRaises(cloud_http.CloudError) as caught:
             self.call({'prompt': 'prop', 'idempotency_key': 'x' * 201})

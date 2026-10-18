@@ -129,7 +129,7 @@ class RuntimeTest(RuntimeFixture):
                 self.assertTrue(runtime.supported)
                 self.assertEqual(cloud.coming_soon(), [])
                 self.assertFalse(cloud.prompt_index_available())
-                self.assertEqual(cloud_account.panel_data(runtime), {'credits': '', 'message': ''})
+                self.assertEqual(cloud_account.panel_data(runtime), {'credits': '', 'today': '', 'message': ''})
                 self.assertEqual(cloud.ui_message(), '')
                 self.assertEqual(runtime.descriptors(), [])
                 self.assertEqual(runtime.etag, '')
@@ -171,6 +171,22 @@ class RuntimeTest(RuntimeFixture):
         self.assertEqual(restarted.etag, '"v1"')
         self.assertEqual(restarted.descriptors(), runtime.descriptors())
         self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.5')
+
+    def test_multipart_capability_comes_from_the_latest_manifest(self):
+        offered = {'blob_multipart': {'min_size': 16 * 1024 * 1024}}
+        runtime = self.runtime(Reply(manifest(tool(), capabilities=offered)), Reply(manifest(tool())),
+                               Reply(manifest(tool(), capabilities={'blob_multipart': {'min_size': 0}})),
+                               Reply(manifest(tool(), capabilities=['blob_multipart'])))
+        self.assertIsNone(cloud.blob_multipart())
+        self.assertTrue(runtime.refresh())
+        self.assertEqual(cloud.blob_multipart(), {'min_size': 16 * 1024 * 1024})
+        self.assertEqual(cloud.Runtime(runtime.client, self.directory.name, signed_in=True).blob_multipart(),
+                         {'min_size': 16 * 1024 * 1024})  # From the cache after a restart.
+        for _ in range(3):  # Withdrawn, then malformed: whole-file PUTs.
+            self.assertTrue(runtime.refresh())
+            self.assertIsNone(cloud.blob_multipart())
+        cloud._runtime = None
+        self.assertIsNone(cloud.blob_multipart())
 
     def test_signed_out_discovery_has_no_auth_or_managed_tools(self):
         runtime = self.runtime(Reply(manifest(tool(available=False, unavailable_reason='sign_in'), account=None)), signed_in=False)
@@ -708,6 +724,10 @@ class MergeTest(unittest.TestCase):
     def test_new_server_tool_needs_no_local_entry(self):
         self.assertEqual(self.names(manifest(tool('new_tool', backends=['managed'])), signed_in=True), {'new_tool': 'managed'})
 
+    def test_coming_soon_never_exposed_even_with_key_marked_instead_of_credits(self):
+        self.assertNotIn('image_generate', self.names(manifest(tool(status='coming_soon')), signed_in=True,
+                                    keys_set={'OPENAI_API_KEY': True}, preferred={'image_generate': 'byok'}))
+
     def test_byok_uses_local_file_contract(self):
         descriptor = tool('image_to_3d', file_inputs=[{'field': 'image', 'required': False,
                                                    'max_mb': 20, 'accept': ['image/png']}])
@@ -715,6 +735,68 @@ class MergeTest(unittest.TestCase):
         found = next(d for d in result if d['name'] == 'image_to_3d')
         self.assertEqual(found['file_inputs'][0]['field'], 'reference')
         self.assertEqual(found['description'], descriptor['description'])
+
+
+class OwnKeyFirstTest(unittest.TestCase):
+    """"Use this key instead of credits", per vendor key (owner, 2026-10-16): config.service_backends is
+    the `preferred` that merge_tools reads, from the checkboxes and the keys that are set."""
+
+    def routes(self, value, *, first=None, keys=(), signed_in=True, policy=None):
+        settings = {config.OWN_KEY_FIRST + name: 'true' if on else 'false' for name, on in (first or {}).items()}
+        keys_set = {name: True for name in keys}
+        with patch.object(config, '_getter', return_value=(None, lambda key, default='': settings.get(key) or default)):
+            preferred = config.service_backends(keys_set)
+        return {d['name']: d['backend'] for d in cloud.merge_tools(value, signed_in=signed_in, keys_set=keys_set,
+                                                                    preferred=preferred, policy=policy)}
+
+    def test_on_by_default_for_every_vendor_key(self):
+        from loopcut import credentials
+        with patch.object(config, '_getter', return_value=(None, lambda key, default='': default)):
+            self.assertEqual(config.own_key_first(), {name: True for name in credentials.VENDOR_KEY_NAMES})
+            self.assertEqual(config.service_backends({'FAL_KEY': True}), {'image_to_3d': 'byok', 'retopology': 'byok'})
+            self.assertEqual(config.service_backends({}), {})
+
+    def test_checked_key_takes_the_own_key_route_with_credits(self):
+        self.assertEqual(self.routes(manifest(tool()), keys=['OPENAI_API_KEY'])['image_generate'], 'byok')
+        self.assertEqual(self.routes(manifest(tool()), first={'OPENAI_API_KEY': True},
+                                     keys=['OPENAI_API_KEY'])['image_generate'], 'byok')
+
+    def test_unchecked_key_takes_credits_first_then_the_key(self):
+        first = {'OPENAI_API_KEY': False}
+        self.assertEqual(self.routes(manifest(tool()), first=first, keys=['OPENAI_API_KEY'])['image_generate'], 'managed')
+        unfunded = manifest(tool(available=False, unavailable_reason='credits'), account={'credits': {'balance': 0}})
+        self.assertEqual(self.routes(unfunded, first=first, keys=['OPENAI_API_KEY'])['image_generate'], 'byok')
+        self.assertEqual(self.routes(manifest(tool(), account=None), first=first, keys=['OPENAI_API_KEY'],
+                                     signed_in=False)['image_generate'], 'byok')
+
+    def test_no_key_is_unchanged(self):
+        for first in (None, {'OPENAI_API_KEY': True}, {'OPENAI_API_KEY': False}):
+            with self.subTest(first=first):
+                self.assertEqual(self.routes(manifest(tool()), first=first)['image_generate'], 'managed')
+                self.assertNotIn('image_generate', self.routes(manifest(tool(), account=None), first=first,
+                                                               signed_in=False))
+
+    def test_each_key_routes_only_its_own_vendors_tools(self):
+        value = manifest(tool(), tool('image_to_3d'), tool('retopology', kind='assist'))
+        routes = self.routes(value, first={'OPENAI_API_KEY': False, 'FAL_KEY': True}, keys=['OPENAI_API_KEY', 'FAL_KEY'])
+        # image_edit has no managed route in this manifest, so its key serves it either way.
+        self.assertEqual(routes, {'image_generate': 'managed', 'image_edit': 'byok', 'image_to_3d': 'byok',
+                                  'retopology': 'byok'})
+
+    def test_private_mode_no_generation_and_coming_soon_still_hide_a_checked_key(self):
+        sfx = tool('sfx', byok={'provider': 'elevenlabs', 'key_name': 'ELEVENLABS_API_KEY', 'data_class': 'C'})
+        self.assertNotIn('sfx', self.routes(manifest(sfx), keys=['ELEVENLABS_API_KEY']))  # manifest(): Private mode on.
+        self.assertNotIn('image_generate', self.routes(manifest(tool()), keys=['OPENAI_API_KEY'],
+                                                       policy={'no_generation': True}))
+        self.assertNotIn('image_generate', self.routes(manifest(tool(status='coming_soon')), keys=['OPENAI_API_KEY']))
+        for reason in ('plan', 'region'):
+            self.assertNotIn('image_generate', self.routes(
+                manifest(tool(available=False, unavailable_reason=reason)), keys=['OPENAI_API_KEY']))
+
+    def test_checked_key_never_falls_back_to_credits(self):
+        # The key went missing after the snapshot: the route is refused, never moved to credits.
+        self.assertEqual(catalog.choose_backend(tool(), signed_in_with_credits=True, preferred_backend='byok',
+                                                has_key=False), {'backend': None, 'unavailable_reason': 'disabled'})
 
 
 class SchemaTest(RuntimeFixture):
@@ -778,6 +860,27 @@ class SchemaTest(RuntimeFixture):
         for bundle in (True, {}, {'required': 'yes', 'description': 'Scene'}, {'required': True}):
             with self.subTest(bundle=bundle):
                 self.assertEqual(cloud.merge_tools(manifest(tool(bundle_input=bundle)), signed_in=True), [])
+
+    def test_bundle_tools_never_ask_the_model_for_a_bundle(self):
+        render = tool('render', byok=None, backends=['managed'], latency='long', apply='load_frames',
+                      cost={'credits_estimate': 2, 'quote_required': True}, approval={'confirm_over_credits': 100},
+                      bundle_input={'required': True, 'description': 'Self-contained Blender scene bundle.'},
+                      input_schema={'type': 'object', 'properties': {'frame_start': {'type': 'integer'}},
+                                    'required': [], 'additionalProperties': False})
+        runtime = self.runtime(Reply(manifest(render, tool())))
+        runtime.refresh()
+        functions = {s['function']['name']: s['function'] for s in cloud.tool_schemas()}
+        function = functions[cloud.PREFIX + 'render']
+        self.assertNotIn('bundle', function['parameters']['properties'])
+        self.assertNotIn('bundle', function['parameters']['required'])
+        self.assertIn('quote_id', function['parameters']['properties'])
+        self.assertTrue(function['description'].startswith(render['description']))
+        self.assertIn('Loopcut packs and uploads the current scene', function['description'])
+        descriptor = next(d for d in runtime.descriptors() if d['name'] == 'render')
+        self.assertEqual(descriptor['bundle_input'], render['bundle_input'])  # The server contract is kept.
+        image = functions[cloud.PREFIX + 'image_generate']  # A tool without a bundle is unchanged.
+        self.assertEqual(image['description'], tool()['description'])
+        self.assertNotIn('bundle', image['parameters']['properties'])
 
     def test_both_provider_paths_unique_and_namespace_roundtrip(self):
         from loopcut import chatgpt_responses as responses
@@ -885,7 +988,7 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(result.text, cloud.UPDATE_MESSAGE)
         self.assertEqual(self.calls, [])
 
-    @patch.object(config, 'BETA', False)
+    @patch.object(config, 'billing_open', lambda: True)
     def test_refusal_reason_precedes_dismissed_runtime_notice(self):
         runtime = self.ready(available=False, unavailable_reason='credits')
         runtime.message = runtime.dismissed_message = cloud.UPDATE_MESSAGE
@@ -983,7 +1086,7 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(cloud.execute('loopcut_cloud__job_status', {'job_id': handle}).text, 'Imported result.')
         self.assertEqual([c[0] for c in self.calls].count('apply'), 1)
 
-    @patch.object(config, 'BETA', False)
+    @patch.object(config, 'billing_open', lambda: True)
     def test_long_error_keeps_extras_and_reports_to_originating_card_once(self):
         self.ready(latency='long')
         self.module.run = lambda *args, **kwargs: {'id': 'job_1', 'status': 'running'}

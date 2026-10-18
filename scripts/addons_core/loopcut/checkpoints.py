@@ -7,6 +7,8 @@ be undone. The user's own .blend on disk is never written to.
 A snapshot is a compressed copy-save of the whole .blend. One is taken per user message, lazily,
 right before the first scene-changing step of that turn, so chat-only turns cost nothing, and one
 before each merge of a wave of workers (kind "wave"), which restores to before that wave was asked for.
+A cloud render's bundle is collected from its own snapshot of the live scene (kind "bundle"), which is
+dropped once collected and never offered as a restore point.
 
 In the Loopcut build of Blender a snapshot is a recovery file (wm.loopcut_snapshot_write): it
 records the path of the file it was taken from, so restoring it (wm.loopcut_snapshot_restore)
@@ -197,6 +199,26 @@ def ensure_for_wave(session: dict, label: str, message_index: int, item_index: i
     was asked for. Raises CheckpointError; the wave must not start without one."""
     entry = _write_snapshot(_store(session), "wave", label, message_index=message_index, item_index=item_index)
     return entry["id"]
+
+
+def for_bundle(session: dict) -> str:
+    """Main thread, as a cloud tool with a bundle input is called (cloud.execute): snapshot the scene as it
+    is now, this turn's edits included, and return the id bundle_from_checkpoint collects. Not a restore
+    point and not the turn's checkpoint; discard() drops it once collected. Raises CheckpointError."""
+    return _write_snapshot(_store(session), "bundle", "Cloud bundle")["id"]
+
+
+def discard(session: dict, checkpoint_id: str) -> None:
+    """Main thread: remove a snapshot nothing restores (a bundle's, once collected), so it never takes
+    the storage budget from the conversation's checkpoints. A missing one is already gone."""
+    store = _store(session)
+    try:
+        entry = store.get(checkpoint_id)
+    except CheckpointError:
+        return
+    store.snapshot_path(checkpoint_id).unlink(missing_ok=True)
+    store.entries.remove(entry)
+    store.save_index()
 
 
 def status(session: dict, checkpoint_id: str) -> str:

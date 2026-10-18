@@ -17,7 +17,7 @@ _CAPTURE = {"type": "function", "function": {
     "name": "capture_viewport",
     "description": ("A render of your copy of the scene set up for your role (modeling clay, materials studio, "
                     "lighting with the scene's engine capped, camera through the camera with guides, animation a "
-                    "sheet of frames), with object names drawn on."),
+                    "sheet of frames)."),
     "parameters": {"type": "object", "properties": {
         "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "back", "top", "camera", "sheet",
                                              "final", "crops"],
@@ -35,7 +35,8 @@ _CAPTURE = {"type": "function", "function": {
                                    "texture unlit, to judge paint; scene: the scene's lights. Two: each angle in both"},
         "isolate": {"type": "boolean", "description": "Hide all but focus"},
         "focus": {"type": "array", "items": {"type": "string"}, "description": "Objects to frame; default yours"},
-        "frames": {"type": "array", "items": {"type": "integer"}, "description": "Animation: up to 6 frames"}}}}}
+        "frames": {"type": "array", "items": {"type": "integer"}, "description": "Animation: up to 6 frames"},
+        "labels": {"type": "boolean", "description": "Draw object names, to tell objects apart; default off"}}}}}
 
 SCHEMAS_OWN = [
     {"type": "function", "function": {

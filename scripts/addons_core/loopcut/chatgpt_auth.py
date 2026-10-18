@@ -322,6 +322,14 @@ def signed_in() -> bool:
     return bool(status().get("signed_in"))
 
 
+def plan_signed_in() -> bool:
+    """Signed in with the plan-usage permission, so the ChatGPT plan can be Loopcut's model. While it is,
+    nothing automatic moves the provider off it (account._store_key, onboarding's own-key screen): only the
+    user's own pick of another provider does."""
+    info = status()
+    return bool(info.get("signed_in") and info.get("plan_usage"))
+
+
 # --- HTTP -----------------------------------------------------------------------------------------
 
 def _b64url(data: bytes) -> str:

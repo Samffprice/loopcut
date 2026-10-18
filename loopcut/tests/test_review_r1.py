@@ -3,6 +3,7 @@
 All HTTP and Blender work is simulated; only temporary files and Python workers run.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -135,6 +136,35 @@ else:
                 self.assertNotIn(secret, traceback.format_exc())
             else:
                 self.fail("Expected a connection error")
+
+    def test_connection_errors_name_what_failed_without_its_text(self):
+        # A cloud render's upload failed as a bare "Could not reach the Loopcut service" while the
+        # service answered (live test 2026-10-17): say which kind of failure, never its message.
+        import ssl
+        secret = "https://storage.example/bundle?X-Amz-Signature=synthetic-private-details"
+        tls = ssl.SSLError(1, secret)
+        tls.reason = "BAD_RECORD_MAC"
+        odd = ssl.SSLError(1, secret)
+        odd.reason = secret
+        # cloud_http.describe() is the one format: the class, then the TLS reason or errno name.
+        for raised, reason in ((urllib.error.URLError(tls), "SSLError BAD_RECORD_MAC"),
+                               (urllib.error.URLError(odd), "SSLError"),
+                               (urllib.error.URLError(TimeoutError(secret)), "TimeoutError (timed out)"),
+                               (ConnectionResetError(54, secret), "ConnectionResetError [Errno 54 ECONNRESET]"),
+                               (urllib.error.URLError(secret), "URLError"),
+                               (BrokenPipeError(secret), "BrokenPipeError")):
+            def transport(*args, raised=raised, **kwargs):
+                raise raised
+            with self.subTest(reason=reason), contextlib.redirect_stdout(io.StringIO()) as console, \
+                    self.assertRaises(cloud_http.CloudError) as caught:
+                cloud_http.Client(api_key="lc_test", transport=transport).request("GET", "/v1/me")
+            self.assertEqual(caught.exception.code, "connection_failed")
+            self.assertEqual(str(caught.exception), f"Could not reach the Loopcut service ({reason})")
+            # The reason rides on the error as detail (blobs.put names it when it gives up).
+            self.assertEqual((caught.exception.detail, caught.exception.extra), (reason, {}))
+            self.assertEqual(console.getvalue(), f"Loopcut: GET request failed in transport: {reason}\n")
+            self.assertNotIn("synthetic-private-details", str(caught.exception) + repr(vars(caught.exception))
+                             + console.getvalue() + traceback.format_exc())
 
     @staticmethod
     def fail_transport(message):

@@ -239,6 +239,48 @@ class AgentLoopTest(unittest.TestCase):
     def awaiting(self):
         self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "the approval card")
 
+    def paid_run_tool(self, name, arguments):
+        """A paid cloud call as cloud.execute's finish makes it (C47): consent under the loop's card, then the
+        result, or the refusal as the tool's text."""
+        from loopcut import cloud, cloud_account, cloud_http
+        try:
+            cloud_account.confirm({"required": False, "text": "About 80 credits ($0.80)", "credits": 80,
+                                   "threshold": 100})
+        except cloud_http.CloudError as ex:
+            return tools.ToolResult(cloud.error_text(ex), ok=False)
+        self.ran.append((name, arguments))
+        return tools.ToolResult("Made a 3D model.")
+
+    def test_a_paid_call_over_ask_above_pauses_and_skip_lets_the_turn_go_on(self):
+        self.run_tool = self.paid_run_tool
+        SCRIPT.replies += [tool_reply("loopcut_cloud__image_to_3d", {"image": "lamp.png"}),
+                           text_reply("Skipped the model; here is how to block it out instead.")]
+        turn = self.start("make the lamp in 3D")
+        self.awaiting()
+        card = next(i for i in self.session["items"] if i.get("status") == "awaiting")
+        self.assertEqual((card["ask"], card["ask_label"]), ("cost", "Approve"))
+        agent.decide(False)
+        turn.thread.join(5)
+        self.assertEqual(turn.outcome, "completed", "a skipped paid call never ends the turn")
+        self.assertEqual((card["status"], self.ran), ("rejected", []))
+        result = next(m for m in SCRIPT.requests[1]["messages"] if m["role"] == "tool")
+        self.assertTrue(result["content"].startswith("declined: The user declined this paid call (it costs 80"))
+        self.assertEqual(self.session["items"][-1]["text"], "Skipped the model; here is how to block it out instead.")
+        self.assertEqual(self.session["spend"]["credits"], 0)
+
+    def test_a_paid_call_over_ask_above_pauses_and_approve_runs_it(self):
+        self.run_tool = self.paid_run_tool
+        SCRIPT.replies += [tool_reply("loopcut_cloud__image_to_3d", {"image": "lamp.png"}), text_reply("Done.")]
+        turn = self.start("make the lamp in 3D")
+        self.awaiting()
+        self.assertEqual(self.ran, [], "nothing runs before the answer")
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertEqual((turn.outcome, len(self.ran)), ("completed", 1))
+        card = next(i for i in self.session["items"] if i.get("name") == "loopcut_cloud__image_to_3d")
+        self.assertEqual(card["status"], "done")
+        self.assertEqual(self.session["spend"], {"credits": 80, "auto": 0, "allowed": 0})
+
     def test_a_note_sent_mid_turn_is_folded_in_before_the_next_request(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
                            text_reply("Done, in red.")]
@@ -1187,6 +1229,46 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(len(compared), 2, "the first look has nothing to compare with")
         self.assertTrue(all(p.endswith(".png") for p, _ in compared))
 
+    def test_an_automatic_look_is_compared_with_the_last_one_as_both_are_stored(self):
+        # The last look is stored compact (image_budget): beside the raw PNG, JPEG's noise alone would differ.
+        import fake_imbuf
+        patcher = mock.patch.dict(sys.modules, {"imbuf": fake_imbuf})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+        compared: list[tuple] = []
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            if name == "capture_viewport":
+                shot.write_bytes(fake_imbuf.make(640, 360 + len(self.ran)))
+                return types.SimpleNamespace(text="Image attached: three_quarter view of Cube.", ok=True, image_path=shot)
+            return types.SimpleNamespace(text="OK\n\nScene changes: ~Cube", ok=True, image_path=None,
+                                         scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
+
+        def alike(previous, current):
+            compared.append((previous.read_bytes(), current.read_bytes()))
+            return False
+
+        step = lambda: tool_reply("run_python", {"code": "tweak()", "summary": "Tweak"})
+        SCRIPT.replies += [step(), step(), text_reply("Done.")]
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("tweak it"))
+        self.session["messages"].append({"role": "user", "content": "tweak it"})
+        self.session["busy"], self.session["turn"] = True, turn
+        agent._run(self.session, turn, run_tool, self.ensure_checkpoint, alike)
+        self.assertEqual(len(compared), 1)
+        self.assertEqual([conversations.media_type(data) for data in compared[0]], ["image/jpeg"] * 2)
+        refs = [p["image_url"]["url"] for m in self.session["messages"] if context.is_capture(m)
+                for p in m["content"] if p.get("type") == "image_url"]
+        self.assertEqual(conversations.image_path(self.session["id"], refs[-1]).read_bytes(), compared[0][1],
+                         "the look compared is the look stored")
+
     def test_many_looks_are_nudged_not_refused(self):
         self.session["auto_run"] = True
         shot = Path(self.data_dir.name) / "viewport.png"
@@ -1625,6 +1707,19 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(len(SCRIPT.requests), 2)
         self.assertNotEqual(self.session["items"][-1]["kind"], "error")
 
+    def test_a_raw_tls_error_reads_as_a_dropped_connection_with_try_again(self):
+        """Persona round 1 (2026-10-16): 'Internal error: SSLError(1, ...BAD_RECORD_MAC...)' ended turns. A broken
+        connection that reaches the loop unwrapped reads in plain words, and the card offers Try again."""
+        import ssl
+        failure = ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] ssl/tls alert bad record mac")
+        with mock.patch.object(llm, "stream_chat", side_effect=failure):
+            self.start("hi").thread.join(5)
+        item = self.session["items"][-1]
+        self.assertEqual(item["kind"], "error")
+        self.assertNotIn("Internal error", item["text"])
+        self.assertIn("Try again", item["text"])
+        self.assertTrue(item.get("retry"))
+
     def test_a_read_timeout_mid_reply_retries_once_without_doubling_the_card(self):
         """Content already reached the reply card (reply["text"]) before the stream broke; the
         retried request starts from scratch, so agent.py's on_retry must have cleared the stale
@@ -1735,7 +1830,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["usage_by_role"]["single"],
                          {"input": 240, "cached": 0, "output": 32005, "requests": 2})
 
-    @mock.patch.object(agent.config, "BETA", False)
+    @mock.patch.object(agent.config, "billing_open", lambda: True)
     def test_out_of_allowance_is_a_card_with_the_gateway_s_offer_not_an_error(self):
         SCRIPT.replies += [(402, {"error": {
             "message": "You have used this week's allowance on the Free plan. It resets in 3 days.",
@@ -1751,10 +1846,16 @@ class AgentLoopTest(unittest.TestCase):
         self.assertTrue(card["text"].startswith("You have used this week's allowance"))
         self.assertFalse(any(i["kind"] == "error" for i in self.session["items"]), "no red error card as well")
         self.assertFalse(self.session["busy"])
-        # The card's buttons are on the newest card only, and Upgrade comes first.
+        # The card's buttons are on the newest card only, and Upgrade comes first. A ChatGPT plan can carry
+        # on where Loopcut's allowance stopped (M7): sign in to it, or switch to it when already signed in.
         display = layout.build(self.session, 400, 600, 1.0, LayoutTest.measure, "m")
         buttons = [h for h in display["hits"] if h["id"].startswith("item") and ".limit." in h["id"]]
-        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "resume"])
+        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "sign_in", "resume"])
+        self.assertEqual(buttons[1]["action"], ("sign_in", "chatgpt"))
+        self.assertIn("Have ChatGPT Plus or Pro? It can run Loopcut now.", str(display["prims"]))
+        display = layout.build(self.session, 400, 600, 1.0, LayoutTest.measure, "m", ui={"chatgpt_plan": True})
+        buttons = [h for h in display["hits"] if h["id"].startswith("item") and ".limit." in h["id"]]
+        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "limit_chatgpt", "resume"])
         # A second 402 from a provider that says nothing structured still gets a card, without a button.
         SCRIPT.replies += [(402, {"error": {"message": "Insufficient credit.", "type": "billing"}})]
         turn = self.start("try again")
@@ -1776,7 +1877,19 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["items"][-1]["text"], "Here is your chair.")
         self.assertFalse(agent.resume(), "nothing to resume once the turn has finished")
 
-    @mock.patch.object(agent.config, "BETA", False)
+    def test_a_stopped_chatgpt_plan_is_a_card_offering_loopcut_models_not_an_error(self):
+        # M2: the ChatGPT plan's own refusals (by code) become a card that offers Loopcut's models for the same chat.
+        SCRIPT.replies += [(403, {"error": {"code": "subscription_sharing_user_not_eligible",
+                                            "message": "Not eligible", "type": "invalid_request_error"}})]
+        turn = self.start("make a chair")
+        turn.thread.join(5)
+        card = self.session["items"][-1]
+        self.assertEqual((card["kind"], card["nudge"]), ("offer", "chatgpt"), card)
+        self.assertIn("continue_loopcut", [a["do"] for a in card["actions"]])
+        self.assertFalse(any(i["kind"] == "error" for i in self.session["items"]))
+        self.assertFalse(self.session["busy"])
+
+    @mock.patch.object(agent.config, "billing_open", lambda: True)
     def test_usage_headers_update_the_account_and_warn_once_when_the_week_is_nearly_used(self):
         SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
                                "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})

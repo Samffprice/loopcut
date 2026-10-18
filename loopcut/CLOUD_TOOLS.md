@@ -10,9 +10,11 @@ and job working folders. Identity is a digest of the service URL and credential;
 in the cache. Signing out cannot restore a signed-in catalog's access. Network failures preserve
 the last verified catalog and skills. Successful interest events are retained across restarts.
 
-Funded accounts use managed tools unless selected in Preferences → Your own keys → Use own keys
-for tools, or `LOOPCUT_BYOK_TOOLS=image_generate,voice_line`. Otherwise supported vendor keys
-enable the local BYOK catalog. Managed schemas follow server descriptors; BYOK schemas follow
+Each vendor key in Preferences → Your own keys has a "Use this key instead of credits" box, shown
+once the key is set and on by default (`LOOPCUT_OWN_KEY_FIRST_<KEY NAME>=false` turns it off). On,
+every tool whose own-key adapter uses that vendor takes the key, even on a funded account; a failing
+own-key call shows its error and never moves to credits. Off, funded accounts use credits first, then
+the key. Without credits, supported vendor keys enable the local BYOK catalog. Managed schemas follow server descriptors; BYOK schemas follow
 the adapter's local input contract. Account no-generation applies until `LOOPCUT_NO_GENERATION`
 or the local preference explicitly overrides it. Managed availability is still subject to server
 enforcement. Services off disables managed routes; premium skills off removes all served skills.

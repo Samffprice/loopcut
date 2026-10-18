@@ -8,7 +8,7 @@ worker_host.Child and driven through WorkerRuntime, as the worker loop will. Cas
 
 - round trip: run_python makes a cube (code and output with newlines and non-ASCII), get_scene_info
   in the same child sees it, init reports undo and stamps, finish writes result.blend and a manifest;
-- a look per role: a 1024-px PNG with names drawn on it (modeling: close views of its own
+- a look per role: a 1024-px PNG, names drawn on it only with labels: true (modeling: close views of its own
   stool; lighting and camera: through the camera, thirds for the camera role, exposure numbers for
   lighting; a sheet of frames for animation), the final look through the camera, the time each
   takes, and no look leaves a trace in the scene;
@@ -401,8 +401,12 @@ def looks(job, spawn):
         assert shot.image_path.parent == child.folder / "captures", shot.image_path
         width, height = png_size(shot.image_path)
         assert 1020 <= max(width, height) <= 1024, (role, width, height)  # A grid of 3 is 3 x 341.
-        labels = pixels_like(shot.image_path, LABEL_BOX)
+        named = runtime.run_tool("capture_viewport", json.dumps({"labels": True}))
+        labels = pixels_like(named.image_path, LABEL_BOX) if named.ok else 0
         assert labels > 150, f"{role}: no labels drawn ({labels} label px)"
+        if role in ("camera", "lighting"):  # One wide tile through the camera: only the names add boxes.
+            assert labels > pixels_like(shot.image_path, LABEL_BOX) + 150, \
+                f"{role}: labels: true adds no names to the default look"
         if role == "modeling":
             assert (width, height) == (1024, 672) and "your Look_Stool (5 objects)" in shot.text \
                 and "front and back views" in shot.text, (width, height, shot.text)

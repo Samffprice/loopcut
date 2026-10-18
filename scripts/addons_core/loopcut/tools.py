@@ -43,6 +43,7 @@ class ToolResult:
     evidence_token: dict | None = None  # Rechecked if later tools in the same batch change the scene.
     guard_notes: list | None = None  # cost_guard.take: modifiers it switched off, shown in the panel too.
     file_image: bool = False  # The image is a file preview, not a look at the open scene.
+    receipt: str = ""  # A paid cloud call that finished: what it used ("Used 6 credits ($0.06)"), for its card.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -123,6 +124,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "angle": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "user"],
                       "description": "Default three_quarter; camera looks through the scene camera"},
             "style": {"type": "string", "enum": ["material", "distinct"]},
+            "labels": {"type": "boolean", "description": "Draw object names, to tell objects apart; default off"},
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
@@ -138,9 +140,9 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "capture_viewport",
         "description": (
-            "An image of the scene, framed by the tool from a 3/4 angle with materials and object names "
-            "drawn on, leaving the user's viewport untouched. Also lists the visible objects nearest "
-            "first, which settles what is in front when colors look alike."),
+            "An image of the scene, framed by the tool from a 3/4 angle with materials, leaving the "
+            "user's viewport untouched. Also lists the visible objects nearest first, which settles "
+            "what is in front when colors look alike."),
         "parameters": {"type": "object", "properties": {
             "focus": {"type": "array", "items": {"type": "string"},
                       "description": "Objects to frame; default everything visible"},
@@ -152,6 +154,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
                       "description": "distinct: a flat color per object, to judge shape and contact. "
                                      "rendered: EEVEE preview with scene lights and world; an approximation "
                                      "when the final engine is Cycles. material uses studio lighting, not scene lights"},
+            "labels": {"type": "boolean", "description": "Draw object names, to tell objects apart; default off"},
         }},
     }},
 ]
@@ -162,9 +165,10 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # delegate starts workers whose results merge into the scene (orchestrator.py); accept_quarantine
 # moves what a merge kept aside into it; uv_unwrap writes UV maps and transfer_textures bakes images and
 # repoints materials (uv_tools.py); bake_paint_masks makes images and stylize_material rebuilds a material
-# (paint_tools.py, offered to workers only).
+# (paint_tools.py, offered to workers only). clip_background puts an attached clip behind a camera.
 CHANGES_SCENE = {"run_python", "import_asset", "frame_camera", "delegate", "accept_quarantine", "uv_unwrap",
-                 "transfer_textures", "bake_paint_masks", "stylize_material", "apply_build"}
+                 "transfer_textures", "bake_paint_masks", "stylize_material", "apply_build",
+                 "clip_background"}  # A camera background and the scene's frame rate (video_attach.py).
 NEEDS_APPROVAL = CHANGES_SCENE
 # Tools since merged into one with a `source` or an `action`: old name -> (current name, the
 # arguments the old name implied, the old name of its `id` argument). Saved conversations still
@@ -870,28 +874,31 @@ def _nearest_first(eye, objects) -> str:
 
 
 def capture_viewport(focus: list[str] | None = None, angle: str = "three_quarter",
-                     style: str = "material") -> ToolResult:
+                     style: str = "material", labels: bool = False) -> ToolResult:
+    """labels: object names drawn on the image. Off by default: on a close shot they cover the subject."""
     if angle == "user":
-        return _capture_viewport(focus, angle, style)
+        return _capture_viewport(focus, angle, style, labels)
     with _editor_context("VIEW_3D"):
-        return _capture_viewport(focus, angle, style)
+        return _capture_viewport(focus, angle, style, labels)
 
 
 def capture_viewport_tool(focus: list[str] | None = None, angle: str = "three_quarter",
-                          style: str = "material") -> ToolResult:
+                          style: str = "material", labels: bool = False) -> ToolResult:
     """The capture_viewport tool: capture_viewport, after the shaders it needs have compiled off
     the main thread (shaders.before_look). Called directly, capture_viewport compiles in the draw."""
     from . import shaders
-    return shaders.before_look(lambda: capture_viewport(focus, angle, style), style, angle, focus)
+    return shaders.before_look(lambda: capture_viewport(focus, angle, style, labels), style, angle, focus)
 
 
-def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolResult:
+def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: bool = False) -> ToolResult:
     import numpy as np
     angles = [*_VIEW_EULERS, "camera", "user", "sheet"]
     if angle not in angles:
         raise ToolError(f"angle must be one of {', '.join(angles)}")
     if style not in ("material", "distinct", "rendered"):
         raise ToolError("style must be material, distinct or rendered")
+    if not isinstance(labels, bool):
+        raise ToolError("labels must be true or false")
     scene = bpy.context.scene
     if angle == "camera" and scene.camera is None:
         raise ToolError("The scene has no active camera (scene.camera is None).")
@@ -946,9 +953,10 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolRe
             tile_w, tile_h = SHEET_TILE
             tiles = []
             for tile_angle in SHEET_ANGLES:
-                view, projection, _ = _framed_view(space, targets, tile_angle, tile_w, tile_h)
+                view, projection, tile_eye = _framed_view(space, targets, tile_angle, tile_w, tile_h)
+                names = _labels(visible, tile_eye, view, projection, tile_w, tile_h) if labels else []
                 tiles.append(_draw_offscreen(scene, space, region, view, projection, tile_w, tile_h,
-                                             [(tile_angle.replace("_", " "), 4.0, tile_h - LABEL_SIZE - 10.0)]))
+                                             [(tile_angle.replace("_", " "), 4.0, tile_h - LABEL_SIZE - 10.0), *names]))
             # Rows are bottom-up: the first two tiles go on the upper row.
             pixels = np.concatenate([np.concatenate(tiles[2:], axis=1), np.concatenate(tiles[:2], axis=1)], axis=0)
             eye = _framed_view(space, targets, "three_quarter", tile_w, tile_h)[2]
@@ -969,8 +977,8 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolRe
                 width, height = CAPTURE_WIDTH, max(1, round(CAPTURE_WIDTH * region.height / max(1, region.width)))
                 view, projection = rv3d.view_matrix.copy(), rv3d.window_matrix.copy()
                 eye = rv3d.view_matrix.inverted().translation
-            labels = _labels(visible, eye, view, projection, width, height) if angle != "user" else []
-            pixels = _draw_offscreen(scene, space, region, view, projection, width, height, labels)
+            names = _labels(visible, eye, view, projection, width, height) if labels else []
+            pixels = _draw_offscreen(scene, space, region, view, projection, width, height, names)
     finally:
         (shading.type, shading.color_type, shading.light, space.overlay.show_overlays) = saved_view
         (shading.use_scene_lights, shading.use_scene_world,
@@ -988,8 +996,9 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str) -> ToolRe
         what = f"four views of {', '.join(o.name for o in targets[:12])}: three quarter, front (top row), side, top (bottom row)"
     else:
         what = f"{angle} view of {', '.join(o.name for o in targets[:12])}"
-    if angle != "user":
+    if labels:
         what += "; objects are labelled with their names"
+    if angle != "user":
         if style == "rendered":
             what += f"; EEVEE lighting preview (final scene engine: {saved_engine}), not a final render"
         elif style == "material":
@@ -1090,32 +1099,57 @@ def crop(pixels, region: list | None):
     return top_down[rows, cols][::-1], f"region x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} from the top-left"
 
 
-def look_at_reference(name: str, region: list | None = None) -> ToolResult:
+def look_at_reference(name: str, region: list | None = None, frame: int | None = None) -> ToolResult:
+    """frame: a clip frame of an attached clip (video_attach.py offers it while there is one)."""
     found, path = _reference(name)
+    title = found["name"]
+    if frame is not None:
+        from . import video_attach
+        path, _, title = video_attach.frame_for(found, frame)
     pixels = _pixels(path)
     height, width = pixels.shape[:2]
     pixels, what = crop(pixels, region)
     out = scratch.folder() / "reference.png"
     out.parent.mkdir(exist_ok=True)
     shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
-    return ToolResult(f"Image attached: {found['name']}, {what}, {shown[0]}x{shown[1]} px "
+    return ToolResult(f"Image attached: {title}, {what}, {shown[0]}x{shown[1]} px "
                       f"(the full image is {width}x{height}).", image_path=out)
 
 
 def compare_with_reference_tool(name: str, focus: list[str] | None = None, angle: str = "three_quarter",
-                                style: str = "material") -> ToolResult:
+                                style: str = "material", frame: int | None = None,
+                                labels: bool = False) -> ToolResult:
     """The compare_with_reference tool; its capture waits for shaders like capture_viewport_tool."""
     from . import shaders
-    _reference(name)  # An unknown reference fails before any shader work.
-    return shaders.before_look(lambda: compare_with_reference(name, focus, angle, style), style, angle, focus,
-                               name="the compare_with_reference tool")
+    found, _ = _reference(name)  # An unknown reference fails before any shader work.
+    if frame is not None:
+        from . import video_attach
+        video_attach.frame_for(found, frame)  # So does a clip frame that is not there.
+    return shaders.before_look(lambda: compare_with_reference(name, focus, angle, style, frame, labels),
+                               style, angle, focus, name="the compare_with_reference tool")
 
 
 def compare_with_reference(name: str, focus: list[str] | None = None, angle: str = "three_quarter",
-                           style: str = "material") -> ToolResult:
+                           style: str = "material", frame: int | None = None, labels: bool = False) -> ToolResult:
+    """frame: a clip frame of an attached clip, beside the scene captured at the scene frame showing it
+    (video_attach.scene_frame); the scene goes back to its own frame after. labels as capture_viewport's:
+    off by default, since the reference beside it has none."""
     import numpy as np
     found, path = _reference(name)
-    shot = capture_viewport(focus, angle, style)
+    title = f"the reference {found['name']}"
+    if frame is None:
+        shot = capture_viewport(focus, angle, style, labels)
+    else:
+        from . import video_attach
+        path, at, title = video_attach.frame_for(found, frame)
+        scene = bpy.context.scene
+        before = scene.frame_current
+        scene.frame_set(at)
+        try:
+            shot = capture_viewport(focus, angle, style, labels)
+        finally:
+            scene.frame_set(before)
+        title += f" (scene frame {at})"
     right = _pixels(shot.image_path)
     height = right.shape[0]
     left = _pixels(path, height)
@@ -1124,7 +1158,7 @@ def compare_with_reference(name: str, focus: list[str] | None = None, angle: str
     canvas[:, left.shape[1] + COMPARE_GAP:] = right
     out = scratch.folder() / "compare.png"
     _save_pixels(canvas, out)
-    return ToolResult(f"Image attached: the reference {found['name']} on the left, {shot.text[len('Image attached: '):]}"
+    return ToolResult(f"Image attached: {title} on the left, {shot.text[len('Image attached: '):]}"
                       f" on the right, at the same height.", image_path=out)
 
 
@@ -1163,10 +1197,10 @@ def execute(name: str, arguments_json: str) -> ToolResult:
             return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
         return cloud.execute(name, arguments)
     from . import (assets, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
-                   uv_tools, workspace)
+                   uv_tools, video_attach, workspace)
     tables = (_DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, assets.DISPATCH,
               camera.DISPATCH, orchestrator.DISPATCH, uv_tools.DISPATCH, texture_tools.DISPATCH, paint_tools.DISPATCH,
-              workspace.DISPATCH)
+              workspace.DISPATCH, video_attach.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
         return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)

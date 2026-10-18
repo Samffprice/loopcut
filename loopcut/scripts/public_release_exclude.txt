@@ -7,5 +7,5 @@ loopcut/tests/test_chatgpt_eval.py
 loopcut/tests/test_codex_answer.py
 # Managed server code belongs to the private platform repository.
 loopcut-web/
-# Third-party captures must never enter a public snapshot.
-mixar-research/
+# Third-party captures must never enter a public snapshot. Their folders are named only in the private
+# loopcut/track/research_folders.txt (excluded above), which public_release.py adds to these rules.

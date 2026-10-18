@@ -335,9 +335,11 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(index, built_index())
         self.assertEqual(len(transport.calls), 1)
         self.assertTrue(runtime.prompts_stale, 'a later request should try the refresh again')
-        warning.assert_called_once()
-        self.assertIn('cached', warning.call_args.args[0])
-        self.assertNotIn('\n', warning.call_args.args[0])
+        lines = [call.args[0] for call in warning.call_args_list]
+        self.assertEqual(lines[0], 'Loopcut: GET request failed in transport: URLError')  # cloud_http's cause line
+        self.assertEqual(len(lines), 2)
+        self.assertIn('cached', lines[1])
+        self.assertNotIn('\n', lines[1])
 
     def test_stale_index_refresh_failure_without_cache_is_optional_or_required(self):
         transport = Transport(llm.urllib.error.URLError('offline'), llm.urllib.error.URLError('offline'))

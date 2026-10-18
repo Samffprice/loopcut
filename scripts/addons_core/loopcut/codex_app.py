@@ -174,7 +174,10 @@ def turn_input(session: dict, ws: Path) -> list[dict]:
 
 
 def data_url(path: Path) -> str:
-    return f"data:{_MIME.get(path.suffix.lower(), 'image/png')};base64,{base64.b64encode(path.read_bytes()).decode()}"
+    """The bytes say the type (a stored <sha>.png can hold a clip's JPEG sheet); else the suffix."""
+    data = path.read_bytes()
+    media = conversations.media_type(data, _MIME.get(path.suffix.lower(), "image/png"))
+    return f"data:{media};base64,{base64.b64encode(data).decode()}"
 
 
 class Server:
@@ -568,7 +571,7 @@ class CodexTurn:
                 return (f"This step was NOT run, because a checkpoint could not be saved first: {ex} Tell the user; "
                         f"do not retry."), False, None, False
         from . import cloud_account
-        with cloud_account.approval_context(lambda details: agent._cloud_consent(self.turn, card, True, details,
+        with cloud_account.approval_context(agent._Consent(self.session, self.turn, card, True,
                 files_allowed=self.cfg.auto_run or self.session['auto_run'])):
             result = self.run_tool(name, arguments)
         agent._note_level(self.turn, name, arguments, len(self.turn.delegations))
@@ -577,6 +580,8 @@ class CodexTurn:
             self.turn.scene_after = result.scene_after
         for guard in getattr(result, "guard_notes", None) or ():
             self.items.append(state.item_guard(guard["text"], guard["modifiers"]))
+        if getattr(result, "receipt", ""):
+            card["cost"] = result.receipt  # What the paid call used, in place of its estimate (C47).
         image = getattr(result, "image_path", None)
         return (result.text, result.ok, Path(image) if image and Path(image).is_file() else None,
                 getattr(result, "file_image", False))

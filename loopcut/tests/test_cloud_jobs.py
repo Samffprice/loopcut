@@ -345,7 +345,8 @@ class JobsTest(unittest.TestCase):
                     "job_done": {"job": job(), "title": "Finished"}}
         before = copy.deepcopy(registry)
         self.assertEqual(cloud_jobs.progress_rows(registry), [{"id": "job_test", "title": "Generate image", "pct": 100,
-                                                             "message": "Done", "cancelable": True}])
+                                                             "message": "Done", "cancelable": True,
+                                                             "note": "2 credits held. Cancel returns them."}])
         self.assertEqual(registry, before)
 
     def test_status_raises_terminal_failure_before_worker_records_exception(self):
@@ -435,6 +436,8 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(texts[0]["content"], self.path.read_text())
         self.assertEqual(json.loads(texts[0]["loopcut_provenance"])["backend"], "byok")
         self.assertEqual(session["items"][0]["kind"], "notice")
+        # A full notice item: the panel's notice layout reads its button fields (KeyError 'checkpoint' before).
+        self.assertEqual(session["items"][0], state.item_notice(session["items"][0]["text"]))
         save.assert_called_once_with(session)
 
     def test_summary_none_and_unimplemented_material(self):
@@ -485,6 +488,265 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(found["c"], self.path.resolve())
         export.assert_called_once_with(found["b"], [ob, "child"])
         self.assertEqual((image.filepath_raw, image.file_format, copied), ("original", "JPEG", []))
+
+
+def remove_identical(items, block):
+    """Blender removes by identity; Block's dict equality would match any unstamped block."""
+    del items[next(n for n, item in enumerate(items) if item is block)]
+
+
+class FakeList(list):
+    """bpy.data's collections: iterable, with new/remove."""
+    def __init__(self, make=None):
+        super().__init__()
+        self.make = make
+
+    def new(self, *args):
+        block = self.make(*args)
+        self.append(block)
+        return block
+
+    def remove(self, block):
+        remove_identical(self, block)
+
+
+class FakeObject(Block):
+    def __init__(self, name, data=None, type="MESH"):
+        super().__init__(name, type=type, data=data, parent=None, users_collection=[], selected=False,
+                         matrix_world=FakeMatrix(), bound_box=[(0, 0, 0), (1, 1, 1)])
+
+    def select_set(self, value):
+        self.selected = value
+
+
+class FakeMatrix:
+    def __matmul__(self, other):
+        return other
+
+    def copy(self):
+        return self
+
+
+class FakeCollection(Block):
+    def __init__(self, name):
+        super().__init__(name)
+        owner = self
+        class Objects(list):
+            def link(self, ob):
+                self.append(ob)
+                ob.users_collection.append(owner)
+            def unlink(self, ob):
+                remove_identical(self, ob)
+                remove_identical(ob.users_collection, owner)
+        self.objects, self.children = Objects(), FakeList()
+        self.children.link = self.children.append
+
+
+def fake_glb():
+    import struct
+    body = json.dumps({"asset": {"version": "2.0"}}).encode()
+    body += b" " * (-len(body) % 4)
+    chunk = struct.pack("<II", len(body), 0x4E4F534A) + body
+    return struct.pack("<III", 0x46546C67, 2, 12 + len(chunk)) + chunk
+
+
+class ModelImportTest(unittest.TestCase):
+    """import_model's FBX branch beside the GLB one, against a scripted bpy (no Blender)."""
+    FBX = b"Kaydara FBX Binary  \x00\x1a\x00\xe8\x1c\x00\x00quads"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        scene_collection = FakeCollection("Scene Collection")
+        self.scene = types.SimpleNamespace(render=types.SimpleNamespace(fps=24, fps_base=1.0),
+                                           collection=scene_collection, unit_settings=types.SimpleNamespace(scale_length=1),
+                                           cursor=types.SimpleNamespace(location=(0, 0, 0)))
+        self.window = types.SimpleNamespace(screen="screen")
+        self.overrides = []
+        layer_objects = FakeList()
+        layer_objects.active = None
+        self.data = types.SimpleNamespace(objects=FakeList(FakeObject), collections=FakeList(FakeCollection),
+                                          images=FakeList(), materials=FakeList(), scenes=[self.scene])
+        self.calls = []
+        context = types.SimpleNamespace(scene=self.scene, window=None, temp_override=self.temp_override,
+                                        window_manager=types.SimpleNamespace(windows=[self.window]),
+                                        view_layer=types.SimpleNamespace(update=lambda: None, objects=layer_objects))
+        self.ops = types.SimpleNamespace(wm=types.SimpleNamespace(fbx_import=self.importer("wm.fbx_import")),
+                                         import_scene=types.SimpleNamespace(fbx=self.importer("import_scene.fbx"),
+                                                                            gltf=self.importer("import_scene.gltf")))
+        self.bpy = types.SimpleNamespace(data=self.data, context=context, ops=self.ops,
+                                         path=types.SimpleNamespace(abspath=lambda value: value))
+        mathutils = types.SimpleNamespace(Vector=tuple)
+        modules = patch.dict(sys.modules, {"bpy": self.bpy, "mathutils": mathutils})
+        modules.start()
+        self.addCleanup(modules.stop)
+
+    def temp_override(self, **values):
+        import contextlib
+        self.overrides.append(values)
+        return contextlib.nullcontext()
+
+    def importer(self, name):
+        """An import operator that adds what a real file would: an object, a packed (embedded) image,
+        an image named by a path outside the job folder, and a material sampling both. It also sets
+        the scene's frame rate, as both FBX importers do."""
+        def run(**options):
+            self.calls.append((name, options))
+            mesh = FakeObject("Remeshed")
+            self.data.objects.append(mesh)
+            self.scene.collection.objects.link(mesh)
+            embedded = Block("baked.png", packed_file=object(), filepath="baked.png")
+            outside = Block("secret.png", packed_file=None, filepath="/Users/someone/secret.png")
+            self.data.images.extend([embedded, outside])
+            nodes = FakeList()
+            nodes.extend(Block(image.name, type="TEX_IMAGE", image=image) for image in (embedded, outside))
+            self.data.materials.append(Block("Material", node_tree=Block("tree", nodes=nodes)))
+            if name != "import_scene.gltf":
+                self.scene.render.fps, self.scene.render.fps_base = 30, 1.001
+            return {"FINISHED"}
+        return run
+
+    def apply(self, suffix, data, kind="assist"):
+        path = self.folder / f"0000-model{suffix}"
+        path.write_bytes(data)
+        result = job()
+        result["id"] = result["provenance"]["job_id"] = "byok_test"
+        result["provenance"].update(backend="byok", kind=kind)
+        result["outputs"][0].update(type="model_3d", name="model", path=str(path), size=len(data),
+                                    sha256=hashlib.sha256(data).hexdigest(),
+                                    mime="model/vnd.fbx" if suffix == ".fbx" else "model/gltf-binary")
+        return cloud_jobs.apply_result({"apply": "import_model"}, result)
+
+    def assert_imported(self, summary, note):
+        self.assertEqual(summary, f"Imported and selected models: Loopcut byok_test model{note}. "
+                                  "Job byok_test; provenance recorded.")
+        collection = next(c for c in self.data.collections if c.name == "Loopcut byok_test model")
+        mesh, root = self.data.objects
+        self.assertTrue(any(child is collection for child in self.scene.collection.children))
+        self.assertEqual([ob.name for ob in collection.objects], [root.name, mesh.name])
+        self.assertFalse(any(ob is mesh for ob in self.scene.collection.objects))
+        self.assertIs(mesh.parent, root)
+        self.assertTrue(mesh.selected and root.selected)
+        self.assertIs(self.bpy.context.view_layer.objects.active, root)
+        self.assertIn("loopcut_provenance", mesh)
+
+    def test_fbx_uses_the_native_importer_with_a_borrowed_window(self):
+        summary = self.apply(".fbx", self.FBX)
+        self.assertEqual([name for name, _ in self.calls], ["wm.fbx_import"])
+        self.assertEqual(self.calls[0][1], {"filepath": str(self.folder / "0000-model.fbx"), "use_custom_props": False})
+        self.assertEqual(self.overrides, [{"window": self.window, "screen": "screen"}])
+        self.assert_imported(summary, " (FBX; left off 1 texture(s) not embedded in the file)")
+        self.assertEqual((self.scene.render.fps, self.scene.render.fps_base), (24, 1.0))
+        # The embedded texture is kept; the one named by an outside path is gone, node and image.
+        self.assertEqual([image.name for image in self.data.images], ["baked.png"])
+        self.assertEqual([node.name for node in self.data.materials[0].node_tree.nodes], ["baked.png"])
+
+    def test_fbx_falls_back_to_the_python_importer(self):
+        self.ops.wm = types.SimpleNamespace()  # A build without WITH_IO_FBX.
+        summary = self.apply(".fbx", self.FBX)
+        self.assertEqual(self.calls, [("import_scene.fbx", {"filepath": str(self.folder / "0000-model.fbx"),
+                                                            "use_custom_props": False, "use_image_search": False})])
+        self.assertEqual(self.overrides, [])
+        self.assert_imported(summary, " (FBX; left off 1 texture(s) not embedded in the file)")
+        self.assertEqual((self.scene.render.fps, self.scene.render.fps_base), (24, 1.0))
+
+    def test_fbx_without_a_window_uses_the_python_importer(self):
+        self.bpy.context.window_manager.windows = []  # Background Blender.
+        self.apply(".fbx", self.FBX)
+        self.assertEqual([name for name, _ in self.calls], ["import_scene.fbx"])
+
+    def test_fbx_textures_beside_the_download_are_kept(self):
+        def importer(**options):
+            self.calls.append(("wm.fbx_import", options))
+            beside = self.folder / "albedo.png"
+            beside.write_bytes(b"png")
+            self.data.objects.append(FakeObject("Remeshed"))
+            self.data.images.append(Block("albedo.png", packed_file=None, filepath=str(beside)))
+            return {"FINISHED"}
+        self.ops.wm.fbx_import = importer
+        summary = self.apply(".fbx", self.FBX)
+        self.assertTrue(summary.startswith("Imported and selected models: Loopcut byok_test model (FBX)."), summary)
+        self.assertEqual([image.name for image in self.data.images], ["albedo.png"])
+
+    def test_native_fbx_reusing_an_existing_image_is_redone_with_the_python_importer(self):
+        # Blender's native importer takes an existing image of the same name instead of the file's
+        # embedded one: a second retopology result showed the first one's textures.
+        earlier = Block("retopo_normal.png", packed_file=object(), filepath="retopo_normal.png")
+        self.data.images.append(earlier)
+        def native(**options):
+            self.calls.append(("wm.fbx_import", options))
+            mesh = FakeObject("Remeshed")
+            nodes = FakeList()
+            nodes.append(Block("normal", type="TEX_IMAGE", image=earlier))
+            material = Block("Material", node_tree=Block("tree", nodes=nodes))
+            mesh.material_slots = [types.SimpleNamespace(material=material)]
+            self.data.objects.append(mesh)
+            self.data.materials.append(material)
+            self.data.collections.append(FakeCollection("FBX import"))
+            self.scene.render.fps = 30
+            return {"FINISHED"}
+        self.ops.wm.fbx_import = native
+        summary = self.apply(".fbx", self.FBX)
+        self.assertEqual([name for name, _ in self.calls], ["wm.fbx_import", "import_scene.fbx"])
+        self.assert_imported(summary, " (FBX; left off 1 texture(s) not embedded in the file)")
+        # Nothing the native import made survives; the earlier image is untouched and not shared.
+        self.assertFalse(any(c.name == "FBX import" for c in self.data.collections))
+        self.assertEqual([m.name for m in self.data.materials], ["Material"])
+        self.assertIsNot(self.data.materials[0].node_tree.nodes[0].image, earlier)
+        self.assertTrue(any(image is earlier for image in self.data.images))
+        self.assertEqual((self.scene.render.fps, self.scene.render.fps_base), (24, 1.0))
+
+    def test_native_fbx_with_fresh_images_is_kept(self):
+        self.data.images.append(Block("other.png", packed_file=object(), filepath="other.png"))
+        self.apply(".fbx", self.FBX)
+        self.assertEqual([name for name, _ in self.calls], ["wm.fbx_import"])
+
+    def test_imported_objects_get_their_own_materials(self):
+        class Material(Block):
+            def copy(self):
+                return Material(self.name + ".001", node_tree=self.node_tree)
+        shared = Material("Retopo", node_tree=Block("tree", nodes=FakeList()))
+        self.data.materials.append(shared)
+        def gltf(**options):
+            self.calls.append(("import_scene.gltf", options))
+            mesh = FakeObject("Remeshed")
+            mesh.material_slots = [types.SimpleNamespace(material=shared)]
+            self.data.objects.append(mesh)
+            return {"FINISHED"}
+        self.ops.import_scene.gltf = gltf
+        self.apply(".glb", fake_glb())
+        mesh = next(ob for ob in self.data.objects if ob.name == "Remeshed")
+        self.assertIsNot(mesh.material_slots[0].material, shared)
+        self.assertEqual(mesh.material_slots[0].material.name, "Retopo.001")
+
+    def test_not_binary_fbx_is_refused_before_import(self):
+        for data in (b"; FBX 7.4.0 project file", fake_glb()):
+            with self.subTest(data=data[:8]), self.assertRaisesRegex(cloud_http.CloudError, "not a binary FBX"):
+                self.apply(".fbx", data)
+        self.assertEqual(self.calls, [])
+
+    def test_glb_import_is_unchanged(self):
+        summary = self.apply(".glb", fake_glb())
+        self.assertEqual(self.calls, [("import_scene.gltf", {"filepath": str(self.folder / "0000-model.glb"),
+                                                             "import_scene_extras": False,
+                                                             "import_scene_as_collection": False})])
+        self.assert_imported(summary, "")
+
+    def test_hosted_and_byok_save_fbx_with_its_suffix(self):
+        from loopcut.byok import runner
+        self.assertEqual(cloud_jobs._SUFFIXES["model/vnd.fbx"], ".fbx")
+        self.assertEqual(runner._SUFFIXES["model/vnd.fbx"], ".fbx")
+        self.assertEqual(cloud_jobs._SUFFIXES["model/gltf-binary"], ".glb")
+        self.assertEqual(runner._SUFFIXES["model/gltf-binary"], ".glb")
+        final = job()
+        final["outputs"][0].update(type="model_3d", name="model", mime="model/vnd.fbx")
+        with patch.object(cloud_jobs, "_redraw"), patch.object(cloud_jobs, "_registry", {}), \
+                patch.object(cloud_jobs.tempfile, "mkdtemp", return_value=str(self.folder)):
+            result = cloud_jobs.run(DESCRIPTOR, {"prompt": "prop"}, {}, project=PROJECT,
+                                    client=Transport(final=final).client())
+        self.assertEqual(Path(result["outputs"][0]["path"]).suffix, ".fbx")
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
 
 
 class MockJobsTest(unittest.TestCase):

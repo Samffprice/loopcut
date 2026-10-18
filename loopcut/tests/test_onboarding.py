@@ -81,7 +81,7 @@ class OnboardingTest(unittest.TestCase):
 
     def setUp(self):
         self.fake.ops.reset_mock()
-        self.onboarding._state.update(step="connect", own_key=False, error="")
+        self.onboarding._state.update(step="connect", own_key=False, left_chatgpt=False, error="")
         self.onboarding._popups.clear()
         self.account._state.update(status="idle", error="", url="", user_code="")
         self.account._cancel.clear()
@@ -127,7 +127,7 @@ class OnboardingTest(unittest.TestCase):
             self.assertTrue(self.account._cancel.is_set())
             model = Splash()
             self.assertTrue(self.onboarding.draw_splash(model, self.context, first_run=False))
-            self.assertIn(('label', 'Connect a model'), model.records)
+            self.assertIn(('label', 'Connect your ChatGPT plan'), model.records)
             self.press_step(model, 'Skip for now')
             privacy = Splash()
             self.assertTrue(self.onboarding.draw_splash(privacy, self.context, first_run=False))
@@ -141,7 +141,7 @@ class OnboardingTest(unittest.TestCase):
         fixtures = module.fixtures(self.state)
         for name, title in (('onboarding_account', 'Create your free Loopcut account'),
                             ('onboarding_account_failed', 'Create your free Loopcut account'),
-                            ('onboarding_connect', 'Connect a model')):
+                            ('onboarding_connect', 'Connect your ChatGPT plan')):
             ui = fixtures[name]['ui']
             self.onboarding._state['step'] = ui['onboarding_step']
             splash = Splash()
@@ -150,7 +150,7 @@ class OnboardingTest(unittest.TestCase):
                 self.onboarding.draw_splash(splash, self.context, first_run=False)
             labels = [r[1] for r in splash.records if r[0] == 'label']
             self.assertIn(title, labels)
-            self.assertEqual('Loopcut accounts open soon' in labels, name == 'onboarding_account_failed')
+            self.assertEqual("Couldn't reach Loopcut" in ' '.join(labels), name == 'onboarding_account_failed')
             self.assertNotIn('HTTP 404', str(labels))
 
     def test_existing_accounts_show_continue_and_model_choices_select_the_provider(self):
@@ -198,13 +198,16 @@ class OnboardingTest(unittest.TestCase):
                     splash = Splash()
                     self.onboarding.draw_splash(splash, self.context, first_run=False)
                     labels = [r[1] for r in splash.records if r[0] == 'label']
-                    self.assertEqual(labels, ['Create your free Loopcut account', '', 'Loopcut accounts open soon'])
+                    self.assertEqual(labels[0], 'Create your free Loopcut account')
+                    self.assertIn("Couldn't reach Loopcut. Try again, or skip", labels)  # Never the raw error.
+                    self.assertNotIn('HTTP', ' '.join(labels))
+                    self.assertNotIn('refused', ' '.join(labels))
                     self.press_step(splash, exit_label)
                     model = Splash()
                     self.onboarding.draw_splash(model, self.context, first_run=False)
                     self.assertIn('loopcut.chatgpt_sign_in', [r[1] for r in model.operators()])
                     self.assertIn('loopcut.onboarding_own_key', [r[1] for r in model.operators()])
-                    self.assertNotIn('Loopcut accounts open soon', str(model.records))
+                    self.assertNotIn("Couldn't reach Loopcut", str(model.records))
 
     def test_account_poll_failure_is_quiet_and_skip_suppresses_a_late_key(self):
         reply = {'device_code': 'fixture', 'user_code': 'TEST', 'verification_url': 'https://sign-in.test'}
@@ -216,7 +219,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertIn('Sign-in was denied', log.getvalue())
         splash = Splash()
         self.onboarding._draw_account(splash, self.context)
-        self.assertIn(('label', 'Loopcut accounts open soon'), splash.records)
+        self.assertIn(('label', "Couldn't reach Loopcut. Try again, or skip"), splash.records)
         self.press_step(splash, 'Skip for now')
         self.assertEqual(self.onboarding._state['step'], 'connect')
         # Approval can already be queued on the main thread when Skip is clicked.
@@ -286,7 +289,12 @@ class OnboardingTest(unittest.TestCase):
         self.onboarding._draw_sign_in(splash, self.context)
         names = [r[1] for r in splash.operators()]
         self.assertNotIn("loopcut.sign_in", names)
-        self.assertIn(("label", "Recommended"), splash.records)
+        labels = [r[1] for r in splash.records if r[0] == "label"]
+        self.assertTrue(any(label.startswith("Recommended · Plus or Pro") for label in labels), labels)
+        self.assertIn("Step 2 of 2. Your ChatGPT Plus or Pro plan", labels)
+        # Signed out: the way to Loopcut's free model goes back to the account step, never past it.
+        back = next(r for r in splash.operators() if r[2] == "No ChatGPT plan? Create a free Loopcut account")
+        self.assertEqual(back[3].step, "account")
         self.assertIn("loopcut.chatgpt_sign_in", names)
         self.assertIn("loopcut.onboarding_own_key", names)
         self.assertNotIn("Use Loopcut's models", [r[2] for r in splash.operators()])
@@ -321,6 +329,94 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(self.prefs.provider, "CHATGPT")
         self.assertEqual(self.onboarding._state["step"], "privacy")
         self.fake.ops.wm.save_userpref.assert_called_once()
+
+    # "For the LLM we always prefer their account, unless they select the Loopcut models" (owner, 2026-10-16).
+    def chatgpt_plan(self, signed_in=True, plan_usage=True):
+        return patch.object(self.chatgpt_ui.chatgpt_auth, "status",
+                            return_value={"signed_in": signed_in, "plan_usage": plan_usage})
+
+    def test_loopcut_sign_in_keeps_a_signed_in_chatgpt_plan(self):
+        self.prefs.provider = "CHATGPT"
+        with self.chatgpt_plan(), patch.object(self.account.credentials, "store") as store:
+            self.account._store_key("fixture-only")
+        store.assert_called_once_with(self.account.BASE_URL, "fixture-only")
+        self.assertEqual(self.prefs.provider, "CHATGPT")
+        self.fake.ops.wm.save_userpref.assert_called_once()
+
+    def test_loopcut_sign_in_selects_loopcut_when_no_chatgpt_plan_is_signed_in(self):
+        for signed_in, plan_usage in ((False, False), (True, False)):  # Signed out, or no plan permission.
+            with self.subTest(signed_in=signed_in, plan_usage=plan_usage):
+                self.prefs.provider = "CHATGPT"
+                with self.chatgpt_plan(signed_in, plan_usage), patch.object(self.account.credentials, "store"):
+                    self.account._store_key("fixture-only")
+                self.assertEqual(self.prefs.provider, "LOOPCUT")
+
+    def test_explicit_loopcut_pick_sticks_while_signed_in_to_chatgpt(self):
+        self.prefs.provider = "CHATGPT"
+        with self.chatgpt_plan(), patch.object(self.account, "signed_in", return_value=True):
+            splash = Splash()
+            self.onboarding._draw_sign_in(splash, self.context)
+            self.press_step(splash, "Use Loopcut's models")
+            self.assertEqual(self.prefs.provider, "LOOPCUT")
+            # Nothing automatic moves it back: a later Loopcut sign-in, the account refresh, ChatGPT's idle finish.
+            with patch.object(self.account.credentials, "store"):
+                self.account._store_key("fixture-only")
+            with patch.object(self.account, "_get", return_value={}), patch.object(self.account, "_redraw"):
+                self.account._refresh_account("fixture-only")
+            self.chatgpt_ui._finished(None, "")
+        self.assertEqual(self.prefs.provider, "LOOPCUT")
+
+    def test_account_refresh_and_chatgpt_sign_out_keep_the_chatgpt_provider(self):
+        self.prefs.provider = "CHATGPT"
+        with self.chatgpt_plan(), patch.object(self.account, "_get", return_value={}), \
+                patch.object(self.account, "_redraw"):
+            self.account._refresh_account("fixture-only")
+        self.assertEqual(self.prefs.provider, "CHATGPT")
+        with self.chatgpt_plan(signed_in=False):
+            self.chatgpt_ui._finished(None, "")  # What sign-out reports; the provider stays as it was.
+        self.assertEqual(self.prefs.provider, "CHATGPT")
+
+    def test_back_from_the_own_key_form_restores_a_signed_in_chatgpt_plan(self):
+        def own_key(enable):
+            op = self.onboarding.LOOPCUT_OT_onboarding_own_key()
+            op.enable = enable
+            self.assertEqual(op.execute(self.context), {"FINISHED"})
+        with self.chatgpt_plan():
+            self.prefs.provider = "CHATGPT"
+            own_key(True)
+            self.assertEqual(self.prefs.provider, "OPENAI")  # The key form opens on a key provider.
+            own_key(False)
+            self.assertEqual(self.prefs.provider, "CHATGPT")
+            own_key(True)
+            self.prefs.provider = "ANTHROPIC"  # The user's own pick on that form stands.
+            own_key(False)
+            self.assertEqual(self.prefs.provider, "ANTHROPIC")
+            self.prefs.provider = "LOOPCUT"  # Unchanged for the Loopcut route.
+            own_key(True)
+            own_key(False)
+            self.assertEqual(self.prefs.provider, "OPENAI")
+        self.prefs.provider = "CHATGPT"
+        own_key(True)
+        with self.chatgpt_plan(signed_in=False):  # Signed out meanwhile: nothing to go back to.
+            own_key(False)
+        self.assertEqual(self.prefs.provider, "OPENAI")
+
+    def test_a_key_prompt_only_for_an_own_key_provider_and_its_way_back(self):
+        """F0287: what the panel asks for when the config does not load (layout._key_prompt)."""
+        self.prefs.provider = "OPENAI"
+        self.assertEqual(self.host._key_needed(True), "OpenAI")
+        self.assertEqual(self.host._key_needed(False), "")
+        for provider in ("CHATGPT", "LOOPCUT"):
+            self.prefs.provider = provider
+            self.assertEqual(self.host._key_needed(True), "", "these routes use the sign-in card")
+        self.prefs.provider = "OPENAI"
+        session = self.state.new_session()
+        with patch.object(self.host, "config_changed") as changed:
+            self.host._do_action(session, ("use_provider", "CHATGPT"))
+            self.assertEqual(self.prefs.provider, "CHATGPT")
+            changed.assert_called_once_with()
+            self.host._do_action(session, ("use_provider", "OLLAMA"))
+            self.assertEqual(self.prefs.provider, "CHATGPT", "only the two account routes")
 
     def test_switching_to_own_key_cancels_a_late_chatgpt_completion(self):
         session = self.state.new_session()
@@ -518,13 +614,82 @@ class OnboardingTest(unittest.TestCase):
             self.assertEqual(self.fake.context.scene["loopcut_no_generation"], "on")
             sync.assert_called_once_with()
         session["items"].append({"cloud_error": {"upgrade": "https://loopcut.org/pricing"}})
-        with patch.object(self.account, "open_browser") as browser, patch.object(self.host.config, "BETA", False):
+        with patch.object(self.account, "open_browser") as browser, patch.object(self.host.config, "billing_open", return_value=True):
             self.host._do_action(session, ("cloud_upgrade", 0))
             browser.assert_called_once_with("https://loopcut.org/pricing")
             session["items"][0]["cloud_error"]["upgrade"] = "file:///invalid"
             with self.assertRaises(ValueError):
                 self.host._do_action(session, ("cloud_upgrade", 0))
             self.assertEqual(browser.call_count, 1)
+
+    def test_offer_buttons_continue_on_loopcut_open_the_site_and_snooze(self):
+        nudges = importlib.import_module(NAME + ".nudges")
+        session = self.state.new_session()
+        session["items"] = [nudges.chatgpt_card("subscription_sharing_usage_limit_exceeded")]
+        choice = {a["do"]: i for i, a in enumerate(session["items"][0]["actions"])}
+        self.prefs.provider = "CHATGPT"
+        with patch.object(self.host.agent, "resume") as resume, patch.object(self.host, "config_changed"), \
+                patch.object(self.account, "default_model", return_value="fast"):
+            session["busy"] = True
+            self.host._do_action(session, ("offer", (0, choice["continue_loopcut"])))
+            self.assertEqual(self.prefs.provider, "CHATGPT", "never switches under a running turn")
+            session["busy"] = False
+            self.host._do_action(session, ("offer", (0, choice["continue_loopcut"])))
+            self.assertEqual(self.prefs.provider, "LOOPCUT")
+            resume.assert_called_once_with()
+            self.assertTrue(session["items"][0]["resolved"].startswith("Carrying on with Loopcut Fast"))
+        self.host._do_action(session, ("offer", (0, choice["sign_in_loopcut"])))
+        self.fake.ops.loopcut.sign_in.assert_called_once_with()
+        card = nudges.locked_tool_card({"name": "sfx", "title": "Sound effects", "why": "credits", "credits": 4,
+                                        "own_key": False}, balance=0)
+        session["items"].append(card)
+        with patch.object(self.account, "open_browser") as browser:
+            self.host._do_action(session, ("offer", (1, 0)))
+            browser.assert_called_once_with(card["actions"][0]["arg"])
+            card["actions"][0]["arg"] = "file:///etc/passwd"
+            with self.assertRaises(ValueError):
+                self.host._do_action(session, ("offer", (1, 0)))
+        with patch.object(nudges, "snooze") as snooze:
+            self.host._do_action(session, ("offer", (1, len(card["actions"]) - 1)))
+            snooze.assert_called_once_with("locked_tool")
+        self.assertEqual(card["resolved"], nudges.DISMISSED)
+        self.host._do_action(session, ("offer", (9, 0)))  # A stale hit after the list changed: nothing.
+
+    def test_limit_card_switches_to_the_chatgpt_plan_and_goes_on(self):
+        session = self.state.new_session()
+        with patch.object(self.host.agent, "resume") as resume, patch.object(self.host, "config_changed"):
+            self.host._do_action(session, ("limit_chatgpt", 0))
+        self.assertEqual(self.prefs.provider, "CHATGPT")
+        resume.assert_called_once_with()
+
+    def test_done_screen_names_the_missing_half(self):
+        self.assertIn("Loopcut account", self.onboarding.done_nudge(True, False, True))
+        self.assertIn("Sign in with ChatGPT", self.onboarding.done_nudge(False, True, True))
+        self.assertIn("ChatGPT runs the conversation", self.onboarding.done_nudge(True, True, True))
+        self.assertEqual(self.onboarding.done_nudge(False, False, False), "")
+
+    def test_preferences_show_the_other_connection_whichever_is_the_model(self):
+        class Box(Splash):
+            def box(self, **kwargs):
+                return Box(self.records)
+            column = row = box
+        for provider, chatgpt_row, loopcut_row in (("OPENAI", True, True), ("CHATGPT", False, True),
+                                                   ("LOOPCUT", True, False)):
+            with self.subTest(provider=provider):
+                layout = Box()
+                self.prefs.provider = provider
+                self.settings.draw_connections(layout, self.prefs)
+                names = [r[1] for r in layout.operators()]
+                self.assertEqual("loopcut.chatgpt_sign_in" in names, chatgpt_row)
+                self.assertEqual("loopcut.sign_in" in names, loopcut_row)
+                self.assertTrue(any("Best setup: both" in r[1] for r in layout.records if r[0] == "label"))
+        layout = Box()
+        self.prefs.provider = "LOOPCUT"
+        with patch.object(self.settings.chatgpt_auth, "status", return_value={
+                "signed_in": True, "plan_usage": True, "email": "person@example.test"}):
+            self.settings.draw_connections(layout, self.prefs)
+        use = next(r for r in layout.operators() if r[1] == "loopcut.use_provider")
+        self.assertEqual(use[3].provider, "CHATGPT")
 
     def test_sign_in_and_dismiss_actions_keep_each_route(self):
         session = self.state.new_session()

@@ -298,7 +298,8 @@ class Worker:
                                            focus=arguments.get("focus"), frames=arguments.get("frames"), step=step,
                                            angles=arguments.get("angles"), shading=arguments.get("shading"),
                                            isolate=bool(arguments.get("isolate")), camera=arguments.get("camera"),
-                                           view_layer=arguments.get("view_layer"))
+                                           view_layer=arguments.get("view_layer"),
+                                           labels=arguments.get("labels", False))
             if name == "check_brief":
                 return self._check_brief(step)
             if name == "import_asset":

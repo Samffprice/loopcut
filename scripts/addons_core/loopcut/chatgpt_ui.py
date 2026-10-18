@@ -180,6 +180,14 @@ class LOOPCUT_OT_chatgpt_welcome(bpy.types.Operator):
             column.label(text=line)
         column.separator()
         column.operator("loopcut.chatgpt_manage_usage", icon="URL")
+        from . import account
+        column.separator()
+        if account.signed_in():  # Both connected: the account keeps adding what a chat plan can't.
+            column.label(text="Your Loopcut account still adds asset search and cloud tools.")
+        else:
+            for line in ("Want images, 3D, audio or asset search too?", "Those run on a free Loopcut account."):
+                column.label(text=line)
+            column.operator("loopcut.sign_in", text="Create free Loopcut account", icon_value=account.mark_icon())
 
     def execute(self, context):
         return {"FINISHED"}
@@ -209,8 +217,8 @@ def draw(column, prefs=None) -> None:
         row.operator("loopcut.chatgpt_sign_in", text="Use another account").new_account = True
         row.operator("loopcut.chatgpt_sign_out")
     else:
-        lines = ("Use your ChatGPT plan: eligible requests in Loopcut use the usage included in",
-                 "your ChatGPT Plus or Pro plan, separate from any Loopcut subscription.")
+        lines = ("Your ChatGPT Plus or Pro plan runs Loopcut's agent: eligible requests use the",
+                 "usage included in your plan. Loopcut credits never pay for it.")
         for n, line in enumerate(lines):
             column.label(text=line, icon="INFO" if n == 0 else "BLANK1")
         column.operator("loopcut.chatgpt_sign_in", text="Sign in with ChatGPT", icon="USER")

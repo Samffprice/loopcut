@@ -34,9 +34,10 @@ MAX_DOWNLOAD = 2 * 1024 * 1024 * 1024
 MAX_REPORT_FILE = 4 * 1024 * 1024
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _JOB_ID = re.compile(r"job_[A-Za-z0-9_-]{1,128}\Z")
+FBX_MAGIC = b"Kaydara FBX Binary"
 _SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
-             "model/gltf-binary": ".glb", "model/gltf+json": ".gltf", "audio/wav": ".wav",
-             "audio/mpeg": ".mp3", "video/mp4": ".mp4", "video/webm": ".webm",
+             "model/gltf-binary": ".glb", "model/gltf+json": ".gltf", "model/vnd.fbx": ".fbx",
+             "audio/wav": ".wav", "audio/mpeg": ".mp3", "video/mp4": ".mp4", "video/webm": ".webm",
              "application/json": ".json", "text/plain": ".txt", "text/markdown": ".md"}
 _registry = {}
 _lock = threading.Lock()
@@ -66,13 +67,21 @@ def _client():
     return mainthread.run_on_main(snapshot).result()
 
 
+def _blob_multipart():
+    """The server's multipart capability, so large tool files (e.g. a 150 MB GLB) go in parts."""
+    from . import cloud
+    return cloud.blob_multipart()
+
+
 def _redraw():
     from . import mainthread
     mainthread.request_redraw()
 
 
 def progress_rows(registry):
-    """Pure panel data, with no Events, locks, Blender or mutable registry values exposed."""
+    """Pure panel data, with no Events, locks, Blender or mutable registry values exposed. A running job can be
+    canceled and the service returns its whole credit hold (C47); once it has finished and only its outputs are
+    downloading, it was charged and can no longer be canceled, and the row says so."""
     rows = []
     for key, row in registry.items():
         job = row["job"]
@@ -80,9 +89,13 @@ def progress_rows(registry):
         if row.get("error") or (job["status"] in TERMINAL and not downloading):
             continue
         message = "Downloading outputs" if downloading else job["progress"]["message"]
+        held = (job.get("credits") or {}).get("reserved", 0) if not downloading else 0
+        note = ("Finished and charged; it can't be canceled now." if downloading
+                else f"{held:,} credits held. Cancel returns them." if held else "")
         rows.append({"id": key, "title": row["title"], "pct": job["progress"]["pct"],
                      "message": "Canceling…" if row.get("canceling") else message,
-                     "cancelable": not row.get("canceling", False)})
+                     "cancelable": not row.get("canceling", False) and not downloading,
+                     "note": "" if row.get("canceling") else note})
     from .cloud import safe_value
     return safe_value(rows)
 
@@ -93,6 +106,8 @@ def ui_rows():
 
 
 def cancel_job(job_id):
+    """False when the job is unknown or already over. A finished job still downloading only stops its download:
+    it was charged, so the panel offers no Cancel then (progress_rows)."""
     with _lock:
         row = _registry.get(job_id)
         if row is None or row.get("error") or (row["job"]["status"] in TERMINAL and row.get("ready", True)):
@@ -101,6 +116,36 @@ def cancel_job(job_id):
         row["canceling"] = True
     _redraw()
     return True
+
+
+def watch(job_id, fn):
+    """fn(job, error) once the job is over here (outputs ready, or an error such as a cancel); at once when it
+    already is. cloud.py settles the chat's spend with it (C47). False for an unknown job."""
+    with _lock:
+        row = _registry.get(job_id)
+        if row is None:
+            return False
+        if row.get("error") is None and not (row["job"]["status"] in TERMINAL and row.get("ready", True)):
+            row.setdefault("watchers", []).append(fn)
+            return True
+        job, error = copy.deepcopy(row["job"]), row.get("error")
+    _notify([fn], job, error)
+    return True
+
+
+def _notify(watchers, job, error):
+    for fn in watchers:
+        try:
+            fn(job, error)
+        except Exception as ex:  # A card's bookkeeping must never break a job.
+            print(f"Loopcut: could not settle a cloud job's charge: {ex!r}")
+
+
+def _final(job_id, job, error=None):
+    with _lock:
+        row = _registry.get(job_id)
+        watchers = row.pop("watchers", []) if row is not None else []
+    _notify(watchers, copy.deepcopy(job), error)
 
 
 def cancel_all():
@@ -129,7 +174,8 @@ def job_status(job_id):
                                              for output in job['outputs']]})
 
 
-def _remember(job, title, cancel):
+def _remember(job, title, cancel, inputs=None):
+    """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it."""
     with _lock:
         if job["id"] in _registry:
             row = _registry[job['id']]
@@ -143,6 +189,7 @@ def _remember(job, title, cancel):
         for key in finished[:-31]:
             del _registry[key]
         _registry[job["id"]] = {"title": title, "job": copy.deepcopy(job), "cancel": cancel, "ready": False,
+                                "input": copy.deepcopy(inputs or {}),
                                 'final': job['status'] in TERMINAL and (job['status'] != 'failed' or bool(job.get('error')))}
     _redraw()
     return True
@@ -404,18 +451,21 @@ def _finish(client, job, cancel, on_progress):
         with _lock:
             _registry[job["id"]]["ready"] = True
         _redraw()
+        _final(job["id"], job)
         return job
     except cloud_http.CloudError as ex:
         ex.extra.setdefault('job', job)
         with _lock:
             _registry[job["id"]]["error"] = ex
         _redraw()
+        _final(job["id"], ex.extra["job"], ex)
         raise
     except OSError as ex:
         error = cloud_http.CloudError("Could not save cloud outputs", "output_save_failed")
         with _lock:
             _registry[job["id"]]["error"] = error
         _redraw()
+        _final(job["id"], job, error)
         raise error from ex
 
 
@@ -427,12 +477,14 @@ def _background(client, job, cancel, on_progress):
 
 
 def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: dict,
-        on_progress=None, cancel=None, client=None) -> dict:
+        on_progress=None, cancel=None, client=None, confirm_token=None) -> dict:
     """Upload, submit once (retry a lost reply with the same key), follow and verify outputs.
 
     quote_id, bundle (an already uploaded manifest hash), and optional idempotency_key are
     call metadata, never vendor input. A caller retrying across run() calls can reuse the key
-    returned in CloudError.extra. Ordinary separate calls always get fresh UUIDs.
+    returned in CloudError.extra; a failed or canceled job returns none, as its key only replays that
+    job (SPEC §3.4). Ordinary separate calls always get fresh UUIDs. confirm_token: the user
+    approved past a server limit (cloud_account._run_confirmed); it goes once, as the x-loopcut-confirm header.
     """
     if (not isinstance(project, dict) or not isinstance(project.get("id"), str) or not project["id"]
             or type(project.get("no_generation")) is not bool):
@@ -476,13 +528,15 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     elif (descriptor.get("bundle_input") or {}).get("required"):
         raise _input_error("An uploaded bundle manifest is required", "bundle")
     try:
-        blobs.upload_missing(selected, client=client)
+        blobs.upload_missing(selected, client=client, cancel=cancel, multipart=_blob_multipart())
     except (OSError, ValueError) as ex:
         raise _input_error("Tool file changed or could not be read during upload", "files") from ex
     if cancel.is_set():
         raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
+    # Quotes and jobs pass the same server limits; the user's approval past one goes as this header (C47).
+    confirm = {"headers": {"x-loopcut-confirm": confirm_token}} if confirm_token else {}
     if (descriptor.get("cost") or {}).get("quote_required") and not arguments.get("quote_id"):
-        quote = client.request("POST", "/v1/quotes", payload)
+        quote = client.request("POST", "/v1/quotes", payload, **confirm)
         if (not isinstance(quote.get("quote_id"), str) or type(quote.get("credits")) is not int
                 or quote["credits"] < 0 or not isinstance(quote.get("expires_at"), str)):
             raise _invalid("Invalid quote from Loopcut")
@@ -497,14 +551,14 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     try:
         for attempt in range(2):
             try:
-                job = _job(client.request("POST", "/v1/jobs", payload))
+                job = _job(client.request("POST", "/v1/jobs", payload, **confirm))
                 if job["tool"] != descriptor["name"]:
                     raise _invalid("Submitted tool changed in job response")
                 break
             except cloud_http.CloudError as ex:
                 if ex.code != "connection_failed" or attempt:
                     raise
-        if not _remember(job, descriptor.get("title", descriptor["name"]), cancel):
+        if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs):
             if descriptor.get("latency") == "long":
                 if cancel.is_set():
                     cancel_job(job["id"])
@@ -517,7 +571,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
             return job
         return _finish(client, job, cancel, on_progress)
     except cloud_http.CloudError as ex:
-        ex.extra.setdefault("idempotency_key", key)
+        if ex.extra.get("job", {}).get("status") not in {"failed", "canceled"}:
+            ex.extra.setdefault("idempotency_key", key)
         raise
 
 
@@ -634,7 +689,7 @@ def _reports(job):
         report = _report_text(output)
         reports.append(report)
         session = state.session()
-        session["items"].append({"kind": "notice", "text": report})
+        session["items"].append(state.item_notice(report))
         conversations.save(session)
     return reports
 
@@ -698,17 +753,32 @@ def _model_import(job):
         if output["type"] != "model_3d":
             continue
         path = Path(output["path"])
-        if path.suffix.lower() not in {".glb", ".gltf"}:
-            raise cloud_http.CloudError("Only GLB/glTF model imports are available in this build", "apply_not_available")
-        _check_gltf(path)
+        fbx = path.suffix.lower() == ".fbx"
+        if not fbx and path.suffix.lower() not in {".glb", ".gltf"}:
+            raise cloud_http.CloudError("Only GLB, glTF and FBX model imports are available in this build",
+                                        "apply_not_available")
+        if fbx:
+            _check_fbx(path)
+        else:
+            _check_gltf(path)
         previous = datablock_snapshot(bpy.data)
-        result = bpy.ops.import_scene.gltf(filepath=str(path), import_scene_extras=False,
-                                           import_scene_as_collection=False)
+        note = ""
+        if fbx:
+            # Tripo returns quads only as FBX; GLB cannot hold them.
+            try:
+                result = _import_fbx(path)
+            finally:
+                dropped = _drop_outside_textures(path, previous)
+            note = f" (FBX; left off {dropped} texture(s) not embedded in the file)" if dropped else " (FBX)"
+        else:
+            result = bpy.ops.import_scene.gltf(filepath=str(path), import_scene_extras=False,
+                                               import_scene_as_collection=False)
         if "FINISHED" not in result:
             raise cloud_http.CloudError("Blender could not import the model", "apply_failed")
         objects = [ob for ob in bpy.data.objects if _identity(ob) not in previous]
         if not objects:
             raise cloud_http.CloudError("Model contained no objects", "apply_failed")
+        _fresh_materials(objects, previous)
         collection = bpy.data.collections.new(f"Loopcut {job['id']} {output['name']}")
         bpy.context.scene.collection.children.link(collection)
         root = bpy.data.objects.new(collection.name, None)
@@ -740,8 +810,123 @@ def _model_import(job):
             ob.select_set(True)
         root.select_set(True)
         bpy.context.view_layer.objects.active = root
-        names.append(collection.name)
+        names.append(collection.name + note)
     return names
+
+
+def _check_fbx(path):
+    """Binary FBX only, the one format the adapters label model/vnd.fbx (fal.model_mime)."""
+    with path.open("rb") as handle:
+        if handle.read(len(FBX_MAGIC)) != FBX_MAGIC:
+            raise cloud_http.CloudError("Cloud model is not a binary FBX", "apply_failed")
+
+
+def _import_fbx(path):
+    """Blender's native FBX importer (wm.fbx_import, C++/ufbx), else the bundled Python add-on's.
+
+    The native operator polls for a window, which a timer-driven apply has not got: borrow the
+    first one; background Blender has none and uses the add-on. Both set the scene's frame rate to
+    the file's, so it is put back. Custom properties stay off, as glTF extras do."""
+    import bpy
+    rates = [(scene, scene.render.fps, scene.render.fps_base) for scene in bpy.data.scenes]
+    wm = bpy.context.window_manager
+    window = bpy.context.window or (wm.windows[0] if wm.windows else None)
+    try:
+        if "fbx_import" in dir(bpy.ops.wm) and window is not None:
+            before = datablock_snapshot(bpy.data)
+            with bpy.context.temp_override(window=window, screen=window.screen):
+                result = bpy.ops.wm.fbx_import(filepath=str(path), use_custom_props=False)
+            if "FINISHED" not in result or not _reused_images(before) or "fbx" not in dir(bpy.ops.import_scene):
+                return result
+            # The native importer takes an existing image of the same name in place of the file's
+            # embedded one, so a second result showed the first one's textures. Undo it and use the
+            # Python importer, which always makes new images from the embedded pixels.
+            _remove_created(before)
+        if "fbx" in dir(bpy.ops.import_scene):
+            return bpy.ops.import_scene.fbx(filepath=str(path), use_custom_props=False, use_image_search=False)
+        raise cloud_http.CloudError("This Blender build has no FBX importer", "apply_not_available")
+    finally:
+        for scene, fps, base in rates:
+            if (scene.render.fps, scene.render.fps_base) != (fps, base):
+                scene.render.fps, scene.render.fps_base = fps, base
+
+
+def _new_materials(before):
+    """Materials the import created or assigned to the objects it created."""
+    import bpy
+    found = {_identity(m): m for m in bpy.data.materials if _identity(m) not in before}
+    for ob in bpy.data.objects:
+        if _identity(ob) not in before:
+            for slot in getattr(ob, "material_slots", ()):
+                if slot.material is not None:
+                    found[_identity(slot.material)] = slot.material
+    return list(found.values())
+
+
+def _reused_images(before):
+    """True when an imported material samples an image that existed before the import."""
+    for material in _new_materials(before):
+        tree = getattr(material, "node_tree", None)
+        for node in getattr(tree, "nodes", ()):
+            image = getattr(node, "image", None)
+            if getattr(node, "type", None) == "TEX_IMAGE" and image is not None and _identity(image) in before:
+                return True
+    return False
+
+
+def _remove_created(before):
+    """Remove every datablock an import added (never one that existed before it). Scenes stay."""
+    import bpy
+    for name in _DATA_COLLECTIONS:
+        collection = getattr(bpy.data, name, None)
+        if collection is None or name == "scenes":
+            continue
+        for block in [b for b in collection if _identity(b) not in before]:
+            collection.remove(block)
+
+
+def _fresh_materials(objects, previous):
+    """Imported objects get their own materials: one that existed before the import is copied, so
+    editing this result never changes another object's material (images were made fresh on import)."""
+    for ob in objects:
+        for slot in getattr(ob, "material_slots", ()):
+            material = slot.material
+            if material is not None and _identity(material) in previous:
+                slot.material = material.copy()
+
+
+def _drop_outside_textures(path, previous):
+    """Untrusted FBX, like glTF, may only use embedded images or files beside the downloaded output.
+
+    Both importers pack embedded textures into the .blend, but open any other texture at the path
+    the file names, anywhere on disk, or leave a placeholder when it is missing. Pixels load lazily,
+    so removing those images (and the texture nodes that use them) reads nothing. Returns the count."""
+    import bpy
+    folder = path.parent.resolve()
+    outside = []
+    for image in bpy.data.images:
+        if _identity(image) in previous or image.packed_file is not None:
+            continue
+        try:
+            target = Path(bpy.path.abspath(image.filepath)).resolve()
+            beside = target.is_relative_to(folder) and target.is_file()
+        except (OSError, ValueError):
+            beside = False
+        if not beside:
+            outside.append(image)
+    if not outside:
+        return 0
+    removed = {_identity(image) for image in outside}
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        if _identity(material) in previous or tree is None:
+            continue
+        for node in list(tree.nodes):
+            if node.type == "TEX_IMAGE" and node.image is not None and _identity(node.image) in removed:
+                tree.nodes.remove(node)
+    for image in outside:
+        bpy.data.images.remove(image)
+    return len(outside)
 
 
 def _check_gltf(path):
@@ -776,19 +961,84 @@ def _strips():
     return editor.strips if hasattr(editor, "strips") else editor.sequences
 
 
-def _add_audio(job):
+_AUDIO_LABELS = {"voice_line": ("VO", "text"), "sfx": ("SFX", "prompt")}  # Strip name prefix, the input it quotes.
+NAME_BYTES = 36  # Of the line or prompt in a strip's name; Blender keeps 63 bytes of a name.
+
+
+def _tool_input(job):
+    """What the call asked for: kept from a managed submit (run), carried by a BYOK job (byok.runner)."""
+    with _lock:
+        kept = (_registry.get(job["id"]) or {}).get("input")
+    value = kept or job.get("input")
+    return value if isinstance(value, dict) else {}
+
+
+def _first_words(text, limit=NAME_BYTES):
+    """The start of `text` within `limit` UTF-8 bytes, ended on a whole word when it can be, … when cut."""
+    text = " ".join(text.split())
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    cut = text[:limit]
+    while len((cut + "…").encode("utf-8")) > limit:
+        cut = cut[:-1]
+    if " " in cut and text[len(cut)] != " ":
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,.;:") + "…"
+
+
+def _audio_name(job, output, taken):
+    """VO • <the line's first words> for voice_line, SFX • <the prompt> for sfx, else the output's name;
+    numbered the way Blender names a copy (.001) when the scene already has a strip by that name."""
+    label, field = _AUDIO_LABELS.get(job["tool"], ("", ""))
+    words = _first_words(str(_tool_input(job).get(field) or "")) if label else ""
+    base = f"{label} • {words}" if words else output["name"]
+    name, n = base, 0
+    while name in taken:
+        n += 1
+        name = f"{base}.{n:03d}"
+    return name
+
+
+def _strip_names():
     import bpy
-    names = []
-    strips = _strips()
+    editor = bpy.context.scene.sequence_editor_create()
+    every = getattr(editor, "strips_all", None)  # With the strips inside meta strips.
+    return {strip.name for strip in (every if every is not None else editor.sequences_all)}
+
+
+def _placement(strip, fps):
+    """Where a strip sits, so the model can place things against it without reading it back."""
+    return (f'"{strip.name}" (channel {strip.channel}, frames {strip.frame_final_start}–{strip.frame_final_end} '
+            f"at {round(fps, 3):g} fps, end exclusive, {strip.frame_final_duration / fps:.2f} s)")
+
+
+def _add_audio(job):
+    """Each sound becomes a strip at the current frame, packed into the .blend as _add_images packs images (the
+    download sits in a temp folder), and a card in the chat under the call to hear it (state.item_audio)."""
+    import bpy
+    from . import conversations, playback, state
+    scene = bpy.context.scene
+    strips, taken = _strips(), _strip_names()
     channel = max((strip.channel for strip in strips), default=0) + 1
+    fps = scene.render.fps / scene.render.fps_base
+    session = state.session()
+    placed, cards = [], []
     for output in job["outputs"]:
-        if output["type"] == "audio":
-            strip = strips.new_sound(output["name"], output["path"], channel=channel,
-                                     frame_start=bpy.context.scene.frame_current)
-            stamp_provenance([strip], job["provenance"])
-            names.append(strip.name)
-            channel += 1
-    return names
+        if output["type"] != "audio":
+            continue
+        strip = strips.new_sound(_audio_name(job, output, taken), output["path"], channel=channel,
+                                 frame_start=scene.frame_current)
+        strip.sound.pack()
+        stamp_provenance([strip], job["provenance"])
+        taken.add(strip.name)
+        placed.append(_placement(strip, fps))
+        kept = conversations.store_audio(session, Path(output["path"]))  # The card's own copy, like a capture's.
+        cards.append(state.item_audio(strip.name, kept, strip.frame_final_duration / fps, playback.peaks(kept)))
+        channel += 1
+    if cards:
+        session["items"].extend(cards)
+        conversations.save(session)
+    return placed
 
 
 def _load_frames(job):

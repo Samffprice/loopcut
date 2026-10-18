@@ -76,7 +76,8 @@ def main():
     os.environ['LOOPCUT_CONFIG_DIR'] = tempfile.mkdtemp(prefix='loopcut-cloud-e2e-config-')
     os.environ['LOOPCUT_NO_GENERATION'] = 'false'
     os.environ['LOOPCUT_PRIVATE_MODE'] = 'true'
-    os.environ['LOOPCUT_BYOK_TOOLS'] = ''
+    for name in ('OPENAI_API_KEY', 'FAL_KEY', 'GEMINI_API_KEY', 'ELEVENLABS_API_KEY'):
+        os.environ['LOOPCUT_OWN_KEY_FIRST_' + name] = 'false'  # Credits first: a shell key must not take the route.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import checkout
     checkout.use()

@@ -169,10 +169,12 @@ def _run_sign_in() -> None:
 
 def _store_key(key: str) -> None:
     """Main thread: the credentials folder comes from bpy, and the preferences page changes."""
-    from . import settings
+    from . import chatgpt_auth, settings
     credentials.store(BASE_URL, key)
     prefs = settings.preferences()
-    if prefs is not None and prefs.provider != "LOOPCUT":
+    # A signed-in ChatGPT plan stays the model: the account adds asset search and credits. Only the user's
+    # own pick of Loopcut Fast/Pro (the provider menu, onboarding's "Use Loopcut's models") moves it.
+    if prefs is not None and prefs.provider != "LOOPCUT" and not chatgpt_auth.plan_signed_in():
         prefs.provider = "LOOPCUT"
     settings.config_changed()
     try:
@@ -241,7 +243,7 @@ def models() -> list[dict]:
             parts.append(f"{multiplier:g}x usage")
         unlock = r.get("unlock_plan") or {}
         if not r.get("available", True):
-            parts.append("Unavailable" if config.BETA else f"{unlock.get('name') or 'a higher'} plan")
+            parts.append(f"{unlock.get('name') or 'a higher'} plan" if config.billing_open() else "Unavailable")
         out.append({"id": str(r["id"]), "label": str(r.get("display_name") or r["id"]),
                     "blurb": str(r.get("blurb") or ""), "note": "  ·  ".join(parts),
                     "available": bool(r.get("available", True)),
@@ -342,7 +344,7 @@ def account_line() -> str:
     if not account:
         return "Signed in"
     who = account.get("email") or "Signed in"
-    plan = "" if config.BETA else str(account.get("plan") or "").capitalize()  # The beta has no plans to show.
+    plan = str(account.get("plan") or "").capitalize() if config.billing_open() else ""  # No sales, no plan names.
     return f"{who}  ·  {plan} plan" if plan else who
 
 
@@ -430,6 +432,18 @@ class LOOPCUT_OT_refresh_account(bpy.types.Operator):
         return {"FINISHED"}
 
 
+SIGNED_OUT_NOTE = "Free: asset search and cloud tools. Works alongside your ChatGPT plan."
+
+
+def _credits_line() -> str:
+    from . import cloud, cloud_account
+    runtime = cloud._runtime
+    if runtime is None:
+        return ""
+    with runtime.lock:
+        return cloud_account.credits_label(runtime.manifest, runtime.signed_in)
+
+
 def draw(column) -> None:
     """The sign-in block on the preferences page."""
     state = _state
@@ -444,16 +458,25 @@ def draw(column) -> None:
         column.label(text="Contacting Loopcut…")
         column.operator("loopcut.cancel_sign_in", text="Cancel")
         return
+    billing = config.billing_open()
     if signed_in():
         row = column.row(align=True)
         row.label(text=account_line(), icon="CHECKMARK")
         row.operator("loopcut.refresh_account", text="", icon="FILE_REFRESH")
+        credits = _credits_line() if billing else ""
+        if credits:
+            column.label(text=credits)
         for line in usage_lines():
             column.label(text=line)
         row = column.row(align=True)
-        row.operator("wm.url_open", text="Account" if config.BETA else "Account and Billing").url = f"{SERVICE_URL}/account"
+        if billing:  # Buying happens on loopcut.org, never in Blender.
+            row.operator("wm.url_open", text="Credits").url = config.credits_url("preferences")
+            row.operator("wm.url_open", text="See plans").url = config.pricing_url("preferences")
+        else:
+            row.operator("wm.url_open", text="Account").url = f"{SERVICE_URL}/account"
         row.operator("loopcut.sign_out")
     else:
+        column.label(text=SIGNED_OUT_NOTE)
         column.operator("loopcut.sign_in", icon="USER")
     if state["status"] == "error" and state["error"]:
         column.label(text=state["error"], icon="ERROR")

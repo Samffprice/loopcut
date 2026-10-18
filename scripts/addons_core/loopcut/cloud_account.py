@@ -3,10 +3,12 @@
 Manifest values are account defaults; local preferences only apply when signed out. A
 project can add a generation restriction, but cannot lift the server's account restriction.
 Pending request hashes, retry keys and quote amounts survive restarts so a lost reply cannot
-turn a retry into a second charge. Calls forward only the approved quote ID to managed jobs.
+turn a retry into a second charge; spent keys do too, so a retry after a failure is a new job.
+Calls forward only the approved quote ID to managed jobs.
 """
 
 import math
+import re
 import hashlib
 import hmac
 import json
@@ -18,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import cloud_http, config
+from .nudges import dollars
 
 PROJECT_PROPERTY = "loopcut_no_generation"
 OVERRIDES = ("inherit", "on", "off")
@@ -78,9 +81,58 @@ def _save_pending(runtime, rows):
                                     'submission_recovery_failed') from ex
 
 
-def complete(runtime, arguments):
-    """Release retry metadata only after a definitive outcome, never after a lost reply."""
+MAX_KEYS = 128
+
+
+def _digest(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _keys(runtime):
+    """Hashes of sent retry keys and the request each was sent for; "" once it is spent.
+
+    A key names one job for good (SPEC §3.4): the same request replays that job, any other is refused
+    as "already used for a different request". So a key is reused only for its own request, and only
+    while its job can still succeed. A lost or damaged file loses only this check, never a charge."""
+    try:
+        with (runtime.cache_dir / 'keys.json').open('rb') as handle:
+            raw = handle.read(32769)
+        rows = json.loads(raw) if len(raw) <= 32768 else None
+        if (not isinstance(rows, dict) or len(rows) > MAX_KEYS
+                or any(not re.fullmatch('[0-9a-f]{64}', k) or not isinstance(v, str)
+                       or not re.fullmatch('(?:[0-9a-f]{64})?', v) for k, v in rows.items())):
+            return {}
+        return rows
+    except (OSError, ValueError):
+        return {}
+
+
+def _note_key(runtime, key, fingerprint):
+    """Under runtime.lock: `key` was sent for this request ("" once spent: never send it again)."""
+    from .cloud import _write_json
+    rows = _keys(runtime)
+    rows.pop(_digest(key), None)
+    rows[_digest(key)] = fingerprint
+    while len(rows) > MAX_KEYS:
+        del rows[next(iter(rows))]
+    try:
+        _write_json(runtime.cache_dir / 'keys.json', rows)
+    except OSError:
+        pass  # Only the check is lost: at worst a retry is refused or replays the old job.
+
+
+def _key_spent(error):
+    """The key can only replay a failed or canceled job, or the service refused it as another request's."""
+    return error.extra.get('job', {}).get('status') in {'failed', 'canceled'} or (
+        error.code == 'invalid_input' and error.extra.get('field') == 'idempotency_key')
+
+
+def complete(runtime, arguments, spent=False):
+    """Release retry metadata only after a definitive outcome, never after a lost reply. A spent key is never
+    sent again, so retrying a failed or canceled job submits a new one."""
     with runtime.lock:
+        if spent and arguments.get('idempotency_key'):
+            _note_key(runtime, arguments['idempotency_key'], '')
         rows = _pending(runtime)
         if rows.get(arguments.fingerprint, {}).get('idempotency_key') == arguments.get('idempotency_key'):
             del rows[arguments.fingerprint]
@@ -126,18 +178,25 @@ def current_policy(local):
 
 
 def credits_label(manifest, signed_in):
+    """The panel's credits line, short enough for a narrow panel: "94 credits ($0.94) · renews 2026-11-01"."""
     credits = (manifest.get("account") or {}).get("credits") if signed_in else None
     if not isinstance(credits, dict) or not _amount(credits.get("balance")):
         return ""
-    parts = [f"{credits['balance']:,g} credits"]
-    if _amount(credits.get("monthly")):
-        parts.append(f"{credits['monthly']:,g}/month")
-    if isinstance(credits.get("resets_at"), str):
+    parts = [f"{credits['balance']:,g} credits ({dollars(credits['balance'])})"]
+    if _amount(credits.get("monthly")) and credits["monthly"] and isinstance(credits.get("resets_at"), str):
         try:
-            parts.append("resets " + datetime.fromisoformat(credits["resets_at"].replace("Z", "+00:00")).date().isoformat())
+            parts.append("renews " + datetime.fromisoformat(credits["resets_at"].replace("Z", "+00:00")).date().isoformat())
         except ValueError:
             pass  # Optional display metadata does not invalidate a usable balance.
     return " · ".join(parts)
+
+
+def receipt(job):
+    """What a finished managed job used, for its card (M4): "Used 6 credits ($0.06)"; "" when nothing was charged."""
+    charged = ((job or {}).get("credits") or {}).get("charged")
+    if not _amount(charged) or not charged:
+        return ""
+    return f"Used {charged:,g} credits ({dollars(charged)})"
 
 
 def _amount(value):
@@ -170,8 +229,8 @@ def refusal(descriptor, policy):
     own_key = (descriptor.get("byok") or {}).get("data_class")
     if policy.get("private_mode") and own_key in ("C", "D"):
         return "Private mode blocks this vendor: " + DATA_LABELS[own_key] + "."
-    if config.BETA and reason in ("sign_in", "credits", "plan"):
-        return "Coming soon."  # The beta sells nothing: no credits or plans to point at.
+    if not config.billing_open() and reason in ("sign_in", "credits", "plan"):
+        return "Coming soon."  # Billing closed: no credits or plans to point at.
     return {"no_generation": "No generation is on for this account or project.",
             "sign_in": "Sign in to use credits.", "credits": "Not enough credits.",
             "plan": "Requires a different plan.", "region": "Unavailable in your region.",
@@ -179,24 +238,39 @@ def refusal(descriptor, policy):
 
 
 def approval_details(descriptor, quote=None):
-    """Pure card text and decision; the threshold is strictly greater-than."""
+    """Pure card text and the server's decision; the threshold is strictly greater-than. required says whether
+    the server's own threshold asks; spending.decide adds the user's "Ask above", the chat budget and the burst
+    guard (C47). A quoted tool is decided on its quote, like an estimate."""
     if descriptor.get("backend") == "byok":
         provider = (descriptor.get("byok") or {}).get("provider", "vendor")
         vendor = {"openai": "OpenAI", "gemini": "Google Gemini", "elevenlabs": "ElevenLabs"}.get(provider, provider)
-        return {"required": True, "text": f"Uses your own {vendor} key", "credits": None}
+        return {"required": True, "text": f"Uses your own {vendor} key", "credits": None, "vendor": vendor}
     cost = descriptor.get("cost") or {}
+    threshold = (descriptor.get("approval") or {}).get("confirm_over_credits", 50)
+    if not _amount(threshold):
+        raise cloud_http.CloudError("Invalid tool credit estimate", "invalid_response")
     if cost.get("quote_required"):
         if quote is None:
-            return {"required": True, "text": "Getting a credit quote…", "credits": None}
+            return {"required": True, "text": "Getting a credit quote…", "credits": None, "threshold": threshold}
         if (not isinstance(quote, dict) or not isinstance(quote.get("quote_id"), str) or not quote["quote_id"]
                 or not _amount(quote.get("credits")) or not isinstance(quote.get("expires_at"), str)):
             raise cloud_http.CloudError("Invalid credit quote from Loopcut", "invalid_response")
-        return {"required": True, "text": f"{quote['credits']:g} credits (quoted)", "credits": quote["credits"]}
+        return {"required": quote["credits"] > threshold, "text": f"{quote['credits']:g} credits "
+                f"({dollars(quote['credits'])}), quoted", "credits": quote["credits"], "threshold": threshold}
     estimate = cost.get("credits_estimate", 0)
-    threshold = (descriptor.get("approval") or {}).get("confirm_over_credits", 50)
-    if not _amount(estimate) or not _amount(threshold):
+    if not _amount(estimate):
         raise cloud_http.CloudError("Invalid tool credit estimate", "invalid_response")
-    return {"required": estimate > threshold, "text": f"{estimate:g} credits estimated", "credits": estimate}
+    # The server's threshold decides; 0 means every priced call asks first (what it sends to add-ons older than
+    # 0.2.4, which hide the balance). Free calls (0 credits) never ask.
+    text = f"About {estimate:g} credits ({dollars(estimate)})" if estimate else "Free"
+    return {"required": estimate > threshold, "text": text, "credits": estimate, "threshold": threshold}
+
+
+def balance(manifest):
+    """The account's credit balance from the manifest, or None."""
+    credits = ((manifest or {}).get("account") or {}).get("credits")
+    value = credits.get("balance") if isinstance(credits, dict) else None
+    return value if _amount(value) else None
 
 
 @contextmanager
@@ -208,6 +282,17 @@ def approval_context(callback):
         yield
     finally:
         _approval.callback = previous
+
+
+def charge_reporter():
+    """What a call was charged, for the card and chat that started it, even from a detached job (C47):
+    report(charged, text) with charged None when it is not known."""
+    callback = getattr(_approval, "callback", None)
+
+    def report(charged, text=""):
+        if getattr(callback, "settles", False) is True:  # agent._Consent; a plain consent function is never sent charges.
+            callback({"charged": charged, "text": text})
+    return report
 
 
 def confirm(details):
@@ -229,7 +314,10 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
     _check_cancel(cancel)
     clean = {k: v for k, v in arguments.items() if k not in ("quote_id", "idempotency_key")}
     try:
-        module.run(descriptor, clean, files, project=project, cancel=cancel, client=client)
+        # Quotes pass the same server limits as jobs (C47); an approved refusal's token also admits the job.
+        _confirmed(lambda token: module.run(descriptor, clean, files, project=project, cancel=cancel, client=client,
+                                            **({"confirm_token": token} if token else {})),
+                   descriptor, arguments, cancel)
     except cloud_http.CloudError as ex:
         if ex.code != "quote_required":
             raise
@@ -271,6 +359,9 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
             runtime.quotes[quote['quote_id']] = quote
             runtime.quote_requests[quote['quote_id']] = arguments.fingerprint
     details = approval_details(descriptor, quote)
+    if isinstance(getattr(runtime, "manifest", None), dict):
+        with runtime.lock:
+            details["balance"] = balance(runtime.manifest)  # The card's "Balance 1,840 → 1,760".
     _check_cancel(cancel)
     confirm(details)
     _check_cancel(cancel)
@@ -305,6 +396,77 @@ def recheck(runtime, descriptor, snapshot):
     snapshot.policy = {**policy, "private_mode": private}
 
 
+SERVER_LIMITS = ("daily_limit_reached", "rate_limited")  # Refusals the user may approve past (spending.py).
+CONFIRM_HEADER = "x-loopcut-confirm"
+
+
+def _confirm_token(error):
+    token = error.extra.get("confirm_token")
+    return token if isinstance(token, str) and 1 <= len(token) <= 512 and token.isprintable() else None
+
+
+_URL = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _readable(message):
+    """A refusal's message for a card: one line, without the link the card's button carries."""
+    text = re.sub(r"\s*(?:Change it|Manage it|See|Visit)?\s*(?:at|on)?\s*" + _URL.pattern + r"\.?", "", message or "")
+    return " ".join(text.split())[:240]
+
+
+def limit_details(error, descriptor, arguments):
+    """The approval card for a server refusal: what was hit, this call's cost, and the account link."""
+    quote = getattr(arguments, "quote", None)
+    details = approval_details(descriptor, quote)
+    message = error.extra.get("message") if isinstance(error.extra.get("message"), str) else str(error)
+    details.update(limit=error.code, required=True, message=_readable(message),
+                   url=_safe_link(error.extra, message) if error.code == "daily_limit_reached" else "")
+    runtime = getattr(arguments, "runtime", None)
+    if isinstance(getattr(runtime, "manifest", None), dict):
+        with runtime.lock:
+            details["balance"] = balance(runtime.manifest)
+    return details
+
+
+def _run_confirmed(module, descriptor, arguments, files, *, project, on_progress, cancel, client):
+    return _confirmed(lambda token: module.run(descriptor, arguments, files, project=project, on_progress=on_progress,
+                                               cancel=cancel, client=client,
+                                               **({"confirm_token": token} if token else {})),
+                      descriptor, arguments, cancel)
+
+
+def _confirmed(run, descriptor, arguments, cancel):
+    """The owner (2026-10-16): a limit pauses on an approval card, never ends the turn. The server refuses over the
+    user's daily limit (402) or its burst guard (429) with a single-use confirm_token, bound to this tool and input
+    and spent only when a job is admitted. The card asks once per limit; Approve sends the same request (same
+    idempotency key) again with it in the x-loopcut-confirm header, and the call keeps it for its job after a quote.
+    "Skip this" declines only this call: the refusal created no job, so its retry key is released."""
+    token = getattr(arguments, "confirm_token", None)
+    asked = set()
+    while True:
+        try:
+            return run(token)
+        except cloud_http.CloudError as ex:
+            fresh = _confirm_token(ex)
+            callback = getattr(_approval, "callback", None)
+            if (ex.code not in SERVER_LIMITS or fresh is None or callback is None or "job" in ex.extra
+                    or ex.code in asked):
+                raise
+            asked.add(ex.code)
+            try:
+                accepted = callback(limit_details(ex, descriptor, arguments))
+            except cloud_http.CloudError as declined:
+                declined.status = declined.status or ex.status  # Definitive: no job was created.
+                raise
+            if not accepted:
+                raise cloud_http.CloudError("Cloud call was not approved; no job was submitted.", "approval_required",
+                                            ex.status) from ex
+            _check_cancel(cancel)
+            token = fresh
+            if isinstance(arguments, _Authorized):
+                arguments.confirm_token = fresh
+
+
 def submit(module, descriptor, arguments, files, *, project, on_progress, cancel, runtime, client):
     """An expired quote is refreshed once, within the price the user approved.
 
@@ -322,28 +484,34 @@ def submit(module, descriptor, arguments, files, *, project, on_progress, cancel
         if pending is None:
             if len(rows) >= MAX_PENDING:
                 raise cloud_http.CloudError('Resolve pending cloud submissions before starting more jobs.', 'pending_limit')
-            pending = {'idempotency_key': arguments.get('idempotency_key') or uuid.uuid4().hex,
-                       'quote': arguments.quote}
+            key = arguments.get('idempotency_key')
+            # A key sent for other inputs, or spent on a failed or canceled job, would be refused or only
+            # replay that job (SPEC §3.4): this attempt gets a new one.
+            if key is None or _keys(runtime).get(_digest(key), arguments.fingerprint) != arguments.fingerprint:
+                key = uuid.uuid4().hex
+            pending = {'idempotency_key': key, 'quote': arguments.quote}
             rows[arguments.fingerprint] = pending
             _save_pending(runtime, rows)
         elif pending['quote'] != arguments.quote:
             raise cloud_http.CloudError('Another submission is pending; retry this call.', 'submission_pending')
         arguments['idempotency_key'] = pending['idempotency_key']
+        _note_key(runtime, pending['idempotency_key'], arguments.fingerprint)
         arguments.receipt = dict(arguments)
     quote = arguments.quote
     try:
-        result = module.run(descriptor, arguments, files, project=project, on_progress=on_progress, cancel=cancel, client=client)
+        result = _run_confirmed(module, descriptor, arguments, files, project=project, on_progress=on_progress,
+                                cancel=cancel, client=client)
     except cloud_http.CloudError as ex:
         # 4xx rejections and terminal jobs are definitive. Transport/5xx errors are ambiguous.
         definitive = ('job' not in ex.extra and ex.status is not None and 400 <= ex.status < 500) or (
             ex.extra.get('job', {}).get('status') in {'failed', 'canceled'})
         if definitive:
-            complete(runtime, arguments)
+            complete(runtime, arguments, _key_spent(ex))
         if ex.code != "quote_expired" or ex.status != 409 or quote is None:
             raise
     else:
         if result.get('status') in {'succeeded', 'failed', 'canceled'}:
-            complete(runtime, arguments)
+            complete(runtime, arguments, result['status'] != 'succeeded')
         return result
     replacement = _quote(module, descriptor, arguments, files, project, cancel, runtime, client)
     if replacement["credits"] > quote["credits"]:
@@ -352,6 +520,7 @@ def submit(module, descriptor, arguments, files, *, project, on_progress, cancel
     retry = _Authorized({k: v for k, v in arguments.items() if k != "idempotency_key"})
     retry["quote_id"] = replacement["quote_id"]
     retry.runtime, retry.fingerprint, retry.quote = runtime, arguments.fingerprint, replacement
+    retry.confirm_token = getattr(arguments, "confirm_token", None)  # Not spent: no job was admitted.
     retry.receipt = dict(retry)
     _check_cancel(cancel)
     # Persist the replacement too, but never refresh a second expired quote in this call.
@@ -361,16 +530,32 @@ def submit(module, descriptor, arguments, files, *, project, on_progress, cancel
         arguments.update(retry)
         rows[retry.fingerprint] = {'idempotency_key': retry['idempotency_key'], 'quote': replacement}
         _save_pending(runtime, rows)
+        _note_key(runtime, retry['idempotency_key'], retry.fingerprint)
     try:
-        result = module.run(descriptor, retry, files, project=project, on_progress=on_progress, cancel=cancel, client=client)
+        result = _run_confirmed(module, descriptor, retry, files, project=project, on_progress=on_progress,
+                                cancel=cancel, client=client)
     except cloud_http.CloudError as ex:
         if ('job' not in ex.extra and ex.status is not None and 400 <= ex.status < 500) or (
                 ex.extra.get('job', {}).get('status') in {'failed', 'canceled'}):
-            complete(runtime, retry)
+            complete(runtime, retry, _key_spent(ex))
         raise
     if result.get('status') in {'succeeded', 'failed', 'canceled'}:
-        complete(runtime, retry)
+        complete(runtime, retry, result['status'] != 'succeeded')
     return result
+
+
+def _safe_link(extra, message=""):
+    """A server-sent account link (the daily limit's), validated: a link field, else one in the message, else the
+    account page."""
+    found = _URL.search(message) if isinstance(message, str) else None
+    for url in [extra.get(key) for key in ("url", "link", "account_url", "manage_url", "upgrade")] + (
+            [found.group(0).rstrip(".,)")] if found else []):
+        try:
+            cloud_http.validate_url(url)
+            return url
+        except (ValueError, TypeError):
+            continue
+    return config.credits_url("daily_limit")
 
 
 def error_details(error):
@@ -379,14 +564,37 @@ def error_details(error):
     if code == "insufficient_credits":
         balance = extra.get("balance") if _amount(extra.get("balance")) else "?"
         needed = extra.get("needed") if _amount(extra.get("needed")) else "?"
-        url = extra.get("upgrade", "") if not config.BETA else ""
+        url = extra.get("upgrade", "") if config.billing_open() else ""
         try:
             cloud_http.validate_url(url)
         except (ValueError, TypeError):
             url = ""
-        hint = "" if config.BETA else " Add credits or use BYOK."
+        hint = " Add credits or use your own vendor key." if config.billing_open() else ""
+        price = f"{needed:g} ({dollars(needed)})" if needed != "?" else "more"
         return {"text": f"insufficient_credits: balance {balance}, needed {needed}." + hint,
-                "message": f"Not enough credits: balance {balance}, needed {needed}.", "upgrade": url}
+                "message": f"Not enough credits: this needs {price}, you have {balance}.", "upgrade": url}
+    if code == "daily_limit_reached":
+        # Server C47 (HTTP 402): the user's optional daily limit. With a confirm_token the card asked first
+        # (_confirmed); this is the refusal without one, or after its one retry.
+        message = _readable(str(error))
+        if not message:
+            limit, spent = extra.get("daily_limit"), extra.get("spent_today")
+            used = f" ({spent:,g} of {limit:,g} credits today)" if _amount(spent) and _amount(limit) else ""
+            message = "Today's credit limit is reached" + used + "."
+        return {"text": "daily_limit_reached: the user's daily credit limit is reached. Do not retry paid tools "
+                        "today unless the user raises it; go on without them.",
+                "message": message, "upgrade": "", "link": _safe_link(extra, str(error)),
+                "link_label": "Change daily limit ↗"}
+    if code == "rate_limited" and (error.status == 429 or "confirm_token" in extra) and "job" not in extra:
+        # The service's own burst guard on paid jobs (about 30 in 10 minutes), refused at submission. A vendor's
+        # 429 on an own-key call arrives as a failed job instead, and keeps the plain retry text.
+        wait = extra.get("retry_after")
+        after = f"retry after {wait:g} seconds" if _amount(wait) and wait else "wait a few minutes"
+        return {"text": f"rate_limited: too many paid jobs in a short time; {after}. Do not retry in a loop: go on "
+                        "without paid tools, or tell the user.",
+                "message": "Too many paid jobs in a short time. Loopcut paused new ones; "
+                           + after.replace("retry after", "try again in") + ".",
+                "upgrade": "", "stop": True}
     if code == "generation_disabled":
         scope = extra.get("scope")
         scope = scope if scope in ("account", "project") else "account or project"
@@ -478,11 +686,25 @@ def change_setting(runtime, name, value):
     threading.Thread(target=save, name="loopcut-account-settings", daemon=True).start()
 
 
+def today_label(manifest, signed_in):
+    """Server C47's account.spend: "Today: 120 credits", and "of 1,000" only when the user set a daily limit.
+    "" when the fields are absent (older servers) or malformed."""
+    spend = ((manifest or {}).get("account") or {}).get("spend") if signed_in else None
+    if not isinstance(spend, dict) or not _amount(spend.get("spent_today")):
+        return ""
+    limit = spend.get("daily_limit")
+    if _amount(limit) and limit:
+        return f"Today: {spend['spent_today']:,g} of {limit:,g} credits"
+    return f"Today: {spend['spent_today']:,g} credits"
+
+
 def panel_data(runtime):
     if runtime is None:
-        return {"credits": "", "message": ""}
+        return {"credits": "", "today": "", "message": ""}
     with runtime.lock:
-        return {"credits": "" if config.BETA else credits_label(runtime.manifest, runtime.signed_in),
+        billing = config.billing_open()
+        return {"credits": credits_label(runtime.manifest, runtime.signed_in) if billing else "",
+                "today": today_label(runtime.manifest, runtime.signed_in) if billing else "",
                 "message": "Saving account settings…" if getattr(runtime, "account_saving", False)
                 else getattr(runtime, "account_message", "")}
 

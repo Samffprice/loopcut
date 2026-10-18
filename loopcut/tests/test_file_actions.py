@@ -128,7 +128,9 @@ class HostActionsTest(unittest.TestCase):
                                              measure=lambda font, size, text: len(text) * size * 0.6), 'is_host': bool,
                      'settings': SimpleNamespace(preferences=lambda: SimpleNamespace(), model_label=str),
                      '_config_cached': lambda: ('model', False, 24000), '_checkpoint_statuses': lambda session: {},
-                     '_cloud_panel_state': lambda session: {}, 'update': SimpleNamespace(banner=lambda: None),
+                     '_cloud_panel_state': lambda session: {}, '_connections_cached': lambda: {},
+                     '_key_needed': lambda needs_setup: '',
+                     'update': SimpleNamespace(banner=lambda: None),
                      '_displays': {}}
         namespace['account'].status = lambda: None
         source = ADDONS / 'loopcut/ui/host.py'

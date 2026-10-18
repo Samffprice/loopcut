@@ -5,8 +5,12 @@ manager with status, headers and read(). Tests inject one; production uses urlli
 redirects disabled so a service redirect cannot forward the account key to another host.
 """
 
+import errno
 import json
 import http.client
+import re
+import socket
+import ssl
 import threading
 import urllib.error
 import urllib.parse
@@ -23,12 +27,13 @@ MAX_RESPONSE = 4 * 1024 * 1024
 class CloudError(RuntimeError):
     """A contract error, retaining fields callers need for credits, retry and upgrades."""
 
-    def __init__(self, message, code, status=None, extra=None, error_type=None):
+    def __init__(self, message, code, status=None, extra=None, error_type=None, detail=None):
         super().__init__(message)
         self.code = code
         self.status = status
         self.extra = dict(extra or {})
         self.error_type = error_type
+        self.detail = detail  # A transport failure's describe() text; never a URL, header or key.
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,36 @@ def contract_headers():
     addon = ".".join(map(str, bl_info["version"]))
     return {"x-loopcut-contract": CONTRACT,
             "x-loopcut-client": f"loopcut-addon/{addon} blender/{blender}"}
+
+
+def describe(error):
+    """A transport failure as class plus errno or SSL reason, e.g. BrokenPipeError [Errno 32 EPIPE].
+
+    Never the exception's text: socket and HTTP messages can carry keys or signed URLs.
+    """
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+        error = error.reason
+    name = type(error).__name__
+    if isinstance(error, ssl.SSLError):
+        reason = getattr(error, "reason", None)
+        if not isinstance(reason, str):
+            found = re.search(r"\[SSL: ([A-Z0-9_]{1,64})\]", str(error))
+            reason = found and found[1]
+        return f"{name} {reason}" if isinstance(reason, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", reason) else name
+    if isinstance(error, TimeoutError):
+        return f"{name} (timed out)"
+    if isinstance(error, socket.gaierror):
+        return f"{name} (name lookup failed)"
+    if isinstance(error, OSError) and isinstance(error.errno, int):
+        symbol = errno.errorcode.get(error.errno)
+        return f"{name} [Errno {error.errno}{' ' + symbol if symbol else ''}]"
+    return name
+
+
+def _unreachable(error, request):
+    cause = describe(error)
+    print(f"Loopcut: {request.get_method()} request failed in transport: {cause}")
+    return CloudError(f"Could not reach the Loopcut service ({cause})", "connection_failed", detail=cause)
 
 
 def _read(response):
@@ -124,9 +159,9 @@ def send(request, transport_fn, timeout):
         with response:
             body = _read(response)
             status, headers = response.status, dict(response.headers)
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
-        # Transport messages and HTTP reason strings can contain keys or signed URLs.
-        raise CloudError("Could not reach the Loopcut service", "connection_failed") from None
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as ex:
+        # Transport messages and HTTP reason strings can contain keys or signed URLs: describe() only.
+        raise _unreachable(ex, request) from None
     if not (200 <= status < 300 or status == 304):
         raise _error(status, body, request) from None
     return body, status, headers
@@ -144,9 +179,9 @@ def open_response(request, transport_fn, timeout):
         with ex:
             body = _read(ex)
         raise _error(ex.code, body, request) from None
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as ex:
         # As in send(): transport messages and reasons can carry keys or signed URLs.
-        raise CloudError("Could not reach the Loopcut service", "connection_failed") from None
+        raise _unreachable(ex, request) from None
 
 
 class Client:

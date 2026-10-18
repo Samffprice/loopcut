@@ -18,7 +18,8 @@ import bpy
 
 from . import account, blender_import, chatgpt_auth, config, settings
 
-_state = {"step": None, "imported": None, "failed": [], "error": "", "own_key": False}
+# left_chatgpt: "Use your own API key" moved the provider off a ChatGPT plan; "Back to model choices" puts it back.
+_state = {"step": None, "imported": None, "failed": [], "error": "", "own_key": False, "left_chatgpt": False}
 _popups = set()  # Splash regions to repaint while a sign-in is in flight; see _refresh_popups.
 _REFRESH_SECONDS = 0.5
 
@@ -224,12 +225,36 @@ def _on_chatgpt_plan() -> bool:
     return prefs is not None and info.get("signed_in") and info.get("plan_usage")
 
 
+ACCOUNT_LEAD = ("Step 1 of 2. The best setup is both: a Loopcut account for tools, your ChatGPT plan for the "
+                "conversation. Either one is optional.")
+ACCOUNT_UNLOCKS = ("Search free asset libraries from the chat", "Trial credits for cloud tools: images, 3D, sound",
+                   "Loopcut's Fast model, free, if you don't use ChatGPT")
+ACCOUNT_UNLOCKS_NO_SALES = (ACCOUNT_UNLOCKS[0], "Cloud tools as they open: images, 3D, sound", ACCOUNT_UNLOCKS[2])
+ACCOUNT_FAILED = "Couldn't reach Loopcut. Try again, or skip and sign in later from the Loopcut panel."
+CONNECT_LEAD = "Your ChatGPT Plus or Pro plan runs the agent, with no charge from Loopcut."
+
+
+def _trial_line() -> str:
+    """"100 trial credits ($1)" once the manifest reports the grant and the server sells; else ""."""
+    from . import cloud, nudges
+    runtime = cloud._runtime
+    if runtime is None or not config.billing_open():
+        return ""
+    with runtime.lock:
+        trial = ((runtime.manifest.get("account") or {}).get("credits") or {}).get("trial")
+    amount = trial.get("amount") if isinstance(trial, dict) else None
+    return f"{amount:g} trial credits ({nudges.dollars(amount)})" if type(amount) in (int, float) and amount > 0 else ""
+
+
 def _draw_account(layout, context) -> None:
     """Accounts are encouraged independently of the model connection and never gate it."""
     column = _content(layout, "Create your free Loopcut account")
     status = account.status()
     if account.signed_in():
         column.label(text=f"Signed in as {account.account_line()}", icon="CHECKMARK")
+        trial = _trial_line()
+        if trial:
+            column.label(text=trial, icon="BLANK1")
         _step_button(column, "Continue", "connect")
     else:
         if status["status"] in ("starting", "waiting"):
@@ -244,11 +269,17 @@ def _draw_account(layout, context) -> None:
             column.label(text="Contacting Loopcut…", icon="TIME")
             _link(column, "Cancel", "loopcut.cancel_sign_in")
         else:
+            _notes(column, ACCOUNT_LEAD)
+            unlocks = column.column(align=True)
+            unlocks.scale_y = 0.8
+            for line in ACCOUNT_UNLOCKS if config.billing_open() else ACCOUNT_UNLOCKS_NO_SALES:
+                unlocks.label(text=line, icon="CHECKMARK")
+            column.separator()
             primary = column.column()
             primary.scale_y = 1.7
             primary.operator("loopcut.sign_in", text="Create free account", icon_value=account.mark_icon())
             if status["status"] == "error":
-                _notes(column, "Loopcut accounts open soon")
+                _notes(column, ACCOUNT_FAILED)  # Never the raw HTTP error; the log has it.
                 _step_button(column, "Continue", "connect")
         props = _link(column, "Skip for now", "loopcut.onboarding_step")
         props.step, props.save = "connect", False
@@ -259,7 +290,7 @@ def _draw_sign_in(layout, context) -> None:
     """Model choices stay available whether the optional Loopcut account was skipped or failed."""
     from . import chatgpt_ui
     chatgpt = chatgpt_ui.status()
-    column = _content(layout, "Connect a model")
+    column = _content(layout, "Connect your ChatGPT plan")
     if chatgpt["status"] == "waiting":
         _watch_popup(context)
         column.label(text="Finish signing in with ChatGPT in your browser", icon="URL")
@@ -273,10 +304,13 @@ def _draw_sign_in(layout, context) -> None:
         props = column.operator("loopcut.onboarding_step", text="Continue")
         props.step, props.save, props.provider = "privacy", True, "CHATGPT"
     else:
+        if account.signed_in():
+            column.label(text="Loopcut account connected", icon="CHECKMARK")
+        _notes(column, "Step 2 of 2. " + CONNECT_LEAD)
         primary = column.column()
         primary.scale_y = 1.7
         primary.operator("loopcut.chatgpt_sign_in", text="Sign in with ChatGPT", icon="USER")
-        _notes(column, "Recommended")
+        _notes(column, "Recommended · Plus or Pro · your plan's usage limits apply")
     if chatgpt["status"] == "error" and chatgpt["error"]:
         _notes(column, chatgpt["error"][:160], "Try signing in again, or use your own API key.")
         _link(column, "Use another ChatGPT account", "loopcut.chatgpt_sign_in").new_account = True
@@ -285,7 +319,11 @@ def _draw_sign_in(layout, context) -> None:
         column.separator()
         props = column.operator("loopcut.onboarding_step", text="Use Loopcut's models")
         props.step, props.save, props.provider = "privacy", True, "LOOPCUT"
-        _notes(column, "Fast and Pro")
+        _notes(column, "No ChatGPT plan? Fast is free; the Pro model comes with the Pro plan."
+               if config.billing_open() else "No ChatGPT plan? Fast and Pro")
+    else:
+        props = _link(column, "No ChatGPT plan? Create a free Loopcut account", "loopcut.onboarding_step")
+        props.step, props.save = "account", False
     column.separator()
     props = _link(column, "Skip for now", "loopcut.onboarding_step")
     props.step, props.save = "privacy", False
@@ -304,11 +342,19 @@ def _draw_privacy(layout) -> None:
     prefs = settings.preferences()
     provider = "OpenAI, on your ChatGPT plan" if prefs.provider == "CHATGPT" else settings.provider_label(prefs.provider)
     column = _content(layout, "Privacy and Control")
-    _notes(column,
-           f"Your messages, a description of the scene and viewport captures go to {provider}. "
-           "Your .blend files are never uploaded.",
-           "Loopcut passes them to the model provider behind Fast and Pro and keeps only token counts "
-           "for metering, never the content." if prefs.provider == "LOOPCUT" else settings.provider_note(prefs.provider))
+    if prefs.provider == "CHATGPT" and account.signed_in():  # Both connected: say what goes where.
+        _notes(column,
+               "Chat: your messages, a scene description and viewport captures go to OpenAI on your ChatGPT "
+               "plan. Loopcut's server never sees the conversation.",
+               "Cloud tools: only what a tool needs (a picture, a mesh, a line of text) goes to Loopcut, and "
+               "each one shows its credit price. Your .blend files are never uploaded.")
+    else:
+        _notes(column,
+               f"Your messages, a description of the scene and viewport captures go to {provider}. "
+               "Your .blend files are never uploaded.",
+               "Loopcut passes them to the model provider behind Fast and Pro and keeps only token counts "
+               "for metering, never the content." if prefs.provider == "LOOPCUT"
+               else settings.provider_note(prefs.provider))
     column.separator()
     column.prop(prefs, "auto_run")
     _notes(column, "Off: Loopcut asks before it runs code. Either way, every turn gets a checkpoint you can restore.")
@@ -330,9 +376,23 @@ def _draw_done(layout) -> None:
     ready = (f"Loopcut is ready on {settings.route_label()}" if _connected()
              else "Sign in or use your own model key in the Loopcut panel to start")
     column.label(text=f"{ready}. {shortcut} jumps to the chat.", icon="NONE" if _state["imported"] else "CHECKMARK")
+    nudge = done_nudge(_connected() and _on_chatgpt_plan(), account.signed_in(), _connected())
+    if nudge:
+        column.label(text=nudge, icon="INFO")
     layout.separator()
     layout.separator(type="LINE")
     layout.separator()
+
+
+def done_nudge(chatgpt: bool, loopcut: bool, connected: bool) -> str:
+    """The Done screen's one line about the half that is missing (spec §3); "" when both are connected."""
+    if chatgpt and loopcut:
+        return "ChatGPT runs the conversation; your Loopcut account runs assets and cloud tools."
+    if chatgpt:
+        return "Add a free Loopcut account any time for asset search and cloud tools: the panel's settings menu."
+    if loopcut and connected:
+        return "Have ChatGPT Plus or Pro? Sign in with ChatGPT in Preferences and the agent runs on your plan."
+    return ""
 
 
 def _failed_addons(context) -> list[str]:
@@ -432,7 +492,14 @@ class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
         prefs = settings.preferences()
         if prefs is not None:
             if self.enable and prefs.provider in {"LOOPCUT", "CHATGPT"}:
+                _state["left_chatgpt"] = prefs.provider == "CHATGPT"
                 prefs.provider = "OPENAI"
+            elif (not self.enable and _state["left_chatgpt"] and prefs.provider == "OPENAI"
+                  and chatgpt_auth.plan_signed_in()):
+                # Back without picking a provider: looking at the key form must not cost the ChatGPT plan.
+                prefs.provider = "CHATGPT"
+        if not self.enable:
+            _state["left_chatgpt"] = False
         if context.region_popup is not None:
             context.region_popup.tag_refresh_ui()
         return {"FINISHED"}

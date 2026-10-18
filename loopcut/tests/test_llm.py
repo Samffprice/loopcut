@@ -16,8 +16,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from loopcut import llm  # noqa: E402
+import fake_imbuf  # noqa: E402
+from loopcut import image_budget, llm  # noqa: E402
 
 
 def sse(*chunks: dict) -> bytes:
@@ -258,6 +260,54 @@ class LLMTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("ok"))
         self.call(max_tokens=0)
         self.assertNotIn("max_tokens", SCRIPT.requests[0]["body"])
+
+    # ------------------------------------------------------------------ image budget (image_budget.py)
+
+    def looks(self, n: int = 6) -> list[dict]:
+        """n stored renders as the agent sends them: ~390 KB of base64 each, 2.4 MB for six."""
+        import base64
+        photo = base64.b64encode(fake_imbuf.make(1568, 882, kind="JPEG", quality=85)).decode()
+        return [{"role": "user", "content": [{"type": "text", "text": f"Viewport capture: look {i}."},
+                                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo}"}}]}
+                for i in range(n)]
+
+    def fitted_call(self, messages: list, urlopen=None):
+        patches = [mock.patch.dict(sys.modules, {"imbuf": fake_imbuf}), mock.patch.object(llm, "_wait", lambda s, c: None)]
+        if urlopen:
+            patches.append(mock.patch.object(llm.urllib.request, "urlopen", urlopen))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return llm.stream_chat(base_url=self.base_url, api_key="secret", model="fast", messages=messages, tools=[],
+                               reasoning_effort="low", on_text=lambda _: None, is_cancelled=lambda: False)
+
+    def test_a_broken_pipe_upload_is_retried_with_smaller_images(self):
+        # The gateway, BYOK providers and the Claude Code bridge: the retry does not re-send the bytes that were cut.
+        import urllib.error
+        import urllib.request
+        SCRIPT.replies.append(text_reply("ok"))
+        sizes, real = [], urllib.request.urlopen
+
+        def urlopen(request, timeout=None):
+            sizes.append(len(request.data))
+            if len(sizes) == 1:
+                raise urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
+            return real(request, timeout=timeout)
+        self.assertEqual(self.fitted_call(self.looks(), urlopen).text, "ok")
+        self.assertEqual(len(sizes), 2)
+        self.assertLess(sizes[1], min(sizes[0], image_budget.REQUEST_BYTES // 2 + 50_000), "the retry: half the budget")
+        self.assertEqual(len(SCRIPT.requests), 1)
+
+    def test_a_413_is_retried_with_smaller_images_and_only_while_they_can_shrink(self):
+        SCRIPT.replies += [(413, {"error": {"message": "Request Entity Too Large"}}, None), text_reply("ok")]
+        self.assertEqual(self.fitted_call(self.looks()).text, "ok")
+        first, second = (len(json.dumps(r["body"])) for r in SCRIPT.requests)
+        self.assertLess(second, min(first, image_budget.REQUEST_BYTES // 2 + 50_000))
+        SCRIPT.requests.clear()
+        SCRIPT.replies.append((413, {"error": {"message": "Request Entity Too Large"}}, None))
+        with self.assertRaises(llm.LLMError) as caught:
+            self.fitted_call([{"role": "user", "content": "hi"}])
+        self.assertEqual((caught.exception.status, len(SCRIPT.requests)), (413, 1), "no images: the same bytes again")
 
     # ------------------------------------------------------------------ call_max_seconds
 

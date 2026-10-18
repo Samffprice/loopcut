@@ -1215,12 +1215,12 @@ class RoleTypesTest(unittest.TestCase):
 
 
 class PromptTest(unittest.TestCase):
-    def test_the_orchestrators_fixed_cost_stays_under_10511_tokens(self):
+    def test_the_orchestrators_fixed_cost_stays_under_10545_tokens(self):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
         fixed = context.fixed_tokens("", agent._orchestrator_schemas(), prompt_id="orchestrator", index=index)
-        self.assertLessEqual(fixed, 10511)
+        self.assertLessEqual(fixed, 10545)  # 10,534 on 2026-10-17 with the captures' labels switch.
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
 
 
@@ -1251,10 +1251,11 @@ class PromptTest(unittest.TestCase):
         self.assertNotIn("steps", worker)
         self.assertIn("letters and digits", worker["prefix"]["description"])
 
-    def test_the_workers_fixed_cost_stays_under_6223_tokens(self):
+    def test_the_workers_fixed_cost_stays_under_6255_tokens(self):
         """Service worker prompt size and public schemas stay within the worker cap."""
         from prompt_index_fixture import built_index
-        self.assertLessEqual(context.fixed_tokens("", workers.schemas(), prompt_id="worker", index=built_index()), 6223)
+        fixed = context.fixed_tokens("", workers.schemas(), prompt_id="worker", index=built_index())
+        self.assertLessEqual(fixed, 6255)  # 6,243 on 2026-10-17 with capture_viewport's labels.
 
     def test_uv_and_texture_tools_reach_every_role_and_run_in_the_child(self):
         from loopcut import tools, worker_host

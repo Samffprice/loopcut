@@ -51,7 +51,25 @@ def tag_redraw_all() -> None:
 def config_changed() -> None:
     """Settings were edited: show the new model (or the lack of a key) on the next redraw."""
     _runtime.pop("model", None)
+    _runtime.pop("connections", None)
     tag_redraw_all()
+
+
+def _connections_cached() -> dict:
+    """The sign-in states the cards draw from (both connections, the tips switch), reread every CONFIG_TTL:
+    the ChatGPT one reads a file, and drawing happens on every mouse move."""
+    cached = _runtime.get("connections")
+    if cached is None or time.monotonic() - cached[1] > CONFIG_TTL:
+        from .. import chatgpt_auth, nudges
+        try:
+            chatgpt = chatgpt_auth.plan_signed_in()
+        except Exception as ex:  # An unreadable sign-in file must not stop the panel drawing.
+            print(f"Loopcut: could not read the ChatGPT sign-in: {ex!r}")
+            chatgpt = False
+        cached = ({"chatgpt_plan": chatgpt, "loopcut_signed_in": account.signed_in(),
+                   "tips_off": nudges.tips_off()}, time.monotonic())
+        _runtime["connections"] = cached
+    return cached[0]
 
 
 def _model_label() -> tuple[str, bool]:
@@ -70,6 +88,15 @@ def _config_cached() -> tuple[str, bool, int]:
             cached = ("Set up Loopcut", True, config.DEFAULT_CONTEXT_BUDGET, time.monotonic())
         _runtime["model"] = cached
     return cached[0], cached[1], cached[2]
+
+
+def _key_needed(needs_setup: bool) -> str:
+    """The own-key provider chosen in Preferences that still has no usable setup ("OpenAI"): the panel asks for
+    its key rather than showing the first-run sign-in card while the user's accounts stay connected (F0287)."""
+    prefs = settings.preferences() if needs_setup else None
+    if prefs is None or prefs.provider in {"LOOPCUT", "CHATGPT"}:
+        return ""
+    return settings.provider_label(prefs.provider)
 
 
 def _checkpoint_statuses(session: dict) -> dict:
@@ -123,17 +150,19 @@ def draw_area() -> None:
     session = state.session()
     draw.retain_images(_image_paths(session))
     model, needs_setup, budget = _config_cached()
+    key_needed = _key_needed(needs_setup)
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
-    from .. import cloud_jobs, workspace
+    from .. import cloud_jobs, playback, workspace
     from .. import chatgpt_ui, onboarding
     if any(item["kind"] == "user" for item in session["items"]):
         onboarding.dismiss_hints()
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
-                            "missing_paths": _missing_paths(session),
-                            "context_budget": budget, "model_options": options, "model_label": settings.model_label(model),
+                            "key_needed": key_needed,
+                            "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
+                            "context_budget": budget, "model_options": options, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
                             "hints_dismissed": onboarding.hints_dismissed(),
                             "sign_in": {"loopcut": account.status(), "chatgpt": chatgpt_ui.status()},
                             "update": update.banner(), "cloud_jobs": cloud_jobs.ui_rows(),
@@ -141,7 +170,7 @@ def draw_area() -> None:
                             "service_policy": {key: getattr(prefs, key, default) for key, default in cloud_account.DEFAULTS.items()},
                             "service_signed_in": bool(cloud._runtime and cloud._runtime.signed_in),
                             "project_override": cloud_account.project_override(context.scene),
-                            **_cloud_panel_state(session)})
+                            **_connections_cached(), **_cloud_panel_state(session)})
     if state.ui.get("view") == "vote":
         state.ui["vote_scroll"] = min(max(state.ui.get("vote_scroll", 0.0), 0.0), display["max_scroll"])
     else:
@@ -165,6 +194,8 @@ def _refresh_missing_paths(session, *, force=False):
     for item in session["items"]:
         paths.update(ref["target"] for ref in item.get("file_references", [])[:layout.REFERENCE_LIMIT]
                      if ref["kind"] == "file")
+        if item.get("audio"):  # A sound card's Play is disabled once its file is gone.
+            paths.add(item["audio"]["path"])
     now = time.monotonic()
     cached = _runtime.get("paths")
     if not force and cached is not None and cached[:2] == (session["id"], paths) and now - cached[2] < PATH_TTL:
@@ -204,7 +235,8 @@ def _cloud_panel_state(session: dict) -> dict:
         rows = _eased_levels(rows)
     return {"coming_soon": rows, "vote_notice": cloud.vote_notice(),
             "cloud_message": message if message == saved["message"] else "",
-            "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"]}
+            "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"],
+            "today": service.get("today", "")}
 
 
 VOTE_EASE_SECONDS = 0.5     # A bar's move to a new level.
@@ -385,10 +417,20 @@ def _do_action(session: dict, action) -> None:
         if error:
             session["items"].append(state.item_error(error))
             session["scroll"] = 0.0
+    elif kind == "audio_play":
+        from .. import playback
+        error = playback.play(index)  # The card's file; it stops the sound playing, if any.
+        _refresh_missing_paths(session, force=True)
+        if error:
+            session["items"].append(state.item_error(error))
+            session["scroll"] = 0.0
+    elif kind == "audio_stop":
+        from .. import playback
+        playback.stop()
     elif kind == "approve":
-        agent.decide(True)
+        agent.decide(True, index=index)  # That card: a worker's paid ask may wait beside the turn's own.
     elif kind == "approve_always":
-        agent.decide(True, always=True)
+        agent.decide(True, always=True, index=index)
     elif kind == "keep_changes":
         session["items"][index]["resolved"] = "kept"
         conversations.save(session)
@@ -427,11 +469,27 @@ def _do_action(session: dict, action) -> None:
         from .. import cloud, cloud_account
         cloud_account.set_project_override(bpy.context.scene, index)
         cloud.sync_settings()
-    elif kind == "cloud_upgrade" and not config.BETA:
+    elif kind == "cloud_upgrade" and config.billing_open():
         from .. import cloud_http
         url = session["items"][index]["cloud_error"]["upgrade"]
         cloud_http.validate_url(url)
         account.open_browser(url)
+    elif kind == "open_web":
+        from .. import cloud_http
+        cloud_http.validate_url(index)
+        account.open_browser(index)
+    elif kind == "offer":
+        _offer_action(session, *index)
+    elif kind == "tips_toggle":
+        from .. import nudges
+        nudges.set_tips_off(not nudges.tips_off())
+        _runtime.pop("connections", None)
+    elif kind == "limit_chatgpt":
+        prefs = settings.preferences()  # The user's own pick: their ChatGPT plan carries the turn on (M7).
+        if prefs is not None and not session["busy"]:
+            prefs.provider = "CHATGPT"
+            config_changed()
+            agent.resume()
     elif kind == "cloud_dismiss":
         from .. import cloud
         cloud.dismiss_ui_message(index)
@@ -452,6 +510,13 @@ def _do_action(session: dict, action) -> None:
             bpy.ops.loopcut.chatgpt_cancel()
         else:
             bpy.ops.loopcut.cancel_sign_in()
+    elif kind == "use_provider" and index in {"CHATGPT", "LOOPCUT"} and not session["busy"]:
+        prefs = settings.preferences()  # The user's own pick, from the add-your-key prompt (layout._key_prompt).
+        if prefs is not None:
+            prefs.provider = index
+            if index == "LOOPCUT":
+                settings.set_tier(account.default_model())
+            config_changed()
     elif kind == "own_key":
         _close_popups()
         from .. import chatgpt_ui
@@ -484,7 +549,7 @@ def _do_action(session: dict, action) -> None:
         conversations.save(session)
     elif kind == "open_account":
         account.open_browser(config.account_url())
-    elif kind == "limit_upgrade" and not config.BETA:
+    elif kind == "limit_upgrade" and config.billing_open():
         _start_upgrade(session, session["items"][index])
     elif kind == "limit_fast":
         settings.set_tier(account.default_model())
@@ -501,7 +566,9 @@ def _do_action(session: dict, action) -> None:
             pinned[index]["pinned"] = False
             conversations.save(session)
     elif kind == "reject":
-        agent.decide(False)
+        agent.decide(False, index=index)
+    elif kind == "stop_turn":
+        agent.stop()
     elif kind == "toggle":
         item = session["items"][index]
         item["expanded"] = not item.get("expanded", False)
@@ -530,7 +597,9 @@ def _do_action(session: dict, action) -> None:
         job_tools.ui_action(kind, index)
     elif kind == "cloud_job_cancel":
         from .. import cloud_jobs
-        cloud_jobs.cancel_job(index)
+        if not cloud_jobs.cancel_job(index):  # Say so rather than ignore the click (C47).
+            state.ui["action_notice"] = {"text": "That job already finished, so it can't be canceled.",
+                                         "until": time.time() + 6.0}
     elif kind == "worker_cancel":
         from .. import waves
         waves.cancel_worker(*index)  # (wave, worker): that worker stops and is not merged; the rest go on.
@@ -570,10 +639,52 @@ def _accept_quarantine(session: dict, item: dict) -> None:
     conversations.save(session)
 
 
+def _offer_action(session: dict, index: int, choice: int) -> None:
+    """A conversion card's button (nudges.py). Purchases open loopcut.org; nothing is bought in Blender."""
+    from .. import cloud_http, nudges
+    items = session["items"]
+    if not 0 <= index < len(items) or items[index].get("kind") != "offer":
+        return
+    item = items[index]
+    if not 0 <= choice < len(item["actions"]):
+        return
+    do, arg = item["actions"][choice]["do"], item["actions"][choice].get("arg", "")
+    if do == "sign_in_loopcut":
+        bpy.ops.loopcut.sign_in()
+    elif do == "sign_in_chatgpt":
+        bpy.ops.loopcut.chatgpt_sign_in()
+    elif do == "web":
+        cloud_http.validate_url(arg)
+        account.open_browser(arg)
+    elif do == "manage_chatgpt":
+        bpy.ops.loopcut.chatgpt_manage_usage()
+    elif do == "vendor_keys":
+        _close_popups()
+        _open_settings()
+    elif do == "own_key":
+        _do_action(session, ("own_key", None))
+    elif do == "prompt" and not session["busy"]:
+        textedit.set_text(session, arg)
+        session["focused"] = True
+    elif do == "continue_loopcut" and not session["busy"]:
+        prefs = settings.preferences()
+        if prefs is None:
+            return
+        prefs.provider = "LOOPCUT"  # The user's own pick of Loopcut's models; it stays until they switch back.
+        settings.set_tier(account.default_model())
+        config_changed()
+        item["resolved"] = "Carrying on with Loopcut Fast. Switch back any time in Preferences."
+        agent.resume()
+    elif do == "dismiss":
+        if item.get("nudge") in nudges.SOFT + ("locked_tool",):
+            nudges.snooze(item["nudge"])
+        item["resolved"] = nudges.DISMISSED
+
+
 def _start_upgrade(session: dict, item: dict) -> None:
     """Open the plans page and wait for the plan to change; then the turn goes on by itself,
     so the user comes back to Blender to find the work under way."""
-    if config.BETA:
+    if not config.billing_open():
         return
     account.open_browser(item["upgrade"]["url"])
     item["status"] = "waiting"
@@ -660,30 +771,57 @@ def has_panel(window) -> bool:
     return window.as_pointer() in _docking or find_panel(window) is not None
 
 
+def _leftovers(window) -> list:
+    """Text Editors the panel borrowed, back from a saved file as plain empty editors: `hosts` holds
+    pointers, which a reload does not keep, but the file keeps the regions `_show_in` hid. A user's
+    own Text Editor shows a text or its header, footer or sidebar."""
+    found = []
+    for area in window.screen.areas:
+        if area.type != "TEXT_EDITOR" or is_host(area):
+            continue
+        space = area.spaces.active
+        if not (space.text or space.show_region_header or space.show_region_footer or space.show_region_ui):
+            found.append(area)
+    return found
+
+
 def dock(window, then=None) -> None:
-    """Split the largest 3D viewport and put the panel on its right, where Cursor keeps its chat.
-    The new area only has its geometry a tick later, so the panel is opened (and `then(area)`
-    called) from a timer."""
+    """Put the panel on the right of the largest 3D viewport, where Cursor keeps its chat. The area
+    it had when the file was saved is used again, so save, reopen and dock never adds one; else the
+    viewport is split. The new area only has its geometry a tick later, so the panel is opened (and
+    `then(area)` called) from a timer."""
+    reuse = find_panel(window) or max(_leftovers(window), key=lambda a: a.width, default=None)
     views = [a for a in window.screen.areas if a.type == "VIEW_3D"]
-    if not views:
+    if reuse is None and not views:
         raise RuntimeError("Loopcut docks next to a 3D viewport, and this window has none.")
-    view = max(views, key=lambda a: a.width * a.height)
-    region = next(r for r in view.regions if r.type == "WINDOW")
     before = {a.as_pointer() for a in window.screen.areas}
     key = window.as_pointer()
     _docking.add(key)
-    try:
-        with bpy.context.temp_override(window=window, area=view, region=region):
-            bpy.ops.screen.area_split(direction="VERTICAL", factor=DOCK_FACTOR)
-    except Exception:
-        _docking.discard(key)
-        raise
+    if reuse is None:
+        view = max(views, key=lambda a: a.width * a.height)
+        region = next(r for r in view.regions if r.type == "WINDOW")
+        try:
+            with bpy.context.temp_override(window=window, area=view, region=region):
+                bpy.ops.screen.area_split(direction="VERTICAL", factor=DOCK_FACTOR)
+        except Exception:
+            _docking.discard(key)
+            raise
 
     def finish():
         try:
-            fresh = [a for a in window.screen.areas if a.as_pointer() not in before]
-            panel = max(fresh + [view], key=lambda a: a.x)
+            panel = reuse
+            if panel is None:
+                fresh = [a for a in window.screen.areas if a.as_pointer() not in before]
+                panel = max(fresh + [view], key=lambda a: a.x)
             _show_in(panel)
+            # Files from builds that split on every reopen keep several. Left to right, each then borders
+            # the viewport, which Blender joins it into: on a tie the older area wins, and they were split from it.
+            for area in sorted(_leftovers(window), key=lambda a: a.x):
+                try:
+                    with bpy.context.temp_override(window=window, area=area):
+                        bpy.ops.screen.area_close()
+                except RuntimeError as ex:
+                    print(f"Loopcut: could not close an empty editor: {ex}")
             if then:
                 then(panel)
         finally:
@@ -985,7 +1123,7 @@ class LOOPCUT_OT_hover(bpy.types.Operator):
 
 
 class LOOPCUT_OT_attach_images(bpy.types.Operator):
-    """Attach images to your next message"""
+    """Attach images or a video clip to your next message"""
     bl_idname = "loopcut.attach_images"
     bl_label = "Attach Images"
     bl_options = {"INTERNAL"}
@@ -994,6 +1132,7 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
     directory: bpy.props.StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE", "HIDDEN"})
     files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement, options={"SKIP_SAVE", "HIDDEN"})
     filter_image: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
+    filter_movie: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
     filter_folder: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
 
     def invoke(self, context, event):
@@ -1006,7 +1145,18 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
         from .. import attachments
         session = state.session()
         paths = [str(Path(self.directory) / entry.name) for entry in self.files if entry.name]
+        clips = [p for p in paths if attachments.is_video(p)]
+        paths = [p for p in paths if p not in clips]
         problems = attachments.add(session, paths)
+        if clips:  # One clip at a time: each needs its part chosen.
+            problems += [f"{Path(p).name}: attach one clip at a time." for p in clips[1:]]
+            window, clip = context.window, clips[0]
+
+            def trim():
+                with bpy.context.temp_override(window=window):
+                    bpy.ops.loopcut.attach_clip("INVOKE_DEFAULT", filepath=clip)
+            bpy.app.timers.register(trim, first_interval=0.0)
+            paths.append(clip)  # Not a failure: the dialog takes it from here.
         for problem in problems:
             session["items"].append(state.item_error(problem))
         if session["attachments"] and not session["focused"]:
@@ -1021,11 +1171,94 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
         return {"FINISHED"} if len(problems) < len(paths) else {"CANCELLED"}
 
 
+_clip_previews: dict = {}  # bpy.utils.previews collection for the clip dialog's thumbnail.
+
+
+def _clip_preview(path: str) -> int:
+    """An icon id for the clip's thumbnail, or 0. Blender's own movie thumbnails; best effort."""
+    try:
+        from bpy.utils import previews  # Not `import bpy.utils.previews`: that makes bpy a local name.
+        if "collection" not in _clip_previews:
+            _clip_previews["collection"] = previews.new()
+        collection = _clip_previews["collection"]
+        preview = collection.get(path) or collection.load(path, path, "MOVIE")
+        return preview.icon_id
+    except (ImportError, KeyError, RuntimeError, AttributeError):
+        return 0
+
+
+class LOOPCUT_OT_attach_clip(bpy.types.Operator):
+    """Choose the part of a video clip to attach (at most 15 s) and what to watch in it"""
+    bl_idname = "loopcut.attach_clip"
+    bl_label = "Attach Clip"
+    bl_options = {"INTERNAL"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE", "HIDDEN"})
+    duration: bpy.props.FloatProperty(options={"SKIP_SAVE", "HIDDEN"})
+    summary: bpy.props.StringProperty(options={"SKIP_SAVE", "HIDDEN"})
+    start: bpy.props.FloatProperty(name="In", description="Seconds from the clip's start", min=0.0,
+                                   precision=2, step=10, options={"SKIP_SAVE"})
+    end: bpy.props.FloatProperty(name="Out", description="Seconds from the clip's start; at most 15 s after In",
+                                 min=0.0, precision=2, step=10, options={"SKIP_SAVE"})
+    watch: bpy.props.StringProperty(name="Watch", description="Optional: what to look at, in your words, "
+                                    "e.g. \"the crossbow and my hands\"", options={"SKIP_SAVE"})
+    solve_camera: bpy.props.BoolProperty(name="Solve camera motion", default=True, options={"SKIP_SAVE"},
+                                         description="Track the footage to recover handheld camera motion; "
+                                                     "dropped when the solve is poor")
+
+    def invoke(self, context, event):
+        from .. import video_attach
+        from ..videoref import MAX_SECONDS, ClipError
+        try:
+            info = video_attach.probe(Path(self.filepath))
+        except ClipError as ex:
+            state.session()["items"].append(state.item_error(str(ex)))
+            tag_redraw_all()
+            return {"CANCELLED"}
+        self.duration = info["frames"] / info["fps"]
+        width, height = info["size"]
+        self.summary = f"{width}x{height} · {info['fps']:.2f} fps · {self.duration:.1f} s"
+        self.start, self.end = 0.0, min(self.duration, MAX_SECONDS)
+        return context.window_manager.invoke_props_dialog(self, width=360, confirm_text="Attach")
+
+    def draw(self, context):
+        from ..videoref import MAX_SECONDS
+        layout = self.layout
+        layout.label(text=Path(self.filepath).name, icon="FILE_MOVIE")
+        icon = _clip_preview(self.filepath)
+        if icon:
+            layout.template_icon(icon_value=icon, scale=6.0)
+        layout.label(text=self.summary)
+        row = layout.row(align=True)
+        row.prop(self, "start")
+        row.prop(self, "end")
+        length = self.end - self.start
+        layout.label(text=f"Uses {length:.2f} s of at most {MAX_SECONDS:g} s",
+                     icon="ERROR" if length > MAX_SECONDS or length <= 0 else "TIME")
+        layout.prop(self, "watch")
+        layout.prop(self, "solve_camera")
+        layout.label(text="The clip stays on this computer; the model sees still frames.", icon="LOCKED")
+
+    def execute(self, context):
+        from .. import video_attach
+        from ..videoref import ClipError
+        session = state.session()
+        try:
+            video_attach.start(session, Path(self.filepath), self.start, self.end, self.watch, self.solve_camera)
+        except (ClipError, OSError) as ex:
+            session["items"].append(state.item_error(f"{Path(self.filepath).name}: {ex}"))
+            tag_redraw_all()
+            return {"CANCELLED"}
+        conversations.save(session)
+        tag_redraw_all()
+        return {"FINISHED"}
+
+
 class LOOPCUT_FH_images(bpy.types.FileHandler):
     bl_idname = "LOOPCUT_FH_images"
     bl_label = "Attach to Loopcut"
     bl_import_operator = LOOPCUT_OT_attach_images.bl_idname
-    bl_file_extensions = ".png;.jpg;.jpeg;.webp;.bmp;.tif;.tiff;.tga"  # attachments.EXTENSIONS
+    bl_file_extensions = ".png;.jpg;.jpeg;.webp;.bmp;.tif;.tiff;.tga;.mp4;.mov"  # attachments.ACCEPTED
 
     @classmethod
     def poll_drop(cls, context):
@@ -1033,7 +1266,7 @@ class LOOPCUT_FH_images(bpy.types.FileHandler):
 
 
 _CLASSES = (LOOPCUT_OT_open, LOOPCUT_OT_focus, LOOPCUT_OT_scroll, LOOPCUT_OT_interact, LOOPCUT_OT_hover,
-            LOOPCUT_OT_attach_images,
+            LOOPCUT_OT_attach_images, LOOPCUT_OT_attach_clip,
             LOOPCUT_FH_images)
 
 
@@ -1057,7 +1290,12 @@ def register() -> None:
 
 
 def unregister() -> None:
+    from .. import playback
+    playback.stop()  # A card's sound does not outlive the panel's code.
     draw.retain_images(())
+    if "collection" in _clip_previews:
+        from bpy.utils import previews
+        previews.remove(_clip_previews.pop("collection"))
     state.session()["focused"] = False
     if "keymap" in _runtime:
         for keymap, items in _runtime.pop("keymap"):

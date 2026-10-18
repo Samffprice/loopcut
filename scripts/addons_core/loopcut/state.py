@@ -47,6 +47,10 @@ def new_session() -> dict:
         "auto_run": False,               # "Always allow" for this conversation; never saved.
         "auto_heavy": False,             # "Always allow renders" (and bakes) likewise.
         "contact_watch": [],             # check_contact pairs run_python measures again; never saved.
+        # Credits this chat spent (spending.py, C47): {credits, auto, allowed}; saved with the conversation.
+        # spend_vendors: own-key vendors approved in this chat; consent, so never saved (like auto_run).
+        "spend": {"credits": 0, "auto": 0, "allowed": 0},
+        "spend_vendors": [],
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},
@@ -107,9 +111,17 @@ def item_notice(text: str, action_label: str = "", checkpoint: str = "", url: st
     return {"kind": "notice", "text": text, "action_label": action_label, "checkpoint": checkpoint, "url": url}
 
 
+def item_audio(name: str, path: str, seconds: float, peaks: list[float]) -> dict:
+    """A generated sound's card in the chat (Play / Stop, playback.py). Kept a notice, so an add-on from
+    before audio cards still opens the chat and shows its text: older add-ons refuse unknown item kinds."""
+    item = item_notice(f"Sound strip added: {name}.")
+    item["audio"] = {"name": name, "path": path, "seconds": seconds, "peaks": list(peaks)}
+    return item
+
+
 def notice_for_display(item: dict) -> dict:
     """Old conversations may retain the pre-beta low-allowance purchase notice."""
-    if config.BETA and urlsplit(item.get("url", "")).path.rstrip("/") in {"/pricing", "/checkout"}:
+    if not config.billing_open() and urlsplit(item.get("url", "")).path.rstrip("/") in {"/pricing", "/checkout"}:
         return {**item, "text": item["text"].split(" Upgrading now", 1)[0], "url": "", "action_label": ""}
     return item
 
@@ -125,14 +137,23 @@ def item_limit(text: str, reason: str, plan: str, resets_at: str, upgrade: dict 
     """The gateway refused a request for want of allowance. upgrade: {url, plan, label, note}
     from the gateway, or None on the top plan. status: "" | waiting (the plans page is open and
     the add-on polls for the new plan) | done (upgraded; the turn goes on by itself)."""
-    if config.BETA and reason in {"week_limit", "session_limit", "model_not_in_plan"}:
+    billing = config.billing_open()
+    if not billing and reason in {"week_limit", "session_limit", "model_not_in_plan"}:
         text = {"week_limit": "This week's allowance is used.",
                 "session_limit": "This session's allowance is used.",
                 "model_not_in_plan": "This model is unavailable."}[reason]
         if resets_at:
             text += f" It resets {resets_at}."
     return {"kind": "limit", "text": text, "reason": reason, "plan": plan, "resets_at": resets_at or "",
-            "upgrade": dict(upgrade) if upgrade and not config.BETA else None, "status": ""}
+            "upgrade": dict(upgrade) if upgrade and billing else None, "status": ""}
+
+
+def item_offer(nudge: str, title: str, text: str, actions: list[dict]) -> dict:
+    """A conversion card (nudges.py): a title, a line or two, and buttons ({label, do, arg, when}). Never
+    saved with the conversation: it is about the moment, and an older add-on would refuse the file.
+    resolved: "" while the buttons show."""
+    return {"kind": "offer", "nudge": nudge, "title": title, "text": text, "actions": [dict(a) for a in actions],
+            "resolved": ""}
 
 
 def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:
@@ -140,8 +161,9 @@ def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:
     return {"kind": "changes", "text": text, "lines": lines, "checkpoint": checkpoint, "resolved": ""}
 
 
-def item_error(text: str) -> dict:
-    return {"kind": "error", "text": text}
+def item_error(text: str, retry: bool = False) -> dict:
+    """retry: the turn stopped on a dropped connection, so the card offers Try again (agent.resume)."""
+    return {"kind": "error", "text": text, **({"retry": True} if retry else {})}
 
 
 WAVE_RUNNING = ("queued", "starting", "working", "checking", "merging")  # A saved one reloads as "stopped".

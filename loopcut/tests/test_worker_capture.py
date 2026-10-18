@@ -7,6 +7,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -291,6 +292,26 @@ class ReferenceTest(unittest.TestCase):
             self.assertIsNone(W._role["reference"])
             W.configure("materials", Path(folder) / "looks", brief={})
             self.assertIsNone(W._role["reference"])
+
+class LabelsTest(unittest.TestCase):
+    """Object names on a worker's look only when asked: on a close shot they covered what was being judged."""
+
+    def labels(self, **kwargs):
+        blender = types.SimpleNamespace(context=types.SimpleNamespace(scene=None))
+        with mock.patch.object(W, "_look", return_value="shot") as look, mock.patch.object(W, "bpy", blender), \
+                mock.patch.object(W.view_layers, "production"), \
+                mock.patch.dict(W._role, {"role": "modeling", "count": 0, "reference": None}):
+            self.assertEqual(W.look(**kwargs), "shot")
+        return look.call_args.kwargs["labels"]
+
+    def test_names_only_when_asked(self):
+        self.assertIs(self.labels(), False)
+        self.assertIs(self.labels(angle="camera"), False)
+        self.assertIs(self.labels(angles=["front", "top"]), False)
+        self.assertIs(self.labels(labels=True), True)
+        with self.assertRaisesRegex(W.ToolError, "labels must be true or false"):
+            W.look(labels="yes")
+
 
 if __name__ == "__main__":
     unittest.main()

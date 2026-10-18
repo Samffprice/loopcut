@@ -29,7 +29,7 @@ from pathlib import Path
 WORKSPACE = Path(__file__).resolve().parents[4]           # .../BlenderCursor/loopcut
 ENV_FILE = WORKSPACE.parent / "loopcut-web" / ".env.local"
 MODEL = "glm-5.3-flash"
-EXTRA = {"reasoning_effort": "low"}                        # Same as the gateway row / mixar_tap.
+EXTRA = {"reasoning_effort": "low"}                        # Same as the gateway row and the research capture tap.
 MAX_TOKENS = 24
 
 

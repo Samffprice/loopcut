@@ -172,9 +172,14 @@ def check():
                   space.overlay.show_overlays, "Render Result" in bpy.data.images)
         shot = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"]}))
         assert shot.ok and shot.image_path.stat().st_size > 10_000, shot
-        assert "labelled with their names" in shot.text, shot.text
+        assert "labelled" not in shot.text, shot.text  # Object names only when asked for.
         out = checkout.OUT
         shutil.copy(shot.image_path, out / "capture_check.png")  # viewport.png is rewritten by every capture.
+        named = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"], "labels": True}))
+        assert named.ok and "objects are labelled with their names" in named.text, named.text
+        drawn = abs(tools._pixels(named.image_path) - tools._pixels(out / "capture_check.png")).max()
+        assert float(drawn) > 0.5, "labels: true must draw the names"
+        shutil.copy(named.image_path, out / "capture_labels_check.png")
         assert ("Render Result" in bpy.data.images) == before[-1], "an offscreen capture must not write Render Result"
         # The same picture twice is alike; after a change it is not.
         same = tools.execute("capture_viewport", json.dumps({"focus": ["Cube", "Sphere"]}))
@@ -204,8 +209,7 @@ def check():
                 assert tuple(sheet.size) == (tools.SHEET_TILE[0] * 2, tools.SHEET_TILE[1] * 2), tuple(sheet.size)
                 bpy.data.images.remove(sheet)
                 assert "four views of" in extra.text, extra.text
-            if name == "capture_user":
-                assert "labelled" not in extra.text, "the user's view is shown as is"
+            assert "labelled" not in extra.text, (name, "object names only when asked for")
         after = (space.region_3d.view_distance, tuple(space.region_3d.view_rotation), space.shading.type,
                  space.overlay.show_overlays, "Render Result" in bpy.data.images)
         assert before == after, f"user's view must be restored after every style: {before} -> {after}"
@@ -248,7 +252,7 @@ def check():
                                   "name": "Reference Photo.png", "pinned": True}]
         images_before = set(bpy.data.images.keys())
         both = tools.execute("compare_with_reference", json.dumps({"name": "reference photo.png", "angle": "front"}))
-        assert both.ok and "on the left, front view" in both.text, both.text
+        assert both.ok and "on the left, front view" in both.text and "labelled" not in both.text, both.text
         side_by_side = bpy.data.images.load(str(both.image_path))
         assert side_by_side.size[0] > 2 * tools.CAPTURE_WIDTH and side_by_side.size[1] > 100, tuple(side_by_side.size)
         bpy.data.images.remove(side_by_side)

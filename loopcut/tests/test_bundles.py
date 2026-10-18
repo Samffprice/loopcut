@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import shutil
 import sys
 import tempfile
 import types
@@ -21,6 +22,13 @@ from fake_blobs import FakeBlobs  # noqa: E402
 INFO = {"blender": "5.2.0", "scene": {"name": "Scène", "camera": "Camera", "frame_start": 1,
                                         "frame_end": 120, "fps": 24}, "missing": [], "unsupported": [], "system": []}
 SOURCE = {"kind": "checkpoint", "session": "ab" * 16, "checkpoint": "cd" * 16}
+
+
+class PathMap(list):
+    """bpy.data.file_path_map's result, as (ID, raw paths) pairs: fake IDs are not hashable."""
+
+    def items(self):
+        return list(self)
 
 
 class Image(types.SimpleNamespace):
@@ -92,6 +100,17 @@ class BundlesTest(unittest.TestCase):
         self.assertIn("Scène".encode(), body)
         self.assertEqual(body, json.dumps(first, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
 
+    def test_canonical_json_writes_whole_floats_as_javascript_does(self):
+        # Blender's fps is 24.0 (fps / fps_base). The service re-serializes the manifest in
+        # JavaScript, which writes 24, and checks that hash: "fps":24.0 got every bundle refused as
+        # "Upload a valid bundle manifest…" (live test 2026-10-17).
+        value = bundles.manifest(self.root, {**INFO, "scene": {**INFO["scene"], "fps": 24.0}}, SOURCE)
+        body = bundles.canonical_json(value)
+        self.assertIn(b'"fps":24,', body)
+        self.assertNotIn(b"24.0", body)
+        fractional = bundles.manifest(self.root, {**INFO, "scene": {**INFO["scene"], "fps": 23.976}}, SOURCE)
+        self.assertIn(b'"fps":23.976,', bundles.canonical_json(fractional))
+
     def test_explicit_checkpoint_creation_time_is_used(self):
         value = bundles.manifest(self.root, {**INFO, "created_at": "2026-10-03T18:00:00Z"}, SOURCE)
         self.assertEqual(value["created_at"], "2026-10-03T18:00:00Z")
@@ -134,6 +153,16 @@ class BundlesTest(unittest.TestCase):
         self.assertEqual(bundles.upload(self.root, value, client=service.client()), digest)
         self.assertEqual(len(service.puts), 3)
         self.assertEqual(bundles.manifest(self.root, INFO, SOURCE), value)
+
+    def test_a_large_scene_goes_in_parts_when_the_server_offers_multipart(self):
+        value = bundles.manifest(self.root, INFO, SOURCE)
+        scene = next(item for item in value["files"] if item["path"] == "scene.blend")
+        service = FakeBlobs(part_size=max(1, scene["size"] // 2))
+        digest = bundles.upload(self.root, value, client=service.client(), multipart={"min_size": scene["size"]})
+        self.assertEqual(service.stored[scene["sha256"]], (self.root / "scene.blend").read_bytes())
+        self.assertGreaterEqual(len(service.part_puts), 2)
+        self.assertNotIn(scene["sha256"], service.puts)
+        self.assertEqual(service.puts[-1], digest)  # The manifest itself stays one small PUT.
 
     def test_changed_or_added_staging_file_is_not_published(self):
         value = bundles.manifest(self.root, INFO, SOURCE)
@@ -310,6 +339,198 @@ class CollectionTest(unittest.TestCase):
             self.assertEqual((stage / libs[0].filepath[2:]).read_bytes(), b"library bytes")
             self.assertEqual(libs[2].filepath, "//libraries/packed.blend")
             self.assertEqual(len(list(stage.rglob("*.blend"))), 2)
+
+    def test_appended_from_notes_and_empty_paths_are_not_inputs(self):
+        # blend_paths lists ID.library_weak_reference for every appended ID, packed or not (a
+        # BlenderKit Glock: live test 2026-10-17), and "" for one the model cleared, which once
+        # resolved to the scene's whole folder. A linked ID's note must not make its library complex.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project, snapshot, stage = root / "project", root / "snapshot.blend", root / "bundle"
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            glock = root / "data/blenderkit/d72fd57d/resolution_2K.blend"  # the eval folder is gone
+            concrete = root / "data/blenderkit/ac2ff40c/resolution_2K.blend"
+            library_path = project / "libraries/rocks.blend"
+            for path in (concrete, library_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"blend")
+
+            def weak(path):
+                return types.SimpleNamespace(filepath=str(path))
+
+            library = self.item(name="rocks", filepath="//libraries/rocks.blend", parent=None, is_missing=False,
+                                library_weak_reference=None)
+            image = self.item(name="Glock_Base_color.jpg", filepath="//textures_2k/Glock_Base_color.jpg",
+                              source="FILE", library=None, packed_file=object(), library_weak_reference=weak(glock))
+            mesh = self.item(name="Glock", library=None, library_weak_reference=weak(glock))
+            material = self.item(name="Rough Cast Concrete Wall", library=None, library_weak_reference=weak(concrete))
+            cleared = self.item(name="Reload", library=None, library_weak_reference=weak(""))
+            rock = self.item(name="rock", library=library, library_weak_reference=types.SimpleNamespace(
+                filepath="//assets/rock_source.blend"))
+            scene = self.scene()
+            data = types.SimpleNamespace(images=[image], meshes=[mesh, rock], materials=[material],
+                                         node_groups=[cleared], objects=[], scenes=[scene], libraries=[library])
+            local = [str(glock), str(glock), str(concrete), "", str(library_path)]
+            fake = self.blender(data, scene, stage, lambda **kw: local if kw["local"] else
+                                [*local, str(library_path.parent / "assets/rock_source.blend")])
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            self.assertEqual(info["unsupported"], [])
+            self.assertEqual(info["missing"], [])
+            self.assertTrue(library.filepath.startswith("//libraries/"))
+            self.assertEqual(image.filepath, "//textures_2k/Glock_Base_color.jpg")
+            self.assertEqual(sorted(p.name for p in stage.rglob("*") if p.is_file()), ["rocks.blend", "scene.blend"])
+
+    def test_sound_strip_path_is_its_sounds_packed_or_copied(self):
+        # A sound strip keeps its own copy of its sound's path, listed even when the sound is packed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project, snapshot, stage = root / "project", root / "snapshot.blend", root / "bundle"
+            project.mkdir()
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            (project / "music.wav").write_bytes(b"music")
+            voice_path = root / "T/job_1/0000-7b64aa41a6d0.wav"  # a temporary file, long gone
+            voice = self.item(name="VO_Reloading", filepath=str(voice_path), library=None, packed_file=object())
+            music = self.item(name="music", filepath="//music.wav", library=None, packed_file=None)
+            strips = [types.SimpleNamespace(type="SOUND", name="VO", sound=voice),
+                      types.SimpleNamespace(type="SOUND", name="Music", sound=music)]
+            scene = self.scene()
+            scene.library = None
+            scene.sequence_editor = types.SimpleNamespace(strips_all=strips)
+            data = types.SimpleNamespace(images=[], sounds=[voice, music], objects=[], scenes=[scene], libraries=[],
+                                         file_path_map=lambda subset: PathMap([(scene, {str(voice_path), "//music.wav"})]))
+            paths = [str(voice_path), str(project / "music.wav"), str(project / "music.wav")]
+            fake = self.blender(data, scene, stage, lambda **kw: paths)
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            self.assertEqual(info["unsupported"], [])
+            self.assertEqual(info["missing"], [])
+            self.assertEqual(voice.filepath, str(voice_path))
+            self.assertTrue(music.filepath.startswith("//sounds/"))
+            self.assertEqual((stage / music.filepath[2:]).read_bytes(), b"music")
+
+    def test_generated_sound_strips_keep_stale_temp_paths_that_are_not_inputs(self):
+        # A strip keeps the temp path it was made from (cloud_jobs._add_audio); its sound was then packed,
+        # unpacked or relinked. Only the Sound is played: packed passes, unpacked is copied or missing.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project, snapshot, stage = root / "project", root / "snapshot.blend", root / "bundle"
+            (project / "sounds").mkdir(parents=True)
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            download = root / "T/job_1-x"
+            download.mkdir(parents=True)
+            stale = {name: download / f"000{n}-7b64aa41a6d{n}.wav" for n, name in enumerate(("sfx", "vo", "gone"))}
+            for path in stale.values():
+                path.write_bytes(b"temporary download")  # Still there: an existing stale path was refused.
+            (project / "sounds/vo.wav").write_bytes(b"unpacked voice")
+            (project / "clip.mp4").write_bytes(b"clip")
+            sfx = self.item(name="sfx", filepath="//sounds/sfx.wav", library=None, packed_file=object())
+            vo = self.item(name="vo", filepath="//sounds/vo.wav", library=None, packed_file=None)
+            gone = self.item(name="gone", filepath="//sounds/gone.wav", library=None, packed_file=None)
+            movie = self.item(type="MOVIE", name="Clip", filepath="//clip.mp4", library=None)
+            strips = [types.SimpleNamespace(type="SOUND", name=f"SFX • {sound.name}", sound=sound)
+                      for sound in (sfx, vo, gone)] + [movie]
+            scene = self.scene()
+            scene.library = None
+            scene.sequence_editor = types.SimpleNamespace(strips_all=strips)
+            listed = {str(path) for path in stale.values()} | {"//clip.mp4"}
+            data = types.SimpleNamespace(images=[], sounds=[sfx, vo, gone], objects=[], scenes=[scene], libraries=[],
+                                         file_path_map=lambda subset: PathMap([(scene, set(listed))] if scene in subset else []))
+            # blend_paths: each strip's own path, the unpacked sounds' paths and the movie; never a packed sound's.
+            paths = [str(path) for path in stale.values()] + [str(project / "sounds/vo.wav"),
+                                                              str(project / "sounds/gone.wav"), str(project / "clip.mp4")]
+            fake = self.blender(data, scene, stage, lambda **kw: paths)
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            self.assertEqual(info["unsupported"], [])
+            self.assertEqual(info["missing"], [{"type": "sounds", "name": "gone", "path": "//sounds/gone.wav"}])
+            self.assertEqual(sfx.filepath, "//sounds/sfx.wav")  # Packed: left alone.
+            self.assertEqual((stage / vo.filepath[2:]).read_bytes(), b"unpacked voice")
+            self.assertEqual((stage / movie.filepath[2:]).read_bytes(), b"clip")
+            self.assertEqual(sorted(p.name for p in stage.rglob("*") if p.is_file()), ["clip.mp4", "scene.blend", "vo.wav"])
+            for path in stale.values():  # Gone from the temp folder: still not inputs, not missing.
+                path.unlink()
+            for item, raw in ((vo, "//sounds/vo.wav"), (gone, "//sounds/gone.wav"), (movie, "//clip.mp4")):
+                item.filepath = raw
+            shutil.rmtree(stage)
+            stage.mkdir()
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            self.assertEqual(info["unsupported"], [])
+            self.assertEqual(info["missing"], [{"type": "sounds", "name": "gone", "path": "//sounds/gone.wav"}])
+
+    def test_sound_strip_copy_left_behind_by_a_repointed_sound_is_not_an_input(self):
+        # A generated sound effect lands in the OS temp folder; the model packed it and pointed its
+        # Sound at the workspace, but the strip's own copy (Python can't read it) still named the
+        # temp file, which still existed, so cloud render refused it (live test 2026-10-17).
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project, snapshot, stage = root / "project", root / "snapshot.blend", root / "bundle"
+            (project / "plates").mkdir(parents=True)
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            temp = root / "T/job_w02c/0000-8d592b630cf0.wav"
+            temp.parent.mkdir(parents=True)
+            temp.write_bytes(b"click")
+            plate = project / "plates/plate.mov"
+            plate.write_bytes(b"movie")
+            click = self.item(name="mag_release_generated.wav", library=None, packed_file=object(),
+                              filepath=str(project / "audio/mag_release_generated.wav"))
+            strips = [types.SimpleNamespace(type="SOUND", name="SFX", sound=click),
+                      self.item(type="MOVIE", name="Plate", filepath="//plates/plate.mov")]
+            scene = self.scene()
+            scene.library = None
+            scene.sequence_editor = types.SimpleNamespace(strips_all=strips)
+
+            def path_map(subset):
+                self.assertEqual(subset, [scene])
+                return PathMap([(scene, {str(temp), "//plates/plate.mov"})])
+
+            data = types.SimpleNamespace(images=[], sounds=[click], movieclips=[], objects=[], scenes=[scene],
+                                         libraries=[], file_path_map=path_map)
+            # blend_paths lists the packed Sound's own path only with packed=True, which packing never asks for.
+            paths = [str(temp), str(plate)]
+            fake = self.blender(data, scene, stage, lambda **kw: paths + (
+                [str(project / "audio/mag_release_generated.wav")] if kw.get("packed") else []))
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            # The temp copy is left out; the movie strip's file is still an input, copied as before.
+            self.assertEqual(info["unsupported"], [])
+            self.assertEqual(info["missing"], [])
+            self.assertEqual(click.filepath, str(project / "audio/mag_release_generated.wav"))  # Packed: left alone.
+            self.assertTrue(strips[1].filepath.startswith("//clips/"))
+            self.assertEqual((stage / strips[1].filepath[2:]).read_bytes(), b"movie")
+
+    def test_real_external_inputs_are_still_copied_refused_or_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project, snapshot, stage = root / "project", root / "snapshot.blend", root / "bundle"
+            project.mkdir()
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            texture, script = root / "elsewhere/wood.png", root / "elsewhere/shader.osl"
+            texture.parent.mkdir()
+            texture.write_bytes(b"wood")
+            script.write_bytes(b"shader")
+            gone, model = root / "gone.png", root / "import/model.obj"
+            wood = self.item(name="wood", filepath=str(texture), source="FILE", library=None)
+            absent = self.item(name="gone", filepath=str(gone), source="FILE", library=None)
+            scene = self.scene()
+            data = types.SimpleNamespace(images=[wood, absent], objects=[], scenes=[scene], libraries=[])
+            # An OSL script and an imported file are inputs the packer has no handler for.
+            paths = [str(texture), str(gone), str(script), str(model)]
+            fake = self.blender(data, scene, stage, lambda **kw: paths)
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, str(project / "scene.blend"))
+            self.assertTrue(wood.filepath.startswith("//textures/"))
+            self.assertEqual((stage / wood.filepath[2:]).read_bytes(), b"wood")
+            self.assertEqual(info["unsupported"], [{"type": "external", "path": str(script),
+                                                    "reason": "Unhandled input path"}])
+            self.assertEqual(info["missing"], [{"type": "textures", "name": "gone", "path": str(gone)},
+                                               {"type": "external", "path": str(model)}])
 
     def test_collect_launches_only_an_isolated_child_and_rejects_reusing_staging(self):
         with tempfile.TemporaryDirectory() as temporary:

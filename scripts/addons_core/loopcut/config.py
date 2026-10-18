@@ -24,7 +24,7 @@ SERVICE_WORKER_MODEL = "fast"  # On the gateway, workers run the Fast alias what
 ROUTER_EFFORT = "low"  # The router's reasoning effort unless LOOPCUT_ROUTER_REASONING_EFFORT names one.
 
 # A per-call output ceiling (llm.py's max_tokens), so a runaway reasoning call cannot burn tens of
-# thousands of tokens and many minutes for nothing (Mixar caps its workers at 64k; measured
+# thousands of tokens and many minutes for nothing (a competing agent caps its workers at 64k; measured
 # GLM-5.3-Flash steps average 3.6k-6.8k output tokens, so 32k leaves normal high/max effort room
 # while still stopping a runaway one). The router's own JSON decision needs far less.
 DEFAULT_MAX_OUTPUT_TOKENS = 32_000
@@ -33,7 +33,7 @@ MAX_OUTPUT_TOKENS_CEILING = 200_000
 # An optional per-call wall-clock limit (llm.py's call_max_seconds): a stream that runs longer is
 # stopped and treated like hitting the output cap (agent._request's retry). Off (0) unless
 # LOOPCUT_CALL_MAX_SECONDS or a role's own names one: at high effort a GLM-5.3-Flash worker's first
-# reply measured 90-300 s (Mixar's run: up to ~820 s), so a fixed 300 s killed a working worker twice
+# reply measured 90-300 s (a competing agent's run: up to ~820 s), so a fixed 300 s killed a working worker twice
 # (eval 20260929-101508). The output cap above bounds a runaway, and llm.py's per-read timeout
 # catches a stalled stream (nothing arriving). Always exempted for a base URL on 127.0.0.1
 # (llm.py): the Claude Code bridge (harness/cc_bridge.py) legitimately takes minutes.
@@ -44,9 +44,17 @@ CODEX_APP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/c
 CODEX_SUMMARIES = ("auto", "concise", "detailed", "none")
 
 
-def pricing_url(reason: str = "") -> str:
-    """The plans page, marked as coming from the app so it says Blender is waiting."""
-    return f"{SERVICE_URL}/pricing?from=app" + (f"&reason={reason}" if reason else "")
+def pricing_url(reason: str = "", plan: str = "") -> str:
+    """The plans page, marked as coming from the app so it says Blender is waiting. reason names the moment
+    that sent the user (the conversion funnel's attribution); plan marks the suggested plan."""
+    return (f"{SERVICE_URL}/pricing?from=app" + (f"&reason={reason}" if reason else "")
+            + (f"&plan={plan}" if plan else ""))
+
+
+def credits_url(reason: str = "") -> str:
+    """The account page, where credit packs are bought; from=app and a reason say which moment sent the user
+    (no #fragment: cloud_http.validate_url refuses them for every link the panel opens)."""
+    return f"{SERVICE_URL}/account?from=app" + (f"&reason={reason}" if reason else "")
 
 
 def account_url() -> str:
@@ -181,7 +189,20 @@ def _as_bool(value: str, key: str) -> bool:
     raise ConfigError(f"{key} must be a boolean, got {value!r}")
 
 
+# Display only now: the " beta" after the version. Purchase surfaces follow billing_open().
 BETA = _as_bool(os.environ.get("LOOPCUT_BETA", "on"), "LOOPCUT_BETA")
+
+
+def billing_open() -> bool:
+    """Whether purchase surfaces show: plan names, credits, upgrade and pricing links, the conversion cards.
+    The server decides with the manifest's flags.billing, so turning sales on or off needs no release. A
+    manifest without the flag (servers before it existed) or no manifest at all keeps them hidden."""
+    from . import cloud
+    runtime = cloud._runtime
+    if runtime is None:
+        return False
+    with runtime.lock:
+        return (runtime.manifest.get("flags") or {}).get("billing") is True
 
 
 def app_version() -> str:
@@ -246,6 +267,23 @@ def checkpoint_budget_mb() -> int:
     return int(value)
 
 
+def spending():
+    """The user's credit spending settings (spending.py, C47): LOOPCUT_ASK_ABOVE_CREDITS (default 25),
+    LOOPCUT_CHAT_BUDGET_CREDITS (150) and LOOPCUT_ASK_EVERY_PAID_CALL (false). Readable without an API key."""
+    from . import spending as policy
+    _, get = _getter()
+    values = {}
+    for key, default, low in (("LOOPCUT_ASK_ABOVE_CREDITS", policy.ASK_ABOVE, 0),
+                              ("LOOPCUT_CHAT_BUDGET_CREDITS", policy.CHAT_BUDGET, 1)):
+        value = get(key, str(default))
+        if not value.isascii() or not value.isdigit() or not low <= int(value) <= policy.MAX_SETTING:
+            raise ConfigError(f"{key} must be {low}-{policy.MAX_SETTING} credits, got {value!r}")
+        values[key] = int(value)
+    return policy.Settings(ask_above=values["LOOPCUT_ASK_ABOVE_CREDITS"],
+                           chat_budget=values["LOOPCUT_CHAT_BUDGET_CREDITS"],
+                           ask_every=_as_bool(get("LOOPCUT_ASK_EVERY_PAID_CALL", "false"), "LOOPCUT_ASK_EVERY_PAID_CALL"))
+
+
 def skills_dir() -> Path | None:
     """Optional local skill source, using the same lookup as other LOOPCUT_* settings."""
     _, get = _getter()
@@ -266,10 +304,28 @@ def service_policy(*, no_generation_default=False) -> dict[str, bool]:
         "private_mode": _as_bool(get("LOOPCUT_PRIVATE_MODE", "true"), "LOOPCUT_PRIVATE_MODE")})
 
 
-def service_backends() -> dict[str, str]:
-    """Per-tool BYOK choices; key presence alone does not override a funded account."""
+# + a vendor key name ("LOOPCUT_OWN_KEY_FIRST_FAL_KEY"): that key's "Use this key instead of credits"
+# checkbox in Preferences → Your own keys. On by default: a user who enters a key gets it used.
+OWN_KEY_FIRST = "LOOPCUT_OWN_KEY_FIRST_"
+
+
+def own_key_first() -> dict[str, bool]:
+    """{vendor key name: use it instead of credits}, whether or not the key is set."""
+    from . import credentials
     _, get = _getter()
-    return {name.strip(): "byok" for name in get("LOOPCUT_BYOK_TOOLS").split(",") if name.strip()}
+    return {name: _as_bool(get(OWN_KEY_FIRST + name, "true"), OWN_KEY_FIRST + name)
+            for name in credentials.VENDOR_KEY_NAMES}
+
+
+def service_backends(keys_set=None) -> dict[str, str]:
+    """The `preferred` routes for cloud.merge_tools: "byok" for every tool whose vendor key is set and
+    marked "Use this key instead of credits". The rest take credits first when the account has them,
+    then the key. A tool with no key set is left alone, so the default never hides a credits route."""
+    from . import credentials
+    from .byok import catalog
+    keys_set = credentials.vendor_keys_set() if keys_set is None else keys_set
+    first = own_key_first()
+    return {tool: "byok" for tool, key in catalog.tool_keys().items() if keys_set.get(key) and first[key]}
 
 
 def run_timeout() -> float:

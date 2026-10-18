@@ -19,7 +19,8 @@ from .http import ByokError, Client
 _ADAPTERS = {"openai": openai, "fal": fal, "gemini": gemini, "elevenlabs": elevenlabs}
 _MIMES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
           ".glb": "model/gltf-binary", ".obj": "model/obj"}
-_SUFFIXES = {"image/png": ".png", "model/gltf-binary": ".glb", "audio/wav": ".wav", "audio/mpeg": ".mp3"}
+_SUFFIXES = {"image/png": ".png", "model/gltf-binary": ".glb", "model/vnd.fbx": ".fbx",
+             "audio/wav": ".wav", "audio/mpeg": ".mp3"}
 
 
 def _validate_input(schema, inputs):
@@ -115,7 +116,9 @@ def run(tool_name, input, files, out_dir, *, transport=None, no_generation=None,
     """Return a completed/failed contract job. HTTP injection accepts (method,url,headers,body,timeout)."""
     job_id = "byok_" + uuid.uuid4().hex
     job = {"id": job_id, "tool": tool_name, "status": "running", "progress": {"pct": 0, "message": "Running"},
-           "credits": {"reserved": 0, "charged": 0, "refunded": 0}, "outputs": [], "provenance": None, "error": None}
+           "credits": {"reserved": 0, "charged": 0, "refunded": 0}, "outputs": [], "provenance": None, "error": None,
+           # What was asked, for the applied result's names (cloud_jobs._add_audio).
+           "input": dict(input) if isinstance(input, dict) else {}}
     try:
         if no_generation is None or private_mode is None:
             policy = config.service_policy()

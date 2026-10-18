@@ -48,9 +48,10 @@ class BetaGatesTest(unittest.TestCase):
             setattr(cls, name.replace('ui.', ''), importlib.import_module(NAME + '.' + name))
 
     def setUp(self):
-        context = patch.object(self.config, 'BETA', True)
-        context.start()
-        self.addCleanup(context.stop)
+        # BETA is the version label now; purchase surfaces follow the server's flags.billing (config.billing_open).
+        for context in (patch.object(self.config, 'BETA', True), patch.object(self.config, 'billing_open', return_value=False)):
+            context.start()
+            self.addCleanup(context.stop)
 
     def display(self, *items, **ui):
         session = self.state.new_session()
@@ -74,7 +75,7 @@ class BetaGatesTest(unittest.TestCase):
             self.assertIn('5%', items[0]['text'])
             self.assert_no_purchase(items)
             self.assert_no_purchase(self.display(*items))
-        with patch.object(self.config, 'BETA', False):
+        with patch.object(self.config, 'billing_open', return_value=True):
             items = []
             self.agent._warn_low_allowance({}, items, {'plan': 'free', 'week': {'used': .95}})
             self.assertEqual(items[0]['url'], self.config.pricing_url('low_allowance'))
@@ -82,7 +83,7 @@ class BetaGatesTest(unittest.TestCase):
 
     def test_limit_state_and_saved_cards_suppress_offers_and_keep_reset(self):
         offer = {'url': self.config.pricing_url(), 'label': 'Upgrade', 'note': 'Purchase Pro now'}
-        with patch.object(self.config, 'BETA', False):
+        with patch.object(self.config, 'billing_open', return_value=True):
             old = self.state.item_limit('Upgrade to continue', 'week_limit', 'free', '2026-10-12', offer)
             self.assertEqual(old['upgrade'], offer)
             self.assertIn(('limit_upgrade', 0), [h['action'] for h in self.display(old)['hits']])
@@ -98,12 +99,12 @@ class BetaGatesTest(unittest.TestCase):
         error = self.cloud_http.CloudError('Refused', 'insufficient_credits', 402,
             {'balance': 1, 'needed': 20, 'upgrade': self.config.pricing_url()})
         detail = self.cloud_account.error_details(error)
-        self.assertIn('balance 1, needed 20', detail['message'])
+        self.assertIn('needs 20 ($0.20), you have 1', detail['message'])
         self.assert_no_purchase(detail)
         card = self.state.item_tool('tool', 'Tool', '')
         card.update(status='failed', expanded=True, cloud_error={'upgrade': self.config.pricing_url()})
         self.assert_no_purchase(self.display(card))
-        with patch.object(self.config, 'BETA', False):
+        with patch.object(self.config, 'billing_open', return_value=True):
             self.assertEqual(self.cloud_account.error_details(error)['upgrade'], self.config.pricing_url())
             self.assertIn(('cloud_upgrade', 0), [h['action'] for h in self.display(card)['hits']])
 
@@ -124,7 +125,7 @@ class BetaGatesTest(unittest.TestCase):
                  'unlock_plan': {'name': 'Max'}}]
         with patch.dict(self.account._state, models=rows):
             self.assertEqual(self.account.models()[0]['note'], '2x usage  ·  Unavailable')
-            with patch.object(self.config, 'BETA', False):
+            with patch.object(self.config, 'billing_open', return_value=True):
                 self.assertEqual(self.account.models()[0]['note'], '2x usage  ·  Max plan')
 
     def test_preferences_gate_purchase_and_show_beta_version(self):
@@ -135,14 +136,15 @@ class BetaGatesTest(unittest.TestCase):
         for beta in (True, False):
             layout = Layout()
             prefs = types.SimpleNamespace(layout=layout, provider='CUSTOM', base_url='https://example.test')
-            with patch.object(self.config, 'BETA', beta), patch.object(Layout, 'operator', operator), \
-                    patch.object(self.account, 'signed_in', return_value=False):
+            with patch.object(self.config, 'BETA', beta), patch.object(self.config, 'billing_open', return_value=not beta), patch.object(Layout, 'operator', operator), \
+                    patch.object(self.account, 'signed_in', return_value=False), \
+                    patch.object(self.settings.credentials, 'vendor_keys_set', return_value={}):
                 self.settings.LoopcutPreferences.draw(prefs, None)
                 self.assertEqual(self.settings.LOOPCUT_OT_blenderkit_get_key.poll(None), not beta)
             names = [entry[1] for entry in layout.calls if entry[0] == 'operator']
             self.assertEqual('loopcut.blenderkit_get_key' in names, not beta)
             texts = [entry[1] for entry in layout.calls if entry[0] == 'label']
-            self.assertIn('Loopcut 0.2.3' + (' beta' if beta else ''), texts)
+            self.assertIn('Loopcut 0.2.4' + (' beta' if beta else ''), texts)
             if beta:
                 self.assert_no_purchase(texts)
                 self.assertNotIn('Workers and routing run on Loopcut plans', texts)
@@ -153,7 +155,7 @@ class BetaGatesTest(unittest.TestCase):
                 {'name': 'render', 'title': 'Cloud rendering', 'summary': 'Render on our machines.', 'state': 'ready',
                  'category': 'Render', 'voted': True, 'level': 1.0, 'badge': 'most_wanted'}]
         for beta in (True, False):  # None of these run yet: no route, price or data class to explain either way.
-            with self.subTest(beta=beta), patch.object(self.config, 'BETA', beta):
+            with self.subTest(beta=beta), patch.object(self.config, 'BETA', beta), patch.object(self.config, 'billing_open', return_value=not beta):
                 for view in ('chat', 'vote'):
                     display = self.display(coming_soon=rows, view=view, service_signed_in=False)
                     self.assert_no_purchase(display)
@@ -172,7 +174,7 @@ class BetaGatesTest(unittest.TestCase):
         runtime = types.SimpleNamespace(lock=threading.Lock(), signed_in=True, account_saving=False, account_message='',
                                         manifest={'account': {'credits': {'balance': 1840, 'resets_at': None}}})
         self.assertEqual(self.cloud_account.panel_data(runtime)['credits'], '')
-        with patch.object(self.config, 'BETA', False):
+        with patch.object(self.config, 'billing_open', return_value=True):
             self.assertIn('1,840 credits', self.cloud_account.panel_data(runtime)['credits'])
             self.assertEqual(self.cloud_account.refusal({'unavailable_reason': 'sign_in'}, {}), 'Sign in to use credits.')
 
@@ -186,7 +188,7 @@ class BetaGatesTest(unittest.TestCase):
             info = {'account_id': '0f8b6a52-2c1d-4e8f-9a3b-5d7e1c2b4a69', 'email': 'tester@example.test', 'plan': 'pro',
                     'session': {'used': .2}, 'week': {'used': .4}}
             layout = Layout()
-            with patch.object(self.config, 'BETA', beta), patch.object(Layout, 'operator', operator), \
+            with patch.object(self.config, 'BETA', beta), patch.object(self.config, 'billing_open', return_value=not beta), patch.object(Layout, 'operator', operator), \
                     patch.object(self.account, 'signed_in', return_value=True), \
                     patch.dict(self.account._state, account=info, status='idle'):
                 self.account.draw(layout)
@@ -197,22 +199,23 @@ class BetaGatesTest(unittest.TestCase):
         self.assertIn('tester@example.test', beta, 'no plan beside the email in the beta')
         self.assert_no_purchase(beta)
         self.assertFalse([t for t in beta if 'credit' in t.lower() or 'billing' in t.lower() or 'plan' in t.lower()], beta)
-        self.assertIn('Account and Billing', before)
+        self.assertIn('See plans', before)
+        self.assertIn('Credits', before)
         self.assertIn('tester@example.test  ·  Pro plan', before)
 
     def test_version_display_and_machine_versions_are_separate(self):
-        self.assertEqual(self.config.version_label(), '0.2.3 beta')
-        self.assertIn('0.2.3 beta', [p.get('text') for p in self.display()['prims']])
-        self.assertEqual(self.update.current_version(), (0, 2, 3))
-        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.3 blender/5.2.0')
-        release = {'version': (0, 2, 4), 'label': '0.2.4', 'asset': None}
+        self.assertEqual(self.config.version_label(), '0.2.4 beta')
+        self.assertIn('0.2.4 beta', [p.get('text') for p in self.display()['prims']])
+        self.assertEqual(self.update.current_version(), (0, 2, 4))
+        self.assertEqual(self.cloud_http.contract_headers()['x-loopcut-client'], 'loopcut-addon/0.2.4 blender/5.2.0')
+        release = {'version': (0, 2, 5), 'label': '0.2.5', 'asset': None}
         status = {'release': release, 'status': 'available', 'dismissed': False, 'error': '', 'progress': 0}
-        self.assertIn('0.2.4 beta', self.update.banner_for(status, False)['text'])
-        self.assertIn('0.2.4 beta', self.update.status_line(status, (0, 2, 3)))
+        self.assertIn('0.2.5 beta', self.update.banner_for(status, False)['text'])
+        self.assertIn('0.2.5 beta', self.update.status_line(status, (0, 2, 4)))
         for state in ('idle', 'current'):
-            self.assertIn('0.2.3 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 3)))
-        with patch.object(self.config, 'BETA', False):
-            self.assertEqual(self.config.version_label(), '0.2.3')
+            self.assertIn('0.2.4 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 4)))
+        with patch.object(self.config, 'BETA', False):  # The label alone; sales follow billing_open.
+            self.assertEqual(self.config.version_label(), '0.2.4')
             self.assertNotIn('beta', self.update.banner_for(status, False)['text'])
 
     def test_config_environment_switches(self):
@@ -240,7 +243,7 @@ class BetaGatesTest(unittest.TestCase):
                 self.draw_help(expect_loopcut=True)
                 splash = Splash()
                 self.support._draw_info(types.SimpleNamespace(layout=splash), None)
-                self.assertIn(('label', 'Loopcut 0.2.3 beta'), splash.records)
+                self.assertIn(('label', 'Loopcut 0.2.4 beta'), splash.records)
                 self.assertEqual(splash.operators()[0][1], 'loopcut.report_bug')
                 with patch.object(self.config, 'BUG_REPORT_URL', 'https://example.test/form'):
                     self.support.LOOPCUT_OT_report_bug().execute(None)

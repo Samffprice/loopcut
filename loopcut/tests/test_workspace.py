@@ -111,6 +111,17 @@ class LayoutTest(Folder):
         self.assertEqual((self.ws / "ref1.jpg").read_bytes(), b"jpeg bytes")
         self.assertEqual(workspace._copy_references(self.session, self.ws), [], "once")
 
+    def test_stored_copies_are_named_for_what_they_hold(self):
+        source = self.root / "made"
+        refs = []
+        for data in (b"\xff\xd8\xff\xe0 a clip's sheet", b"\x89PNG\r\n\x1a\n a photo"):
+            source.write_bytes(data)
+            refs.append(conversations.store_image(self.session, source))
+        self.session["references"] = [{"ref": refs[0], "full": refs[0], "name": "take.mp4 2.00-4.27s"},
+                                      {"ref": refs[1], "full": refs[1], "name": "gone.webp", "source": "/gone.webp"}]
+        self.assertEqual(workspace._copy_references(self.session, self.ws), ["take.mp4 2.00-4.27s.jpg", "gone.png"])
+        self.assertEqual((self.ws / "take.mp4 2.00-4.27s.jpg").read_bytes(), b"\xff\xd8\xff\xe0 a clip's sheet")
+
     def test_the_shells_environment_has_no_keys_and_finds_blender_first(self):
         env = workspace.shell_env(self.ws, {"PATH": "/usr/bin", "HOME": "/h", "OPENAI_API_KEY": "sk",
                                             "LOOPCUT_BASE_URL": "x", "GITHUB_TOKEN": "t", "PYTHONPATH": "/p"})

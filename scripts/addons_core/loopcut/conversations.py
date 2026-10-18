@@ -6,6 +6,7 @@ file it has worked in (Save As and checkpoint restores add to the list); opening
 resumes the most recent conversation for it.
 
 Layout, per conversation id:  conversations/<id>/conversation.json, meta.json, images/<sha>.png
+(every stored image is named .png, but most hold JPEG, image_budget.compact: media_type reads the bytes)
 Viewport captures are stored once as files and referenced from messages as `loopcut-image:<name>`;
 inline base64 would make every save rewrite megabytes. wire_messages() expands them per request.
 """
@@ -19,11 +20,13 @@ import threading
 import time
 from pathlib import Path
 
-from . import checkpoints, context, state
+from . import checkpoints, context, image_budget, state
 
 IMAGE_SCHEME = "loopcut-image:"
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
+_AUDIO_SUFFIXES = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".bin")  # aud reads by content.
+_AUDIO_NAME = re.compile(r"^[0-9a-f]{64}(?:" + "|".join(map(re.escape, _AUDIO_SUFFIXES)) + ")$")
 _ITEM_KINDS = {"user", "assistant", "tool", "error", "notice", "changes", "limit", "wave", "merge"}
 # Which images are still sent is context.kept_images; an image costs about ten tool results.
 KEEP_IMAGES, KEEP_ATTACHED = context.KEEP_IMAGES, context.KEEP_ATTACHED
@@ -33,7 +36,7 @@ _ROLES = {"user", "assistant", "tool"}
 # missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
 _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
-              "mode", "codex_thread")
+              "mode", "codex_thread", "spend")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 # Conversations kept somewhere other than root(): a worker's transcript and captures live in its
 # job folder (waves.py). Keyed by conversation id; set before the first save.
@@ -66,8 +69,10 @@ def _write_atomic(path: Path, text: str) -> None:
 
 
 def save(session: dict) -> None:
-    """Safe from any thread. A conversation nobody has written in is not worth a folder."""
-    if not session["items"]:
+    """Safe from any thread. A conversation nobody has written in is not worth a folder. Offer cards
+    (state.item_offer) are left out: they belong to the moment, and older add-ons refuse unknown items."""
+    items = [i for i in session["items"] if i.get("kind") != "offer"]
+    if not items:
         return
     with _lock:
         folder = _folder(session["id"])
@@ -75,7 +80,12 @@ def save(session: dict) -> None:
         if not session["title"]:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
-        body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED}
+        body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED
+                if key != "spend"}
+        from . import spending
+        with spending.lock:
+            body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
+        body["items"] = items
         meta = {"id": session["id"], "projects": session["projects"], "title": session["title"],
                 "created": session["created"], "updated": time.time(),
                 "turns": sum(1 for i in session["items"] if i["kind"] == "user")}
@@ -93,6 +103,19 @@ def _own_image_path(value) -> bool:
     path = Path(value)
     return (path.is_absolute() and _IMAGE_NAME.match(path.name) is not None and path.parent.name == "images"
             and ".." not in path.parts)
+
+
+def _audio_card(item: dict) -> bool:
+    """A notice's sound (state.item_audio). Its length and peaks are drawn, so a NaN or a string would break the
+    panel; Play reads only a copy store_audio made in a conversation's own audio folder."""
+    audio = item["audio"]
+    path = Path(audio["path"]) if isinstance(audio, dict) and isinstance(audio.get("path"), str) else None
+    return (item["kind"] == "notice" and path is not None and isinstance(audio.get("name"), str)
+            and path.is_absolute() and _AUDIO_NAME.match(path.name) is not None and path.parent.name == "audio"
+            and ".." not in path.parts
+            and type(audio.get("seconds")) in (int, float) and 0 <= audio["seconds"] < float("inf")
+            and isinstance(audio.get("peaks"), list) and len(audio["peaks"]) <= 256
+            and all(type(p) in (int, float) and 0 <= p <= 1 for p in audio["peaks"]))
 
 
 def _validate(body) -> dict:
@@ -127,6 +150,8 @@ def _validate(body) -> dict:
         if not _own_image_path(item.get("image_path", "")):
             # The panel loads this file: only a capture stored in this conversation's own images folder.
             raise ConversationError("malformed image path")
+        if "audio" in item and not _audio_card(item):
+            raise ConversationError("malformed audio item")
         lines = item.get("lines", []) if item["kind"] in ("changes", "merge") else item.get("images", [])
         if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
             raise ConversationError(f"malformed {item['kind']} item")
@@ -144,6 +169,9 @@ def _validate(body) -> dict:
     usage = body.get("usage", {})
     if not isinstance(usage, dict) or any(not isinstance(usage.get(k, 0), int) for k in _USAGE):
         raise ConversationError("malformed usage")
+    from . import spending
+    if "spend" in body and not spending.valid_ledger(body["spend"]):
+        body.pop("spend")  # A damaged ledger starts over rather than losing the conversation.
     return body
 
 
@@ -158,6 +186,8 @@ def load(conversation_id: str) -> dict:
     session = state.new_session()
     session.update({key: body[key] for key in _PERSISTED if key in body})
     session["usage"] = {key: int(body.get("usage", {}).get(key, 0)) for key in _USAGE}
+    from . import spending
+    session["spend"] = {key: body.get("spend", {}).get(key, value) for key, value in spending.new_ledger().items()}
     # Whatever was in flight when Blender closed is over.
     for item in session["items"]:
         if item.get("streaming"):
@@ -252,9 +282,10 @@ def add_project(session: dict, filepath: str) -> None:
         session["projects"].append(project)
 
 
-def store_image(session: dict, source: Path, card: dict | None = None) -> str:
-    """Copy a capture into the conversation and return the reference to put in a message."""
-    data = source.read_bytes()
+def store_image(session: dict, source: Path, card: dict | None = None, *, side: int = image_budget.STORE_SIDE) -> str:
+    """Copy an image into the conversation, compact (image_budget.compact: at most `side` px, JPEG unless it has
+    transparency or PNG is smaller), and return the reference to put in a message. Every request re-sends it."""
+    data = image_budget.compact(source.read_bytes(), side)
     name = hashlib.sha256(data).hexdigest() + ".png"
     folder = _folder(session["id"]) / "images"
     folder.mkdir(parents=True, exist_ok=True)
@@ -264,6 +295,31 @@ def store_image(session: dict, source: Path, card: dict | None = None) -> str:
     if card is not None:
         card["image_path"] = str(target)
     return IMAGE_SCHEME + name
+
+
+def store_audio(session: dict, source: Path) -> str:
+    """Copy a generated sound into the conversation, for its chat card: the download is in a temp folder the
+    system may clear, and the .blend's packed copy is not a file Play can read. Returns the copy's path."""
+    data = source.read_bytes()
+    suffix = source.suffix.lower()
+    name = hashlib.sha256(data).hexdigest() + (suffix if suffix in _AUDIO_SUFFIXES else ".bin")
+    folder = _folder(session["id"]) / "audio"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / name
+    if not target.is_file():
+        target.write_bytes(data)
+    return str(target)
+
+
+def media_type(data: bytes, default: str = "image/png") -> str:
+    """The image type its first bytes say; a stored image's .png name does not."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return default
 
 
 def image_path(conversation_id: str, reference: str) -> Path:
@@ -295,8 +351,9 @@ def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = fr
                         if full.is_file():
                             path = full
                     if path.is_file():
-                        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-                        part = {**part, "image_url": {**part["image_url"], "url": f"data:image/png;base64,{encoded}"}}
+                        data = path.read_bytes()
+                        url = f"data:{media_type(data)};base64,{base64.b64encode(data).decode('ascii')}"
+                        part = {**part, "image_url": {**part["image_url"], "url": url}}
                     else:
                         part = {"type": "text", "text": "[image no longer available]"}
                 parts.append(part)

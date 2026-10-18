@@ -163,6 +163,25 @@ class ConversationsTest(unittest.TestCase):
         with self.assertRaises(cv.ConversationError):
             cv.image_path(session["id"], cv.IMAGE_SCHEME + "../../../secret.png")
 
+    def test_the_wire_names_the_type_the_stored_bytes_hold(self):
+        # Every stored image is <sha>.png, but a clip's sheets are JPEG (video_worker.draw_sheet).
+        session = self.session("/work/desk.blend", "like this clip")
+        source = Path(self.tmp.name) / "sheet"
+        refs = {}
+        for media, data in (("image/jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF sheet"),
+                            ("image/png", b"\x89PNG\r\n\x1a\n capture"),
+                            ("image/webp", b"RIFF\x10\x00\x00\x00WEBPVP8 still"),
+                            ("image/png", b"made up")):
+            source.write_bytes(data)
+            refs[cv.store_image(session, source)] = (media, data)
+        self.assertTrue(all(ref.endswith(".png") for ref in refs), "stored names keep their old form")
+        session["messages"].append({"role": "user", cv.ATTACHED: True, "content": [
+            {"type": "text", "text": "time it like this"},
+            *({"type": "image_url", "image_url": {"url": ref}} for ref in refs)]})
+        wired = cv.wire_messages(session["id"], session["messages"])[-1]["content"][1:]
+        for part, (media, data) in zip(wired, refs.values()):
+            self.assertEqual(part["image_url"]["url"], f"data:{media};base64,{base64.b64encode(data).decode()}")
+
     def test_attached_images_outlive_captures_and_the_marker_is_never_sent(self):
         session = self.session("/work/desk.blend", "make it look like this")
         picture = Path(self.tmp.name) / "picture.png"

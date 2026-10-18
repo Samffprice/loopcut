@@ -27,6 +27,9 @@ from .byok import catalog
 
 NAMESPACE = "loopcut_cloud"
 PREFIX = NAMESPACE + "__"
+OFFER = "offer_tool"  # Local, never a server tool: shows the card for a locked tool (locked_tools).
+MODEL_SOURCE_HEADER = "x-loopcut-model-source"
+MODEL_SOURCES = ("chatgpt", "loopcut", "own_key", "local")
 REFRESH_SECONDS = 600
 MAX_SKILLS = 128
 MAX_SKILL_BYTES = 256 * 1024
@@ -160,10 +163,16 @@ def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, pol
     return result
 
 
+def _packs_scene(descriptor):
+    """A managed tool whose input is the scene itself: Loopcut packs and uploads it per call (_upload_bundle)."""
+    return descriptor.get("backend") == "managed" and bool(descriptor.get("bundle_input"))
+
+
 def schema(descriptor):
     parameters = deepcopy(descriptor["input_schema"])
     properties = parameters.setdefault("properties", {})
     required = parameters.setdefault("required", [])
+    description = descriptor["description"]
     for field in descriptor.get("file_inputs", []):
         name = field["field"]
         properties[name] = {"type": "string", "description":
@@ -173,18 +182,15 @@ def schema(descriptor):
             required.append(name)
     if descriptor.get("backend") == "managed":
         properties["idempotency_key"] = {"type": "string", "minLength": 1, "maxLength": 200,
-            "description": "Reuse only when retrying a failed submission with the same inputs."}
+            "description": "Leave unset: Loopcut reuses its own key when a reply is lost. A key names one job, "
+                           "so sending it again returns that job; never reuse one to retry a failure."}
         if (descriptor.get("cost") or {}).get("quote_required"):
             properties["quote_id"] = {"type": "string", "minLength": 1,
                 "description": "Optional quote from a previous call with the same inputs. The client obtains a quote and asks for approval before submission."}
-        bundle = descriptor.get("bundle_input")
-        if bundle:
-            properties["bundle"] = {"type": "string", "pattern": "^[0-9a-f]{64}$",
-                "description": "SHA-256 of an already uploaded, self-contained bundle manifest. " + bundle["description"]}
-            if bundle["required"] and "bundle" not in required:
-                required.append("bundle")
+    if _packs_scene(descriptor):  # The model cannot build a bundle; the contract's bundle field is filled per call.
+        description += " Loopcut packs and uploads the current scene as its bundle itself."
     return {"type": "function", "function": {"name": PREFIX + descriptor["name"],
-            "description": descriptor["description"], "parameters": parameters}}
+            "description": description, "parameters": parameters}}
 
 
 JOB_SCHEMA = {"type": "function", "function": {"name": PREFIX + "job_status",
@@ -293,6 +299,9 @@ class Runtime:
         # vote_lock so the server's answers arrive, and apply, in click order.
         self.vote_states, self.vote_notice, self.vote_lock = {}, "", threading.Lock()
         self.dismissed_message = ""
+        # chatgpt | loopcut | own_key | local: which kind of model this install uses, sent with the manifest
+        # request only when signed in (the funnel's "both connected"; never which account, key or model).
+        self.model_source = ""
         self.quotes = {}  # Session-only amounts for the approval card, never vendor input.
         self.quote_requests = {}
         self.lock, self.refresh_lock = threading.RLock(), threading.Lock()
@@ -344,6 +353,13 @@ class Runtime:
             return (settings.get("no_generation", False) or self.policy.get("no_generation", False)
                     or getattr(self, "account_pending", {}).get("no_generation", False))
 
+    def blob_multipart(self):
+        """The manifest's capabilities.blob_multipart (contract 0.6), or None: whole-file PUTs only."""
+        from . import blobs
+        with self.lock:
+            capabilities = self.manifest.get("capabilities")
+            return blobs.multipart_capability(capabilities.get("blob_multipart") if isinstance(capabilities, dict) else None)
+
     def private_mode(self):
         with self.lock:
             settings = (self.manifest.get("account") or {}).get("settings") or {}
@@ -368,6 +384,8 @@ class Runtime:
                     return True  # A concurrent index user already refreshed while we waited.
                 prompt_updates = self.prompt_updates
                 headers = {"If-None-Match": self.etag} if self.etag else {}
+                if self.signed_in and self.model_source in MODEL_SOURCES:
+                    headers[MODEL_SOURCE_HEADER] = self.model_source
             response = self.client.request_response("GET", "/v1/manifest", headers=headers, auth=self.signed_in)
             with self.lock:
                 if response.status != 304:
@@ -378,6 +396,7 @@ class Runtime:
                 self.refreshed_at = time.monotonic()
                 self._save()
             self._load_skills(fetch=True)
+            self._observe()
             return True
         except cloud_http.CloudError as ex:
             if ex.status == 404:
@@ -394,12 +413,23 @@ class Runtime:
         finally:
             self.refresh_lock.release()
 
+    def _observe(self):
+        """Queue the trial and low-credit cards a fresh manifest calls for (nudges.py); never fails a refresh."""
+        from . import nudges
+        try:
+            with self.lock:
+                manifest, signed_in = deepcopy(self.manifest), self.signed_in
+            live = [d["name"] for d in self.descriptors() if d.get("backend") == "managed"]
+            nudges.observe(manifest, signed_in, live)
+        except Exception as ex:  # Cards are a nicety; the catalog must still load.
+            print(f"Loopcut: could not check credits for cards: {ex!r}")
+
     def handle_error(self, error):
         if error.code == "contract_unsupported":
             with self.lock:
                 self.supported, self.message, self.skills = False, UPDATE_MESSAGE, []
                 self._save()
-        elif error.code == "tool_disabled":
+        elif error.code in ("tool_disabled", "daily_limit_reached"):  # The daily line follows a refusal too.
             self.refreshed_at = 0
             self.refresh_async()
         elif (error.code == "quote_required" and isinstance(error.extra.get("quote_id"), str)
@@ -651,8 +681,28 @@ def _snapshot():
     with _runtime.lock:
         _runtime.policy = config.service_policy(no_generation_default=settings.get("no_generation", False))
         _runtime.keys_set = credentials.vendor_keys_set()
-        _runtime.preferred = config.service_backends()
+        _runtime.preferred = config.service_backends(_runtime.keys_set)
+        try:
+            _runtime.model_source = model_source()
+        except Exception as ex:  # Funnel metadata; never a reason for the catalog to fail.
+            print(f"Loopcut: could not tell the model source: {ex!r}")
+            _runtime.model_source = ""
     return _runtime
+
+
+def model_source():
+    """Main thread: chatgpt | loopcut | own_key | local, from the provider in use."""
+    from . import settings
+    prefs = settings.preferences()
+    if settings.on_chatgpt_plan():
+        return "chatgpt"
+    if prefs is None:
+        return ""
+    if prefs.provider == "LOOPCUT":
+        return "loopcut"
+    if prefs.provider == "OLLAMA" or prefs.base_url.startswith(("http://127.0.0.1", "http://localhost")):
+        return "local"
+    return "own_key"
 
 
 def sync_settings():
@@ -714,9 +764,115 @@ def unregister():
     cloud_jobs.cancel_all()
 
 
+def locked_tools(runtime=None):
+    """Live tools the user could unlock (M1): their route is missing only for want of a sign-in, credits or
+    a plan. Anything No generation, Private mode, the region or an off switch blocks is never listed, and
+    nothing is while the server does not sell (config.billing_open). [{name, title, why, credits, own_key}]."""
+    runtime = runtime or _runtime
+    if runtime is None or not runtime.supported or not config.billing_open():
+        return []
+    available = {d["name"] for d in runtime.descriptors()}
+    no_generation, private = runtime.no_generation(), runtime.private_mode()
+    with runtime.lock:
+        manifest = deepcopy(runtime.manifest)
+        signed_in = runtime.signed_in
+    if not manifest.get("flags", {}).get("services"):
+        return []
+    local = set(catalog.tool_keys())  # Tools with an own-key adapter: the card can offer that route too.
+    rows = []
+    for d in manifest.get("tools", []):
+        if not isinstance(d, dict) or d.get("name") in available or d.get("name") == OFFER:
+            continue
+        reason = d.get("unavailable_reason")
+        if (d.get("status") not in ("live", "beta") or (no_generation and d.get("kind") == "gen")
+                or d.get("apply") in {"import_material", "apply_shape_keys"}
+                or reason in ("no_generation", "private_mode", "disabled", "region")
+                or (private and cloud_account.data_class(d) in ("C", "D"))):
+            continue
+        cost = (d.get("cost") or {}).get("credits_estimate")
+        rows.append({"name": d["name"], "title": _display(d, "title") or d.get("title") or d["name"],
+                     "why": "sign_in" if not signed_in else "plan" if reason == "plan" else "credits",
+                     "credits": cost if type(cost) is int else None, "own_key": d["name"] in local})
+    return rows
+
+
+UNAVAILABLE_NOTE = "Loopcut cloud tools you can't call now; if asked for one, say why in one line and offer what you can do"
+OWN_KEY_NOTE = "* also works with the user's own vendor key (Preferences > Your own keys)"
+
+
+def unavailable_line(runtime=None):
+    """One line for the prompt's end: the cloud tools this user cannot call now, and why (coming soon, a sign-in,
+    credits, No generation or Private mode), so "generate an image" ends in a reason and an alternative rather
+    than a dead end (persona round 1, F0276/F0278). Tools offer_tool covers (locked_tools) are left to its
+    card. No generation and Private mode only explain: nothing is offered around them. "" when nothing is
+    missing or there is no catalog."""
+    runtime = runtime or _runtime
+    if runtime is None or not runtime.supported:
+        return ""
+    available = {d["name"] for d in runtime.descriptors()} | {row["name"] for row in locked_tools(runtime)}
+    no_generation, private, billing = runtime.no_generation(), runtime.private_mode(), config.billing_open()
+    with runtime.lock:
+        manifest, signed_in = deepcopy(runtime.manifest), runtime.signed_in
+    own_keys = {d["name"]: (d.get("byok") or {}).get("data_class")  # Tools with an own-key adapter, and its class.
+                for d in catalog.descriptors(no_generation=False, private_mode=False, keys_set={})}
+    groups, starred = {}, False
+    for d in manifest.get("tools", []):
+        name = d.get("name") if isinstance(d, dict) else None
+        if not name or name in available or name == OFFER or d.get("apply") in {"import_material", "apply_shape_keys"}:
+            continue
+        reason, generates = d.get("unavailable_reason"), d.get("kind") == "gen"
+        if reason == "disabled":
+            continue
+        if (no_generation and generates) or reason == "no_generation":
+            why = "off: No generation is on"  # The user's own setting governs, whatever the tool's status.
+        elif d.get("status") not in ("live", "beta"):
+            why = "coming soon"
+        elif (private and cloud_account.data_class(d) in ("C", "D")) or reason == "private_mode":
+            why = "off: Private mode blocks this vendor"
+        elif reason == "region":
+            why = "not in the user's region"
+        elif not signed_in:
+            why = "needs a free Loopcut sign-in"
+        elif reason == "plan":
+            why = "needs another plan" if billing else "coming soon"
+        else:
+            why = "needs credits" if billing else "coming soon"
+        title = _display(d, "title") or str(d.get("title") or name)
+        if not why.startswith("off") and name in own_keys and not (private and own_keys[name] in ("C", "D")):
+            title, starred = title + "*", True
+        groups.setdefault(why, []).append(title)
+    if not groups:
+        return ""
+    listed = "; ".join(f"{', '.join(titles)}: {why}" for why, titles in groups.items())
+    return f"{UNAVAILABLE_NOTE}: {listed}." + (f" {OWN_KEY_NOTE}." if starred else "")
+
+
+def offer_schema(locked):
+    """One short tool, sent only while something is locked: the model asks the add-on to show the way."""
+    titles = ", ".join(row["title"] for row in locked)
+    return {"type": "function", "function": {"name": PREFIX + OFFER, "description":
+            f"Locked Loopcut cloud tools: {titles}. Only when the user asks for what one does, call this once "
+            "so the app shows them how to unlock it. Never call it unprompted.",
+            "parameters": {"type": "object", "properties": {"tool": {"type": "string",
+                           "enum": [row["name"] for row in locked]}}, "required": ["tool"]}}}
+
+
+def _offer(arguments):
+    from . import nudges, state, tools
+    tool = next((row for row in locked_tools() if row["name"] == (arguments or {}).get("tool")), None)
+    if tool is None:
+        return tools.ToolResult("That tool is not locked; use the tools you have.", ok=False)
+    with _runtime.lock:
+        balance = ((_runtime.manifest.get("account") or {}).get("credits") or {}).get("balance")
+    return tools.ToolResult(nudges.offer_locked(state.session(), tool, balance if tool["why"] == "credits" else None))
+
+
 def tool_schemas():
     descriptors = _runtime.descriptors() if _runtime else []
     schemas = [schema(d) for d in descriptors]
+    locked = locked_tools()
+    if locked:
+        schemas.append(offer_schema(locked))
     with _jobs_lock:
         pending = any(row["result"] is None for row in _jobs.values())
     if any(d["latency"] == "long" for d in descriptors) or pending:
@@ -728,7 +884,8 @@ def skill_options():
     if _runtime is None:
         return {}
     return {"server_skills": _runtime.server_skills(),
-            "available_tools": [NAMESPACE + "." + tool_name(s["function"]["name"]) for s in tool_schemas()],
+            "available_tools": [NAMESPACE + "." + tool_name(s["function"]["name"]) for s in tool_schemas()
+                                if tool_name(s["function"]["name"]) != OFFER],
             "no_generation": _runtime.no_generation()}
 
 
@@ -863,7 +1020,8 @@ def approval(name, arguments=None, roots=(), *, files_only=False):
 
 
 def changes_scene(name):
-    return is_tool(name)  # job_status may apply finished outputs; checkpoint before either call.
+    # job_status may apply finished outputs; checkpoint before either call. offer_tool only draws a card.
+    return is_tool(name) and tool_name(name) != OFFER
 
 
 def describe(name, arguments):
@@ -873,18 +1031,22 @@ def describe(name, arguments):
     descriptor = next((d for d in (_runtime.descriptors() if _runtime else []) if d["name"] == bare), None)
     if bare == "job_status":
         return f"Cloud job {arguments.get('job_id', '')}", ""
+    if bare == OFFER:
+        row = next((r for r in locked_tools() if r["name"] == (arguments or {}).get("tool")), None)
+        return f"How to unlock {row['title'] if row else 'a cloud tool'}", ""
     title = descriptor["title"] if descriptor else bare
     quote = None
     if descriptor and descriptor["backend"] == "managed" and isinstance(arguments.get("quote_id"), str):
         with _runtime.lock:
             quote = _runtime.quotes.get(arguments["quote_id"])
     route = cloud_account.approval_details(descriptor, quote)["text"] if descriptor else "cloud"
-    return f"{title} ({route})", ""
+    return f"{title} · {route}", ""
 
 
 def error_text(error):
     # Preserve contract extras for retries, quotes, refunds and policy explanations.
-    extra = {k: v for k, v in error.extra.items() if k not in {"job", "upgrade"}}
+    # A confirm_token (C47) is a single-use approval capability: never in model text or history.
+    extra = {k: v for k, v in error.extra.items() if k not in {"job", "upgrade", "confirm_token"}}
     return safe_value(_error_message(error) + ("\n" + json.dumps({"error": {"code": error.code,
         "type": error.error_type, **extra}}, ensure_ascii=False) if extra else ""))
 
@@ -1024,9 +1186,55 @@ def _discard_preparation(directory):
         print('Loopcut: could not remove temporary cloud inputs')
 
 
+BUNDLE_NAMED = 10  # Inputs a refused bundle names, per list; the rest are counted.
+
+
+def _bundle_refusal(packed):
+    """A scene that would not render as it looks here is not sent: name what is missing or unsupported."""
+    def named(rows):
+        lines = [" ".join(str(row[key]) for key in ("type", "name", "path") if row.get(key))
+                 + (f": {row['reason']}" if row.get("reason") else "") for row in rows[:BUNDLE_NAMED]]
+        return lines + ([f"and {len(rows) - BUNDLE_NAMED} more"] if len(rows) > BUNDLE_NAMED else [])
+    lists = {key: packed[key] for key in ("missing", "unsupported") if packed[key]}
+    counts = " and ".join(f"{len(rows)} {key}" for key, rows in lists.items())
+    return cloud_http.CloudError(f"Loopcut can't pack this scene: {counts} input(s), listed below. Relink or pack "
+                                 "them, or remove them from the scene, then call again. Nothing was uploaded.",
+                                 "bundle_incomplete", extra={key: named(rows) for key, rows in lists.items()})
+
+
+def blob_multipart():
+    """For upload workers: whether large files may go in parts (SPEC 3.3); None before a manifest arrives."""
+    runtime = _runtime
+    return runtime.blob_multipart() if runtime is not None else None
+
+
+def _upload_bundle(session, checkpoint, staging, client, cancel, progress):
+    """Worker: collect the call's snapshot in a child Blender, refuse it if incomplete, upload it, and return
+    the manifest's SHA-256, the job's bundle. Once per call: the quote, its card and Approve reuse the hash."""
+    from . import bundles, checkpoints
+    cloud_account._check_cancel(cancel)
+    progress("Packing the scene…")
+    try:
+        packed = checkpoints.bundle_from_checkpoint(session, checkpoint, staging)
+    except (checkpoints.CheckpointError, bundles.BundleError, OSError, ValueError) as ex:
+        raise cloud_http.CloudError(f"Could not pack the scene: {ex}", "bundle_failed") from ex
+    if packed["missing"] or packed["unsupported"]:
+        raise _bundle_refusal(packed)
+    cloud_account._check_cancel(cancel)
+    size = f"{sum(item['size'] for item in packed['manifest']['files']) / 1_000_000:,.1f} MB"
+    progress(f"Uploading {size}…")
+    try:
+        digest = bundles.upload(staging, packed["manifest"], client=client, cancel=cancel, progress=progress,
+                                multipart=blob_multipart())
+    except (bundles.BundleError, OSError, ValueError) as ex:
+        raise cloud_http.CloudError(f"Could not upload the scene: {ex}", "bundle_failed") from ex
+    progress(f"Scene uploaded ({size}).")  # What the card says while its quote waits for approval.
+    return digest
+
+
 def execute(name, arguments):
     """Main thread: resolve scene references, then hand remote work back to the agent thread."""
-    from . import tools
+    from . import checkpoints, state, tools
     import bpy
     origin_scene = getattr(getattr(bpy, 'context', None), 'scene', None)
     try:
@@ -1035,6 +1243,8 @@ def execute(name, arguments):
         return tools.ToolResult(str(ex), ok=False)
     if tool_name(name) == "job_status":
         return _job_status(arguments)
+    if tool_name(name) == OFFER:
+        return _offer(arguments)
     runtime = _runtime
     descriptor = next((d for d in (runtime.descriptors() if runtime else []) if d["name"] == tool_name(name)), None)
     if descriptor is None:
@@ -1067,7 +1277,9 @@ def execute(name, arguments):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is missing).", ok=False)
     if any(not callable(getattr(module, fn, None)) for fn in ("resolve_files", "run", "apply_result")):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is incomplete).", ok=False)
-    out_dir = None
+    out_dir, session, bundle_checkpoint = None, None, None
+    if _packs_scene(descriptor):
+        arguments = {k: v for k, v in arguments.items() if k != "bundle"}  # Only the scene packed here is sent.
     try:
         _validate_arguments(descriptor, arguments)
         out_dir = runtime.cache_dir / "jobs" / uuid.uuid4().hex
@@ -1088,7 +1300,11 @@ def execute(name, arguments):
                                        timeout=source.timeout, client_headers=source.version_headers())
         else:
             vendor_key = credentials.vendor_key(descriptor["byok"]["key_name"])
-    except (cloud_http.CloudError, config.ConfigError, OSError, ValueError, tools.ToolError) as ex:
+        if _packs_scene(descriptor):  # Last, so nothing above can strand it: the scene as it is at this call.
+            session = state.session()
+            bundle_checkpoint = checkpoints.for_bundle(session)
+    except (cloud_http.CloudError, config.ConfigError, OSError, ValueError, tools.ToolError,
+            checkpoints.CheckpointError) as ex:
         if out_dir is not None:
             _discard_preparation(out_dir)
         if isinstance(ex, cloud_http.CloudError):
@@ -1100,27 +1316,37 @@ def execute(name, arguments):
     def finish(is_cancelled, on_main):
         cancel = _Cancel(is_cancelled)
         progress = lambda p: _progress(name, p)
+        report = cloud_account.charge_reporter()  # Settles the chat's spend on this call's card (C47).
         authorized = False
         try:
             cloud_account._check_cancel(cancel)
             if file_consent:
                 cloud_account.confirm({'required': True, 'text': 'Upload local files: ' + ', '.join(external),
                                        'credits': None, 'file_access': True})
-            approved_arguments = cloud_account.authorize(module, descriptor, arguments, files, runtime=runtime,
+            call_arguments = arguments
+            if bundle_checkpoint:  # Packed once: the quote, its card and an Approve retry all send this hash.
+                call_arguments = {**arguments, "bundle": _upload_bundle(session, bundle_checkpoint, out_dir / "bundle",
+                                                                        snapshot.client, cancel, progress)}
+            approved_arguments = cloud_account.authorize(module, descriptor, call_arguments, files, runtime=runtime,
                 project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
                 cancel=cancel, client=snapshot.client)
             on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
             authorized = True
         except cloud_http.CloudError as ex:
             runtime.handle_error(ex)
+            report(0)  # Nothing was submitted: a hold taken at consent is released.
             return tools.ToolResult(error_text(ex), ok=False)
         finally:
+            if bundle_checkpoint:  # Collected or not, its snapshot is no restore point; not waited for.
+                from . import mainthread
+                mainthread.run_on_main(lambda: checkpoints.discard(session, bundle_checkpoint))
             if not authorized:
                 _discard_preparation(out_dir)
         try:
             job = _run(snapshot, module, descriptor, approved_arguments, files, out_dir, cancel, progress)
             if descriptor["latency"] == "long" and descriptor["backend"] == "managed":
                 cancel.detach()
+                release = lambda spent=False: cloud_account.complete(runtime, approved_arguments, spent)
                 with _jobs_lock:
                     finished = [key for key, row in _jobs.items() if row["result"] is not None]
                     for key in finished[:-31]:
@@ -1128,21 +1354,62 @@ def execute(name, arguments):
                     _jobs.setdefault(job["id"], {"descriptor": descriptor, "module": module,
                                                 "handle_error": runtime.handle_error,
                                                 "report_error": cloud_account.error_reporter(), "result": None,
-                                                'scene': origin_scene,
-                                                'complete': lambda: cloud_account.complete(runtime, approved_arguments)})
+                                                'scene': origin_scene, 'complete': release})
+                watch = getattr(module, "watch", None)
+                if job.get("status") in ("succeeded", "failed", "canceled"):
+                    _settle_final(report, job, None)
+                elif callable(watch):  # Done, failed or canceled from the panel: the card gets its charge.
+                    def settle(final, error):
+                        _settle_final(report, final, error)
+                        if final.get("status") in ("failed", "canceled"):
+                            release(True)  # A retry before job_status already gets a new key.
+                    watch(job["id"], settle)
                 return tools.ToolResult(json.dumps({"job_id": job["id"], "status": job["status"],
                                                    "next": "loopcut_cloud.job_status"}))
+            if descriptor["backend"] == "managed":
+                _settle_final(report, job, None)
             if cancel.is_set():
                 return tools.ToolResult("Cloud call canceled; no output applied.", ok=False)
             if job.get("status") != "succeeded":
                 return tools.ToolResult(f"Cloud job {job.get('status', 'incomplete')}; no output applied.", ok=False)
             return on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene))
         except cloud_http.CloudError as ex:
+            _settle_error(report, ex)
             return tools.ToolResult(error_text(ex), ok=False)
         finally:
             if descriptor['backend'] == 'managed':
                 _discard_preparation(out_dir)
     return tools.ToolResult("Preparing cloud job…", then=finish)
+
+
+NOT_SUBMITTED = {"canceled", "approval_required", "declined", "quote_changed", "submission_pending", "pending_limit",
+                 "invalid_input", "account_changed", "tool_changed"}
+
+
+def _charged(job):
+    charged = ((job or {}).get("credits") or {}).get("charged") if isinstance(job, dict) else None
+    return charged if type(charged) in (int, float) and math.isfinite(charged) and charged >= 0 else None
+
+
+def _settle_final(report, job, error):
+    """A managed job's outcome, for the chat's spend: what it was charged, or nothing (C47)."""
+    if error is not None:
+        return _settle_error(report, error)
+    from . import spending
+    charged = _charged(job)
+    if charged is not None:
+        report(charged, spending.receipt_text(charged, canceled=job.get("status") == "canceled"))
+    elif job.get("status") in ("failed", "canceled"):
+        report(0, spending.receipt_text(0, canceled=job.get("status") == "canceled"))
+
+
+def _settle_error(report, error):
+    """A failed call keeps its hold only when the server may have charged it (a lost reply, a 5xx)."""
+    job = error.extra.get("job")
+    if isinstance(job, dict):
+        return _settle_final(report, job, None)
+    if error.code in NOT_SUBMITTED or (error.status is not None and 400 <= error.status < 500):
+        report(0)
 
 
 def _apply(module, descriptor, job):
@@ -1155,7 +1422,10 @@ def _apply(module, descriptor, job):
     except (tools.ToolError, OSError, ValueError) as ex:
         return tools.ToolResult(f"Could not apply cloud output: {str(ex)[:400]}", ok=False,
                                 scene_before=before, scene_after=scene_diff.snapshot())
-    return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot())
+    receipt = cloud_account.receipt(job) if descriptor.get("backend") == "managed" else ""
+    if receipt and _runtime is not None:
+        _runtime.refresh_async()  # The panel's balance follows the charge.
+    return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot(), receipt=receipt)
 
 
 def _apply_to_scene(module, descriptor, job, scene):
@@ -1195,7 +1465,7 @@ def _job_status(arguments):
         record["handle_error"](ex)
         record["report_error"](ex)
         if record.get('complete') and ex.extra.get('job', {}).get('status') in {'failed', 'canceled'}:
-            record['complete']()
+            record['complete'](True)
         result = tools.ToolResult(error_text(ex), ok=False)
         if ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
             record["result"] = result
@@ -1205,7 +1475,7 @@ def _job_status(arguments):
     if not _same_scene(record.get('scene')):
         return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
     if record.get('complete'):
-        record['complete']()
+        record['complete'](job['status'] != 'succeeded')
     if arguments.get("cancel"):
         record["result"] = tools.ToolResult("Cloud job finished before cancellation; no output applied.", ok=False)
     elif _runtime and _runtime.no_generation() and record["descriptor"]["kind"] == "gen":

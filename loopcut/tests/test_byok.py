@@ -31,6 +31,7 @@ from loopcut.byok.http import ByokError, Client, Response, urllib_transport  # n
 
 PNG = b"\x89PNG\r\n\x1a\nmock image payload"
 GLB = b"glTF\x02\x00\x00\x00mock model payload"
+FBX = b"Kaydara FBX Binary  \x00\x1a\x00\xe8\x1c\x00\x00mock quad payload"
 MP3 = b"ID3mock sound payload"
 PCM = b"\x00\x00\x01\x00\xff\x7f"
 
@@ -148,12 +149,12 @@ class ByokTest(unittest.TestCase):
         self.assertEqual(parts["image"].get_payload(decode=True), PNG)
         self.assertNotIn(str(self.reference), call["body"].decode(errors="replace"))
 
-    def fal_fake(self, field):
+    def fal_fake(self, field, data=GLB, result=None):
+        result = {field: {"url": "https://v3.fal.media/files/result.glb"}} if result is None else result
         return FakeTransport(reply({"request_id": "req_123", "status_url": "https://queue.fal.run/vendor/requests/req_123/status",
                                     "response_url": "https://queue.fal.run/vendor/requests/req_123"}),
                              reply({"status": "IN_QUEUE"}), reply({"status": "IN_PROGRESS"}),
-                             reply({"status": "COMPLETED"}), reply({field: {"url": "https://v3.fal.media/files/result.glb"}}),
-                             Response(200, {}, GLB))
+                             reply({"status": "COMPLETED"}), reply(result), Response(200, {}, data))
 
     def assert_fal_calls(self, fake, endpoint, payload):
         self.assertEqual(len(fake.calls), 6)
@@ -185,13 +186,73 @@ class ByokTest(unittest.TestCase):
         self.assertEqual(job["provenance"]["kind"], "gen")
 
     def test_fal_remesh_submit_poll_result_download_under_no_generation(self):
-        fake = self.fal_fake("model")
-        job = self.job("retopology", fake, {"face_limit": 2000, "quad": True}, no_generation=True)
+        fake = self.fal_fake("model_mesh")
+        job = self.job("retopology", fake, {"face_limit": 2000}, no_generation=True)
         self.assert_output(job, GLB, "model_3d", "model/gltf-binary", "fal", "tripo3d/tripo/remesh")
+        self.assertEqual(Path(job["outputs"][0]["path"]).suffix, ".glb")
         self.assert_fal_calls(fake, "tripo3d/tripo/remesh",
-                              {"model_url": "data:model/gltf-binary;base64," + base64.b64encode(GLB).decode(),
-                               "face_limit": 2000, "quad": True})
+                              {"mesh_url": "data:model/gltf-binary;base64," + base64.b64encode(GLB).decode(),
+                               "face_limit": 2000, "quad": False})
         self.assertEqual(job["provenance"]["kind"], "assist")
+
+    def test_fal_remesh_quads_come_back_as_fbx(self):
+        # The FBX is labelled by its bytes, whatever the vendor's file name or content type says.
+        result = {"model_mesh": {"url": "https://v3.fal.media/files/result.glb", "content_type": "model/gltf-binary",
+                                 "file_name": "result.glb", "file_size": len(FBX)}}
+        fake = self.fal_fake(None, FBX, result)
+        job = self.job("retopology", fake, {"face_limit": 2000, "quad": True}, no_generation=True)
+        self.assert_output(job, FBX, "model_3d", "model/vnd.fbx", "fal", "tripo3d/tripo/remesh")
+        self.assertEqual(job["outputs"][0]["name"], "model")
+        self.assertEqual(Path(job["outputs"][0]["path"]).suffix, ".fbx")
+        self.assert_fal_calls(fake, "tripo3d/tripo/remesh",
+                              {"mesh_url": "data:model/gltf-binary;base64," + base64.b64encode(GLB).decode(),
+                               "face_limit": 2000, "quad": True})
+
+    def test_fal_remesh_falls_back_to_the_matching_model_urls_entry(self):
+        for quad, data, chosen in ((True, FBX, "fbx"), (False, GLB, "glb")):
+            urls = {name: {"url": f"https://v3.fal.media/files/{name}-result"} for name in ("glb", "fbx")}
+            result = {"model_mesh": None, "model_urls": {**urls, "base_model": None, "pbr_model": None}}
+            with self.subTest(quad=quad):
+                fake = self.fal_fake(None, data, result)
+                job = self.job("retopology", fake, {"quad": quad})
+                self.assert_output(job, data, "model_3d", fal.model_mime(data), "fal", "tripo3d/tripo/remesh")
+                self.assertEqual(fake.calls[-1]["url"], f"https://v3.fal.media/files/{chosen}-result")
+        fake = self.fal_fake(None, FBX, {"model_urls": {"glb": None, "fbx": {"url": "https://v3.fal.media/files/only"}}})
+        self.assert_output(self.job("retopology", fake), FBX, "model_3d", "model/vnd.fbx", "fal", "tripo3d/tripo/remesh")
+        fake = self.fal_fake(None, FBX, {"model_mesh": None, "model_urls": {"glb": None, "fbx": None}})
+        self.assertEqual(self.job("retopology", fake)["error"]["code"], "vendor_failed")
+        self.assertEqual(len(fake.calls), 5, "no download without a model URL")
+
+    def test_fal_remesh_bytes_that_are_neither_fbx_nor_glb_fail_unsaved(self):
+        for data in (b"; FBX 7.4.0 project file\nascii", b"<html>expired</html>", b"PK\x03\x04zip"):
+            result = {"model_mesh": {"url": "https://v3.fal.media/files/result.fbx", "file_name": "result.fbx"}}
+            with self.subTest(data=data):
+                job = self.job("retopology", self.fal_fake(None, data, result), {"quad": True})
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual(job["error"]["code"], "vendor_failed")
+                self.assertIn("labelled FBX", job["error"]["message"])
+                self.assertEqual(job["outputs"], [])
+        self.assertFalse(list((self.root / "outputs").glob("*")))
+        self.assertEqual(fal.model_mime(FBX), "model/vnd.fbx")
+        self.assertEqual(fal.model_mime(GLB), "model/gltf-binary")
+        with self.assertRaises(ByokError) as caught:
+            fal.model_mime(b"plain", {"content_type": "application/octet-stream"})
+        self.assertNotIn("labelled", caught.exception.error["message"])
+
+    def test_fal_remesh_face_limit_ranges(self):
+        model = {"model": (GLB, "model/gltf-binary")}
+        for quad, faces in ((True, 10001), (True, 499), (False, 20001), (False, 499)):
+            fake = FakeTransport()
+            with self.subTest(quad=quad, faces=faces), self.assertRaises(ByokError) as caught:
+                fal.execute("retopology", {"quad": quad, "face_limit": faces}, model, Client(fake), "test-fal")
+            self.assertEqual(caught.exception.error["field"], "face_limit")
+            self.assertEqual(fake.calls, [])
+        for quad, faces in ((True, 10000), (True, 500), (False, 20000), (False, 500)):
+            with self.subTest(quad=quad, faces=faces):
+                fake = self.fal_fake("model_mesh", FBX if quad else GLB)
+                job = self.job("retopology", fake, {"quad": quad, "face_limit": faces})
+                self.assertEqual(job["status"], "succeeded", job["error"])
+                self.assertEqual(json.loads(fake.calls[0]["body"])["face_limit"], faces)
 
     def test_gemini_request_pcm_saved_as_wav(self):
         fake = FakeTransport(voice_reply())
@@ -621,7 +682,8 @@ class Layout:
 with tempfile.TemporaryDirectory() as folder:
     os.environ["LOOPCUT_CONFIG_DIR"] = folder
     for name in credentials.VENDOR_KEY_NAMES: os.environ.pop(name, None)
-    for name, label, prop, note in settings.VENDOR_ROWS:
+    for name, label, prop, note, first in settings.VENDOR_ROWS:
+        assert settings.LoopcutPreferences.__annotations__[first]["default"] is True
         field = settings.LoopcutPreferences.__annotations__[prop]
         assert field["subtype"] == "PASSWORD" and field["options"] == {"SKIP_SAVE"}
         field["set"](None, "test-saved")
@@ -634,7 +696,9 @@ with tempfile.TemporaryDirectory() as folder:
     layout = Layout()
     settings.draw_vendor_keys(layout, object())
     assert "Your own keys" in layout.labels
-    assert all(prop in layout.props and note in layout.labels for _, _, prop, note in settings.VENDOR_ROWS)
+    assert all(prop in layout.props and note in layout.labels for _, _, prop, note, _ in settings.VENDOR_ROWS)
+    # Only the environment's OpenAI key is set: only its "Use this key instead of credits" box shows.
+    assert [first for *_, first in settings.VENDOR_ROWS if first in layout.props] == ["openai_key_first"]
     assert {op.key_name for name, op in layout.ops} == set(credentials.VENDOR_KEY_NAMES)
     assert any("Environment" in label for label in layout.labels)
     os.environ["LOOPCUT_NO_GENERATION"] = "true"

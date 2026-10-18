@@ -805,9 +805,9 @@ def _checker_look(objects):
             shading.type, shading.color_type, shading.light = "SOLID", "TEXTURE", "STUDIO"
             overlay.show_overlays = False
             width, height = tools.CAPTURE_WIDTH, tools.CAPTURE_WIDTH * 3 // 4
-            view, projection, eye = tools._framed_view(space, objects, "three_quarter", width, height)
-            labels = tools._labels(objects, eye, view, projection, width, height)
-            pixels = tools._draw_offscreen(scene, space, region, view, projection, width, height, labels)
+            view, projection, _ = tools._framed_view(space, objects, "three_quarter", width, height)
+            # No names, as in a worker's final look: they would cover the checker being judged.
+            pixels = tools._draw_offscreen(scene, space, region, view, projection, width, height, [])
         finally:
             shading.type, shading.color_type, shading.light, overlay.show_overlays = saved
     path = scratch.folder() / "uv_checker.png"

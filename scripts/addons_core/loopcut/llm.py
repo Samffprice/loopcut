@@ -29,6 +29,40 @@ class Cancelled(Exception):
 RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 RETRY_DELAYS = (1.0, 3.0, 8.0)
 MAX_RETRY_AFTER = 30.0
+CONNECTION_LOST = "connection_lost"  # LLMError.code when the connection kept dropping: the panel offers Try again.
+
+
+def dropped_connection(ex) -> bool:
+    """A connection that broke on the way (a TLS alert such as bad_record_mac, a broken pipe, a reset, a reply
+    cut off), which another try may get through. Not an HTTP answer, and not a certificate this computer
+    refuses, which fails the same way every time."""
+    import http.client
+    import ssl
+    if isinstance(ex, (urllib.error.HTTPError, ssl.SSLCertVerificationError)):
+        return False
+    if isinstance(ex, urllib.error.URLError):
+        return not isinstance(ex.reason, ssl.SSLCertVerificationError)
+    return isinstance(ex, (TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException))
+
+
+def short_cause(ex) -> str:
+    """"SSLError: SSLV3_ALERT_BAD_RECORD_MAC", "BrokenPipeError: Broken pipe": enough for a bug report, short."""
+    if isinstance(ex, str):
+        return ex[:100]
+    if isinstance(ex, urllib.error.URLError) and isinstance(ex.reason, BaseException):
+        ex = ex.reason
+    reason = getattr(ex, "reason", None)
+    detail = reason if isinstance(reason, str) and reason else getattr(ex, "strerror", None) or str(ex)
+    return f"{type(ex).__name__}: {str(detail)[:80]}" if detail else type(ex).__name__
+
+
+def connection_lost(service: str, cause=None, while_replying: bool = False) -> LLMError:
+    """What the panel shows when the connection to `service` kept dropping after the retries: plain words,
+    Try again on the card (CONNECTION_LOST), and the technical cause last, in brackets."""
+    when = "while it was replying" if while_replying else "before it could answer"
+    tail = f" ({short_cause(cause)})" if cause is not None else ""
+    return LLMError(f"The connection to {service} dropped {when}. Nothing was lost: press Try again.{tail}",
+                    code=CONNECTION_LOST)
 
 
 @dataclass
@@ -104,13 +138,17 @@ def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
         time.sleep(0.1)
 
 
-def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], bool]):
+def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: float,
+          is_cancelled: Callable[[], bool], on_drop: Callable[[], bool] = lambda: False):
     """Open the stream, retrying failures that are likely to pass. Nothing has been streamed to
     the user yet at this point, so a retry is invisible apart from the wait. A read or connect
     timeout at this stage (getting the status line and headers) is a socket.timeout/TimeoutError
-    that urlopen itself wraps as URLError, so it is already covered by the clause below."""
+    that urlopen itself wraps as URLError, so it is already covered by the clause below. The
+    request is built again for each try: after a dropped connection or a 413, on_drop
+    (image_budget.Sized.tighten) has made its images smaller."""
     for attempt in range(len(RETRY_DELAYS) + 1):
         last = attempt == len(RETRY_DELAYS)
+        request = build()
         try:
             return urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as ex:
@@ -120,7 +158,8 @@ def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], boo
             with ex:
                 body = ex.read()
                 retry_after = ex.headers.get("Retry-After", "")
-            if last or ex.code not in RETRY_STATUSES:
+            # 413: too large for the server (Loopcut's gateway, on Vercel, takes 4.5 MB): retried with smaller images.
+            if last or (ex.code not in RETRY_STATUSES and not (ex.code == 413 and on_drop())):
                 error = _error_payload(body)
                 raise LLMError(f"HTTP {ex.code}: {_error_detail(body)}", ex.code,
                                str(error.get("code") or error.get("type") or ""), error) from ex
@@ -131,7 +170,8 @@ def _open(request, base_url: str, timeout: float, is_cancelled: Callable[[], boo
                   f"waiting {delay:g}s)")
         except urllib.error.URLError as ex:
             if last:
-                raise LLMError(f"Could not reach {base_url}: {ex.reason}") from ex
+                raise LLMError(f"Could not reach {base_url}: {ex.reason}", code=CONNECTION_LOST) from ex
+            on_drop()  # A broken pipe or a reset as the body went up: large uploads are cut that way.
             delay = RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the request after {ex.reason!r} ({attempt + 1}/{len(RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")
@@ -274,6 +314,9 @@ def stream_chat(
     the partial reply card's text) before the retried request's own deltas start arriving. Without
     on_retry, or after that one retry also breaks, the error surfaces as it did before this existed.
 
+    Every provider sends the messages through image_budget.Sized: their inline images stay under a
+    byte budget, and a try after the connection dropped as the request went up sends them smaller.
+
     The ChatGPT plan provider (base URL chatgpt_auth.CHATGPT_PLAN_BASE_URL) is not chat completions:
     chatgpt_responses.stream speaks the Responses API with the signed-in account's token instead,
     and returns the same Completion. It reads correlation headers locally and never sends them
@@ -306,7 +349,7 @@ def stream_chat(
         body["tools"] = tools
     if max_tokens:
         body["max_tokens"] = max_tokens
-    from . import config
+    from . import config, image_budget
     service = config.on_service(base_url)
     request_headers = {name: value for name, value in (headers or {}).items()
                        if name.lower() != "x-loopcut-prompt"
@@ -319,12 +362,15 @@ def stream_chat(
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     })
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers=request_headers,
-        method="POST",
-    )
+    sized = image_budget.Sized(messages)
+
+    def build() -> urllib.request.Request:
+        return urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps({**body, "messages": sized.messages()}).encode("utf-8"),
+            headers=request_headers,
+            method="POST",
+        )
     deadline = (time.monotonic() + call_max_seconds
                 if call_max_seconds and not _is_loopback(base_url) else None)
     # Two separate, small budgets: before any content this attempt, the same capped backoff as a
@@ -333,7 +379,7 @@ def stream_chat(
     before_content = 0
     retried_partial = False
     while True:
-        response = _open(request, base_url, timeout, is_cancelled)
+        response = _open(build, base_url, timeout, is_cancelled, sized.tighten)
         if service and prompt_id is not None:
             cloud.note_prompt_version(response.headers.get("x-loopcut-prompt-version"))
         try:
@@ -342,13 +388,13 @@ def stream_chat(
             cause = ex.__cause__
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise LLMError(f"Connection lost while streaming the reply: {cause!r}") from cause
+                    raise LLMError(f"Connection lost while streaming the reply: {cause!r}", code=CONNECTION_LOST) from cause
                 retried_partial = True
                 print(f"Loopcut: retrying once from scratch after the stream broke mid-reply ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(RETRY_DELAYS):
-                raise LLMError(f"Connection lost before any reply arrived: {cause!r}") from cause
+                raise LLMError(f"Connection lost before any reply arrived: {cause!r}", code=CONNECTION_LOST) from cause
             delay = RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the request after {cause!r} ({before_content + 1}/{len(RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")

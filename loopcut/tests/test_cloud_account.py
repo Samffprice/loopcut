@@ -36,7 +36,7 @@ def display(session=None, **ui):
 class LogicTest(unittest.TestCase):
     def test_credit_balance_monthly_and_reset_only_when_signed_in(self):
         manifest = {"account": {"credits": {"balance": 1840, "monthly": 2000, "resets_at": "2026-11-01T00:00:00Z"}}}
-        self.assertEqual(account.credits_label(manifest, True), "1,840 credits · 2,000/month · resets 2026-11-01")
+        self.assertEqual(account.credits_label(manifest, True), "1,840 credits ($18.40) · renews 2026-11-01")
         self.assertEqual(account.credits_label(manifest, False), "")
         self.assertEqual(account.credits_label({"account": {}}, True), "")
         self.assertEqual(account.credits_label({"account": None}, True), "")
@@ -46,17 +46,33 @@ class LogicTest(unittest.TestCase):
     def test_malformed_optional_credit_metadata_is_not_displayed(self):
         for balance in (None, True, -1, float("nan"), "42"):
             self.assertEqual(account.credits_label({"account": {"credits": {"balance": balance}}}, True), "")
-        self.assertEqual(account.credits_label({"account": {"credits": {"balance": 5, "resets_at": "bad"}}}, True), "5 credits")
+        self.assertEqual(account.credits_label({"account": {"credits": {"balance": 5, "resets_at": "bad"}}}, True), "5 credits ($0.05)")
 
     def test_managed_threshold_is_strict_and_card_names_the_estimate(self):
         for credits, required in ((0, False), (49, False), (50, False), (51, True)):
             detail = account.approval_details(descriptor(cost={"credits_estimate": credits}))
-            self.assertEqual(detail, {"required": required, "text": f"{credits} credits estimated", "credits": credits})
+            text = f"About {credits} credits (${credits / 100:.2f})" if credits else "Free"
+            self.assertEqual(detail, {"required": required, "text": text, "credits": credits, "threshold": 50})
 
-    def test_quote_card_uses_actual_cost_even_below_threshold(self):
+    def test_server_threshold_zero_confirms_every_priced_call(self):
+        # What the server sends clients that hide the balance: every charge asks first; free calls never do.
+        for credits, required in ((0, False), (1, True), (6, True)):
+            tool = descriptor(cost={"credits_estimate": credits}, approval={"confirm_over_credits": 0})
+            self.assertEqual(account.approval_details(tool)["required"], required)
+
+    def test_receipt_names_what_a_finished_job_used(self):
+        self.assertEqual(account.receipt({"credits": {"reserved": 6, "charged": 6, "refunded": 0}}),
+                         "Used 6 credits ($0.06)")
+        for job in ({"credits": {"charged": 0}}, {"credits": {"charged": -1}}, {}, None):
+            self.assertEqual(account.receipt(job), "")
+
+    def test_quote_card_uses_actual_cost_and_the_same_threshold(self):
+        # C47: a quoted tool is decided on its quote like an estimate, instead of always asking.
         tool = descriptor(cost={"credits_estimate": 100, "quote_required": True})
         detail = account.approval_details(tool, {"quote_id": "qt_1", "credits": 3, "expires_at": "later"})
-        self.assertEqual(detail, {"required": True, "text": "3 credits (quoted)", "credits": 3})
+        self.assertEqual(detail, {"required": False, "text": "3 credits ($0.03), quoted", "credits": 3, "threshold": 50})
+        self.assertTrue(account.approval_details(tool, {"quote_id": "qt_1", "credits": 80, "expires_at": "later"})["required"])
+        self.assertTrue(account.approval_details(tool)["required"], "no quote yet: the card waits for one")
         self.assertNotIn("100", account.approval_details(tool)["text"])
         with self.assertRaises(cloud_http.CloudError):
             account.approval_details(tool, {"quote_id": "qt_1", "credits": -3, "expires_at": "later"})
@@ -120,7 +136,7 @@ class LogicTest(unittest.TestCase):
         refused = descriptor(data_class="C", byok=None, unavailable_reason="private_mode")
         self.assertEqual(account.refusal(refused, {}), "Private mode blocks this vendor: May train (C).")
 
-    @patch.object(config, "BETA", False)
+    @patch.object(config, "billing_open", lambda: True)
     def test_cost_and_upgrade_are_visible_on_card(self):
         session = state.new_session()
         card = state.item_tool("loopcut_cloud__render", "Render", "")
@@ -147,7 +163,7 @@ class LogicTest(unittest.TestCase):
             account.confirm(account.approval_details(descriptor(backend="byok")))
         account.confirm(account.approval_details(descriptor(cost={"credits_estimate": 1})))
 
-    @patch.object(config, "BETA", False)
+    @patch.object(config, "billing_open", lambda: True)
     def test_model_error_is_short_and_link_is_safe(self):
         error = cloud_http.CloudError("Refused", "insufficient_credits", 402,
                                       {"balance": 1, "needed": 20, "upgrade": "https://loopcut.org/pricing"})
@@ -167,7 +183,7 @@ class LogicTest(unittest.TestCase):
             wait.assert_not_called()
             self.assertTrue(agent._cloud_consent(turn, card, True, detail))
             self.assertTrue(card["paid_approval"])
-            self.assertEqual(card["cost"], "51 credits estimated")
+            self.assertEqual(card["cost"], "About 51 credits ($0.51)")
             wait.assert_called_once_with(turn)
 
 
@@ -212,7 +228,7 @@ class MockAccountTest(unittest.TestCase):
     def posts(self, endpoint):
         return [c["body"] for c in self.mock.calls if c["path"] == endpoint and c["method"] == "POST"]
 
-    @patch.object(config, "BETA", False)
+    @patch.object(config, "billing_open", lambda: True)
     def test_manifest_credits_refresh_and_signed_out_hide(self):
         self.assertIn("1,840 credits", account.panel_data(self.runtime)["credits"])
         self.client.request("POST", "/mock/control", {"balance": 1200})
@@ -320,7 +336,7 @@ class MockAccountTest(unittest.TestCase):
             self.assertEqual((caught.exception.status, caught.exception.code), (403, "private_mode"))
             self.assertIn("data class C", account.error_details(caught.exception)["text"])
 
-    @patch.object(config, "BETA", False)
+    @patch.object(config, "billing_open", lambda: True)
     def test_402_gives_user_link_and_short_model_result(self):
         self.client.request("POST", "/mock/control", {"balance": 0})
         notices = []
@@ -343,7 +359,7 @@ class MockAccountTest(unittest.TestCase):
         result = self.run_approved(self.tool("render"), self.render_arguments(), consent)
         self.assertEqual(result["status"], "succeeded")
         quoted = next(iter(self.mock.state.quotes.values()))["quote"]
-        self.assertEqual(seen[0]["text"], f"{quoted['credits']} credits (quoted)")
+        self.assertEqual(seen[0]["text"], f"{quoted['credits']} credits (${quoted['credits'] / 100:.2f}), quoted")
         submitted = self.posts("/v1/jobs")[0]
         self.assertEqual(submitted["quote_id"], quoted["quote_id"])
         self.assertNotIn("quote_id", submitted["input"])
@@ -406,7 +422,7 @@ class MockAccountTest(unittest.TestCase):
         self.assertEqual(len(self.posts("/v1/jobs")), 1)
         self.assertEqual(len(self.mock.state.jobs), 0)
 
-    @patch.object(config, "BETA", False)
+    @patch.object(config, "billing_open", lambda: True)
     def test_cloud_dispatch_uses_consent_before_running_and_surfaces_402(self):
         notices = []
         def consent(detail):

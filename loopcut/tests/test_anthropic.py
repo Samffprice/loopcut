@@ -463,6 +463,30 @@ class ErrorTest(Base):
             self.stream(model="claude-nope")
         self.assertEqual(len(Fake.requests), 2)
 
+    def test_a_broken_pipe_is_retried_with_smaller_images(self):
+        import urllib.error
+        import fake_imbuf
+        photo = base64.b64encode(fake_imbuf.make(1568, 882, kind="JPEG", quality=85)).decode()
+        looks = [{"role": "user", "content": [{"type": "text", "text": f"Viewport capture: look {n}."},
+                                              {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo}"}}]}
+                 for n in range(6)]
+        Fake.script = [(200, reply(text("ok")))]
+        sizes, real = [], am._post
+
+        def post(url, body, *args):
+            sizes.append(len(json.dumps(body)))
+            if len(sizes) == 1:
+                raise urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
+            return real(url, body, *args)
+        with mock.patch.dict(sys.modules, {"imbuf": fake_imbuf}), mock.patch.object(am, "_post", post):
+            completion, _ = self.stream(conversation(*looks))
+        self.assertEqual((completion.text, len(sizes)), ("ok", 2))
+        from loopcut import image_budget
+        self.assertLess(sizes[1], min(sizes[0], image_budget.REQUEST_BYTES // 2 + 50_000), "the retry: half the budget")
+        sent = json.dumps(self.body())
+        self.assertEqual(sent.count('"type": "image"') + sent.count("omitted to keep the request small"), 7,
+                         "every look sent, smaller, or named in a note")
+
     def test_rate_limit_waits_as_retry_after_says_capped(self):
         Fake.script = [(429, error_body("rate_limit_error"), {"retry-after": "2"}),
                        (429, error_body("rate_limit_error"), {"retry-after": "900"}),

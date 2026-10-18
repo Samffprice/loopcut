@@ -839,6 +839,98 @@ class StreamTest(Base):
         completion, _ = self.stream()
         self.assertEqual(completion.text, "ok")
 
+    def _drops(self, *failures):
+        """chatgpt_responses._post raising each failure in turn, then the fake server as usual."""
+        real, calls = chatgpt_responses._post, []
+
+        def post(*args, **kwargs):
+            calls.append(1)
+            if len(calls) <= len(failures):
+                raise failures[len(calls) - 1]
+            return real(*args, **kwargs)
+        patcher = mock.patch.object(chatgpt_responses, "_post", post)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_a_tls_alert_in_place_of_the_status_line_is_retried(self):
+        """Persona round 1 (2026-10-16): api.openai.com cut large uploads with a bad_record_mac alert, read by
+        getresponse() as ssl.SSLError (urlopen does not wrap it), and the turn ended as 'Internal error'."""
+        import ssl
+        FakeResponses.script = [(200, reply("ok"))]
+        calls = self._drops(ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] ssl/tls alert bad record mac"))
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(calls)), ("ok", 2))
+
+    def test_broken_pipe_reset_and_a_cut_off_status_line_are_retried(self):
+        import http.client
+        FakeResponses.script = [(200, reply("ok"))]
+        calls = self._drops(urllib.error.URLError(BrokenPipeError(32, "Broken pipe")),
+                            ConnectionResetError(54, "Connection reset by peer"), http.client.IncompleteRead(b""))
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(calls)), ("ok", 4))
+
+    def test_a_broken_pipe_is_retried_with_smaller_images(self):
+        # 2026-10-17: every try re-sent the same 6-7 MB of images, and every try was cut off with a broken pipe.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import fake_imbuf
+        from loopcut import image_budget
+        photo = base64.b64encode(fake_imbuf.make(1568, 882, kind="JPEG", quality=85)).decode()
+        looks = [{"role": "user", "content": [{"type": "text", "text": f"Viewport capture: look {n}."},
+                                              {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo}"}}]}
+                 for n in range(6)]
+        FakeResponses.script = [(200, reply("ok"))]
+        sizes, images, real = [], [], chatgpt_responses._post
+
+        def post(body, *args, **kwargs):
+            sizes.append(len(json.dumps(body)))
+            images.append((json.dumps(body).count('"input_image"'), json.dumps(body).count("omitted to keep the request small")))
+            if len(sizes) == 1:
+                raise urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
+            return real(body, *args, **kwargs)
+        with mock.patch.dict(sys.modules, {"imbuf": fake_imbuf}), mock.patch.object(chatgpt_responses, "_post", post):
+            completion, _ = self.stream([*conversation(), *looks])
+        self.assertEqual((completion.text, len(sizes)), ("ok", 2))
+        self.assertLess(sizes[0], image_budget.REQUEST_BYTES + 50_000, "the first try is fitted already")
+        self.assertLess(sizes[1], min(sizes[0], image_budget.REQUEST_BYTES // 2 + 50_000), "the retry: half the budget")
+        self.assertEqual(sum(images[1]), sum(images[0]), "every look sent, smaller, or named in a note")
+
+    def test_a_connection_that_keeps_dropping_ends_in_plain_words_with_try_again(self):
+        import ssl
+        calls = self._drops(*[ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac")] * 9)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(len(calls), len(llm.RETRY_DELAYS) + 1, "the existing budget: one try and three retries")
+        self.assertEqual(caught.exception.code, llm.CONNECTION_LOST)
+        text = str(caught.exception)
+        self.assertTrue(text.startswith("The connection to ChatGPT dropped"), text)
+        self.assertIn("Try again", text)
+        self.assertNotIn("Internal error", text)
+
+    def test_a_refused_certificate_is_not_retried(self):
+        import ssl
+        calls = self._drops(urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed")))
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(caught.exception.code, llm.CONNECTION_LOST)
+
+    def test_an_error_answer_whose_body_breaks_off_still_counts_by_its_status(self):
+        import io
+        import ssl
+
+        class Broken(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                raise ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac")
+        busy = urllib.error.HTTPError("https://api.openai.com/v1/responses", 503, "busy", {}, io.BufferedReader(Broken()))
+        FakeResponses.script = [(200, reply("ok"))]
+        calls = self._drops(busy)
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(calls)), ("ok", 2))
+
     def test_replay_falls_back_without_ids_then_without_replay(self):
         FakeResponses.script = [(200, reply("one", calls=[("call_r", "run_python", "{}", "loopcut")], reasoning="ENC-R"))]
         messages = conversation()

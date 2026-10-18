@@ -60,10 +60,11 @@ _animated_at = 0.0
 
 def _animating() -> float | None:
     """The redraw period wanted now, or None."""
-    from . import state
+    from . import playback, state
     if time.time() < state.ui.get("animate_until", 0.0):
         return EASE_EVERY
-    return ANIMATE_EVERY if state.session().get("busy") else None
+    # A chat audio card's waveform fills in as its sound plays.
+    return ANIMATE_EVERY if state.session().get("busy") or playback.playing() else None
 
 
 def _turn_running() -> bool:

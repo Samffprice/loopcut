@@ -534,6 +534,10 @@ class Worker:
         turn.cancel = cancel  # Kept across a retry, so Stop and the row's Cancel reach the new loop.
         turn.config = dataclasses.replace(roles.worker, max_steps=0, auto_run=True,
                                           auto_look=roles.worker.auto_look and self.brief["role"] in AUTO_LOOK_ROLES)
+        # Credits (C47): a worker spends from the user's chat and turn, never a budget of its own; a paid call
+        # that asks shows in the user's panel under this name, and the worker waits for the answer.
+        turn.chat = (self.wave.session, self.wave.turn)
+        turn.worker = f"worker {self.id} ({self.brief['role']})"
         return turn
 
     def _now(self) -> float:

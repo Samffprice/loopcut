@@ -275,6 +275,14 @@ class CodexAppTest(unittest.TestCase):
         reply = codex_app._reply("Image attached: the scene.", True, image)
         self.assertTrue(reply["contentItems"][1]["imageUrl"].startswith("data:image/png;base64,"))
 
+    def test_a_data_url_names_the_type_its_bytes_hold(self):
+        stored = Path(self.tmp.name) / ("a" * 64 + ".png")  # A clip's sheet: JPEG, stored as <sha>.png.
+        stored.write_bytes(b"\xff\xd8\xff\xe0 sheet")
+        self.assertTrue(codex_app.data_url(stored).startswith("data:image/jpeg;base64,"))
+        unknown = Path(self.tmp.name) / "photo.jpg"
+        unknown.write_bytes(b"made up")
+        self.assertTrue(codex_app.data_url(unknown).startswith("data:image/jpeg;base64,"), "else the suffix")
+
 
 if __name__ == "__main__":
     unittest.main()

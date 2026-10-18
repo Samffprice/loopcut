@@ -205,9 +205,12 @@ runtime caches in the local install tree. Python build helpers suppress bytecode
 the separate `package_archive` copy also filters caches.
 
 Private comparison files are read at runtime. Override their locations with
-`--skills-dir`, `--prompts-dir`, `--mixar-dir`, `--economics-file`, or the matching
-`LOOPCUT_RELEASE_SKILLS_DIR`, `LOOPCUT_RELEASE_PROMPTS_DIR`, `LOOPCUT_RELEASE_MIXAR_DIR`,
+`--skills-dir`, `--prompts-dir`, `--research-dir`, `--economics-file`, or the matching
+`LOOPCUT_RELEASE_SKILLS_DIR`, `LOOPCUT_RELEASE_PROMPTS_DIR`, `LOOPCUT_RELEASE_RESEARCH_DIR`,
 `LOOPCUT_RELEASE_ECONOMICS_FILE` environment variables; `--cost-doc FILE` is repeatable.
+The research folders (kept out of every snapshot) and the default `--research-dir` are named
+only in the private `loopcut/track/research_folders.txt`; without it the research check reports
+missing coverage.
 Missing sources are reported as reduced coverage. Withheld add-on constants from
 server-held-prompts plan section 1 are expected blockers until moved to the server.
 Review other findings before adding their SHA-256 hashes and reasons to
@@ -271,7 +274,7 @@ descriptions, and the worker brief's step count and budget wording (C16). Artifa
 | `get_object_info` | How an object is set up: modifier settings, material and geometry node trees, constraints, animation, custom properties. Read before editing someone's material. `detail=transform`: only transform, dimensions, bounds, mesh counts, modifiers, parent/children and slot names. Past 8,000 characters whole sections go, largest first, named in `omitted` (`object_info.fit`), never a value cut in half. `"world"` (or a world's name) reads the world's node tree. A socket name a node has twice carries its index, here and in Scene changes' links: `Mix Shader.Shader (inputs[2])`, so a swapped connection shows. |
 | `check_contact` | Placement measured on the evaluated world-space meshes, not judged from bounds or a capture: for pairs `{a, relation, b}`, `rests_on` (every foot or leg of a on b's top, gravity -Z; a leg through a rug fails), `touches`, `clear_of` (at least `gap` apart) or `inside` (b's convex hull), each gets pass, fail or unavailable with the reason, the gap or penetration, and for a failure the move that would fix it. Nothing is moved. An empty stands for its child meshes. `watch=true` measures the pairs again after every later `run_python` of the conversation and lists a change of status in its Scene changes. How: `contact.py`'s docstring. |
 | `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. |
-| `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. Its caption ends with how it was drawn (viewport mode, view transform, size). A worker's own `capture_viewport` renders in its child instead: see "Worker looks". |
+| `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. Its caption ends with how it was drawn (viewport mode, view transform, size). Object names are drawn on only with `labels: true` (here and in `compare_with_reference`): on a close shot they covered the subject. A worker's own `capture_viewport` renders in its child instead: see "Worker looks". |
 | `frame_camera` | Aim a camera and fit `objects` (a root or empty counts its children, instances included) into its render frame in one call: `direction` `keep` (its rotation), `front`, `side`, `top`, `three_quarter` or a vector, no roll; `margin` per side; `region` (x0,y0,x1,y1) fits into part of the frame, the lens shift kept; `lens`, or `ortho_scale` for an orthographic camera. Solved exactly from evaluated vertices, render aspect, sensor fit and shift (`framing.py`), not a bounding sphere; the clip range widens if the subject needs it; `create` makes a scene camera. Reports per object its bounds in frame, % inside, clipped edges, margins and offset, and which margin binds the fit. A scene change (checkpoint, approval, one undo step), except `report_only`, which only measures (`tools.only_reads`), with `frames` a line per frame. |
 | `inspect_scene` | [Real inspection renders](VISUAL_INSPECTION.md) across named cameras and frames, in a labeled sheet; geometry, studio materials, or actual scene lighting, with stale-result rejection. |
 | `compare_with_reference` | The attached reference on the left and a capture on the right in one image, for the compare-adjust loop of copying a picture. |
@@ -393,6 +396,7 @@ earlier, UI buttons, timers); geometry built directly with bmesh or `from_pydata
 | `Blender --factory-startup --enable-event-simulate --python loopcut/harness/input_check.py` | ~8s | Click, type, select, undo, complete an @mention, Esc through simulated events. |
 | `LOOPCUT_SHOTS=<dir> Blender --factory-startup --enable-event-simulate -p 0 0 1440 900 --python loopcut/harness/vote_check.py` | ~15s | The vote view end to end against a stand-in `/v1` service in the same process (the saved manifest in `fixtures/vote_manifest.json`, `/v1/votes` with other voters seeded): the strip, opening the ranked view, a vote, two quick votes in a row, a fourth refused without a request, a take-back, the tooltip, back to chat; panel screenshots `vote-*.png` in `LOOPCUT_SHOTS`. Run it with `BLENDER_USER_RESOURCES` set to a throwaway folder. |
 | `Blender -b --factory-startup --python loopcut/harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `loopcut/scripts/shot.sh attachments` shows the chips. |
+| `Blender -b --factory-startup --python loopcut/harness/image_budget_check.py` | ~3s | Stored images and request budgets with the real encoder: a PNG render stored as a 1568 px JPEG its card still loads, flat and see-through images kept as PNG, a request of eight renders fitted under the budget and halved after a dropped upload. |
 | `Blender -b --factory-startup --python loopcut/harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |
 | `loopcut/scripts/onboarding_check.sh` | ~40s | First run of the build in a throwaway home folder: clicks through a fresh start, imports stock settings and checks they took effect and stock Blender's folder is byte-identical, screenshots every step to `../out/onboarding/`. |
 | `Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/contact_check.py` | ~3s | `check_contact` on fixtures built on the spot (a floating table top, a lamp with a short foot, a chair through a rug, roots, a collection instance, penetrating cubes, a mirrored slab, a one-sided wall, a bowl): every status, depth and fix asserted, each fix applied and checked again; then watched pairs that `run_python` breaks and mends; then the shared_support eval's reading corner (`corner.py`: a side table wound inward, a lamp base's rim level with the chair's feet), whose gaps once read as metres of overlap; an open strap loop (a torus with a gap cut, wound either way) 39 mm clear of a lens barrel, a band round a lens mount, and the strap dipped 10 mm in, which once read as 375 mm. |
@@ -500,6 +504,14 @@ time comes from the checkpoint (or the entry file's mtime), so repeated serializ
 `cloud_http.Client` carries service authentication and contract/version headers; its injectable
 urlopen-style transport also lets the blob tests exercise presigned PUTs without sockets.
 
+Every storage PUT goes through one retry loop (`blobs._send`: 5 tries with backoff, URL refresh
+near expiry, cancel between tries and per body block, `cloud_http.describe` causes). When the
+manifest offers `capabilities.blob_multipart` (contract 0.6) and a file is at least its `min_size`
+(16 MiB), `blobs.put_multipart` sends it in the server's parts (5 MiB), each part through that loop,
+with progress "Uploading scene.blend: part 4/16…", then completes; a failure or cancel aborts it.
+Smaller files, servers without the capability, and a server answering the start with 404 get one PUT.
+R2 connections from some networks break every 20-30 MB, which a single 80 MB PUT rarely survives.
+
 Bundle check: `<blender> -b --factory-startup --python loopcut/harness/bundle_check.py -- <tmpdir>`.
 It creates private test data, checks the saved relative texture path and every manifest hash,
 and uploads twice to an in-process fake service. It prints PASS/FAIL and exits nonzero on failure.
@@ -514,8 +526,13 @@ fresh one without losing the old.
   file does not share the chats that built it, and the user's file is never written.
 - A conversation belongs to every file it has worked in: Save As, the first save of an untitled
   scene, and checkpoint restores all add to that list. An unsaved scene always starts fresh.
-- Viewport captures are stored once as PNGs beside the conversation and referenced from
-  messages; they are expanded to data URIs only when a request is sent.
+- Images (captures, renders, attached pictures) are stored once beside the conversation and
+  referenced from messages; they are expanded to data URIs only when a request is sent. Every
+  request re-sends them, so `image_budget.py` keeps them small: stored as JPEG (quality 85, at most
+  1568 px) unless they have transparency or PNG is smaller, and each request's images under 2 MB of
+  base64 however many there are: the newest three tool images and the user's own as stored, older
+  tool images as 512 px thumbnails, the oldest left out eight at a time with a note of what each
+  showed; half the budget on a retry after the connection dropped as the request went up.
 - A turn cut short (Stop, or Blender closing) gets its unanswered tool calls answered, so the
   history stays valid for the API. Files on disk are validated on load; a damaged one is skipped
   and left in place.
@@ -614,7 +631,7 @@ remembers what was tried, and its notices go into the tool results so the histor
 A request with several deliverables is split. The agent in the user's Blender is then an
 orchestrator: it does small things itself (level 1), and briefs workers for the rest with
 `delegate`, one wave per call (level 2 for one deliverable, 3 for several; levels are inferred from
-what it does and kept in `session["turn_levels"]`). Design 07 in `mixar-research/findings/` has the
+what it does and kept in `session["turn_levels"]`). Design 07 in the private research findings has the
 whole design; the frozen interfaces are there.
 
 - `delegate` is refused unless every requirement and check quotes the user, kept objects are owned by

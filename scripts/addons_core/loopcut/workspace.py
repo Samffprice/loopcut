@@ -283,12 +283,16 @@ def _shims(ws: Path) -> None:
             path.chmod(0o755)
 
 
-def _reference_name(reference: dict, taken: set) -> str:
-    """The attached image's own file name; a stored PNG copy is named after it."""
+def _reference_name(reference: dict, taken: set, stored: Path) -> str:
+    """The attached image's own file name; a stored copy is named after it, with the suffix of what it
+    holds (PNG, or JPEG for a clip's sheet, whose name is "take.mp4 2.00-4.27s")."""
+    from . import conversations
     name = Path(str(reference.get("name") or "attached.png")).name or "attached.png"
     source = Path(str(reference.get("source") or ""))
     if not source.is_file():
-        name = f"{Path(name).stem}.png"
+        stem = Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTENSIONS else name
+        with stored.open("rb") as handle:
+            name = stem + (".jpg" if conversations.media_type(handle.read(12)) == "image/jpeg" else ".png")
     stem, suffix, n = Path(name).stem, Path(name).suffix, 2
     while name in taken:
         name, n = f"{stem}-{n}{suffix}", n + 1
@@ -305,10 +309,11 @@ def _copy_references(session: dict, ws: Path) -> list[str]:
         key = reference.get("full") or reference.get("ref")
         if not key or key in done:
             continue
-        name = _reference_name(reference, taken)
+        name = reference.get("name")
         source = Path(str(reference.get("source") or ""))
         try:
             origin = source if source.is_file() else conversations.image_path(session["id"], key)
+            name = _reference_name(reference, taken, origin)
             shutil.copy2(origin, ws / name)
         except Exception as ex:  # A missing image is said in the note, never a failed turn.
             print(f"Loopcut: could not copy {name} into the workspace: {ex!r}")

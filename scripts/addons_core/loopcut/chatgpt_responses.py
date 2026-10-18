@@ -51,7 +51,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 
-from . import chatgpt_auth, cloud, context, llm
+from . import chatgpt_auth, cloud, context, image_budget, llm
 
 NAMESPACE = "loopcut"
 NAMESPACE_DESCRIPTION = ("Loopcut's tools. They act on the user's open Blender scene and, when one is set up, "
@@ -494,10 +494,11 @@ def _post(body: dict, token: str, timeout: float, turn_state: str = "", session:
 
 
 def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcript: _Transcript,
-          turn_state: Callable[[], str] = lambda: "", session: str = ""):
+          turn_state: Callable[[], str] = lambda: "", session: str = "", on_drop: Callable[[], bool] = lambda: False):
     """Open the stream: the token (refreshed when near expiry, and once more after a 401), retries
     for 429/5xx that are not usage limits, and one retry per optional feature a 400 refuses (the body
-    is built again by build(), which leaves out every feature refused so far)."""
+    is built again by build(), which leaves out every feature refused so far, and after a dropped
+    connection sends smaller images: on_drop is image_budget.Sized.tighten)."""
     attempt, refreshed, refused = 0, False, set()
     while True:
         body = build()
@@ -509,9 +510,12 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
         try:
             return _post(body, token, read_timeout(), turn_state(), session)
         except urllib.error.HTTPError as ex:
-            with ex:
-                raw = ex.read(200_000)
-                headers = ex.headers
+            headers = ex.headers
+            try:
+                with ex:
+                    raw = ex.read(200_000)
+            except (OSError, http.client.HTTPException):
+                raw = b""  # The answer's body broke off; its status still decides.
             error = _error_from(ex.code, raw, headers)
             transcript.response({"status": ex.code, "error": error.details, "headers": _headers(headers)})
             if ex.code == 401 and not refreshed and error.code not in _NO_RETRY:
@@ -538,9 +542,17 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
                 delay = min(max(delay, float(retry_after)), llm.MAX_RETRY_AFTER)
             print(f"Loopcut: retrying the ChatGPT request after HTTP {ex.code} ({attempt + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as ex:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as ex:
+            # A dropped connection: refused, reset, a broken pipe while the body went up, or a TLS alert such
+            # as bad_record_mac read in place of the status line (ssl.SSLError, which urlopen does not wrap).
+            # api.openai.com cut large uploads (2.5-5 MB) that way about one time in four on 2026-10-16.
+            if not llm.dropped_connection(ex):
+                if isinstance(ex, urllib.error.URLError):  # A refused certificate, say: the same every time.
+                    raise llm.LLMError(f"Could not reach ChatGPT: {ex.reason}") from None
+                raise
             if attempt >= len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Could not reach api.openai.com: {getattr(ex, 'reason', ex)}") from None
+                raise llm.connection_lost("ChatGPT", ex) from None
+            on_drop()
             delay = llm.RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the ChatGPT request after {getattr(ex, 'reason', ex)!r} "
                   f"({attempt + 1}/{len(llm.RETRY_DELAYS)}, waiting {delay:g}s)")
@@ -760,15 +772,17 @@ def stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_eff
     cache_key = f"loopcut-{conversation}-{role}" if conversation else ""
     deadline = time.monotonic() + call_max_seconds if call_max_seconds else None
     before_content, retried_partial = 0, False
+    sized = image_budget.Sized(messages)
 
     def build() -> dict:
-        return request_body(model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort,
+        return request_body(model=model, messages=sized.messages(), tools=tools, reasoning_effort=reasoning_effort,
                             cache_key=cache_key)
 
     turn = _turn(messages)
     while True:
         transcript = _Transcript()
-        response = _open(build, is_cancelled, transcript, lambda: _turn_state(cache_key, turn), session_id(cache_key))
+        response = _open(build, is_cancelled, transcript, lambda: _turn_state(cache_key, turn), session_id(cache_key),
+                         sized.tighten)
         _remember_turn_state(cache_key, turn, response.headers)
         meta = {"model": model, "effort": reasoning_effort, "request_id": _request_id(response.headers),
                 "headers": _headers(response.headers)}
@@ -778,13 +792,13 @@ def stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_eff
             cause = ex.__cause__ or "the stream ended before response.completed"
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise llm.LLMError(f"Connection lost while streaming the reply: {cause!r}") from cause
+                    raise llm.connection_lost("ChatGPT", cause, while_replying=True) from cause
                 retried_partial = True
                 print(f"Loopcut: retrying the ChatGPT request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Connection lost before any reply arrived: {cause!r}") from cause
+                raise llm.connection_lost("ChatGPT", cause) from cause
             delay = llm.RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the ChatGPT request after {cause!r} ({before_content + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")

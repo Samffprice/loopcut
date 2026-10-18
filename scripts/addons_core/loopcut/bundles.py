@@ -14,6 +14,8 @@ libraries with unpacked external dependencies are unsupported; plain libraries a
 Installation inputs stay at their original paths and are listed under system: the matching
 Blender version supplies them, including the factory startup's essentials brush libraries.
 Implicit point caches and unknown external path types are reported rather than guessed.
+Paths Blender lists but never reads are not inputs: where an appended ID came from (its weak
+reference, as BlenderKit leaves), a sound strip's own copy of a path, and empty fields.
 The manifest/hash/upload side imports no bpy and uses only the standard library.
 Image paths use filepath_raw: filepath would reload and discard recovered painted pixels.
 Dirty still/tiled images are saved only into staging, keeping those checkpoint buffers.
@@ -145,14 +147,28 @@ def manifest(staging_dir, scene_info, source):
     return value
 
 
+def _js_numbers(value):
+    """The service re-serializes the manifest in JavaScript and checks its hash, and JavaScript
+    writes a whole float as an integer: Python's "fps":24.0 must go out as "fps":24."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _js_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_js_numbers(item) for item in value]
+    return value
+
+
 def canonical_json(value):
     _validate_manifest(value)
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    return json.dumps(_js_numbers(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                       allow_nan=False).encode("utf-8")
 
 
-def upload(staging_dir, manifest, *, client=None):
+def upload(staging_dir, manifest, *, client=None, cancel=None, progress=None, multipart=None):
     """Upload absent file blobs, then the canonical manifest blob; return its SHA-256.
+
+    multipart: the manifest's capabilities.blob_multipart, so a large scene.blend goes in parts.
 
     The manifest temporary file lives outside staging, so another manifest() call cannot
     accidentally include it (or the bundle's own hash) in its files list.
@@ -165,13 +181,13 @@ def upload(staging_dir, manifest, *, client=None):
     if actual != {item["path"] for item in manifest["files"]}:
         raise BundleError("Staging files differ from the manifest")
     client = client or cloud_http.Client()
-    blobs.upload_missing(files, client=client)
+    blobs.upload_missing(files, client=client, cancel=cancel, progress=progress, multipart=multipart)
     digest = hashlib.sha256(body).hexdigest()
     with tempfile.TemporaryDirectory(prefix="loopcut-manifest-") as temporary:
         path = Path(temporary) / "manifest.json"
         path.write_bytes(body)
         blobs.upload_missing([{"path": path, "sha256": digest, "size": len(body), "mime": "application/json"}],
-                             client=client)
+                             client=client, cancel=cancel, progress=progress)
     return digest
 
 
@@ -290,6 +306,43 @@ def _references(bpy, unsupported):
     return refs
 
 
+def _not_inputs(bpy, base, library_paths):
+    """Paths blend_paths lists that Blender never reads, so the render machine never needs them.
+
+    ID.library_weak_reference is the file an ID was appended from with Append (Reuse Data), as
+    BlenderKit does; it is listed even for packed IDs (Report Missing Files skips it). A sound
+    strip keeps its own copy of the path it was made from (scene.cc lists it even when the sound
+    is packed); it plays the Sound, which is packed or copied. Python cannot read that copy, and
+    it goes stale once the sound is unpacked or relinked (a generated sound's temporary download),
+    so it is found per scene: the paths file_path_map lists for a scene that none of its movie or
+    image strips claim.
+    """
+    paths = set()
+    collection_type = getattr(getattr(bpy, "types", None), "bpy_prop_collection", list)
+    for name in dir(bpy.data):
+        collection = getattr(bpy.data, name, None)
+        if name.startswith("_") or not isinstance(collection, collection_type):
+            continue
+        for item in collection:
+            weak = getattr(item, "library_weak_reference", None)
+            if weak is not None and weak.filepath:
+                library = getattr(item, "library", None)
+                paths.add(_resolve_path(weak.filepath,
+                                        library_paths[library.as_pointer()] if library else base))
+    scenes = [scene for scene in bpy.data.scenes if scene.sequence_editor]
+    for scene, listed in (bpy.data.file_path_map(subset=scenes) if scenes else {}).items():
+        scene_base = library_paths[scene.library.as_pointer()] if scene.library else base
+        claimed = set()
+        for strip in scene.sequence_editor.strips_all:
+            if strip.type == "MOVIE":
+                claimed.add(_resolve_path(strip.filepath, scene_base))
+            elif strip.type == "IMAGE":
+                claimed.update(_resolve_path(os.path.join(strip.directory, element.filename), scene_base)
+                               for element in strip.elements)
+        paths.update(path for raw in listed if raw and (path := _resolve_path(raw, scene_base)) not in claimed)
+    return paths
+
+
 def _collect_opened(blend_path, staging_dir, original_path=None):
     """Child only. The only save target is staging/scene.blend, with remapping disabled."""
     import bpy
@@ -387,10 +440,14 @@ def _collect_opened(blend_path, staging_dir, original_path=None):
 
     # Inspect unhandled inputs before rewriting anything. blend_paths also sees linked inputs
     # which are not represented by the supported datablock types (for example external meshes).
-    local_paths = {path for raw in bpy.utils.blend_paths(absolute=True, local=True)
-                   if not system_path(path := _resolve_path(raw, base))}
-    all_paths = {path for raw in bpy.utils.blend_paths(absolute=True, local=False)
-                 if not system_path(path := _resolve_path(raw, base))}
+    not_inputs = _not_inputs(bpy, base, library_paths)
+
+    # An empty path names no file; resolved, it would be the scene's whole folder.
+    def input_paths(local):
+        return {path for raw in bpy.utils.blend_paths(absolute=True, local=local)
+                if raw and (path := _resolve_path(raw, base)) not in not_inputs and not system_path(path)}
+
+    local_paths, all_paths = input_paths(True), input_paths(False)
     linked_paths = set()
     for ref in refs:
         if ref["library"]:
@@ -421,8 +478,12 @@ def _collect_opened(blend_path, staging_dir, original_path=None):
         copy_reference({"owner": lib, "attribute": "filepath", "folder": "libraries", "raw": str(path),
                         "sequence": False, "directory": False, "members": None, "name": lib.name})
     for path in sorted(local_paths):
-        if str(path) not in handled:
+        if str(path) in handled:
+            continue
+        if path.exists():
             unsupported.append({"type": "external", "path": str(path), "reason": "Unhandled input path"})
+        else:
+            missing.append({"type": "external", "path": str(path)})
     scene = bpy.context.scene
     result = {"blender": ".".join(map(str, bpy.app.version)),
               "scene": {"name": scene.name, "camera": scene.camera.name if scene.camera else None,

@@ -73,6 +73,31 @@ class StoreTest(unittest.TestCase):
             for e in reloaded.entries:
                 self.assertEqual(reloaded.snapshot_path(e["id"]).exists(), not e["expired"])
 
+    def test_bundle_snapshot_is_indexed_for_collection_then_discarded(self):
+        from unittest.mock import patch
+        saved = []
+
+        def save_as_mainfile(filepath, copy, compress):
+            Path(filepath).write_bytes(b"live scene")
+            saved.append((filepath, copy))
+            return {"FINISHED"}
+        fake = types.SimpleNamespace(ops=types.SimpleNamespace(wm=types.SimpleNamespace(save_as_mainfile=save_as_mainfile)),
+                                     data=types.SimpleNamespace(filepath="/projects/shot.blend"))
+        with tempfile.TemporaryDirectory() as root, patch.dict(sys.modules, {"bpy": fake}), \
+                patch.dict("os.environ", {"LOOPCUT_DATA_DIR": root}), \
+                patch("loopcut.config.checkpoint_budget_mb", return_value=2048):
+            session = state.new_session()
+            checkpoint_id = cp.for_bundle(session)
+            store = cp.Store(Path(root), session["id"])
+            entry = store.get(checkpoint_id)
+            self.assertEqual((entry["kind"], entry["expired"], entry["in_place"]), ("bundle", False, False))
+            self.assertEqual(saved, [(str(store.snapshot_path(checkpoint_id)), True)])  # A copy: the open file is untouched.
+            self.assertEqual(session["pending_checkpoint"], None)  # The turn's own checkpoint is not this one.
+            cp.discard(session, checkpoint_id)
+            self.assertFalse(store.snapshot_path(checkpoint_id).exists())
+            self.assertEqual(cp.Store(Path(root), session["id"]).entries, [])
+            cp.discard(session, checkpoint_id)  # Already gone: nothing to do.
+
     def test_rejects_ids_that_are_not_ours(self):
         with self.assertRaises(cp.CheckpointError):
             cp.Store(Path("/tmp"), "../../etc")

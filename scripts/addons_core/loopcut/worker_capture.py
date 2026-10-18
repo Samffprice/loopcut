@@ -35,8 +35,8 @@ never a whole set whose floor would shrink the product to a dot. Named angles us
 camera placed with framing.fit. Everything temporary (cameras, the studio world and key light,
 albedo's material copies) is tagged lc_temp and removed afterwards; every scene, render, object and
 material setting a look changes, and the frame, is put back, so a look changes nothing a later
-tool, check or the result can see (the originals of a material are never edited). Names
-are drawn onto the image afterwards, from inspection_worker.projections, with blf.
+tool, check or the result can see (the originals of a material are never edited). With
+labels, names are drawn onto the image afterwards, from inspection_worker.projections, with blf.
 A look first repairs the worker's own meshes (repair_meshes): a face model code added without its
 corners crashes the render's triangulation, and with it the child.
 """
@@ -245,7 +245,8 @@ def warm() -> float:
 
 def look(angle: str | None = None, focus: list[str] | None = None, frames: list[int] | None = None,
          step: int | None = None, angles: list[str] | None = None, shading=None,
-         isolate: bool = False, camera: str | None = None, view_layer: str | None = None) -> ToolResult:
+         isolate: bool = False, camera: str | None = None, view_layer: str | None = None,
+         labels: bool = False) -> ToolResult:
     """angle None is the role's own default (three_quarter means the same, since it is the schema's
     default): modeling's close views of its deliverable, lighting's and camera's view through the
     camera, and so on (plan). angles: one labelled sheet of these views instead (PANEL_ANGLES);
@@ -256,9 +257,12 @@ def look(angle: str | None = None, focus: list[str] | None = None, frames: list[
     paint in studio light and generic angles while the shot was a staged layer through saved
     cameras): camera is what every view through a camera looks through, and with no angle the
     look is final (animation: its frames through it); view_layer is the layer rendered and
-    measured, its exclusions, holdouts and overrides (default view_layers.production)."""
+    measured, its exclusions, holdouts and overrides (default view_layers.production). labels:
+    object names drawn on (never on final); off by default, since they covered the subject."""
     if angle is not None and angle not in ANGLES:
         raise ToolError(f"angle must be one of {', '.join(ANGLES)}")
+    if not isinstance(labels, bool):
+        raise ToolError("labels must be true or false")
     views, shadings = angles_of(angles), shadings_of(shading)
     chosen = _named_camera(camera) if camera else None
     view_layer = str(view_layer or "")
@@ -268,8 +272,8 @@ def look(angle: str | None = None, focus: list[str] | None = None, frames: list[
     _role["count"] += 1
     if angle == "crops":
         return _review(focus, shadings[0] if shadings else "scene", bool(isolate), step, chosen, view_layer)
-    return _look(angle, focus, frames, step=step, views=views, shadings=shadings, isolate=bool(isolate),
-                 reference=_role["reference"], camera=chosen, view_layer=view_layer)
+    return _look(angle, focus, frames, labels=labels, step=step, views=views, shadings=shadings,
+                 isolate=bool(isolate), reference=_role["reference"], camera=chosen, view_layer=view_layer)
 
 
 def _named_camera(name: str):

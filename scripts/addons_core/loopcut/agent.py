@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable
 
-from . import checkpoints, config, context, conversations, llm, repeats, state
+from . import checkpoints, config, context, conversations, image_budget, llm, repeats, spending, state, videoref
 from .ui.markdown import finish_reply
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
@@ -37,8 +37,7 @@ problem; it is not proof that materials or lights need rebuilding. Inspect the c
 - Tool calls in one reply run in order, each after the previous one finished: a look placed after a \
 run_python sees its result.
 - After a reply whose steps changed the scene you get one capture of the result (three_quarter, or the \
-last angle you asked for) with object names drawn on, unless you looked yourself after the last change in \
-that reply. When it would look the same as your last one you get a note instead of the image. Ask for capture_viewport or compare_with_reference only for another angle, a \
+last angle you asked for), unless you looked yourself after the last change in that reply. When it would look the same as your last one you get a note instead of the image. Ask for capture_viewport or compare_with_reference only for another angle, a \
 focus, a sheet of four views, a rendered look at lighting, or a comparison; the same look at an \
 unchanged scene is refused after 3 times. Never move the user's \
 viewport or shading. Fix what is actually wrong in the picture, then finish.
@@ -175,6 +174,15 @@ class Turn:
         self.may_divert = False
         self.diverted = False
         self.codex = None  # config.CodexApp when Codex's own loop runs the turn (CODEX_SPEC, codex_app.py).
+        # Credits (spending.py, C47): paid calls this turn, workers' included, and the burst guard's limit;
+        # the user's spending settings, read on the main thread by _configure.
+        self.paid_calls = 0
+        self.burst_limit = spending.BURST
+        self.spending: spending.Settings | None = None
+        # A worker's turn (waves.py): the user's (session, turn), whose ledger, burst guard and panel its paid
+        # calls share, and the name its asks show there. None and "" for the user's own turn.
+        self.chat: tuple | None = None
+        self.worker = ""
 
 
 def _redraw() -> None:
@@ -330,6 +338,38 @@ def _addons_line() -> str:
     return addons.line(addons.enabled(), bundled)
 
 
+MODEL_ROUTES = {"chatgpt": "the user's ChatGPT plan (Sign in with ChatGPT)", "loopcut": "the user's Loopcut account",
+                "local": "a model server on this computer"}
+
+
+def _model_line(cfg: config.Config | None) -> str:
+    """Main thread: the model this turn runs on and how it is reached, one line, so the model can name itself
+    (F0288: it sent the user to ChatGPT's own model picker)."""
+    from . import account, cloud, settings
+    if cfg is None or not cfg.model:
+        return ""
+    prefs, source = settings.preferences(), cloud.model_source()
+    name = account.model_label(cfg.model) if source == "loopcut" else cfg.model
+    route = MODEL_ROUTES.get(source) or (f"the user's own {settings.provider_label(prefs.provider)} key"
+                                         if prefs is not None else "")
+    head = f"You are {name}, reached through {route}" if route else f"You are {name}"
+    return head + "; the user picks the model in Loopcut's model menu, in this panel."
+
+
+def _setup_line(cfg: config.Config | None) -> str:
+    """Main thread: the model line, and the cloud tools this turn can't call and why (cloud.unavailable_line), so
+    "can you generate images?" gets a reason and an alternative in a line (F0276). They sit at the prompt's end
+    with the add-ons line: the cache pays only when they change."""
+    from . import cloud
+    lines = []
+    for what, make in (("the model", lambda: _model_line(cfg)), ("the unavailable cloud tools", cloud.unavailable_line)):
+        try:
+            lines.append(make())
+        except Exception as ex:  # A fact line is a nicety; the turn goes on without it.
+            print(f"Loopcut: could not describe {what}: {ex!r}")
+    return "\n".join(line for line in lines if line)
+
+
 def _system_prompt(session: dict) -> str:
     """The fixed prompt plus what is installed, read at the turn's start on the main thread."""
     extra = session.get("addons_line") or ""
@@ -402,6 +442,7 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
     session = session if session is not None else state.session()
     from . import cloud
     cloud.sync_settings()
+    turn.spending = config.spending()
     codex = config.codex_app()
     if codex is not None:
         session["mode"] = "workspace"
@@ -432,13 +473,13 @@ def _update_account(info: dict) -> None:
 
 
 def _warn_low_allowance(session: dict, items: list, info: dict) -> None:
-    """Warn once before the week's allowance runs out; beta has no purchase action."""
+    """Warn once before the week's allowance runs out; with billing closed there is no purchase action."""
     used = (info.get("week") or {}).get("used")
     if session.get("warned_low") or not isinstance(used, (int, float)) or used < LOW_ALLOWANCE:
         return
     session["warned_low"] = True
     left, plan = max(0, round((1 - used) * 100)), str(info.get("plan") or "")
-    if config.BETA:
+    if not config.billing_open():
         items.append(state.item_notice(f"About {left}% of this week's allowance is left."))
     elif plan == "free":
         items.append(state.item_notice(
@@ -483,9 +524,10 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import assets, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools
-    return (tools.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
-            + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + cloud.tool_schemas())
+    from . import assets, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools, video_attach
+    return video_attach.with_clip_tools(
+        tools.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
+        + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + cloud.tool_schemas())
 
 
 def _tool_title(name: str, schemas: Callable | None = None) -> str:
@@ -576,25 +618,178 @@ def _wait_for_approval(turn: Turn) -> bool:
     return turn.approved
 
 
-def _cloud_consent(turn, card, asks, details, *, files_allowed=False):
-    """Cost consent is per call, even when ordinary scene edits are auto-approved."""
-    if "error" in details:
-        card["cloud_error"] = details["error"]
-        card["expanded"] = True
+_card_waits: dict = {}  # id(card) -> _CardWait: an ask answered on its own card (a worker's, in the user's panel).
+
+
+class _CardWait:
+    def __init__(self):
+        self.event, self.approved = threading.Event(), False
+
+    def answer(self, approved: bool) -> None:
+        self.approved = approved
+        self.event.set()
+
+
+def _wait_for_card(card: dict, turns) -> bool:
+    """A worker's ask: wait for its own card's answer, so a main-turn card waiting at the same time keeps its own."""
+    wait = _card_waits[id(card)] = _CardWait()
+    try:
+        while not wait.event.wait(_POLL_SECONDS):
+            if any(t.cancel.is_set() for t in turns):
+                raise llm.Cancelled()
+        if any(t.cancel.is_set() for t in turns):
+            raise llm.Cancelled()
+        return wait.approved
+    finally:
+        _card_waits.pop(id(card), None)
+
+
+def _save_spend(session: dict) -> None:
+    """A charge known after the turn ended (a detached job) is saved with its conversation now; a running turn
+    saves it with its next step."""
+    if not session.get("busy"):
+        conversations.save(session)
+
+
+class _Consent:
+    """One cloud call's consent and charge, bound to its card (cloud_account.approval_context). Cost consent is per
+    call, even when ordinary scene edits are auto-approved: spending.decide says whether it asks. Every ask pauses
+    the turn on a card (owner, 2026-10-16); Approve runs the call, "Skip this" declines only this call and the model
+    is told why. A worker asks in the user's panel, named, and waits. A detached job reports its charge here later
+    (cloud_account.charge_reporter), so the chat's spend follows what was really charged."""
+
+    settles = True  # cloud_account.charge_reporter sends it what each call was charged.
+
+    def __init__(self, session, turn, card, asks=True, files_allowed=False):
+        self.session, self.turn, self.card = session, turn, card
+        self.asks, self.files_allowed = asks, files_allowed
+        self.hold = None       # (credits held, ran without asking) once the call may run.
+        self.limit_approved = False  # The user approved past a server limit, seeing this call's cost: no second ask.
+        self.shown = [card]    # The cards that show its cost: its own, and a worker's ask in the user's panel.
+
+    def chat(self):
+        if getattr(self.turn, "chat", None):
+            return self.turn.chat
+        return (self.session if self.session is not None else state.session()), self.turn
+
+    def __call__(self, details):
+        if "error" in details:
+            for card in self.shown:
+                card["cloud_error"] = details["error"]
+                card["expanded"] = True
+            _redraw()
+            return True
+        if "charged" in details:
+            self._settle(details["charged"], details.get("text") or "")
+            return True
+        self.card["cost"] = details["text"]
+        if details.get("file_access"):
+            if not details["required"] or self.files_allowed:
+                return True
+            if not self.asks:
+                return False
+            self.turn.decided.clear()
+            self.card.update(status="awaiting", paid_approval=False, heavy=False)
+            _redraw()
+            approved = _wait_for_approval(self.turn)
+            self.card["status"] = "running" if approved else "rejected"
+            _redraw()
+            return approved
+        if details.get("limit"):  # A server limit refused it (cloud_account._confirmed): ask, then it goes again.
+            approved = self._ask(details["limit"], details)
+            # Its card showed the price unless a quote was still coming; then the price asks on its own.
+            self.limit_approved = approved and details.get("credits") is not None
+            return approved
+        chat_session, chat_turn = self.chat()
+        settings = getattr(chat_turn, "spending", None) or spending.Settings()
+        explicit, allowed = self.limit_approved, set()  # A limit card that showed the price was its approval.
+        while not explicit:
+            with spending.lock:
+                kind = spending.decide(details, spending.ledger(chat_session), settings, calls=chat_turn.paid_calls,
+                                       burst_limit=chat_turn.burst_limit,
+                                       vendors=chat_session.setdefault("spend_vendors", []))
+            if kind == spending.RUN or kind in allowed:  # Allowed once for this call (a budget smaller than it).
+                break
+            allowed.add(kind)
+            if not self._ask(kind, details):
+                return False
+            with spending.lock:
+                spending.allow(kind, details, spending.ledger(chat_session), settings, chat_turn,
+                               chat_session["spend_vendors"])
+            if kind in (spending.COST, spending.VENDOR):  # The user approved this very call.
+                explicit = True
+                break
+        with spending.lock:
+            chat_turn.paid_calls += 1
+            held = spending.start(spending.ledger(chat_session), details, not explicit)
+        self.hold = (held, not explicit) if held else None
         _redraw()
         return True
-    card["cost"] = details["text"]
-    if not details["required"] or (details.get('file_access') and files_allowed):
+
+    def _ask(self, kind: str, details: dict) -> bool:
+        """Pause on an approval card until the user answers. False when nobody can be asked (a worker with no user
+        turn behind it), which refuses the call; "Skip this" raises the declined result the model reads."""
+        from . import cloud_http
+        chat_session, chat_turn = self.chat()
+        worker = self.turn.worker if getattr(self.turn, "chat", None) else ""
+        if not self.asks and not worker:
+            return False
+        settings = getattr(chat_turn, "spending", None) or spending.Settings()
+        with spending.lock:
+            lines = spending.ask_lines(kind, details, spending.ledger(chat_session), settings,
+                                       calls=chat_turn.paid_calls, balance=details.get("balance"), worker=worker)
+        fields = {"ask": kind, "ask_lines": lines, "ask_label": spending.approve_label(kind, settings),
+                  "paid_approval": True, "heavy": False, "install": False}
+        if details.get("url"):
+            fields["ask_link"] = details["url"]
+        if worker:
+            card = state.item_tool(self.card.get("name", ""), f"{worker}: {self.card.get('summary') or ''}".rstrip(": "), "")
+            card.update(cost=details["text"], worker=worker, **fields)
+            card["status"] = "awaiting"
+            if card not in self.shown:
+                self.shown.append(card)
+            chat_session["items"].append(card)
+            _redraw()
+            try:
+                approved = _wait_for_card(card, (chat_turn, self.turn))
+            except llm.Cancelled:
+                card["status"] = "rejected"
+                raise
+        else:
+            card = self.card
+            self.turn.decided.clear()
+            card.update(status="awaiting", **fields)
+            _redraw()
+            approved = _wait_for_approval(self.turn)
+        for key in ("ask", "ask_lines", "ask_label", "ask_link"):
+            card.pop(key, None)
+        card["status"] = ("done" if worker else "running") if approved else "rejected"
+        _redraw()
+        if not approved:
+            self.card["declined"] = True
+            raise cloud_http.CloudError(spending.declined(kind, details, settings, calls=chat_turn.paid_calls),
+                                        "declined")
         return True
-    if not asks:
-        return False
-    turn.decided.clear()
-    card.update(status="awaiting", paid_approval=not details.get('file_access', False), heavy=False)
-    _redraw()
-    approved = _wait_for_approval(turn)
-    card["status"] = "running" if approved else "rejected"
-    _redraw()
-    return approved
+
+    def _settle(self, charged, text: str) -> None:
+        if self.hold is None and not charged:
+            return  # Nothing held and nothing charged: a free call keeps "Free", a skipped one its price.
+        if text:
+            for card in self.shown:
+                card["cost"] = text
+        if self.hold is not None and charged is not None:
+            held, auto = self.hold
+            self.hold = None  # Once: a job's watcher and its job_status may both report.
+            chat_session, _ = self.chat()
+            with spending.lock:
+                spending.settle(spending.ledger(chat_session), held, charged, auto)
+            _save_spend(chat_session)
+        _redraw()
+
+
+def _cloud_consent(turn, card, asks, details, *, files_allowed=False, session=None):
+    """One answer from a fresh _Consent (tests and simple callers); the loop binds a _Consent per call."""
+    return _Consent(session, turn, card, asks, files_allowed)(details)
 
 
 def _image_message(reference: str, what: str, *, file_preview: bool = False) -> dict:
@@ -657,10 +852,19 @@ def _correlation_headers(session: dict, role: str) -> dict:
 
 def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single") -> list[str]:
     """Describe the images the user just attached, so the description outlives the turn and any
-    summary, and the model works from a checklist rather than a glance. Returns their names."""
-    refs = [p["image_url"]["url"] for p in message["content"] if p.get("type") == "image_url"]
+    summary, and the model works from a checklist rather than a glance. Returns their names. A clip's
+    contact sheets are left out: they are frames to time an action by, not an image to reproduce, and the
+    message describes them already (videoref.user_content)."""
+    sheets = {r["ref"] for r in session["references"] if r.get("video")}
+    refs = [p["image_url"]["url"] for p in message["content"]
+            if p.get("type") == "image_url" and p["image_url"]["url"] not in sheets]
     names = [r["name"] for r in session["references"] if r["ref"] in refs]
-    wired = conversations.wire_messages(session["id"], [message])[0]["content"]
+    if not refs:
+        message[context.REFERENCE_CARD] = True
+        return []
+    stills = {**message, "content": [p for p in message["content"]
+                                     if p.get("type") != "image_url" or p["image_url"]["url"] in refs]}
+    wired = conversations.wire_messages(session["id"], [stills])[0]["content"]
     parts = [{"type": "text", "text": "Reference images: " + ", ".join(names) + "."}] + [p for p in wired if p.get("type") == "image_url"]
     completion = llm.stream_chat(
         base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
@@ -701,14 +905,16 @@ def _auto_look(session: dict, turn: Turn, run_tool, alike) -> tuple[str, "Path |
         return f"\n\nAutomatic preview unavailable: {shot.text}", None
     turn.changed = False
     previous = _last_look(session["messages"])
+    path = shot.image_path
     try:
-        same = previous is not None and alike(conversations.image_path(session["id"], previous), shot.image_path)
+        path = image_budget.compact_file(path)  # As stored, like the previous look: JPEG's noise is no change.
+        same = previous is not None and alike(conversations.image_path(session["id"], previous), path)
     except Exception as ex:  # Comparing is a saving, never a reason to lose the look.
         print(f"Loopcut: could not compare the capture with the previous one: {ex!r}")
         same = False
     if same:
         return SAME_LOOK_NOTE.format(angle=turn.angle, width=tools.CAPTURE_WIDTH), None
-    return f"\n\n{shot.text}", shot.image_path
+    return f"\n\n{shot.text}", path
 
 
 class BudgetStop(Exception):
@@ -839,8 +1045,10 @@ def _workspace_prompt(session: dict) -> str:
 
 
 def _workspace_schemas() -> list[dict]:
-    from . import cloud, workspace
-    return [s for s in _tool_schemas() if s["function"]["name"] in workspace.LIVE_TOOLS
+    from . import cloud, video_attach, workspace
+    # An attached clip's tools too (the ChatGPT plan's route), as its <video_reference> note names them.
+    live = workspace.LIVE_TOOLS + (video_attach.CLIP_TOOLS if video_attach.has_clip(state.session()) else ())
+    return [s for s in _tool_schemas() if s["function"]["name"] in live
             or cloud.is_tool(s["function"]["name"])] + workspace.SCHEMAS
 
 
@@ -1113,7 +1321,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         if spec.reference_card and last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
             try:
                 names = _reference_card(session, cfg, last, turn.cancel.is_set, spec.role)
-                items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
+                if names:
+                    items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
             except llm.LLMError as ex:
                 print(f"Loopcut: could not describe the attached images: {ex}")
         if spec.on_turn_start:
@@ -1233,8 +1442,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     raise llm.Cancelled()
                 delegations = len(turn.delegations)
                 from . import cloud_account
-                with cloud_account.approval_context(lambda details: _cloud_consent(turn, card, spec.asks, details,
-                        files_allowed=cfg.auto_run or session['auto_run'])):
+                with cloud_account.approval_context(_Consent(session, turn, card, spec.asks,
+                                                             files_allowed=cfg.auto_run or session['auto_run'])):
                     result = run_tool(call.name, arguments)
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
@@ -1266,8 +1475,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if asked_look:  # After the change: run_python's own capture is taken after its code ran.
                     result.text += _look_note(turn)
                     turn.changed, turn.touched = False, []
-                card["status"] = "done" if result.ok else "failed"
+                # A paid call the user skipped did not fail: it is shown as skipped (spending.declined).
+                card["status"] = "done" if result.ok else "rejected" if card.get("declined") else "failed"
                 card["output"] = result.text
+                if getattr(result, "receipt", ""):
+                    card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
                 for guard in getattr(result, "guard_notes", None) or ():  # Already in result.text too.
                     items.append(state.item_guard(guard["text"], guard["modifiers"]))
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})
@@ -1327,15 +1539,22 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         items.append(state.item_error("Stopped."))
     except (config.ConfigError, llm.LLMError) as ex:
         turn.outcome = "error"
-        if getattr(ex, "status", None) == 402:
+        from . import nudges
+        stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
+        if stopped is not None:
+            items.append(stopped)  # The ChatGPT plan stopped: offer Loopcut's models for the same chat (M2).
+        elif getattr(ex, "status", None) == 402:
             items.append(_limit_item(ex))
         else:
-            items.append(state.item_error(str(ex)))
+            items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") == llm.CONNECTION_LOST))
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
         turn.outcome = "error"
         import traceback
         traceback.print_exc()
-        items.append(state.item_error(f"Internal error: {ex!r}"))
+        if llm.dropped_connection(ex):  # A provider's client let a broken connection through: plain words.
+            items.append(state.item_error(str(llm.connection_lost("the model", ex)), retry=True))
+        else:
+            items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
         if spec.on_end:
@@ -1350,6 +1569,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         changed = _changes_item(session, turn) if spec.changes_card else None
         if changed:
             items.append(changed)
+        if spec.role != "worker" and turn.outcome != "error" and not turn.cancel.is_set():
+            from . import nudges
+            nudges.flush(session)  # A waiting trial or low-credit card, after the reply, never during it.
         if turn.scene_after is not None:
             session["scene_seen"] = turn.scene_after  # What the next message's context diffs against.
         for item in items:
@@ -1394,6 +1616,11 @@ def send(text: str) -> bool:
         return True
     if not (text or attachments):
         return False
+    from . import video_attach
+    waiting = video_attach.preparing(session)
+    if waiting:
+        session["items"].append(state.item_notice(f"Still preparing {', '.join(waiting)}; send once it is ready."))
+        return False
     turn = Turn()
     try:
         _configure(turn, session)
@@ -1409,14 +1636,16 @@ def send(text: str) -> bool:
     # chat shows only what they typed. The snapshot taken here is what changed_only measures from.
     content = f"{_scene_context(text, session.get('scene_seen'))}\n\n{text or 'See the attached images.'}"
     session["scene_seen"] = session["scene_turn_start"] = _scene_snapshot()
-    session["addons_line"] = _addons_line()
+    # The prompt's last lines, read here on the main thread: the model and cloud tools, then the add-ons.
+    session["addons_line"] = "\n".join(line for line in (_setup_line(turn.config), _addons_line()) if line)
     if attachments:
-        session["messages"].append({"role": "user", conversations.ATTACHED: True, "content": [
-            {"type": "text", "text": content},
-            *({"type": "image_url", "image_url": {"url": a["ref"]}} for a in attachments)]})
+        # A clip's sheets are images like any other; videoref.user_content adds the clip's own description.
+        session["messages"].append({"role": "user", conversations.ATTACHED: True,
+                                    "content": videoref.user_content(content, attachments)})
         known = {r["ref"] for r in session["references"]}
         session["references"] += [{"ref": a["ref"], "full": a.get("full", a["ref"]), "name": a["name"], "pinned": True,
-                                   **({"source": a["source"]} if a.get("source") else {})}
+                                   **({"source": a["source"]} if a.get("source") else {}),
+                                   **({"video": a["video"]} if a.get("video") else {})}
                                   for a in attachments if a["ref"] not in known]
         session["attachments"] = []
     else:
@@ -1453,13 +1682,23 @@ def resume() -> bool:
     return True
 
 
-def decide(approved: bool, always: bool = False) -> bool:
-    """Answer the pending approval card, if there is one. `always` stops asking in this
-    conversation: for renders when the card is a render's, otherwise for everything else."""
+def decide(approved: bool, always: bool = False, index: int | None = None) -> bool:
+    """Answer a pending approval card: the one at `index` when it is waiting (a click), else the first waiting
+    (Enter, Esc). `always` stops asking in this conversation: for renders when the card is a render's, otherwise
+    for everything else; never for paid or install cards. A worker's ask (a paid call in the background) is
+    answered on its own card, so a card of the user's turn waiting at the same time keeps its own answer."""
     session = state.session()
+    items = session["items"]
+    card = items[index] if index is not None and 0 <= index < len(items) and items[index].get("status") == "awaiting" \
+        else next((i for i in items if i.get("status") == "awaiting"), None)
+    if card is None:
+        return False
+    wait = _card_waits.get(id(card))
+    if wait is not None:
+        wait.answer(approved)
+        return True
     turn = session["turn"]
-    card = next((i for i in session["items"] if i.get("status") == "awaiting"), None)
-    if turn is None or card is None:
+    if turn is None:
         return False
     if approved and always and not card.get("paid_approval") and not card.get("install"):
         session["auto_heavy" if card.get("heavy") else "auto_run"] = True
