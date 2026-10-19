@@ -4,6 +4,7 @@ All HTTP and Blender work is simulated; only temporary files and Python workers 
 """
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -150,7 +151,8 @@ else:
         for raised, reason in ((urllib.error.URLError(tls), "SSLError BAD_RECORD_MAC"),
                                (urllib.error.URLError(odd), "SSLError"),
                                (urllib.error.URLError(TimeoutError(secret)), "TimeoutError (timed out)"),
-                               (ConnectionResetError(54, secret), "ConnectionResetError [Errno 54 ECONNRESET]"),
+                               (ConnectionResetError(errno.ECONNRESET, secret),
+                                f"ConnectionResetError [Errno {errno.ECONNRESET} ECONNRESET]"),
                                (urllib.error.URLError(secret), "URLError"),
                                (BrokenPipeError(secret), "BrokenPipeError")):
             def transport(*args, raised=raised, **kwargs):

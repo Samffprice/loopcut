@@ -1,6 +1,7 @@
 """Contract headers, envelope errors and missing-only streaming uploads, without HTTP or Blender."""
 
 import contextlib
+import errno
 import hashlib
 import http.client
 import io
@@ -582,10 +583,10 @@ class CloudHttpTest(unittest.TestCase):
 
     def test_service_connection_errors_keep_the_cause(self):
         def send(request, *, timeout):
-            raise urllib.error.URLError(ConnectionResetError(54, "reset " + "lc_" + "synthetic"))
+            raise urllib.error.URLError(ConnectionResetError(errno.ECONNRESET, "reset " + "lc_" + "synthetic"))
         with contextlib.redirect_stdout(io.StringIO()) as console, self.assertRaises(cloud_http.CloudError) as caught:
             cloud_http.Client(api_key="lc_" + "fake-for-tests", transport=send).request("GET", "/v1/me")
-        cause = "ConnectionResetError [Errno 54 ECONNRESET]"
+        cause = f"ConnectionResetError [Errno {errno.ECONNRESET} ECONNRESET]"  # 54 on macOS, 104 on Linux CI.
         self.assertEqual((str(caught.exception), caught.exception.detail, caught.exception.code),
                          (f"Could not reach the Loopcut service ({cause})", cause, "connection_failed"))
         self.assertEqual(console.getvalue(), f"Loopcut: GET request failed in transport: {cause}\n")
