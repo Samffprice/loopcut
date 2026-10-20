@@ -204,6 +204,8 @@ TRIAL_CHIPS = {  # Live tool → (chip, the request it writes into the input; no
     "image_generate": ("Reference image", "Generate a reference image for this scene."),
     "retopology": ("Retopology", "Retopologize the selected mesh."),
     "render": ("Cloud render", "Render this scene on Loopcut's GPUs."),
+    "motion_from_text": ("Text to motion", "Animate my character walking forward and waving."),
+    "motion_from_video": ("Motion from video", "Capture the movement in my video and put it on my character."),
 }
 
 

@@ -528,9 +528,12 @@ def _do_action(session: dict, action) -> None:
         _open_settings()
     elif kind == "example_request":
         if not session["busy"] and 0 <= index < len(layout.EXAMPLE_REQUESTS):
+            # One click sends a starter prompt; with no model connected yet it waits in the input instead.
             textedit.set_text(session, layout.EXAMPLE_REQUESTS[index])
             session["focused"] = True
             _close_popups()
+            if not _config_cached()[1]:
+                _submit(session)
     elif kind == "open_settings":
         state.ui["service_settings"] = False
         _close_popups()

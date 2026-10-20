@@ -11,6 +11,7 @@ running Blender's own.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,8 @@ OUT = WORKSPACE / "out"
 
 
 def use() -> None:
+    # Harness runs are not users: no usage events (telemetry.py) unless a run asks for them.
+    os.environ.setdefault("LOOPCUT_TELEMETRY", "off")
     loaded = [name for name in sys.modules if name == "loopcut" or name.startswith("loopcut.")]
     if loaded:
         import addon_utils

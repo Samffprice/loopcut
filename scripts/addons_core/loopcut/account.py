@@ -47,7 +47,9 @@ _MARK_SIZE = 64
 
 
 class AccountError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: str = "sign_in_failed"):
+        super().__init__(message)
+        self.code = code  # A machine code for the setup_step usage event (telemetry.py), never shown.
 
 
 def signed_in() -> bool:
@@ -62,8 +64,18 @@ def _redraw() -> None:
     mainthread.request_redraw()
 
 
+def _client_header() -> dict:
+    """The contract's x-loopcut-client (add-on, Blender, OS and processor), so the server can record what a
+    sign-in linked (device poll) and what a token is used from. Never a reason for a request to fail."""
+    try:
+        from . import cloud_http
+        return {"x-loopcut-client": cloud_http.client_value()}
+    except Exception:
+        return {}
+
+
 def _post(path: str, payload: dict, token: str = "") -> dict:
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json", **_client_header()}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(f"{SERVICE_URL}{path}", data=json.dumps(payload).encode("utf-8"),
@@ -73,7 +85,8 @@ def _post(path: str, payload: dict, token: str = "") -> dict:
 
 def _get(path: str, token: str) -> dict:
     request = urllib.request.Request(f"{SERVICE_URL}{path}",
-                                     headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                                     headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                                              **_client_header()})
     return _send(request)
 
 
@@ -88,11 +101,11 @@ def _send(request) -> dict:
             message = json.loads(body)["error"]["message"]
         except (ValueError, KeyError, TypeError):
             message = f"HTTP {ex.code}"
-        raise AccountError(message) from ex
+        raise AccountError(message, f"http_{ex.code}") from ex
     except (urllib.error.URLError, TimeoutError, ValueError) as ex:
-        raise AccountError(f"Could not reach {SERVICE_URL}: {ex}") from ex
+        raise AccountError(f"Could not reach {SERVICE_URL}: {ex}", "unreachable") from ex
     if not isinstance(payload, dict):
-        raise AccountError("Unexpected reply from the Loopcut service")
+        raise AccountError("Unexpected reply from the Loopcut service", "bad_reply")
     return payload
 
 
@@ -113,6 +126,21 @@ def open_browser(url: str) -> None:
         webbrowser.open(url)
 
 
+def _setup_event(ok: bool, code: str = "") -> None:
+    """The Loopcut sign-in's outcome as a setup_step usage event (telemetry.py); any thread, never raises."""
+    try:
+        from . import telemetry
+        telemetry.setup_step("loopcut_account", "loopcut", ok, code or None)
+    except Exception:
+        pass
+
+
+def _platform() -> dict:
+    """os and arch for the device poll (the usage events' values): the server records them with the link."""
+    from . import telemetry
+    return {"os": telemetry.os_name(), "arch": telemetry.arch_name()}
+
+
 def _device_name() -> str:
     import platform
     return f"Blender on {platform.node() or platform.system()}"[:80]
@@ -124,10 +152,10 @@ def _run_sign_in() -> None:
         device_code, user_code = started.get("device_code"), started.get("user_code")
         url = str(started.get("verification_url") or "").strip()
         if not url.startswith("https://"):
-            raise AccountError(f"The sign-in reply had a bad page address: {url!r}")
+            raise AccountError(f"The sign-in reply had a bad page address: {url!r}", "bad_reply")
         interval = float(started.get("interval") or 3)
         if not (device_code and user_code and url):
-            raise AccountError("The sign-in reply was incomplete")
+            raise AccountError("The sign-in reply was incomplete", "bad_reply")
         _state.update(status="waiting", user_code=user_code, url=url, error="")
         _redraw()
         if _cancel.is_set():
@@ -140,7 +168,7 @@ def _run_sign_in() -> None:
                 _state.update(status="idle", user_code="", url="")
                 _redraw()
                 return
-            polled = _post("/api/device/poll", {"device_code": device_code})
+            polled = _post("/api/device/poll", {"device_code": device_code, **_platform()})
             if _cancel.is_set():
                 _state.update(status="idle", user_code="", url="")
                 return
@@ -151,16 +179,20 @@ def _run_sign_in() -> None:
                 key = str(polled["api_key"])
                 mainthread.run_on_main(lambda: None if _cancel.is_set() else _store_key(key)).result()
                 _state.update(status="idle", user_code="", url="", error="")
+                _setup_event(True)
                 _refresh_account(key)
                 return
-            raise AccountError("Sign-in was denied" if outcome == "denied" else "The sign-in code expired; try again")
-        raise AccountError("The sign-in code expired; try again")
+            raise AccountError("Sign-in was denied" if outcome == "denied" else "The sign-in code expired; try again",
+                               "denied" if outcome == "denied" else "expired")
+        raise AccountError("The sign-in code expired; try again", "expired")
     except AccountError as ex:
         print(f"Loopcut: sign-in failed: {ex}")
+        _setup_event(False, ex.code)
         _state.update(status="error", error=str(ex) + ". Try Sign in to Loopcut again, or use another route.", user_code="", url="")
     except Exception as ex:  # Worker thread: show it rather than lose it.
         import traceback
         traceback.print_exc()
+        _setup_event(False, "internal")
         _state.update(status="error", error="Sign-in could not finish. Try Sign in to Loopcut again, or use another route.",
                       user_code="", url="")
     finally:

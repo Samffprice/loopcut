@@ -170,7 +170,7 @@ class RuntimeTest(RuntimeFixture):
         restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
         self.assertEqual(restarted.etag, '"v1"')
         self.assertEqual(restarted.descriptors(), runtime.descriptors())
-        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.5')
+        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.7')
 
     def test_multipart_capability_comes_from_the_latest_manifest(self):
         offered = {'blob_multipart': {'min_size': 16 * 1024 * 1024}}
@@ -1239,7 +1239,7 @@ class LifecycleTest(RuntimeFixture):
                 patch.object(config, 'service_policy', return_value={'no_generation': True, 'private_mode': True}), \
                 patch.object(config, 'service_backends', return_value={}):
             signed_in = cloud._snapshot()
-            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.5')
+            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.7')
             signed_in.manifest = manifest(tool())
             signed_in._save()
             key.return_value = ''

@@ -354,6 +354,11 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         get=_get_polypizza_key, set=_set_polypizza_key,
         description="Free key from poly.pizza (account > API) for low-poly models. Stored in Loopcut's "
                     "credentials file. Poly Haven and your Blender asset libraries need no key")
+    share_usage_stats: bpy.props.BoolProperty(
+        name="Share anonymous usage stats", default=True,
+        description="Send Loopcut short events about launches, the setup steps and how each turn ended: versions, "
+                    "OS, the model's name, timings and error codes, with a random install id. Never prompts, "
+                    "replies, file or object names, or anything from the scene. Details: loopcut.org/privacy")
     auto_update: bpy.props.BoolProperty(
         name="Download updates automatically", default=True,
         description="Look for a newer Loopcut now and then and download it in the background. "
@@ -499,6 +504,10 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
                 row.operator("loopcut.restart_to_update")
             elif status not in ("checking", "downloading", "installing"):
                 row.operator("loopcut.check_for_updates", text="Check Now")
+
+        row = layout.row()
+        row.use_property_split = False
+        row.prop(self, "share_usage_stats")  # telemetry.py; the privacy policy points here.
 
 
 def wrap(text: str, width: int) -> list[str]:

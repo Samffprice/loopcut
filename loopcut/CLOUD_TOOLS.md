@@ -30,6 +30,17 @@ availability result until all three exist. Errors carry credits, refund and retr
 Calls use the agent's approval/checkpoint cards. BYOK, quoted calls, credit estimates over the
 descriptor threshold and references outside allowed file roots request approval.
 
+Motion (contract 0.7: `motion_from_video`, `motion_from_text`) returns `motion.bvh`, a rig-neutral
+SOMA77 skeleton, and `motion.json`. `apply_motion` (`cloud_jobs._apply_motion`, `motion_retarget.py`)
+retargets it onto the call's `target_armature` here, for free; without one, onto a new SOMA skeleton
+with a generated capsule body. A descriptor's `apply_args` (here `target_armature`) are offered to the
+model with its inputs, stripped before quotes and jobs, and kept with the job for the handler.
+`prepare_inputs` resolves the target when the tool is called (the named object or a mesh's armature,
+else the active or the one selected humanoid armature) and refuses a named non-humanoid before any
+upload. A video reference may be a movie clip, a video strip or a file: mp4, mov or webm, within the
+tool's size, at most 60 s captured; the client sends its measured `video_seconds`, and a trimmed strip's
+trim as `start_s`/`end_s`. Retargeting is checked in Blender by `harness/motion_check.py`.
+
 Skill digests cover original Markdown bytes, but the endpoint returns parsed metadata and body.
 The client verifies the canonical LF format and unquoted/single-quoted/double-quoted regex fields.
 Other original whitespace/quoting/order cannot be recovered; those skills are rejected. A raw-file

@@ -177,6 +177,15 @@ def vote_click(m, host, session, requests, errors, name, signed_in):
     check(hits.get('vote.' + name) == ('vote', name), who + ': the vote view has the vote action')
     check((hits.get('vote.signin') == ('sign_in', 'loopcut')) != signed_in,
           who + ': the vote view asks to sign in only when signed out')
+    if signed_in and name in m.cloud._runtime.votes['mine']:
+        # Sign-in adopts the install's anonymous votes (SPEC §3.11), so the signed-out vote is already this
+        # account's: take it back first, then vote as a signed-in tester would.
+        start = len(requests)
+        host._do_action(session, ('vote', name))
+        wait_for_cloud(m, errors)
+        taken = [r['method'] for r in requests[start:] if r['path'] == '/v1/votes/' + name]
+        check(taken == ['DELETE'] and name not in m.cloud._runtime.votes['mine'],
+              who + ': the vote adopted at sign-in can be taken back')
     start = len(requests)
     host._do_action(session, ('vote', name))
     wait_for_cloud(m, errors)
@@ -314,9 +323,10 @@ def exercise(url, key, mode, directory, server_requests=None):
             way = vote_click(m, host, session, requests, errors, expected[0], signed_in=True)
             check(way != 'interest' or runtime.interests[expected[0]] == 'thanks', 'signed in: the interest event was accepted')
             # A second click takes the vote back: a DELETE on a votes server; without votes it stays here.
+            voted = len(requests)  # After any take-back of a vote adopted at sign-in (vote_click).
             host._do_action(session, ('vote', expected[0]))
             wait_for_cloud(m, errors)
-            deletes = [r for r in requests[start:] if r['method'] == 'DELETE']
+            deletes = [r for r in requests[voted:] if r['method'] == 'DELETE']
             check(expected[0] not in runtime.votes['mine'] and len(deletes) == (way == 'votes')
                   and all(r['auth'] and r['path'] == '/v1/votes/' + expected[0] for r in deletes)
                   and len([r for r in requests[start:] if r['path'] == '/v1/events']) <= 2,

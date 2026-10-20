@@ -1805,6 +1805,77 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("twice in a row", self.session["items"][-1]["text"])
         self.assertEqual(len(SCRIPT.requests), 2, "no third attempt")
 
+    def empty_reply(self, reasoning: str = "", finish: str = "stop", output_tokens: int = 4) -> bytes:
+        """What user D's first turn on Loopcut Fast got on 2026-10-20: a stop with no text and no tool call, maybe
+        after a little hidden reasoning (z.ai's delta.reasoning_content)."""
+        chunks = [{"choices": [{"delta": {"reasoning_content": reasoning}}]}] if reasoning else []
+        chunks += [{"choices": [{"delta": {"content": ""}, "finish_reason": finish}]},
+                   {"choices": [], "usage": {"prompt_tokens": 12853, "completion_tokens": output_tokens}}]
+        return sse(*chunks)
+
+    def test_an_empty_first_reply_is_retried_once_as_it_was(self):
+        SCRIPT.replies += [self.empty_reply(), text_reply("Here it is.")]
+        turn = self.start("make a donut")
+        turn.thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], "Here it is.")
+        self.assertEqual(len(SCRIPT.requests), 2)
+        self.assertEqual(SCRIPT.requests[1]["messages"], SCRIPT.requests[0]["messages"], "the same request again")
+        self.assertEqual([m["role"] for m in self.session["messages"]], ["user", "assistant"])
+        self.assertEqual(turn.outcome, "completed")
+
+    def test_a_reasoning_only_reply_twice_is_an_error_with_try_again(self):
+        """Before this, the panel removed the empty reply card and ended the turn: the user saw nothing at all."""
+        SCRIPT.replies += [self.empty_reply("The user"), self.empty_reply("Build a")]
+        turn = self.start("make a donut")
+        turn.thread.join(5)
+        last = self.session["items"][-1]
+        self.assertEqual(last["kind"], "error")
+        self.assertEqual(last["text"], agent.EMPTY_REPLY_MESSAGE)
+        self.assertTrue(last.get("retry"), "the card offers Try again")
+        self.assertFalse([i for i in self.session["items"] if i["kind"] == "assistant"], "no blank reply card")
+        self.assertEqual(len(SCRIPT.requests), 2, "one retry, no third attempt")
+        self.assertEqual((turn.outcome, turn.error_code), ("error", llm.EMPTY_REPLY))
+        self.assertEqual(self.session["messages"][-1]["role"], "user", "Try again (agent.resume) can run")
+
+    def test_a_cut_off_first_reply_is_retried_and_replaced(self):
+        cut = sse({"choices": [{"delta": {"content": "I'll"}, "finish_reason": "stop"}]},
+                  {"choices": [], "usage": {"prompt_tokens": 12853, "completion_tokens": 4}})
+        SCRIPT.replies += [cut, text_reply("Here it is.")]
+        self.start("make a donut").thread.join(5)
+        replies = [i["text"] for i in self.session["items"] if i["kind"] == "assistant"]
+        self.assertEqual(replies, ["Here it is."], "the fragment is replaced, not kept beside the retry")
+        self.assertEqual(len(SCRIPT.requests), 2)
+
+    def test_a_short_complete_answer_is_not_a_fragment(self):
+        short = sse({"choices": [{"delta": {"content": "Hi!"}, "finish_reason": "stop"}]},
+                    {"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 2}})
+        SCRIPT.replies.append(short)
+        self.start("hi").thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 1)
+
+    def test_a_content_filter_stop_says_so_without_a_retry(self):
+        """z.ai ends a filtered stream with finish_reason "sensitive", no text and no usage."""
+        SCRIPT.replies += [sse({"choices": [{"delta": {"reasoning_content": "Build a waving flag"}}]},
+                               {"choices": [{"delta": {"content": ""}, "finish_reason": "sensitive"}]})]
+        turn = self.start("make a flag")
+        turn.thread.join(5)
+        self.assertEqual(self.session["items"][-1]["text"], agent.FILTERED_REPLY_MESSAGE)
+        self.assertEqual(len(SCRIPT.requests), 1)
+        self.assertEqual(turn.error_code, llm.CONTENT_FILTER)
+
+    def test_an_empty_reply_after_work_ends_the_turn_as_before(self):
+        """After a step that ran tools, an empty last word is retried once for a summary; if it stays empty the
+        turn still ends normally, since the work itself is on screen."""
+        SCRIPT.replies += [tool_reply("run_python", {"code": "x()"}), self.empty_reply(), self.empty_reply()]
+        self.start("hi")
+        self.awaiting()
+        agent.decide(True)
+        turn = self.session["turn"]
+        turn.thread.join(5)
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual(len(SCRIPT.requests), 3)
+        self.assertFalse([i for i in self.session["items"] if i["kind"] == "error"])
+
     def test_max_effort_retries_the_capped_step_at_high(self):
         with mock.patch.dict(os.environ, {"LOOPCUT_REASONING_EFFORT": "max"}):
             SCRIPT.replies += [self.capped_reply(), text_reply("ok")]

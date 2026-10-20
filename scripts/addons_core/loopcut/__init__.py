@@ -8,7 +8,7 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 2, 4),
+    "version": (0, 2, 5),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
@@ -31,6 +31,11 @@ def register() -> None:
         update.register()
         shaders.register()  # Subprocess shader compilation on Windows/Linux, once.
     try:
+        from . import telemetry
+        telemetry.register()  # app_start a few seconds later, off the startup path; nothing when switched off.
+    except Exception as ex:
+        print(f"Loopcut: usage stats not set up: {type(ex).__name__}")
+    try:
         from . import checkpoints
         checkpoints.remove_stale_sessions()
     except OSError as ex:
@@ -46,9 +51,10 @@ def register() -> None:
 
 
 def unregister() -> None:
-    from . import account, agent, cloud, dev_reload, lifecycle, mainthread, settings, support, worker_host
+    from . import account, agent, cloud, dev_reload, lifecycle, mainthread, settings, support, telemetry, worker_host
     from .ui import host
     agent.stop()
+    telemetry.unregister()
     worker_host.shutdown_all()
     cloud.unregister()
     account.unregister()

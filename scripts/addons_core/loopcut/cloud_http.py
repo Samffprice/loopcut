@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from . import bl_info, config, credentials
 
-CONTRACT = "0.5"
+CONTRACT = "0.7"
 MAX_RESPONSE = 4 * 1024 * 1024
 
 
@@ -64,16 +64,27 @@ def validate_url(url):
     return parts
 
 
+def client_value() -> str:
+    """The x-loopcut-client value: `loopcut-addon/<version> blender/<version> os/<os> arch/<arch>`. The first two
+    are SPEC §3's; os and arch (the usage events' values) follow as extra space-separated tokens, which every
+    server parser of the header ignores, so the device link and API requests say which platform they run on.
+    bpy.app.version is a constant, so any thread may call this."""
+    from . import telemetry
+    try:
+        import bpy
+    except ImportError:  # Plain Python (tests, tools): no Blender to name.
+        bpy = None
+    version = getattr(getattr(bpy, "app", None), "version", ())
+    blender = ".".join(map(str, version)) if version else "unknown"
+    addon = ".".join(map(str, bl_info["version"]))
+    return f"loopcut-addon/{addon} blender/{blender} os/{telemetry.os_name()} arch/{telemetry.arch_name()}"
+
+
 def contract_headers():
     if threading.current_thread() is not threading.main_thread():
         from . import mainthread
         return mainthread.run_on_main(contract_headers).result(timeout=30)
-    import bpy
-    version = getattr(getattr(bpy, "app", None), "version", ())
-    blender = ".".join(map(str, version)) if version else "unknown"
-    addon = ".".join(map(str, bl_info["version"]))
-    return {"x-loopcut-contract": CONTRACT,
-            "x-loopcut-client": f"loopcut-addon/{addon} blender/{blender}"}
+    return {"x-loopcut-contract": CONTRACT, "x-loopcut-client": client_value()}
 
 
 def describe(error):

@@ -49,19 +49,23 @@ def _finished(result: dict | None, error: str) -> None:
 
 
 def _run_sign_in(new_account: bool) -> None:
-    from . import account
-    result, error = None, ""
+    from . import account, telemetry
+    result, error, code = None, "", ""
     try:
         result = chatgpt_auth.sign_in(account.open_browser, new_account=new_account, cancelled=_cancel.is_set,
                                       on_url=lambda url: (_state.update(status="waiting", url=url), _redraw()))
     except chatgpt_auth.ChatGPTAuthError as ex:
         error = "" if ex.code == "cancelled" else str(ex)
+        code = ex.code or (f"http_{ex.status}" if ex.status else "sign_in_failed")
     except Exception:  # The worker thread must always report back.
         import traceback
         traceback.print_exc()
-        error = "ChatGPT sign-in could not finish."
+        error, code = "ChatGPT sign-in could not finish.", "internal"
     if error:
         error += " Try Sign in with ChatGPT again, or choose another provider."
+    if code != "cancelled" and not _cancel.is_set():  # Whether ChatGPT sign-in worked: a setup_step usage event.
+        telemetry.setup_step("chatgpt", "chatgpt", bool(result and result.get("signed_in")) and not error,
+                             None if result and not error else code or "not_signed_in")
     mainthread.run_on_main(lambda: _finished(result, error))
 
 

@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import threading
+import time
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable
 
@@ -123,6 +124,14 @@ NO_PROGRESS_PROMPT = ("[Loopcut] The same tool call keeps failing without changi
 # without producing anything usable: appended to that request only, never saved to the conversation.
 CAP_RETRY_PROMPT = ("[Loopcut] That reply stopped without a usable answer or tool call. Decide now and act: "
                     "call one tool, or reply in a few plain sentences.")
+# A reply with no text and no tool call (an empty or reasoning-only completion) before the turn did anything:
+# _request retries it once, as it was, then shows this instead of ending the turn with nothing on screen. On
+# 2026-10-20 a new user's first turn on Loopcut Fast (glm-5.3-flash) came back with 4 output tokens and no text,
+# so the panel showed nothing at all and they never came back; 2 of 677 full-size Fast requests did that.
+EMPTY_REPLY_MESSAGE = ("The model sent back an empty reply twice, so nothing happened yet. Press Try again, or pick "
+                       "another model in the model menu below.")
+FILTERED_REPLY_MESSAGE = ("The model provider's content filter stopped this reply before it said anything. Rephrase "
+                          "the request, or pick another model in the model menu below.")
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -183,6 +192,15 @@ class Turn:
         # calls share, and the name its asks show there. None and "" for the user's own turn.
         self.chat: tuple | None = None
         self.worker = ""
+        # Steps whose reply called tools: an empty reply after work ends the turn as before; one before any
+        # work is an error the user can retry (_request).
+        self.tool_steps = 0
+        # The turn's usage event (telemetry.py): when it started, what ran it, the first chat item it added,
+        # and the machine code of the error that ended it.
+        self.started: float | None = None
+        self.telemetry: dict = {}
+        self.first_item = 0
+        self.error_code = ""
 
 
 def _redraw() -> None:
@@ -1163,6 +1181,37 @@ def _completion_unusable(completion: llm.Completion) -> bool:
     return not completion.tool_calls
 
 
+def _completion_empty(completion: llm.Completion) -> bool:
+    """Nothing to show and nothing to run: no text, no tool call, whatever the finish reason (stop, a
+    provider's own "network_error", a content filter's "sensitive"), except the output cap, which
+    _completion_unusable already handles."""
+    return (not completion.tool_calls and not completion.text.strip() and completion.finish_reason != "length"
+            and not completion.timed_out)
+
+
+def _completion_fragment(completion: llm.Completion) -> bool:
+    """A text-only stop of a few reported output tokens that does not end a sentence ("I'll"): a reply cut off,
+    not an answer. Glm-5.3-flash never answered under 28 tokens in ~200 sampled first turns (2026-10-20); user
+    D's had 4, counting reasoning."""
+    text = completion.text.strip()
+    tokens = (completion.usage or {}).get("output")
+    return (not completion.tool_calls and completion.finish_reason == "stop" and 0 < len(text) <= 16
+            and text[-1] not in ".!?)…:" and isinstance(tokens, int) and tokens <= 4)
+
+
+def _empty_kind(completion: llm.Completion) -> str:
+    """For the log: which kind of nothing."""
+    tokens = (completion.usage or {}).get("output")
+    what = "reasoning only" if completion.reasoning_chars else "empty"
+    return f"{what} (finish_reason {completion.finish_reason!r}, {tokens if tokens is not None else '?'} output tokens)"
+
+
+def _drop_empty(items: list, reply: dict) -> None:
+    reply["streaming"] = False
+    if not reply["text"].strip() and reply in items:
+        items.remove(reply)
+
+
 def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SINGLE_SPEC) -> llm.Completion:
     """One request with the conversation as it stands, streamed into a reply card. A reply that
     hits the output cap (max_tokens, or call_max_seconds -- llm.py reports both as finish_reason
@@ -1259,6 +1308,27 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                 items.remove(reply)
             raise llm.LLMError(f"{spec.role.capitalize()} step stopped at {reason} twice in a row, "
                                f"without a usable reply or tool call.")
+    fragment = not getattr(turn, "tool_steps", 0) and _completion_fragment(completion)
+    if (_completion_empty(completion) or fragment) and not turn.cancel.is_set():
+        if completion.finish_reason in llm.FILTERED_FINISHES:
+            _drop_empty(items, reply)
+            print(f"Loopcut: {spec.role} reply stopped by the provider's content filter "
+                  f"(finish_reason {completion.finish_reason!r}).")
+            raise llm.LLMError(FILTERED_REPLY_MESSAGE, code=llm.CONTENT_FILTER)
+        print(f"Loopcut: {spec.role} step came back "
+              f"{'a cut-off fragment' if fragment else _empty_kind(completion)}; retrying once.")
+        reply["text"] = ""  # The retry's own text, not appended to a fragment.
+        _redraw()
+        completion = call(wired, cfg.reasoning_effort)
+        record(completion)
+        if _completion_empty(completion) and not turn.cancel.is_set():
+            print(f"Loopcut: {spec.role} step came back {_empty_kind(completion)} again.")
+            if completion.finish_reason in llm.FILTERED_FINISHES:
+                _drop_empty(items, reply)
+                raise llm.LLMError(FILTERED_REPLY_MESSAGE, code=llm.CONTENT_FILTER)
+            if not getattr(turn, "tool_steps", 0):  # Nothing happened this turn: say so, with Try again.
+                _drop_empty(items, reply)
+                raise llm.LLMError(EMPTY_REPLY_MESSAGE, code=llm.EMPTY_REPLY)
     reply["streaming"] = False
     finish_reply(reply, turn.roots[0] if turn.roots else None)
     if not reply["text"].strip():
@@ -1306,7 +1376,23 @@ def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec,
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
          ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     """The turn's loop with the spec send() chose; today's single loop when it chose none."""
-    run_loop(session, turn, getattr(turn, "spec", None) or SINGLE_SPEC, run_tool, ensure_checkpoint, alike)
+    try:
+        run_loop(session, turn, getattr(turn, "spec", None) or SINGLE_SPEC, run_tool, ensure_checkpoint, alike)
+    finally:
+        try:
+            from . import telemetry
+            telemetry.turn_end(turn, list(session["items"]))  # Off, signed out of stats or headless: nothing.
+        except Exception as ex:
+            print(f"Loopcut: turn usage event not recorded: {type(ex).__name__}")
+
+
+def _error_code(ex) -> str:
+    """A machine code for the turn's usage event: the API's code, else its HTTP status. Never the message."""
+    code = getattr(ex, "code", "")
+    if isinstance(code, str) and code:
+        return code
+    status = getattr(ex, "status", None)
+    return f"http_{status}" if isinstance(status, int) else ("config" if isinstance(ex, config.ConfigError) else "llm_error")
 
 
 def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_main,
@@ -1362,6 +1448,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 return
 
             step_message = messages[-1]
+            turn.tool_steps += 1
             images = []
             changed_by = None  # (card, tool message) of the reply's last step that changed the scene.
             # Call key -> [its number in this reply, the ledger's revision after it]: the same call twice
@@ -1539,6 +1626,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         items.append(state.item_error("Stopped."))
     except (config.ConfigError, llm.LLMError) as ex:
         turn.outcome = "error"
+        turn.error_code = _error_code(ex)
         from . import nudges
         stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
         if stopped is not None:
@@ -1546,9 +1634,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         elif getattr(ex, "status", None) == 402:
             items.append(_limit_item(ex))
         else:
-            items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") == llm.CONNECTION_LOST))
+            items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") in (llm.CONNECTION_LOST,
+                                                                                     llm.EMPTY_REPLY)))
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
         turn.outcome = "error"
+        turn.error_code = "connection_lost" if llm.dropped_connection(ex) else "internal"
         import traceback
         traceback.print_exc()
         if llm.dropped_connection(ex):  # A provider's client let a broken connection through: plain words.
@@ -1656,6 +1746,9 @@ def send(text: str) -> bool:
 
 
 def _launch(session: dict, turn: Turn) -> None:
+    from . import telemetry
+    turn.started, turn.first_item = time.monotonic(), len(session["items"])
+    turn.telemetry = telemetry.turn_start(turn.config)  # Main thread: which kind of model runs this turn.
     session["scroll"], session["confirm_restore"] = 0.0, None
     session["busy"], session["turn"] = True, turn
     session["turn_outcome"] = "running"

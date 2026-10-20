@@ -346,7 +346,7 @@ else:
 
         with patch.dict(sys.modules, {"bpy": types.SimpleNamespace(app=App())}):
             headers = self.on_worker(cloud_http.contract_headers)
-        self.assertTrue(headers["x-loopcut-client"].endswith("blender/5.2.0"))
+        self.assertIn(" blender/5.2.0 os/", headers["x-loopcut-client"])  # os and arch follow since the activation work.
 
     def test_worker_policy_snapshot_dispatches_preference_access(self):
         with patch.object(config, "_getter", side_effect=lambda:

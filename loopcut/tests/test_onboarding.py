@@ -4,6 +4,7 @@ Load Blender-facing modules under a private package so the suite's other bpy stu
 agent fixtures are untouched. No browser, HTTP, preferences file or Blender is used.
 """
 
+import json
 import importlib
 import importlib.util
 import io
@@ -237,6 +238,24 @@ class OnboardingTest(unittest.TestCase):
             self.account._run_sign_in()
         store.assert_not_called()
         self.assertEqual(self.onboarding._state['step'], 'connect')
+
+    def test_the_device_link_reports_the_add_on_blender_and_platform(self):
+        """The server records these with the link (activation-web's linkMetadata): the contract header on every
+        device-flow request, os and arch in the poll body."""
+        requests = []
+        with patch.object(self.account, '_send', side_effect=lambda request: requests.append(request) or {}):
+            self.account._post('/api/device/poll', {'device_code': 'x', **self.account._platform()})
+        [request] = requests
+        self.assertTrue(request.get_header('X-loopcut-client', '').startswith('loopcut-addon/'))
+        body = json.loads(request.data)
+        self.assertIn(body['os'], ('mac', 'windows', 'linux'))
+        self.assertIn(body['arch'], ('arm64', 'x86_64', 'other'))
+        reply = {'device_code': 'fixture', 'user_code': 'TEST', 'verification_url': 'https://sign-in.test'}
+        with patch.object(self.account, '_post', side_effect=[reply, {'status': 'denied'}]) as post, \
+                patch.object(self.account._cancel, 'wait', return_value=False), patch.object(self.account, 'open_browser'):
+            self.account._cancel.clear()
+            self.account._run_sign_in()
+        self.assertEqual(set(post.call_args_list[1].args[1]), {'device_code', 'os', 'arch'})
 
     def test_account_waiting_and_starting_allow_cancel_and_skip(self):
         for status in ('waiting', 'starting'):
@@ -519,18 +538,25 @@ class OnboardingTest(unittest.TestCase):
         browser.assert_not_called()
         self.assertEqual(self.account.status()["status"], "idle")
 
-    def test_example_only_fills_input_and_accepted_send_dismisses_for_good(self):
+    def test_a_starter_sends_in_one_click_and_dismisses_the_first_run_note_for_good(self):
         session = self.state.new_session()
-        with patch.object(self.host.agent, "send", return_value=True) as send:
+        with patch.object(self.host, "_config_cached", return_value=("fast", False, 1000)), \
+                patch.object(self.host.agent, "send", return_value=True) as send:
             self.host._do_action(session, ("example_request", 1))
-            send.assert_not_called()
-            self.assertEqual(session["input"], self.host.layout.EXAMPLE_REQUESTS[1])
-            self.assertTrue(session["focused"])
-            self.host._submit(session)
+            send.assert_called_once_with(self.host.layout.EXAMPLE_REQUESTS[1])
         self.assertEqual(session["input"], "")
         self.assertTrue(self.prefs.first_message_sent)
         self.state.ui.clear()  # Simulate reopening the app with the saved preference.
         self.assertTrue(self.onboarding.hints_dismissed())
+
+    def test_a_starter_only_fills_the_input_while_setup_is_needed(self):
+        session = self.state.new_session()
+        with patch.object(self.host, "_config_cached", return_value=("Set up Loopcut", True, 1000)), \
+                patch.object(self.host.agent, "send", return_value=True) as send:
+            self.host._do_action(session, ("example_request", 0))
+        send.assert_not_called()
+        self.assertEqual(session["input"], self.host.layout.EXAMPLE_REQUESTS[0])
+        self.assertTrue(session["focused"])
 
     def test_rejected_send_keeps_hints_and_the_draft(self):
         session = self.state.new_session()

@@ -72,6 +72,7 @@ def draw_splash(layout, context, first_run: bool) -> bool:
             # A previous Loopcut version's settings win: Blender's quick setup offers those itself.
             can_copy_prev = bpy.types.PREFERENCES_OT_copy_prev.poll(context)
             step = _state["step"] = "import" if not can_copy_prev and _source() else "setup"
+            _report("welcome", None)  # The first-run setup window opened.
         if step != "import":
             return False
         _draw_import(layout)
@@ -358,6 +359,7 @@ def _draw_privacy(layout) -> None:
     column.separator()
     column.prop(prefs, "auto_run")
     _notes(column, "Off: Loopcut asks before it runs code. Either way, every turn gets a checkpoint you can restore.")
+    column.prop(prefs, "share_usage_stats")  # Off: no usage events at all (telemetry.py).
     column.separator(factor=2)
     _step_button(column, "Continue", "done", save=True)
     _step_button(column, "Back", "connect")
@@ -393,6 +395,48 @@ def done_nudge(chatgpt: bool, loopcut: bool, connected: bool) -> str:
     if loopcut and connected:
         return "Have ChatGPT Plus or Pro? Sign in with ChatGPT in Preferences and the agent runs on your plan."
     return ""
+
+
+def _choice() -> str | None:
+    """The model route set up so far, as the usage events name it; None when nothing is connected."""
+    if not _connected():
+        return None
+    provider = getattr(settings.preferences(), "provider", "")
+    return "chatgpt" if provider == "CHATGPT" else "loopcut" if provider == "LOOPCUT" else "own_key"
+
+
+def _report(step: str, choice: str | None, ok: bool = True, code: str | None = None) -> None:
+    """One first-run setup outcome as a setup_step usage event (telemetry.py). Never raises."""
+    try:
+        from . import telemetry
+        telemetry.setup_step(step, choice, ok, code)
+    except Exception as ex:
+        print(f"Loopcut: setup event not recorded: {type(ex).__name__}")
+
+
+def _report_move(current: str | None, target: str, provider: str) -> None:
+    """What a step button means for the setup's usage events: a skip, a pick, or the end. A sign-in that
+    worked or failed reports itself (account._setup_event, chatgpt_ui._run_sign_in). Never raises."""
+    from . import telemetry
+    try:
+        if telemetry.enabled():
+            _report_move_now(current, target, provider)
+    except Exception as ex:
+        print(f"Loopcut: setup event not recorded: {type(ex).__name__}")
+
+
+def _report_move_now(current: str | None, target: str, provider: str) -> None:
+    if current == "account" and target == "connect" and not account.signed_in():
+        _report("loopcut_account", "skip")
+    elif current == "connect" and target == "privacy":
+        if _state["own_key"]:
+            _report("own_key", "own_key", _connected(), None if _connected() else "not_connected")
+        elif provider == "LOOPCUT":
+            _report("chatgpt", "loopcut")
+        elif provider != "CHATGPT" and not _on_chatgpt_plan():
+            _report("chatgpt", "skip")
+    if target == "done":
+        _report("done", _choice(), _connected(), None if _connected() else "not_connected")
 
 
 def _failed_addons(context) -> list[str]:
@@ -488,6 +532,8 @@ class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
             from . import chatgpt_ui
             account.cancel_sign_in()
             chatgpt_ui.cancel_sign_in()
+        if self.enable and not _state["own_key"]:
+            _report("chatgpt", "own_key")
         _state["own_key"] = self.enable
         prefs = settings.preferences()
         if prefs is not None:
@@ -524,6 +570,7 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
         prefs = settings.preferences()
         if self.provider != "CURRENT" and prefs is not None:
             prefs.provider = self.provider
+        _report_move(_state["step"], self.step, self.provider)
         _state["step"] = self.step
         if self.save:
             bpy.ops.wm.save_userpref()

@@ -819,10 +819,18 @@ _ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_
                 "merge": _item_merge, "offer": _item_offer}
 
 
+# Starter prompts on an empty conversation: one click sends one (or fills the input while no model is connected).
+# Each one shows what Loopcut does well and finishes on the free tier with no credits: Loopcut Fast, local tools,
+# and the free asset search (Loopcut's index when signed in, BlenderKit's free assets and Poly Haven otherwise).
+# Verified 2026-10-20 on Fast's model (glm-5.3-flash with the hosted prompts) from the default scene, clicked in the
+# panel: chest 151 s, chair 41 s (BlenderKit free, signed out), ball 102 s, rocks 30 s, each finished by the
+# orchestrator itself. Lighting plus camera ("light it like a sunset and frame it") was dropped: it delegated four
+# worker waves and ran past 5 minutes. Change one only after running it on the default model again.
 EXAMPLE_REQUESTS = (
-    "Make the selected object brushed metal.",
-    "Add a floor and soft studio lighting.",
-    "Explain the modifiers on the selected object.",
+    "Model a stylized treasure chest with gold trim",
+    "Find a wooden chair in the free asset libraries and add it",
+    "Animate a rubber ball bouncing, with squash and stretch",
+    "Scatter twenty low-poly rocks of different sizes around the cube",
 )
 
 
@@ -903,17 +911,26 @@ def _key_prompt(f: Frame, x, cursor, width) -> int:
 
 
 def _first_run(f: Frame, x, cursor, width) -> int:
+    """The starter prompts on an empty conversation, under the scope note until the first message is sent."""
     small = f.px(T.FONT_SIZE_SMALL)
-    cursor += f.paragraph("chat.hints.scope", x, cursor, width,
-                          "Loopcut can inspect and edit this scene; it can't see other apps. "
-                          "Code asks for approval by default.", small, T.TEXT_FAINT) + f.px(8)
+    if not f.ui.get("hints_dismissed"):
+        cursor += f.paragraph("chat.hints.scope", x, cursor, width,
+                              "Loopcut can inspect and edit this scene; it can't see other apps. "
+                              "Code asks for approval by default.", small, T.TEXT_FAINT) + f.px(8)
+    sends = not f.ui.get("needs_setup")
+    cursor += f.paragraph("chat.hints.title", x, cursor, width, "Try one:" if sends else "Then try one:",
+                          small, T.TEXT_MUTED) + f.px(4)
     for n, request in enumerate(EXAMPLE_REQUESTS):
         id = f"chat.hint{n}"
-        height = len(wrap(request, "ui", small, width - f.px(16), f.measure)) * f.line_height(small) + f.px(8)
-        f.rect(id + ".bg", x, cursor, width, height, T.BUTTON_GHOST if f.ui.get("hover") == id else T.NONE,
-               f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
-        f.paragraph(id + ".label", x + f.px(8), cursor + f.px(4), width - f.px(16), request, small, T.TEXT_MUTED)
-        f.hit(id, x, cursor, width, height, ("example_request", n), tip="Fill the input; review it before sending")
+        height = len(wrap(request, "ui", small, width - f.px(28), f.measure)) * f.line_height(small) + f.px(10)
+        hover = f.ui.get("hover") == id
+        f.rect(id + ".bg", x, cursor, width, height, T.BUTTON_GHOST if hover else T.NONE,
+               f.px(T.RADIUS_SMALL), 1, T.ACCENT if hover else T.CARD_BORDER)
+        f.text(id + ".mark", x + f.px(8), cursor + f.px(5), "›", small, T.ACCENT)
+        f.paragraph(id + ".label", x + f.px(20), cursor + f.px(5), width - f.px(28), request, small,
+                    T.TEXT if hover else T.TEXT_MUTED)
+        f.hit(id, x, cursor, width, height, ("example_request", n),
+              tip="Send this to Loopcut" if sends else "Fill the input; connect a model above to send it")
         cursor += height + f.px(4)
     return cursor
 
@@ -944,7 +961,7 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
                               f.px(T.FONT_SIZE), T.TEXT_MUTED) + gap
     if f.ui.get("needs_setup") and not session["busy"]:
         cursor = _key_prompt(f, x, cursor, width) if f.ui.get("key_needed") else _setup_routes(f, x, cursor, width)
-    if empty and not f.ui.get("hints_dismissed"):
+    if empty and not f.ui.get("key_needed"):
         cursor = _first_run(f, x, cursor, width)
 
     content, view = cursor - gap + 2 * pad, bottom - top

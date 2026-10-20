@@ -35,7 +35,7 @@ class FakeBlobs:
     def __call__(self, request, *, timeout):
         method = request.get_method()
         headers = {key.lower(): value for key, value in request.header_items()}
-        assert headers["x-loopcut-contract"] == "0.5"
+        assert headers["x-loopcut-contract"] == "0.7"
         assert headers["x-loopcut-client"].startswith("loopcut-addon/")
         assert " blender/" in headers["x-loopcut-client"]
         assert timeout > 0

@@ -23,7 +23,7 @@ from . import blobs, cloud_http
 
 TERMINAL = {"succeeded", "failed", "canceled"}
 STATES = {"queued", "running"} | TERMINAL
-OUTPUT_TYPES = {"image", "model_3d", "material", "audio", "video", "render_frames", "report"}
+OUTPUT_TYPES = {"image", "model_3d", "material", "audio", "video", "render_frames", "report", "motion"}
 POLL_SECONDS = .25
 STREAM_TIMEOUT = 2
 STREAM_ATTEMPTS = 2
@@ -38,7 +38,10 @@ FBX_MAGIC = b"Kaydara FBX Binary"
 _SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
              "model/gltf-binary": ".glb", "model/gltf+json": ".gltf", "model/vnd.fbx": ".fbx",
              "audio/wav": ".wav", "audio/mpeg": ".mp3", "video/mp4": ".mp4", "video/webm": ".webm",
-             "application/json": ".json", "text/plain": ".txt", "text/markdown": ".md"}
+             "application/json": ".json", "text/plain": ".txt", "text/markdown": ".md", "application/x-bvh": ".bvh"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}  # video/mp4, video/quicktime, video/webm (motion_from_video).
+MAX_CAPTURE_SECONDS = 60  # Of video one motion capture takes (contract 0.7, SPEC §3.2 Motion).
+MAX_MOTION_BYTES = 64 * 1024 * 1024
 _registry = {}
 _lock = threading.Lock()
 
@@ -174,8 +177,10 @@ def job_status(job_id):
                                              for output in job['outputs']]})
 
 
-def _remember(job, title, cancel, inputs=None):
-    """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it."""
+def _remember(job, title, cancel, inputs=None, apply_args=None, references=None):
+    """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it.
+    apply_args: the call's client-only arguments for the apply handler (contract 0.7), never sent.
+    references: the scene references its files came from (a clip's name), for names only."""
     with _lock:
         if job["id"] in _registry:
             row = _registry[job['id']]
@@ -189,7 +194,8 @@ def _remember(job, title, cancel, inputs=None):
         for key in finished[:-31]:
             del _registry[key]
         _registry[job["id"]] = {"title": title, "job": copy.deepcopy(job), "cancel": cancel, "ready": False,
-                                "input": copy.deepcopy(inputs or {}),
+                                "input": copy.deepcopy(inputs or {}), "apply_args": copy.deepcopy(apply_args or {}),
+                                "references": dict(references or {}),
                                 'final': job['status'] in TERMINAL and (job['status'] != 'failed' or bool(job.get('error')))}
     _redraw()
     return True
@@ -518,7 +524,10 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
         if size <= 0 or size > row["max_mb"] * 1024 * 1024 or mime not in row["accept"]:
             raise _input_error("Tool file type or size is not accepted", field)
         selected.append({"path": path, "mime": mime, "sha256": hashes[field], "size": size})
-    inputs = {k: v for k, v in arguments.items() if k not in file_fields | {"bundle", "quote_id", "idempotency_key"}}
+    from .cloud import apply_args as client_args
+    local = set(client_args(descriptor))  # Contract 0.7: kept for the apply handler, never sent to the server.
+    inputs = {k: v for k, v in arguments.items()
+              if k not in file_fields | local | {"bundle", "quote_id", "idempotency_key"}}
     payload = {"tool": descriptor["name"], "input": inputs, "files": hashes}
     if arguments.get("bundle") is not None:
         digest = arguments["bundle"]
@@ -558,7 +567,9 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
             except cloud_http.CloudError as ex:
                 if ex.code != "connection_failed" or attempt:
                     raise
-        if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs):
+        if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs,
+                         {k: v for k, v in arguments.items() if k in local},
+                         {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}):
             if descriptor.get("latency") == "long":
                 if cancel.is_set():
                     cancel_job(job["id"])
@@ -591,6 +602,9 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
             continue
         if not isinstance(value, str) or not value:
             raise _input_error("File reference must be an image, object name or path", field)
+        if _accepts_video(row):
+            found[field] = _video_plan(descriptor, arguments, row, value)["path"]
+            continue
         image, ob = bpy.data.images.get(value), bpy.data.objects.get(value)
         if image is not None:
             path = directory / f"input-{n}.png"
@@ -612,6 +626,137 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
                 raise _input_error("Scene reference or file was not found", field)
         found[field] = path
     return found
+
+
+def _accepts_video(row):
+    return any(isinstance(mime, str) and mime.startswith("video/") for mime in row.get("accept", []))
+
+
+def _movie_strip(name):
+    import bpy
+    editor = getattr(bpy.context.scene, "sequence_editor", None)
+    if editor is None:
+        return None
+    every = getattr(editor, "strips_all", None)
+    strip = (every if every is not None else editor.sequences_all).get(name)
+    return strip if strip is not None and strip.type == "MOVIE" else None
+
+
+_probes = {}
+
+
+def _probe_video(path):
+    """(seconds, fps) as Blender reads the file; a clip is loaded and removed. Cached per file version."""
+    import bpy
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key not in _probes:
+        try:
+            clip = bpy.data.movieclips.load(str(path), check_existing=False)
+        except RuntimeError as ex:
+            raise _input_error(f"{path.name} is not a video Blender can read", "video") from ex
+        try:
+            fps, frames = float(clip.fps), int(clip.frame_duration)
+        finally:
+            bpy.data.movieclips.remove(clip)
+        if fps <= 0 or frames < 1:
+            raise _input_error(f"{path.name} has no frames or frame rate Blender can read", "video")
+        if len(_probes) > 32:
+            _probes.clear()
+        _probes[key] = (frames / fps, fps)
+    return _probes[key]
+
+
+def _video_plan(descriptor, arguments, row, value):
+    """A video scene reference (movie clip, movie strip or file path) checked before anything is uploaded:
+    mp4/mov/webm, the size the tool takes, and at most MAX_CAPTURE_SECONDS captured. A trimmed strip's
+    trim becomes the capture's start_s/end_s unless the call gave them."""
+    import bpy
+    field = row["field"]
+    clip = getattr(bpy.data, "movieclips", {}).get(value)
+    strip = None if clip is not None else _movie_strip(value)
+    if clip is not None:
+        if getattr(clip, "source", "MOVIE") != "MOVIE":
+            raise _input_error(f"Movie clip {value!r} is an image sequence; use a video file", field)
+        path = Path(bpy.path.abspath(clip.filepath))
+    elif strip is not None:
+        path = Path(bpy.path.abspath(strip.filepath))
+    else:
+        from . import files
+        path = files.check(files.resolve(value))
+    try:
+        path = path.resolve()
+        size = path.stat().st_size if path.is_file() else -1
+    except OSError:
+        size = -1
+    if size <= 0:
+        raise _input_error(f"Video {value!r} was not found as a movie clip, video strip or file", field)
+    if path.suffix.lower() not in VIDEO_SUFFIXES:
+        raise _input_error(f"{path.name} is not an MP4, MOV or WebM video", field)
+    if size > row["max_mb"] * 1024 * 1024:
+        raise _input_error(f"{path.name} is {size / 1048576:.0f} MB; the limit is {row['max_mb']:g} MB", field)
+    seconds, _fps = _probe_video(path)
+    start, end = arguments.get("start_s"), arguments.get("end_s")
+    trim = {}
+    if strip is not None and start is None and end is None and strip.frame_duration > 0:
+        per_frame = seconds / strip.frame_duration  # Scene frames of the whole strip, whatever its speed.
+        first = max(0, strip.frame_offset_start)
+        if first > 0 or strip.frame_final_duration < strip.frame_duration:
+            trim = {"start_s": round(first * per_frame, 3),
+                    "end_s": round(min(seconds, (first + strip.frame_final_duration) * per_frame), 3)}
+            start, end = trim["start_s"], trim["end_s"]
+    start = 0.0 if start is None else float(start)
+    end = seconds if end is None else float(end)
+    if end > seconds + 0.05 or start >= end:
+        raise _input_error(f"The capture {start:.2f}–{end:.2f} s is outside the video (0–{seconds:.2f} s)", field)
+    if end - start > MAX_CAPTURE_SECONDS + 1e-6:
+        raise _input_error(f"{path.name} is {end - start:.1f} s long; capture at most {MAX_CAPTURE_SECONDS} s by "
+                           "choosing the part with start_s and end_s", field)
+    return {"path": path, "seconds": seconds, "trim": trim}
+
+
+def prepare_inputs(descriptor: dict, arguments: dict, files: dict) -> dict:
+    """Main thread, after resolve_files: the arguments the call actually sends and applies with. Adds a video's
+    measured length (video_seconds) and a trimmed strip's start_s/end_s when the tool takes them, and resolves
+    apply_motion's target_armature (contract 0.7 apply_args) now, so selection changes during the job don't matter."""
+    out = dict(arguments)
+    properties = (descriptor.get("input_schema") or {}).get("properties", {})
+    for row in descriptor.get("file_inputs", []):
+        if _accepts_video(row) and row["field"] in files and isinstance(arguments.get(row["field"]), str):
+            plan = _video_plan(descriptor, arguments, row, arguments[row["field"]])
+            if "video_seconds" in properties:
+                out["video_seconds"] = round(plan["seconds"], 3)
+            out.update({k: v for k, v in plan["trim"].items() if k in properties})
+    from .cloud import apply_args as client_args
+    if descriptor.get("apply") == "apply_motion" and "target_armature" in client_args(descriptor):
+        target = motion_target(arguments.get("target_armature"))
+        if target is not None:
+            out["target_armature"] = target.name
+    return out
+
+
+def motion_target(name):
+    """The armature apply_motion animates: the named object (or a mesh's armature), else the active or the one
+    selected humanoid armature, else None (a new skeleton). A named one that is not a humanoid is refused."""
+    _main_only()
+    import bpy
+    from . import motion_retarget
+    if name is not None:
+        ob = bpy.data.objects.get(name)
+        armature = motion_retarget.armature_of(ob)
+        if armature is None:
+            raise _input_error(f"{name!r} is not an armature or a mesh deformed by one in this file; name an "
+                               "armature, or leave target_armature out for a new skeleton", "target_armature")
+        if motion_retarget.rig_of(armature) is None:
+            raise _input_error(f"{armature.name!r} does not look like a humanoid rig (hips, legs, arms and head); "
+                               "leave target_armature out for a new skeleton", "target_armature")
+        return armature
+    view_layer = bpy.context.view_layer
+    candidates = [motion_retarget.armature_of(view_layer.objects.active)]
+    selected = {motion_retarget.armature_of(o) for o in getattr(bpy.context, "selected_objects", ())} - {None}
+    if len(selected) == 1:
+        candidates.append(selected.pop())
+    return next((a for a in candidates if a is not None and motion_retarget.rig_of(a) is not None), None)
 
 
 # Include embedded ID datablocks, which do not occur in bpy.data.node_groups / shape_keys.
@@ -654,7 +799,7 @@ def result_summary(handler, job, names=(), reports=()):
     """Pure model-facing result; reports are also saved in Text datablocks and the conversation."""
     actions = {"add_image_reference": "Added image references", "import_model": "Imported and selected models",
                "add_audio_strip": "Added sound strips at the current frame", "load_frames": "Loaded frames in the sequencer",
-               "attach_report": "Attached reports", "none": "Saved outputs"}
+               "attach_report": "Attached reports", "none": "Saved outputs", "apply_motion": "Applied motion"}
     line = f"{actions[handler]}: {', '.join(names) or 'no outputs'}. Job {job['id']}; provenance recorded."
     from .cloud import safe_value
     return safe_value(line + ("\n" + "\n".join(reports) if reports else ""))
@@ -1072,6 +1217,49 @@ def _load_frames(job):
     return names
 
 
+def _kept(job, key):
+    with _lock:
+        value = (_registry.get(job["id"]) or {}).get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _read_output(output, limit):
+    path = Path(output["path"])
+    if path.stat().st_size > limit:
+        raise cloud_http.CloudError(f"{output['name']} is larger than Loopcut applies", "apply_failed")
+    return path.read_text(encoding="utf-8")
+
+
+def _apply_motion(job):
+    """Retarget motion.bvh onto the call's target_armature (resolved when it was called), or onto a new SOMA
+    skeleton with a simple body; motion.json adds the frame rate check, fingers and warnings."""
+    import bpy
+    from . import motion_retarget
+    outputs = job["outputs"]
+    bvh = next((o for o in outputs if o["mime"] == "application/x-bvh" or o["name"].lower().endswith(".bvh")), None)
+    sidecar = next((o for o in outputs if o is not bvh and (o["mime"] == "application/json"
+                                                             or o["name"].lower().endswith(".json"))), None)
+    if bvh is None:
+        raise cloud_http.CloudError("The motion result has no motion.bvh", "apply_failed")
+    meta = motion_retarget.read_meta(_read_output(sidecar, 1024 * 1024) if sidecar else "")
+    args, inputs = _kept(job, "apply_args") or job.get("apply_args") or {}, _tool_input(job)
+    notes, target = [], None
+    name = args.get("target_armature")
+    if isinstance(name, str) and name:
+        target = motion_retarget.armature_of(bpy.data.objects.get(name))
+        if target is None or motion_retarget.rig_of(target) is None:
+            notes.append(f"'{name}' is no longer a humanoid armature in this scene, so the motion went on a new skeleton")
+            target = None
+    title = inputs.get("prompt")
+    if not isinstance(title, str) or not title.strip():
+        reference = Path(next(iter(_kept(job, "references").values()), ""))
+        title = reference.stem if reference.suffix.lower() in VIDEO_SUFFIXES else reference.name
+    line = motion_retarget.apply(_read_output(bvh, MAX_MOTION_BYTES), meta, target=target, title=title or "motion",
+                                 in_place=args.get("in_place") is True,
+                                 frame_start=args.get("frame_start") if type(args.get("frame_start")) is int else None)
+    return [line + ("; " + "; ".join(notes) if notes else "")]
+
+
 def apply_result(descriptor: dict, job: dict) -> str:
     """Apply a finished managed or BYOK job and stamp every newly created ID datablock."""
     _main_only()
@@ -1086,13 +1274,13 @@ def apply_result(descriptor: dict, job: dict) -> str:
     handlers = {"add_image_reference": _add_images, "import_model": _model_import,
                 "add_audio_strip": _add_audio, "load_frames": _load_frames,
                 "attach_report": lambda job: [o["name"] for o in job["outputs"] if o["type"] == "report"],
-                "none": lambda job: [o["path"] for o in job["outputs"]]}
+                "apply_motion": _apply_motion, "none": lambda job: [o["path"] for o in job["outputs"]]}
     if handler not in handlers:
         raise cloud_http.CloudError(f"Result handler {handler!r} is not available in this build", "apply_not_available")
     before = datablock_snapshot(bpy.data)
     try:
         names = handlers[handler](job)
-        reports = _reports(job) if handler != "none" else []
+        reports = _reports(job) if handler not in ("none", "apply_motion") else []
         if descriptor.get("name") == "asset_search" and handler == "attach_report":
             _remember_assets(job)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as ex:

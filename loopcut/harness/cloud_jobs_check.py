@@ -4,11 +4,14 @@
 
 Start the mock with --live-tools image_generate,image_to_3d --job-seconds .5.
 The harness also enables those routes via /mock/control. It requires no stored credentials.
+The motion part (contract 0.7) needs ffmpeg on PATH for its short test video, else it skips that call.
 """
 
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -97,7 +100,74 @@ def main():
             check(ex.code == 'apply_not_available', 'destructive glTF variants are refused before import')
         else:
             raise AssertionError('glTF variants reached the importer')
+    motion(client)
     print("PASS cloud jobs check", flush=True)
+
+
+def motion(client):
+    """apply_motion against the mock, which serves a real Kimodo SOMA77 walk (contract 0.7): the apply_args
+    target_armature and in_place stay local, and a video reference is measured, quoted and applied."""
+    from loopcut import motion_retarget
+    fixture = (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "motion" / "kimodo_walk_60.bvh").read_text()
+    client.request("POST", "/mock/control", {"live_tools": ["motion_from_text", "motion_from_video"]})
+    descriptors = {row["name"]: row for row in client.request("GET", "/v1/manifest")["tools"]}
+    text, video = descriptors["motion_from_text"], descriptors["motion_from_video"]
+    check(cloud._descriptor(text) and cloud._descriptor(video), "motion descriptors are callable in this build")
+    check("target_armature" in cloud.schema({**text, "backend": "managed"})["function"]["parameters"]["properties"],
+          "target_armature is offered to the model")
+    scene = bpy.context.scene
+    hero, body = motion_retarget.build_skeleton(motion_retarget.Source(motion_retarget.parse_bvh(fixture)), scene, (2, 0, 0))
+    hero.name, body.name = "Hero", "Hero body"
+    project = {"id": "cloud-harness", "no_generation": False}
+    check("in_place" in cloud.apply_args(text) and "in_place" in cloud.apply_args(video), "in_place is an apply argument")
+    prepared = cloud_jobs.prepare_inputs(text, {"prompt": "walk forward and wave", "target_armature": "Hero body",
+                                                "in_place": True}, {})
+    check(prepared["target_armature"] == "Hero", "a deformed mesh names its armature")
+    with patch.object(cloud_jobs, "_client", return_value=client):
+        job = cloud_jobs.run(text, prepared, {}, project=project)  # The mock refuses unknown inputs with 422.
+        check(cloud_jobs._kept(job, "apply_args") == {"target_armature": "Hero", "in_place": True},
+              "target_armature and in_place kept for the handler, not sent")
+        check(motion_retarget.parse_bvh(Path(next(o["path"] for o in job["outputs"] if o["name"] == "motion.bvh"))
+                                        .read_text()).by_name.get("LeftShin") is not None, "the mock serves a SOMA77 BVH")
+        line = cloud_jobs.apply_result(text, job)
+        print(line, flush=True)
+        action = hero.animation_data.action if hero.animation_data else None
+        check(action is not None and action.name.startswith("Motion: walk forward"), "motion applied to the named armature")
+        check("root motion in place" in line and "fingers not animated" in line, "in_place and the sidecar reach the handler")
+        check("loopcut_provenance" in action, "the motion's action carries provenance")
+        xs = []
+        for frame in range(scene.frame_start, scene.frame_start + 48):
+            scene.frame_set(frame)
+            xs.append((hero.matrix_world @ hero.pose.bones["Hips"].head).to_2d())
+        check(max((x - xs[0]).length for x in xs) < 0.2, "in place: the hips stay over their start")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("SKIP motion_from_video: no ffmpeg for the test video", flush=True)
+            return
+        folder = Path(tempfile.mkdtemp(prefix="loopcut-motion-video-"))
+        clip_path = folder / "take.mp4"
+        subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=96x64:rate=30",
+                        "-pix_fmt", "yuv420p", str(clip_path)], check=True)
+        clip = bpy.data.movieclips.load(str(clip_path))
+        for ob in bpy.context.selected_objects:
+            ob.select_set(False)
+        bpy.context.view_layer.objects.active = None
+        arguments = {"video": clip.name}
+        files = cloud_jobs.resolve_files(video, arguments, folder / "inputs")
+        prepared = cloud_jobs.prepare_inputs(video, arguments, files)
+        check(abs(prepared["video_seconds"] - 2.0) < 0.1 and "target_armature" not in prepared,
+              f"the clip is measured ({prepared['video_seconds']} s) and nothing is targeted")
+        try:
+            cloud_jobs.run(video, prepared, files, project=project)
+            check(False, "motion_from_video asks for a quote first")
+        except cloud_http.CloudError as ex:
+            check(ex.code == "quote_required" and ex.extra.get("credits") == 6, f"2 s quoted at {ex.extra.get('credits')} credits")
+            quote = ex.extra["quote_id"]
+        job = cloud_jobs.run(video, {**prepared, "quote_id": quote}, files, project=project)
+        line = cloud_jobs.apply_result(video, job)
+        print(line, flush=True)
+        check("new skeleton" in line and "Motion: take" in line and "root motion in world" in line,
+              "no target: the motion lands on a new skeleton named from the clip, travelling")
 
 
 try:

@@ -689,23 +689,35 @@ class FirstRunTest(unittest.TestCase):
         for button in (a, b):
             self.assertLessEqual(button["x"] + button["w"], 240 - T.PAD)
 
-    def test_examples_fill_the_input_and_scope_explains_the_boundary(self):
+    def test_starter_prompts_send_and_scope_explains_the_boundary(self):
         display = build()
-        for n in range(3):
+        self.assertTrue(3 <= len(layout.EXAMPLE_REQUESTS) <= 4)
+        for n, request in enumerate(layout.EXAMPLE_REQUESTS):
             self.assertEqual(hit(display, f"chat.hint{n}")["action"], ("example_request", n))
-            self.assertEqual(texts(display)[f"chat.hint{n}.label.l0"], layout.EXAMPLE_REQUESTS[n])
+            self.assertEqual(hit(display, f"chat.hint{n}")["tip"], "Send this to Loopcut")
+            shown = " ".join(v for k, v in sorted(texts(display).items()) if k.startswith(f"chat.hint{n}.label.l"))
+            self.assertEqual(shown, request)
+        self.assertEqual(texts(display)["chat.hints.title.l0"], "Try one:")
         scope = " ".join(value for key, value in texts(display).items() if key.startswith("chat.hints.scope"))
         self.assertIn("inspect and edit", scope)
         self.assertIn("can't see other apps", scope)
         self.assertIn("approval", scope)
 
-    def test_dismissed_hints_do_not_reappear_in_a_new_chat(self):
+    def test_starters_return_in_every_new_chat_without_the_first_run_note(self):
         display = build(hints_dismissed=True)
-        self.assertFalse([p for p in display["prims"] if p["id"].startswith("chat.hint")])
+        self.assertFalse([p for p in display["prims"] if p["id"].startswith("chat.hints.scope")])
+        self.assertEqual(len([h for h in display["hits"] if h["action"][0] == "example_request"]),
+                         len(layout.EXAMPLE_REQUESTS))
         self.assertIn("chat.empty0.l0", ids(display, "prims"))
         session = state.new_session()
         session["items"].append(state.item_user("Make it red"))
         self.assertFalse([h for h in build(session)["hits"] if h["action"][0] == "example_request"])
+
+    def test_starters_wait_in_the_input_until_a_model_is_connected(self):
+        display = build(needs_setup=True)
+        self.assertEqual(hit(display, "chat.hint0")["tip"], "Fill the input; connect a model above to send it")
+        self.assertEqual(texts(display)["chat.hints.title.l0"], "Then try one:")
+        self.assertGreater(hit(display, "chat.hint0")["y"], hit(display, "chat.signin.loopcut")["y"])
 
     def test_own_key_provider_without_its_key_asks_for_the_key_not_a_sign_in(self):
         """F0287: picking OpenAI with no key brought back the first-run sign-in card, both accounts connected."""

@@ -35,7 +35,8 @@ MAX_SKILLS = 128
 MAX_SKILL_BYTES = 256 * 1024
 UPDATE_MESSAGE = "Update Loopcut to use cloud tools"
 _APPLY = {"add_image_reference", "import_model", "import_material", "add_audio_strip",
-          "load_frames", "attach_report", "none", "apply_shape_keys"}
+          "load_frames", "attach_report", "none", "apply_shape_keys", "apply_motion"}
+_FIELD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _runtime = None
 _snapshot_at = 0
 # Deferred application only. cloud_jobs owns status, downloads and cancellation by server ID.
@@ -54,9 +55,34 @@ def is_tool(name):
     return tool_name(name) is not None
 
 
+def apply_args(descriptor):
+    """Contract 0.7 apply_args: client-only arguments of the apply handler, as {name: JSON Schema}. They are
+    offered to the model, stripped before quotes and jobs, and handed to the handler when it applies."""
+    spec = (descriptor or {}).get("apply_args")
+    properties = spec.get("properties") if isinstance(spec, dict) else None
+    return dict(properties) if isinstance(properties, dict) else {}
+
+
+def _apply_args_valid(value):
+    spec = value.get("apply_args")
+    if spec is None:
+        return True
+    if (not isinstance(spec, dict) or spec.get("type") != "object" or spec.get("additionalProperties") is not False
+            or not isinstance(spec.get("properties"), dict)
+            or not isinstance(spec.get("required", []), list)
+            or any(not isinstance(f, str) or f not in spec["properties"] for f in spec.get("required", []))):
+        return False
+    taken = set((value.get("input_schema") or {}).get("properties", {})) | {
+        f.get("field") for f in value.get("file_inputs", []) if isinstance(f, dict)}
+    return all(isinstance(name, str) and _FIELD.fullmatch(name) and name not in taken and isinstance(schema, dict)
+               for name, schema in spec["properties"].items())
+
+
 def _descriptor(value):
     """Validate executable fields; optional display metadata such as category cannot reject a tool."""
     if not isinstance(value, dict):
+        return False
+    if not _apply_args_valid(value):
         return False
     schema, files = value.get("input_schema"), value.get("file_inputs", [])
     cost, approval = value.get("cost") or {}, value.get("approval") or {}
@@ -175,10 +201,18 @@ def schema(descriptor):
     description = descriptor["description"]
     for field in descriptor.get("file_inputs", []):
         name = field["field"]
-        properties[name] = {"type": "string", "description":
-            "Scene reference: an object name to export, an image datablock name, or a capture/render file path. "
-            "The client resolves and uploads this file. Accepted types: " + ", ".join(field.get("accept", []))}
+        video = any(mime.startswith("video/") for mime in field.get("accept", []))
+        properties[name] = {"type": "string", "description": (
+            "Scene reference: a movie clip or video strip name, or a video file path. "
+            if video else
+            "Scene reference: an object name to export, an image datablock name, or a capture/render file path. ")
+            + "The client resolves and uploads this file. Accepted types: " + ", ".join(field.get("accept", []))}
         if field["required"] and name not in required:
+            required.append(name)
+    spec = descriptor.get("apply_args") or {}
+    for name, value in apply_args(descriptor).items():
+        properties.setdefault(name, deepcopy(value))
+        if name in spec.get("required", []) and name not in required:
             required.append(name)
     if descriptor.get("backend") == "managed":
         properties["idempotency_key"] = {"type": "string", "minLength": 1, "maxLength": 200,
@@ -1285,6 +1319,9 @@ def execute(name, arguments):
         out_dir = runtime.cache_dir / "jobs" / uuid.uuid4().hex
         out_dir.mkdir(parents=True, exist_ok=True)
         files = module.resolve_files(descriptor, arguments, out_dir)
+        prepare = getattr(module, "prepare_inputs", None)
+        if callable(prepare):  # Measured inputs (a video's length) and the apply handler's resolved target.
+            arguments = prepare(descriptor, arguments, files)
         # Exports are ours. Unresolved local paths require their own gate before hashing or upload,
         # including tools invoked outside agent.run_loop and workers that cannot ask the user.
         from . import files as local_files

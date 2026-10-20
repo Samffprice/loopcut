@@ -42,6 +42,14 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
+    # The Azure sign-in for code signing is tied to this environment, which only main, the v* release
+    # tags and ci/windows-signing may use (Settings > Environments). Its secrets hold the Azure ids.
+    environment: windows-signing
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -162,10 +170,6 @@ jobs:
             -DOPTIX_ROOT_DIR=%GITHUB_WORKSPACE%\optix ^
             -DCPACK_OVERRIDE_PACKAGENAME=%PACKAGE_NAME% || exit /b 1
           ninja -C build install || exit /b 1
-          cd build
-          cpack -G ZIP || exit /b 1
-          rem The .msi installer needs the WiX toolset; the .zip above is the release if it is missing.
-          cpack -G WIX || echo WiX packaging failed, shipping the zip only
 
       # The kernel step above may fail without failing the run; say so where it cannot be missed.
       # Runs after CPack: Blender's isolated Python can create runtime caches.
@@ -182,6 +186,68 @@ jobs:
           fi
           if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Loopcut.app/Contents/MacOS/Loopcut; else blender=build/bin/blender.exe; fi
           "$blender" -b --factory-startup --python-expr "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
+
+      # Code signing with Microsoft Artifact Signing: account loopcutsign (South Central US), certificate
+      # profile loopcutrelease, through SignTool and Microsoft's plugin for it, both pinned. Only the
+      # Azure CLI sign-in is tried. It comes after the build because its token lasts about an hour.
+      - name: Signing tools (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:GITHUB_WORKSPACE signing
+          nuget install Microsoft.Windows.SDK.BuildTools -Version 10.0.28000.2705 -OutputDirectory $tools -NonInteractive
+          if ($LASTEXITCODE) { throw "nuget install failed" }
+          nuget install Microsoft.ArtifactSigning.Client -Version 1.0.146 -OutputDirectory $tools -NonInteractive
+          if ($LASTEXITCODE) { throw "nuget install failed" }
+          $signtool = "$tools\Microsoft.Windows.SDK.BuildTools.10.0.28000.2705\bin\10.0.28000.0\x64\signtool.exe"
+          $dlib = "$tools\Microsoft.ArtifactSigning.Client.1.0.146\bin\x64\Azure.CodeSigning.Dlib.dll"
+          foreach ($file in $signtool, $dlib) { if (-not (Test-Path $file)) { throw "Missing $file" } }
+          $metadata = "$tools\metadata.json"
+          @{
+            Endpoint = 'https://scus.codesigning.azure.net'
+            CodeSigningAccountName = 'loopcutsign'
+            CertificateProfileName = 'loopcutrelease'
+            CorrelationId = "$env:GITHUB_REPOSITORY run $env:GITHUB_RUN_ID"
+            ExcludeCredentials = @('EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential')
+          } | ConvertTo-Json | Set-Content -Encoding utf8 $metadata
+          "LOOPCUT_SIGNTOOL=$signtool", "LOOPCUT_SIGN_DLIB=$dlib", "LOOPCUT_SIGN_METADATA=$metadata",
+            "LOOPCUT_SIGN_CACHE=$tools\cache" | Add-Content $env:GITHUB_ENV
+
+      - name: Sign in to Azure for signing (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # CPack signs every program and library in each package's staging folder before archiving it,
+      # then the .msi itself is signed. A release is never shipped unsigned: without the signing
+      # secrets only a build with no release_tag goes through, with a warning.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: build
+        run: |
+          if [ -n "$AZURE_CLIENT_ID" ]; then
+            # -D replaces packaging.cmake's list, so the release hygiene hook (Python caches out) goes first again.
+            root="$(cygpath -m "$GITHUB_WORKSPACE")/blender"
+            sign=(-D "CPACK_PRE_BUILD_SCRIPTS=$root/build_files/cmake/loopcut_release_hygiene.cmake;$root/loopcut/scripts/cpack_sign.cmake")
+          elif [ -n "$RELEASE_TAG" ]; then
+            echo "::error title=No signing secrets::The windows-signing environment has no Azure secrets, and a release must be signed."; exit 1
+          else
+            sign=()
+            echo "::warning title=Unsigned build::No signing secrets in the windows-signing environment; this build is unsigned."
+          fi
+          cpack -G ZIP "${sign[@]}"
+          # The .msi installer needs the WiX toolset; the .zip above is the release if it is missing.
+          if cpack -G WIX "${sign[@]}"; then
+            if [ -n "$AZURE_CLIENT_ID" ]; then pwsh -NoProfile -File ../blender/loopcut/scripts/sign_windows.ps1 loopcut-*.msi; fi
+          else
+            echo "WiX packaging failed, shipping the zip only"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

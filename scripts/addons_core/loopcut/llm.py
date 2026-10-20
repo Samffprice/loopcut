@@ -30,6 +30,12 @@ RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 RETRY_DELAYS = (1.0, 3.0, 8.0)
 MAX_RETRY_AFTER = 30.0
 CONNECTION_LOST = "connection_lost"  # LLMError.code when the connection kept dropping: the panel offers Try again.
+EMPTY_REPLY = "empty_reply"  # LLMError.code: the model answered with nothing to show or run, twice (agent._request).
+CONTENT_FILTER = "content_filter"  # LLMError.code: the provider's own filter stopped the reply (agent._request).
+# finish_reason values some providers send when their content filter stops a reply: z.ai's GLM API ends the
+# stream with "sensitive" (and no usage), OpenAI-compatible servers with "content_filter". Measured 2026-10-20 on
+# glm-5.3-flash, a request that names Taiwan's flag or Tiananmen Square stops this way, with no text.
+FILTERED_FINISHES = frozenset({"sensitive", "content_filter"})
 
 
 def dropped_connection(ex) -> bool:
@@ -81,6 +87,10 @@ class Completion:
     account: dict | None = None  # Plan and window usage from Loopcut's gateway headers; see account_from_headers.
     timed_out: bool = False  # call_max_seconds cut the stream short; finish_reason is set to "length" too.
     prompt_version: str | None = None
+    # Characters of hidden reasoning the stream carried (delta.reasoning_content on z.ai and DeepSeek-style
+    # servers, delta.reasoning on OpenRouter). Never shown or sent back; it tells a reasoning-only reply, which
+    # has nothing to show, from an empty one in the log.
+    reasoning_chars: int = 0
 
     def as_message(self) -> dict:
         message = {"role": "assistant", "content": self.text or None}
@@ -241,6 +251,9 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         completion.text += text
                         streamed = True
                         on_text(text)
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if isinstance(reasoning, str) and reasoning:
+                        completion.reasoning_chars += len(reasoning)  # Nothing shown, so not "streamed".
                     for part in delta.get("tool_calls") or []:
                         streamed = True
                         call = calls.setdefault(part.get("index", 0), ToolCall())
@@ -357,6 +370,12 @@ def stream_chat(
     if service and prompt_id is not None:
         from . import cloud
         request_headers["x-loopcut-prompt"] = prompt_id
+    if service:  # Loopcut's gateway only: add-on, Blender, OS and processor, as on every other Loopcut request.
+        try:
+            from . import cloud_http
+            request_headers["x-loopcut-client"] = cloud_http.client_value()
+        except Exception:
+            pass
     request_headers.update({
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

@@ -139,6 +139,17 @@ class LLMTest(unittest.TestCase):
         self.assertEqual(headers.get("x-loopcut-conversation"), "abc123")
         self.assertEqual(headers.get("x-loopcut-role"), "worker")
 
+    def test_the_gateway_hears_the_add_on_blender_and_platform(self):
+        """x-loopcut-client on hosted requests, as on every other Loopcut request; never to another provider."""
+        SCRIPT.replies += [text_reply("hi"), text_reply("hi")]
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": self.base_url}):
+            self.call()
+        self.call()
+        hosted, other = (request["headers"] for request in SCRIPT.requests[-2:])
+        self.assertRegex(hosted.get("x-loopcut-client", ""),
+                         r"^loopcut-addon/\d+\.\d+\.\d+ blender/\S+ os/(mac|windows|linux) arch/(arm64|x86_64|other)$")
+        self.assertNotIn("x-loopcut-client", {k.lower() for k in other})
+
     def test_extra_headers_never_override_the_api_key_or_content_type(self):
         SCRIPT.replies.append(text_reply("hi"))
         self.call(headers={"Authorization": "Bearer nope", "Content-Type": "text/plain", "Accept": "*/*"})
