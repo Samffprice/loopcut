@@ -19,7 +19,9 @@ in a sandbox made with BLENDER_USER_RESOURCES (never a different HOME: a sign-in
     --stage failed    the service is unreachable: the sign-in fails, "Continue without an account" leads to the
                       model step, and finishing leaves the setup to come back
     --stage existing  a sandbox with preferences and a Loopcut key but no progress file (an install from before
-                      the setup): no setup, the normal splash, marked done
+                      the setup): the whole setup from the account, modal, each step showing what it has (signed
+                      in, its model connected), every primary pressed once; privacy recorded as seen
+    --stage existing-again  the same sandbox relaunched: the normal splash, never the setup again
     --stage screens   every screen and state with fixture data (signed in, a fresh trial, live cloud tools),
                       each checked to fit the window and screenshotted for review (--suffix names the size);
                       then the photo card: the setup closes, the panel docks and the request goes out with the
@@ -45,8 +47,8 @@ import bpy
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", choices=("fresh", "import", "missing", "resume", "failed", "existing", "screens",
-                                        "clicks"), required=True)
+parser.add_argument("--stage", choices=("fresh", "import", "missing", "resume", "failed", "existing", "existing-again",
+                                        "screens", "clicks"), required=True)
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--suffix", default="", help="added to each screenshot's name, e.g. the window size")
 ARGS = parser.parse_args(argv)
@@ -125,6 +127,72 @@ def try_to_dismiss() -> None:
     simulate("ESC", "RELEASE", 40, 40)
     simulate("RET", "PRESS", 40, 40)
     simulate("RET", "RELEASE", 40, 40)
+
+
+def at(cx: int, cy: int) -> tuple[int, int]:
+    """A point given in the popup's own pixels from its top-left, as measured on the review crops at
+    1440x900, in window pixels."""
+    region = onboarding._state["region"]
+    return region.x + cx, region.y + region.height - cy
+
+def hover(cx: int, cy: int):
+    def run():
+        simulate("MOUSEMOVE", "NOTHING", *at(cx, cy))
+    return run
+
+def press(cx: int, cy: int):
+    def run():
+        x, y = at(cx, cy)
+        simulate("LEFTMOUSE", "PRESS", x, y)
+        simulate("LEFTMOUSE", "RELEASE", x, y)
+    return run
+
+def one_click(name: str, cx: int, cy: int, happened, rebuild: bool = False):
+    """As a person clicks: onto the button, a pause (1.5 s, across the setup's 1 s timer), ONE press and
+    release; the next tick checks it acted. rebuild: the splash is rebuilt during the pause, as when what it
+    shows changes (a sign-in finishing), which once left the button inactive until the pointer moved."""
+    def verify():
+        check(happened(), f"one click on {name} did nothing")
+        print("ONE CLICK OK:", name, "(rebuilt while hovered)" if rebuild else "")
+    return [hover(cx, cy), *([onboarding._refresh_splash] if rebuild else []), press(cx, cy), verify]
+
+
+def primary_center() -> tuple[int, int]:
+    """Where the step's filled primary button is, read off a screenshot: its middle, in window pixels."""
+    import numpy as np
+    path = ARGS.out / "primary-probe.png"
+    ARGS.out.mkdir(parents=True, exist_ok=True)
+    with bpy.context.temp_override(window=window()):
+        bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=2)
+        bpy.ops.screen.screenshot(filepath=str(path))
+    image = bpy.data.images.load(str(path))
+    w, h = image.size
+    px = np.array(image.pixels[:], dtype=np.float32).reshape(h, w, 4)[:, :, :3] * 255  # Rows from the bottom.
+    bpy.data.images.remove(image)
+    path.unlink()
+    region = onboarding._state["region"]
+    band = px[region.y:region.y + region.height, region.x + 60:region.x + region.width - 60]
+    rows = np.nonzero((np.abs(band - [242, 239, 233]).max(axis=2) < 6).mean(axis=1) > 0.8)[0]
+    check(len(rows) > 0, "no filled primary button on screen")
+    return region.x + region.width // 2, region.y + int(rows.mean())
+
+
+def one_click_primary(name: str, happened):
+    """one_click on the step's primary button, wherever it is."""
+    spot = {}
+
+    def locate():
+        spot["xy"] = primary_center()
+        simulate("MOUSEMOVE", "NOTHING", *spot["xy"])
+
+    def click():
+        simulate("LEFTMOUSE", "PRESS", *spot["xy"])
+        simulate("LEFTMOUSE", "RELEASE", *spot["xy"])
+
+    def verify():
+        check(happened(), f"one click on {name} did nothing")
+        print("ONE CLICK OK:", name)
+    return [locate, click, verify]
 
 
 def expect_modal(step: str) -> None:
@@ -328,12 +396,56 @@ elif ARGS.stage == "failed":
           closed, done)
 
 elif ARGS.stage == "existing":
-    def existing():
+    def step_is(step: str):
+        return lambda: onboarding._state["step"] == step
+
+    def account_step():
         check(PREFS.exists(), "the sandbox needs preferences")
         check(account.signed_in(), "the sandbox needs a Loopcut key")
+        expect_modal("account")  # Set up before 0.2.6: the setup too, from the account, modal.
+        check(onboarding.is_existing() and progress().get("existing") is True, f"progress is {progress()}")
+        check(not onboarding.privacy_seen(), "privacy seen before its step")
+        check(not onboarding._credits_pending(), "still waiting for the credits")
+        shot("account")
+        try_to_dismiss()
+
+    def how_step():
+        expect_modal("how")
+        shot("how")
+
+    def model_step():
+        expect_modal("connect")
+        check(onboarding._connected(), "the sandbox's model is not connected")
+        shot("model")
+
+    def privacy_step():
+        expect_modal("privacy")
+        check(settings.preferences().share_conversations, "sharing is not on by default")
+        shot("privacy")
+
+    def try_step():
+        expect_modal("done")
+        check(onboarding.privacy_seen(), "privacy not recorded as seen")
+        shot("try-it")
+        call(bpy.ops.loopcut.onboarding_try, card="")
+
+    def closed():
+        check(not wm().splash_modal and not onboarding._splash_open(), "the setup did not close")
+        check(progress() == {"version": 1, "step": "done", "done": True, "privacy_seen": 1, "existing": True},
+              f"progress is {progress()}")
+
+    steps(*[lambda: None] * 11,  # The credits check gives up after 15 s (the service is unreachable).
+          account_step, lambda: expect_modal("account"),
+          *one_click_primary("Continue (signed in)", step_is("how")), how_step,
+          *one_click_primary("Continue (how it works)", step_is("connect")), model_step,
+          *one_click_primary("Continue (the model it has)", step_is("privacy")), privacy_step,
+          *one_click_primary("Continue (privacy)", step_is("done")), try_step, closed, done)
+
+elif ARGS.stage == "existing-again":
+    def again():
+        check(PREFS.exists() and progress().get("privacy_seen") == 1, "run --stage existing in this sandbox first")
         check(onboarding._state["step"] is None and onboarding._state["finished"], f"state is {onboarding._state}")
-        check(not wm().splash_modal, "the splash is modal for a set-up install")
-        check(progress()["done"] is True, f"progress is {progress()}")
+        check(not wm().splash_modal, "the splash is modal after the notice was seen")
         shot("normal-splash")
         try_to_dismiss()
 
@@ -341,7 +453,7 @@ elif ARGS.stage == "existing":
         refresh()
         shot("after-outside-click")
 
-    steps(existing, dismissed, done)
+    steps(again, dismissed, done)
 
 else:  # screens and clicks: the same fixture
     from datetime import datetime, timezone
@@ -436,33 +548,6 @@ else:  # screens and clicks: the same fixture
         check(users[-1]["images"], "the sample photo was not attached")
         check(progress() == {"version": 1, "step": "done", "done": True}, f"progress is {progress()}")
         shot("5-sent")
-
-    def at(cx: int, cy: int) -> tuple[int, int]:
-        """A point given in the popup's own pixels from its top-left, as measured on the review crops at
-        1440x900, in window pixels."""
-        region = onboarding._state["region"]
-        return region.x + cx, region.y + region.height - cy
-
-    def hover(cx: int, cy: int):
-        def run():
-            simulate("MOUSEMOVE", "NOTHING", *at(cx, cy))
-        return run
-
-    def press(cx: int, cy: int):
-        def run():
-            x, y = at(cx, cy)
-            simulate("LEFTMOUSE", "PRESS", x, y)
-            simulate("LEFTMOUSE", "RELEASE", x, y)
-        return run
-
-    def one_click(name: str, cx: int, cy: int, happened, rebuild: bool = False):
-        """As a person clicks: onto the button, a pause (1.5 s, across the setup's 1 s timer), ONE press and
-        release; the next tick checks it acted. rebuild: the splash is rebuilt during the pause, as when what it
-        shows changes (a sign-in finishing), which once left the button inactive until the pointer moved."""
-        def verify():
-            check(happened(), f"one click on {name} did nothing")
-            print("ONE CLICK OK:", name, "(rebuilt while hovered)" if rebuild else "")
-        return [hover(cx, cy), *([onboarding._refresh_splash] if rebuild else []), press(cx, cy), verify]
 
     def prefs():
         return settings.preferences()

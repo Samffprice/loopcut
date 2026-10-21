@@ -202,14 +202,27 @@ def _run_sign_in() -> None:
         _redraw()
 
 
+def _own_route_works(prefs) -> bool:
+    """A provider of the user's own (their key, or a local model) that loads: kept over a new sign-in."""
+    if prefs.provider in ("LOOPCUT", "CHATGPT"):
+        return False
+    try:
+        config.load()
+    except config.ConfigError:
+        return False
+    return True
+
+
 def _store_key(key: str) -> None:
     """Main thread: the credentials folder comes from bpy, and the preferences page changes."""
     from . import chatgpt_auth, settings
     credentials.store(BASE_URL, key)
     prefs = settings.preferences()
-    # A signed-in ChatGPT plan stays the model: the account adds asset search and credits. Only the user's
-    # own pick of Loopcut Fast/Pro (the provider menu, onboarding's "Use Loopcut's models") moves it.
-    if prefs is not None and prefs.provider != "LOOPCUT" and not chatgpt_auth.plan_signed_in():
+    # A signed-in ChatGPT plan stays the model, and so does a working key of the user's own (an install from
+    # before the setup signing in now): the account adds asset search and credits. Only the user's own pick of
+    # Loopcut Fast/Pro (the provider menu, onboarding's "Use Loopcut's models") moves it.
+    if prefs is not None and prefs.provider != "LOOPCUT" and not chatgpt_auth.plan_signed_in() \
+            and not _own_route_works(prefs):
         prefs.provider = "LOOPCUT"
     settings.config_changed()
     try:

@@ -17,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import sys
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -97,7 +98,7 @@ class OnboardingTest(unittest.TestCase):
         cls.fake.types.AddonPreferences = AddonPreferences
         cls.fake.props = Mock()
         cls.fake.ops = Mock()
-        cls.fake.app = types.SimpleNamespace(version=(5, 2, 0), timers=Mock())
+        cls.fake.app = types.SimpleNamespace(version=(5, 2, 0), timers=Mock(), background=False)
         cls.fake.context = types.SimpleNamespace()
         cls.fake.utils = types.ModuleType("bpy.utils")
         cls.fake.utils.previews = types.ModuleType("bpy.utils.previews")
@@ -114,11 +115,13 @@ class OnboardingTest(unittest.TestCase):
             setattr(cls, name.replace("ui.", ""), importlib.import_module(NAME + "." + name))
 
     def setUp(self):
+        self.fake.app.background = False  # An interactive Blender; the headless tests say otherwise.
         self.fake.ops.reset_mock()
         self.fake.app.timers.reset_mock()
         self.onboarding._state.update(step="connect", own_key=False, left_chatgpt=False, error="", no_account=False,
                                       claimed=False, waiting_since=0.0, credits_asked=0.0, region=None,
-                                      finished=False, imported=None, failed=[], drawn=None)
+                                      finished=False, imported=None, failed=[], drawn=None, existing=False,
+                                      change_model=False)
         self.onboarding._popups.clear()
         self.onboarding._reported.clear()
         folder = tempfile.TemporaryDirectory()
@@ -415,9 +418,10 @@ class OnboardingTest(unittest.TestCase):
             self.assertIsNone(self.onboarding._refresh_popups())
 
     def test_loopcut_sign_in_selects_provider_saves_and_advances(self):
-        self.prefs.provider = "OPENAI"
+        self.prefs.provider = "OPENAI"  # Chosen, but with no key: nothing that works to keep.
         self.onboarding._state["step"] = "account"
-        with patch.object(self.account.credentials, "store") as store:
+        with patch.object(self.account.credentials, "store") as store, \
+                patch.object(self.account.config, "load", side_effect=self.account.config.ConfigError("no key")):
             self.account.on_signed_in.append(self.onboarding._on_signed_in)
             try:
                 self.account._store_key("fixture-only")
@@ -843,20 +847,141 @@ class OnboardingTest(unittest.TestCase):
                 self.assertEqual(self.onboarding._state["step"], expected)
                 self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": expected, "done": False})
 
-    def test_installs_from_before_the_setup_with_a_model_or_account_are_marked_done_silently(self):
-        for signed_in, connected in ((True, False), (False, True)):
+    def test_installs_from_before_the_setup_go_through_it_from_the_account(self):
+        """0.2.5 installs with a model or an account no longer skip the setup (conversation logs are new, and on):
+        they start at the account, modal, told apart from new installs in the funnel, and once through the privacy
+        step and finished, never again."""
+        on = self.onboarding
+        for signed_in, connected in ((True, False), (False, True), (True, True)):
             with self.subTest(signed_in=signed_in, connected=connected):
                 self.progress.unlink(missing_ok=True)
                 self.fresh_session()
                 with patch.object(self.account, "signed_in", return_value=signed_in), \
-                        patch.object(self.onboarding, "_connected", return_value=connected), \
-                        patch.object(self.onboarding, "_report") as report:
+                        patch.object(self.account, "account_line", return_value="person@example.test"), \
+                        patch.object(on, "_connected", return_value=connected), \
+                        patch.object(on, "_report") as report:
+                    splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=False))
+                self.assertTrue(drawn)
+                self.assertEqual(on._state["step"], "account")
+                self.assertTrue(wm.splash_modal)
+                self.assertTrue(on.is_existing())
+                self.assertEqual(on.load_progress()["existing"], True)
+                self.assertFalse(on.privacy_seen())
+                self.assertIn(unittest.mock.call("welcome", None, code="existing"), report.call_args_list)
+                labels = [r[1] for r in splash.records if r[0] == "label"]
+                self.assertIn("You're signed in" if signed_in else "Create your free account", labels)
+                if not signed_in:  # Like a new install: no way past the sign-in until it fails.
+                    self.assertNotIn("Not now", [r[2] for r in splash.operators()])
+                on.save_progress("done", done=True, privacy_seen=True)  # Through privacy and finished.
+                self.fresh_session()
+                with patch.object(self.account, "signed_in", return_value=signed_in), \
+                        patch.object(on, "_connected", return_value=connected):
                     splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
-                self.assertFalse(drawn)  # The normal splash, closing on an outside click as ever.
+                self.assertFalse(drawn)  # Never again: the normal splash.
                 self.assertFalse(wm.splash_modal)
-                self.assertEqual(json.loads(self.progress.read_text())["done"], True)
-                report.assert_not_called()
-                self.assertTrue(self.onboarding._state["finished"])
+
+    def test_an_install_from_before_resumes_as_one(self):
+        on = self.onboarding
+        on.save_progress("connect", existing=True)
+        self.fresh_session()
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(on, "_connected", return_value=False), \
+                patch.object(on, "_report") as report:
+            self.draw_step()
+        self.assertEqual(on._state["step"], "connect")
+        self.assertTrue(on._state["existing"])
+        report.assert_any_call("welcome", None, code="existing_resumed")
+        on.save_progress("done", done=True)  # Done in a build before the privacy step: once more, as existing.
+        self.fresh_session()
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(on, "_connected", return_value=False):
+            self.draw_step()
+        self.assertEqual(on._state["step"], "account")
+        self.assertTrue(on._state["existing"])
+
+    def test_an_install_from_before_keeps_its_model_at_the_model_step(self):
+        """It says which model is connected, Continue keeps it (reported as kept), "Change model" shows the
+        choices."""
+        on = self.onboarding
+        on._state.update(step="connect", existing=True)
+        for provider, name, detail in (("LOOPCUT", "Loopcut models", "Loopcut Fast"),
+                                       ("CHATGPT", "ChatGPT", "person@example.test"),
+                                       ("OPENAI", "OpenAI, with your key", "test-model")):
+            with self.subTest(provider=provider), \
+                    patch.object(self.account, "signed_in", return_value=True), \
+                    patch.object(on, "_connected", return_value=True), \
+                    patch.object(on.settings, "model_label", return_value="Loopcut Fast"), \
+                    patch.object(self.chatgpt_ui, "account_line", return_value="person@example.test"):
+                self.prefs.provider = provider
+                on._state["change_model"] = False
+                splash = Splash()
+                on._draw_connect(splash, self.context)
+                labels = [r[1] for r in splash.records if r[0] == "label"]
+                for text in ("Your model is connected", name, "Connected", detail):
+                    self.assertIn(text, labels)
+                self.assertEqual([r[2] for r in splash.operators()], ["Continue", "← Back", "Change model"])
+                with patch.object(on, "_report") as report:
+                    on._report_move_now("connect", "privacy", "CURRENT")
+                report.assert_called_once_with("chatgpt", on._choice(), code="existing_kept")
+                op = on.LOOPCUT_OT_onboarding_change_model()
+                with patch.object(on, "_report"):
+                    self.assertEqual(op.execute(self.context), {"FINISHED"})
+                splash = Splash()
+                on._draw_connect(splash, self.context)
+                self.assertIn("Add a key", [r[2] for r in splash.operators()])  # The choices, to change.
+        on._state.update(existing=False, change_model=False)
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(on, "_connected", return_value=True):
+            splash = Splash()
+            on._draw_connect(splash, self.context)
+        self.assertNotIn("Your model is connected", [r[1] for r in splash.records])  # New installs choose.
+
+    def test_the_sign_in_switch_for_installs_from_before_is_off(self):
+        """The owner: they sign in like new installs. The switch exists, off; on, it offers "Not now"."""
+        on = self.onboarding
+        self.assertFalse(on.EXISTING_MAY_SKIP_SIGN_IN)
+        on._state.update(step="account", existing=True)
+        with patch.object(on, "EXISTING_MAY_SKIP_SIGN_IN", True):
+            splash = Splash()
+            on._draw_account(splash, self.context)
+        self.assertIn("Not now", [r[2] for r in splash.operators()])
+        self.assertIn("loopcut.onboarding_no_account", [r[1] for r in splash.operators()])
+
+    def test_a_working_key_of_ones_own_survives_a_loopcut_sign_in(self):
+        self.prefs.provider = "OPENAI"
+        with patch.object(self.account.credentials, "store"), \
+                patch.object(self.account.config, "load", return_value=object()):
+            self.account._store_key("fixture-only")
+        self.assertEqual(self.prefs.provider, "OPENAI")
+
+    def test_a_new_install_sees_privacy_in_the_setup_once(self):
+        on = self.onboarding
+        self.progress.unlink(missing_ok=True)
+        on._state["step"] = "privacy"
+        on.save_progress("privacy")
+        self.assertFalse(on.privacy_seen())
+        splash = Splash()
+        on._draw_privacy(splash)
+        self.press_step(splash, "Continue")
+        self.assertEqual(on._state["step"], "done")
+        self.assertTrue(on.privacy_seen())
+        on.save_progress("done", done=True)  # Finishing keeps it.
+        self.assertTrue(on.load_progress()["privacy_seen"])
+        self.assertFalse(on.load_progress()["existing"])
+        self.assertEqual(json.loads(self.progress.read_text())["privacy_seen"], on.PRIVACY_NOTICE)
+        self.fresh_session()
+        splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+        self.assertFalse(drawn)  # Done: never the setup or its privacy step again.
+
+    def test_headless_runs_never_count_as_having_seen_the_privacy_screen(self):
+        on = self.onboarding
+        on.save_progress("done", done=True, privacy_seen=True)
+        self.fake.app.background = True
+        self.assertFalse(on.privacy_seen())
+        on.save_progress("done", done=True, privacy_seen=False)
+        on.mark_privacy_seen()  # Nobody saw anything.
+        self.fake.app.background = False
+        self.assertFalse(on.privacy_seen())
 
     def test_an_unconnected_install_from_before_gets_the_setup_and_a_done_one_never_again(self):
         self.progress.unlink(missing_ok=True)
@@ -866,7 +991,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertTrue(drawn)
         self.assertEqual(self.onboarding._state["step"], "account")
         self.assertTrue(wm.splash_modal)
-        self.onboarding.save_progress("done", done=True)
+        self.onboarding.save_progress("done", done=True, privacy_seen=True)  # Through its privacy step.
         self.fresh_session()
         with patch.object(self.onboarding, "_connected", return_value=False):
             splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))

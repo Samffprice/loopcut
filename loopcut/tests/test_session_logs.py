@@ -450,7 +450,8 @@ class SizeTest(Base):
 class GatingTest(Base):
     def setUp(self):
         super().setUp()
-        for patcher in (patch.object(credentials, "folder", return_value=self.root / "config"),
+        for patcher in (patch.object(session_logs, "_privacy_seen", return_value=True),
+                        patch.object(credentials, "folder", return_value=self.root / "config"),
                         patch.object(credentials, "api_key", return_value=""),
                         patch.object(cloud_http, "contract_headers", return_value=dict(HEADERS)),
                         patch.object(session_logs, "known_secrets", return_value=[]),
@@ -470,6 +471,16 @@ class GatingTest(Base):
         sys.modules["bpy"].app.background = False
         session_logs._stopped = True
         self.assertFalse(session_logs.sharing_on())
+
+    def test_nothing_is_shared_before_the_user_has_seen_what_is_shared(self):
+        """The setup's privacy step (onboarding.privacy_seen) comes first, for every install, those updated from
+        0.2.5 included: the preference defaults to on, so an update must not start uploading unannounced."""
+        with patch.object(session_logs, "_privacy_seen", return_value=False):
+            self.assertFalse(session_logs.sharing_on())
+            self.assertEqual(session_logs.turn_start({"id": uuid.uuid4().hex}, types.SimpleNamespace(model="m")), {})
+        self.assertTrue(session_logs.sharing_on())
+        with patch.object(session_logs, "_privacy_seen", side_effect=RuntimeError("no add-on")):
+            self.assertFalse(session_logs.sharing_on())  # Unknown is not seen.
 
     def test_turn_start_names_every_route_and_is_empty_when_off(self):
         cfg = types.SimpleNamespace(model="gpt-5.5")

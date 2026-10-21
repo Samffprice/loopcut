@@ -686,7 +686,9 @@ def _preferences():
 
 
 def sharing_on() -> bool:
-    """Main thread: uploads allowed by the environment, the preference and an interactive Blender."""
+    """Main thread: uploads allowed by the environment, the preference, an interactive Blender, and a user who has
+    seen what is shared (the setup's privacy step, which installs from before the setup go through too:
+    onboarding.privacy_seen)."""
     if env_off() or _stopped:
         return False
     try:
@@ -694,9 +696,15 @@ def sharing_on() -> bool:
         if getattr(bpy.app, "background", True):
             return False
         prefs = _preferences()
+        seen = _privacy_seen()
     except Exception:  # No preferences (unregistered, a test stand-in): nothing is sent.
         return False
-    return prefs is not None and bool(getattr(prefs, "share_conversations", False))
+    return seen and prefs is not None and bool(getattr(prefs, "share_conversations", False))
+
+
+def _privacy_seen() -> bool:
+    from . import onboarding
+    return onboarding.privacy_seen()
 
 
 def _current_route(cfg=None) -> tuple[str, str]:

@@ -37,12 +37,16 @@ from . import account, blender_import, chatgpt_auth, config, settings
 # region: the splash's popup region when a step last drew, for the watchdog.
 _state = {"step": None, "imported": None, "failed": [], "error": "", "own_key": False, "left_chatgpt": False,
           "no_account": False, "claimed": False, "waiting_since": 0.0, "credits_asked": 0.0, "region": None,
-          "finished": False, "starting_since": 0.0, "drawn": None}
+          "finished": False, "starting_since": 0.0, "drawn": None, "existing": False, "change_model": False}
 _popups = set()  # Splash regions to repaint while a sign-in is in flight; see _refresh_popups.
 _REFRESH_SECONDS = 0.5
 _WATCH_SECONDS = 1.0
 PROGRESS_FILE = "onboarding.json"
 PROGRESS_VERSION = 1    # The flow that wrote the file: 1 is 0.2.6's.
+PRIVACY_NOTICE = 1      # onboarding.json's privacy_seen: the version of what conversation logs send that was shown.
+# Installs from before the setup (set up in 0.2.5 or older) go through it too, each step showing what they have.
+# Without a Loopcut account they sign in like new installs (the owner, 2026-10-21); True lets them skip with "Not now".
+EXISTING_MAY_SKIP_SIGN_IN = False
 SIGN_IN_PATIENCE = 120  # Seconds a browser sign-in may take before "Continue without an account" shows.
 CREDITS_PATIENCE = 15   # Seconds to wait for the account's credits before carrying on without them.
 CLAIM_WINDOW = 2 * 24 * 3600  # Only a grant this recent is offered as "Claim": an older one may be spent.
@@ -51,7 +55,8 @@ NUMBERED = ("account", "how", "connect", "privacy", "done")  # "Step n of 5"; Bl
 # half way through re-registering), so a step is only drawn, and only modal, once all of them exist.
 OPERATORS = ("import_blender_settings", "onboarding_step", "onboarding_own_key", "onboarding_no_account",
              "onboarding_claim", "onboarding_try", "sign_in", "cancel_sign_in", "open_sign_in_page",
-             "copy_sign_in_link", "chatgpt_sign_in", "chatgpt_cancel", "chatgpt_copy_link", "fetch_models")
+             "copy_sign_in_link", "chatgpt_sign_in", "chatgpt_cancel", "chatgpt_copy_link", "fetch_models",
+             "onboarding_change_model")
 STARTING_PATIENCE = 15  # Seconds of "Loopcut is starting…" before it says to restart.
 _registered = False  # Between register() and unregister(): the watchdog never opens a setup outside it.
 MEDIA = Path(__file__).parent / "media"
@@ -104,24 +109,61 @@ def _progress_path() -> Path:
 
 
 def load_progress() -> dict | None:
-    """{"version", "step", "done"}, or None when there is no file or it cannot be read."""
+    """{"version", "step", "done", "privacy_seen"}, or None when there is no file or it cannot be read."""
     try:
         data = json.loads(_progress_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or data.get("step") not in (*NUMBERED, "import", "setup"):
         return None
-    return {"version": data.get("version"), "step": data["step"], "done": data.get("done") is True}
+    return {"version": data.get("version"), "step": data["step"], "done": data.get("done") is True,
+            "privacy_seen": data.get("privacy_seen") == PRIVACY_NOTICE, "existing": data.get("existing") is True}
 
 
-def save_progress(step: str, done: bool = False) -> None:
+def save_progress(step: str, done: bool = False, privacy_seen: bool | None = None, existing: bool | None = None) -> None:
+    """privacy_seen, existing: None keeps what the file says."""
     path = _progress_path()
+    saved = load_progress() or {}
+    if privacy_seen is None:
+        privacy_seen = bool(saved.get("privacy_seen"))
+    if existing is None:
+        existing = bool(saved.get("existing"))
+    data = {"version": PROGRESS_VERSION, "step": step, "done": done}
+    if privacy_seen:
+        data["privacy_seen"] = PRIVACY_NOTICE
+    if existing:
+        data["existing"] = True
     try:
         temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps({"version": PROGRESS_VERSION, "step": step, "done": done}), encoding="utf-8")
+        temporary.write_text(json.dumps(data), encoding="utf-8")
         os.replace(temporary, path)
     except OSError as ex:
         print(f"Loopcut: could not save the setup's progress: {ex}")
+
+
+def privacy_seen() -> bool:
+    """Whether this install's user has seen what conversation logs send (the setup's privacy step, which installs
+    from before the setup go through too): until then nothing of a conversation is uploaded
+    (session_logs.sharing_on). A background run never counts: nobody saw anything."""
+    if getattr(bpy.app, "background", True):
+        return False
+    return bool((load_progress() or {}).get("privacy_seen"))
+
+
+def mark_privacy_seen() -> None:
+    """The user went past the screen that says what is shared (the privacy step). Never headless."""
+    if getattr(bpy.app, "background", True):
+        return
+    progress = load_progress()
+    if progress is None:
+        save_progress(_state["step"] if _state["step"] in NUMBERED else "account", privacy_seen=True)
+    else:
+        save_progress(progress["step"], progress["done"], privacy_seen=True)
+
+
+def is_existing() -> bool:
+    """An install from before this setup (0.2.5 or older, set up already): its steps show what it has."""
+    return bool(_state["existing"] or (load_progress() or {}).get("existing"))
 
 
 def _resume_step(saved: str) -> str:
@@ -136,18 +178,24 @@ def _resume_step(saved: str) -> str:
 def _start_step(first_run: bool) -> str | None:
     """Where the setup opens this session; None once it is done."""
     progress = load_progress()
-    if (progress is not None and progress["done"]) or settings.preferences() is None:
-        return None  # Done, or a dev checkout not enabled as an add-on: nothing to set up.
+    if settings.preferences() is None:
+        return None  # A dev checkout not enabled as an add-on: nothing to set up.
+    if progress is not None and progress["done"] and progress["privacy_seen"]:
+        return None  # Through the setup, privacy step included.
     if first_run:  # No preferences: Blender's own settings first, wherever a saved setup stood.
         can_copy_prev = bpy.types.PREFERENCES_OT_copy_prev.poll(bpy.context)
         step = "import" if not can_copy_prev and _source() else "setup"
-    elif progress is None and (_connected() or account.signed_in()):
-        save_progress("done", done=True)  # Set up before this flow existed: no setup, no sign-in wall.
-        return None
     else:
-        step = _resume_step(progress["step"] if progress else "account")
-    save_progress(step)
-    _report("welcome", None, code="resumed" if progress else None)  # The first-run setup window opened.
+        # Set up before this setup existed (a model or an account, no progress), or done before the privacy step
+        # was part of it: the whole setup too, from the account, each step showing what is already there.
+        starting = (progress is None and (_connected() or account.signed_in())) or bool(progress and progress["done"])
+        _state["existing"] = starting or bool(progress and progress["existing"])
+        step = _resume_step("account" if starting or progress is None else progress["step"])
+    save_progress(step, existing=True if _state["existing"] else None)
+    if _state["existing"]:  # Told apart from new installs in the funnel.
+        _report("welcome", None, code="existing_resumed" if progress and not progress["done"] else "existing")
+    else:
+        _report("welcome", None, code="resumed" if progress else None)  # The first-run setup window opened.
     return step
 
 
@@ -224,6 +272,7 @@ def _signature() -> tuple:
     status, chatgpt, signed_in = account.status(), chatgpt_ui.status(), account.signed_in()
     credits = _credits() if signed_in else None
     shown = (step, _ready(), _state["own_key"], _state["no_account"], _state["claimed"], _state["error"],
+             _state["change_model"],
              tuple(_state["failed"]), status["status"], status.get("user_code"), status.get("error"), signed_in,
              chatgpt["status"], chatgpt.get("error"), _credits_pending(),
              bool(_state["waiting_since"]) and now - _state["waiting_since"] > SIGN_IN_PATIENCE,
@@ -836,6 +885,9 @@ def _draw_account(layout, context) -> None:
     if slow:
         column.separator(factor=0.5)
         _text(column, "Taking a while? You can sign in next time.", MUTED, center=True)
+    if EXISTING_MAY_SKIP_SIGN_IN and is_existing() and status["status"] not in ("starting", "waiting", "error"):
+        _, right = _footer(column)
+        _link(right, "loopcut.onboarding_no_account", "Not now")
     if status["status"] in ("starting", "waiting", "error"):  # Else no footer: the line above ends the screen.
         _, right = _footer(column)
         if slow or status["status"] == "error":
@@ -1149,6 +1201,9 @@ TITLE_OFFSET = 0.17  # Separator factor: with the column's spacing, half the dif
 def _draw_sign_in(layout, context) -> None:
     """One model is required. Loopcut's own models come with every account, so nobody signed in is stuck."""
     from . import chatgpt_ui
+    if is_existing() and _connected() and not _state["change_model"]:
+        _draw_connected(layout)  # An install from before the setup keeps the model it has.
+        return
     chatgpt = chatgpt_ui.status()
     column = _page(layout, "connect")
     _headline(column, "Choose the model for your chat", "You can change it later in Preferences.")
@@ -1191,6 +1246,42 @@ def _draw_sign_in(layout, context) -> None:
     _back(left, "how" if account.signed_in() else "account")  # Without an account the setup skipped "how".
     if not account.signed_in():  # And a way on: the setup comes back next start.
         _step_link(right, "Skip for now", "privacy")
+
+
+def _connected_route(prefs) -> tuple[dict, str, str]:
+    """(icon, name, detail) of the model already connected, as the model step's choices name it."""
+    from . import chatgpt_ui
+    if prefs.provider == "CHATGPT":
+        return _icon("person"), "ChatGPT", chatgpt_ui.account_line()
+    if prefs.provider == "LOOPCUT":
+        return _row_mark(), "Loopcut models", settings.model_label(prefs.model)
+    if prefs.provider == "OLLAMA":
+        return _icon("computer"), settings.provider_label(prefs.provider), prefs.model
+    return _icon("key"), f"{settings.provider_label(prefs.provider)}, with your key", prefs.model
+
+
+def _draw_connected(layout) -> None:
+    """The model step for an install from before the setup: the model it already has, kept with Continue."""
+    prefs = settings.preferences()
+    column = _page(layout, "connect")
+    _report_once("chatgpt", _choice(), "existing_shown")
+    _headline(column, "Your model is connected", "Loopcut keeps using it.")
+    icon, name, detail = _connected_route(prefs)
+    box = _group(column)
+    title = box.row()
+    title.alignment = "LEFT"
+    _text(_icon_row(title, icon), name)
+    if _styled(title):
+        title.label_styled(text="Connected", color=SUCCESS)
+    else:
+        title.label(text="Connected")
+    if detail:
+        _text(_icon_row(box), detail, MUTED, tight=True)
+    props = _primary(column, "loopcut.onboarding_step", "Continue")
+    props.step, props.save = "privacy", False
+    left, right = _footer(column)
+    _back(left, "how" if account.signed_in() else "account")
+    _link(right, "loopcut.onboarding_change_model", "Change model")
 
 
 def _on_signed_in() -> None:
@@ -1460,6 +1551,10 @@ def _report_move(current: str | None, target: str, provider: str) -> None:
 
 
 def _report_move_now(current: str | None, target: str, provider: str) -> None:
+    if current == "connect" and target == "privacy" and _state["existing"] and not _state["change_model"] \
+            and not _state["own_key"]:
+        _report("chatgpt", _choice(), code="existing_kept")  # An install from before kept its model.
+        return
     if current == "how" and target == "connect":
         _report("chatgpt", None, code="how_continue")  # The explainer before the model step, read.
     if current == "connect" and target == "privacy":
@@ -1626,6 +1721,8 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
         if self.provider != "CURRENT" and prefs is not None:
             prefs.provider = self.provider
         _report_move(_state["step"], self.step, self.provider)
+        if _state["step"] == "privacy" and self.step == "done":
+            mark_privacy_seen()  # What conversation logs share was on screen: they may start.
         if self.step == "account":
             _state["no_account"] = False
         _go(self.step)
@@ -1648,6 +1745,20 @@ class LOOPCUT_OT_onboarding_no_account(bpy.types.Operator):
         _report("loopcut_account", "skip", False, "sign_in_failed" if failed else "sign_in_slow")
         _state.update(no_account=True, waiting_since=0.0)
         _go("connect")
+        if context.region_popup is not None:
+            context.region_popup.tag_refresh_ui()
+        return {"FINISHED"}
+
+
+class LOOPCUT_OT_onboarding_change_model(bpy.types.Operator):
+    """Choose another model for your chat"""
+    bl_idname = "loopcut.onboarding_change_model"
+    bl_label = "Change Model"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        _state["change_model"] = True
+        _report("chatgpt", _choice(), code="existing_change")
         if context.region_popup is not None:
             context.region_popup.tag_refresh_ui()
         return {"FINISHED"}
@@ -1721,7 +1832,8 @@ def _close_and_start(card: dict | None):
 
 
 _CLASSES = (LOOPCUT_OT_import_blender_settings, LOOPCUT_OT_onboarding_own_key, LOOPCUT_OT_onboarding_step,
-            LOOPCUT_OT_onboarding_no_account, LOOPCUT_OT_onboarding_claim, LOOPCUT_OT_onboarding_try)
+            LOOPCUT_OT_onboarding_no_account, LOOPCUT_OT_onboarding_claim, LOOPCUT_OT_onboarding_try,
+            LOOPCUT_OT_onboarding_change_model)
 
 
 def register() -> None:
