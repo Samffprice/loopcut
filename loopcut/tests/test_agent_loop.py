@@ -2200,7 +2200,7 @@ class LayoutTest(unittest.TestCase):
     def measure(font, size, text):
         return len(text) * size * 0.5
 
-    def test_thinking_line_shimmers_and_counts_dots_with_the_clock(self):
+    def test_thinking_line_shimmers_and_pulses_its_ellipsis_with_the_clock(self):
         session = state.new_session()
         session["items"] += [state.item_user("hi"), state.item_assistant()]
         session["busy"] = True
@@ -2210,11 +2210,12 @@ class LayoutTest(unittest.TestCase):
             return [p for p in display["prims"] if p.get("id", "").startswith("item1.thinking")]
 
         first, later = prims_at(0.0), prims_at(1.0)
-        self.assertEqual("".join(p["text"] for p in first), "Thinking.")
-        self.assertEqual("".join(p["text"] for p in later), "Thinking...")
+        # Any still frame reads "Thinking…", never "Thinking." (a screenshot is a still frame).
+        self.assertEqual("".join(p["text"] for p in first), "Thinking…")
+        self.assertEqual("".join(p["text"] for p in later), "Thinking…")
+        self.assertNotEqual(first[-1]["color"], later[-1]["color"], "the ellipsis pulses")
         brightest = lambda prims: max(prims[:-1], key=lambda p: p["color"][0])["text"]
         self.assertNotEqual(brightest(first), brightest(later), "the highlight moves along the word")
-        self.assertNotIn("…", "".join(p.get("text", "") for p in first))
         session["items"][-1]["streaming"] = False
         session["items"][-1]["text"] = "Done."
         display = layout.build(session, 400, 600, 1.0, self.measure, "m", None, {"now": 2.0})

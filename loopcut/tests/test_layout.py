@@ -536,7 +536,7 @@ class StreamingIndicatorTest(unittest.TestCase):
         self.assertEqual([id for id in ids(display, "prims") if id.endswith(".dots")],
                          [prefix + ".dots"])
         self.assertEqual("".join(p["text"] for p in display["prims"]
-                                 if p["id"].startswith(prefix + ".")), word + ".")
+                                 if p["id"].startswith(prefix + ".")), word + "…")
 
     def assert_no_indicator(self, display):
         self.assertFalse([id for id in ids(display, "prims") if id.endswith(".dots")])

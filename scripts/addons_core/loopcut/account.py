@@ -28,6 +28,9 @@ WATCH_EVERY = 4.0          # Seconds between looks at /v1/me while the user upgr
 WATCH_FOR = 15 * 60.0      # How long to keep looking.
 _watch_generation = 0
 MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))  # Until /v1/models answers.
+# Tier ids earlier clients saved, as the gateway maps them (LEGACY_MODEL_ALIASES in its chat route): 0.2.4 offered
+# "mimo", which is Pro now. A preference still holding one is labelled as the tier it reaches.
+LEGACY_MODELS = {"mimo": "pro"}
 
 _state = {
     "status": "idle",   # idle | starting | waiting | error
@@ -295,6 +298,7 @@ def keeps_context(base_url: str, model_id: str) -> bool:
 
 
 def model_label(model_id: str) -> str:
+    model_id = LEGACY_MODELS.get(model_id, model_id)
     return next((m["label"] for m in models() if m["id"] == model_id), model_id)
 
 

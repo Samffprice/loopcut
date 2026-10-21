@@ -27,7 +27,7 @@ PROVIDERS = (
      "Chats are billed to this key's OpenAI account, not your ChatGPT plan or Loopcut credits."),
     ("OPENROUTER", "OpenRouter", "https://openrouter.ai/api/v1", "", ""),
     ("OLLAMA", "Ollama (this computer)", "http://127.0.0.1:11434/v1", "",
-     "Nothing leaves this computer. The model needs tool calling and image input."),
+     "Model requests stay on this computer. The model needs tool calling and image input."),
     ("CUSTOM", "Custom", "", "", "Any endpoint that speaks the OpenAI chat completions API with tools."),
     # Last, so the stored enum values of the rows above stay what they were.
     ("CHATGPT", "ChatGPT plan", chatgpt_auth.CHATGPT_PLAN_BASE_URL, config.CHATGPT_PLAN_MODEL,
@@ -354,6 +354,12 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         get=_get_polypizza_key, set=_set_polypizza_key,
         description="Free key from poly.pizza (account > API) for low-poly models. Stored in Loopcut's "
                     "credentials file. Poly Haven and your Blender asset libraries need no key")
+    share_conversations: bpy.props.BoolProperty(
+        name="Share conversations to improve Loopcut", default=True,
+        description="After each turn, send Loopcut a text log of the conversation (your messages, the replies, the "
+                    "tool calls and their results) and the add-on's console lines, with a random install id. Kept "
+                    "90 days to fix problems and improve Loopcut, never used for training. Never images, .blend files "
+                    "or keys. Details: loopcut.org/privacy")
     share_usage_stats: bpy.props.BoolProperty(
         name="Share anonymous usage stats", default=True,
         description="Send Loopcut short events about launches, the setup steps and how each turn ended: versions, "
@@ -505,9 +511,35 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             elif status not in ("checking", "downloading", "installing"):
                 row.operator("loopcut.check_for_updates", text="Check Now")
 
-        row = layout.row()
-        row.use_property_split = False
-        row.prop(self, "share_usage_stats")  # telemetry.py; the privacy policy points here.
+        draw_privacy(layout, self)
+
+
+PRIVACY_NOTE = ("Conversation logs are text only: no images, .blend files or keys. Loopcut keeps them 90 days to fix "
+                "problems and improve the app, and never uses them for training.")
+
+
+def draw_privacy(layout, prefs) -> None:
+    """Privacy and Support on the preferences page: the two sharing switches (session_logs.py, telemetry.py; the
+    privacy policy points here) and Report a Problem, which lives here and never in the chat panel."""
+    from . import session_logs
+    box = layout.box()
+    box.label(text="Privacy and Support", icon="LOCKED")
+    column = box.column()
+    column.use_property_split = False
+    column.prop(prefs, "share_conversations")
+    column.prop(prefs, "share_usage_stats")
+    notes = column.column(align=True)
+    notes.scale_y = 0.75
+    notes.active = False
+    for line in wrap(PRIVACY_NOTE, 90):
+        notes.label(text=line)
+    row = column.row()
+    row.operator("loopcut.report_problem", text="Report a Problem…", icon="HELP")
+    line = session_logs.report_line()
+    if line:
+        icon = "ERROR" if session_logs.report_state()["status"] == "failed" else "INFO"
+        for index, part in enumerate(wrap(line, 90)):
+            column.label(text=part, icon=icon if index == 0 else "BLANK1")
 
 
 def wrap(text: str, width: int) -> list[str]:
@@ -747,8 +779,9 @@ def choose_model(model_id: str) -> None:
 def model_label(model_id: str) -> str:
     """What the panel's model button shows for the configured model."""
     prefs = preferences()
-    if prefs is not None and prefs.provider == "LOOPCUT":
-        return account.model_label(model_id)
+    if prefs is not None and prefs.provider == "LOOPCUT":  # "Loopcut Fast", as the site and the setup say.
+        label = account.model_label(model_id)
+        return label if label.startswith("Loopcut") else f"Loopcut {label}"
     if on_chatgpt_plan():  # The route shows too: signed in with ChatGPT.
         return f"ChatGPT · {model_id}"
     return model_id

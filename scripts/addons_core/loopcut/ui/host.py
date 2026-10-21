@@ -309,6 +309,30 @@ def _submit(session: dict) -> None:
     state.ui["mentions"] = []
 
 
+def start_request(window, text: str, images: tuple = ()) -> None:
+    """Open the panel and send a starter request with its images (onboarding's first projects). Like a
+    starter prompt, it waits in the input while no model is connected."""
+    def send(area):
+        from .. import attachments
+        session = state.session()
+        if session["busy"]:
+            return
+        for problem in attachments.add(session, list(images)):
+            print(f"Loopcut: {problem}")
+        textedit.set_text(session, text)
+        session["focused"] = True
+        _close_popups()
+        if not _config_cached()[1]:
+            _submit(session)
+        tag_redraw_all()
+
+    panel = find_panel(window)
+    if panel is not None:
+        send(panel)
+    else:
+        dock(window, then=send)
+
+
 # ---------------------------------------------------------------- the + menu
 
 PICKER_ROWS = 8

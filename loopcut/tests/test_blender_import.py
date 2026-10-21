@@ -45,6 +45,9 @@ class BlenderImportTest(unittest.TestCase):
         self.assertIsNone(bi.stock_root("win32", {}))
         self.assertEqual(bi.stock_root("linux", {"XDG_CONFIG_HOME": "/x"}), Path("/x/blender"))
         self.assertEqual(bi.stock_root("linux", {}), Path.home() / ".config" / "blender")
+        # The harness's fake stock settings stand in on every platform.
+        for platform in ("darwin", "win32", "linux"):
+            self.assertEqual(bi.stock_root(platform, {"LOOPCUT_STOCK_BLENDER_DIR": "/fake"}), Path("/fake"))
         self.assertEqual(bi.stock_root("darwin", {}), Path.home() / "Library" / "Application Support" / "Blender")
 
     def test_copy_leaves_the_source_alone_and_keeps_links_as_links(self):

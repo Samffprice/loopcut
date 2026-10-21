@@ -119,6 +119,8 @@ scripts/modules/_bpy_internal/assets/remote_library/*_openapi.py linguist-genera
 /release/loopcut/*.svg !filter diff merge text
 /release/loopcut/*.md !filter diff merge text
 /.github/readme/** !filter !diff !merge binary
+# The add-on's own media (the first-run setup's sample photo, our render), likewise.
+/scripts/addons_core/loopcut/media/** !filter !diff !merge binary
 # Bundled third-party extensions (release/extensions/bundled.json): ordinary Git files, byte-for-byte
 # as published on extensions.blender.org (no LFS, no end-of-line conversion).
 /release/extensions/system/** !filter -text -diff -merge

@@ -6,6 +6,7 @@ as text: an invisible or misplaced element shows up as a bad rect or a color equ
 background.
 """
 
+import math
 import re
 from pathlib import Path
 
@@ -184,7 +185,7 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 SHIMMER_PERIOD = 1.8   # Seconds for the highlight to sweep the word once.
 SHIMMER_WIDTH = 0.3    # Of the word's length, the bright part of the sweep.
-DOT_PERIOD = 0.45      # Seconds per step of the dots: . .. ...
+DOT_PERIOD = 1.35      # Seconds per pulse of the ellipsis after the word.
 
 
 def _mix(a, b, t: float):
@@ -192,9 +193,9 @@ def _mix(a, b, t: float):
 
 
 def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
-    """The waiting line, animated the way people expect: a highlight sweeps along the word and
-    the dots count up. Driven by ui["now"]; mainthread redraws while a turn runs. Returns the
-    line height."""
+    """The waiting line, animated the way people expect: a highlight sweeps along the word and the
+    ellipsis after it pulses (a still frame reads "Working…", never "Working."). Driven by ui["now"];
+    mainthread redraws while a turn runs. Returns the line height."""
     now = float(f.ui.get("now") or 0.0)
     sweep = (now % SHIMMER_PERIOD) / SHIMMER_PERIOD * (1 + 2 * SHIMMER_WIDTH) - SHIMMER_WIDTH
     cx = x
@@ -203,7 +204,8 @@ def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
         bright = max(0.0, 1 - abs(along - sweep) / SHIMMER_WIDTH)
         f.text(f"{id}.c{i}", cx, y, ch, size, _mix(T.TEXT_FAINT, T.TEXT, bright))
         cx += f.measure("ui", size, ch)
-    f.text(f"{id}.dots", cx, y, "." * (int(now / DOT_PERIOD) % 3 + 1), size, T.TEXT_FAINT)
+    pulse = 0.5 - 0.5 * math.cos(2 * math.pi * (now % DOT_PERIOD) / DOT_PERIOD)
+    f.text(f"{id}.dots", cx, y, "…", size, _mix(T.TEXT_FAINT, T.TEXT, pulse))
     return f.line_height(size)
 
 

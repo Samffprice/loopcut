@@ -54,15 +54,19 @@ def register(cls):
 class Layout:
     """Record draw order and the enabled state of each checkbox's own row."""
 
-    def __init__(self, calls=None, parent=None):
+    def __init__(self, calls=None, parent=None, kind=""):
         self.calls = calls if calls is not None else []
         self.parent = parent
+        self.kind = kind
         self.enabled = True
 
     def child(self, **kwargs):
         return Layout(self.calls, self)
 
-    box = column = row = split = child
+    def box(self, **kwargs):
+        return Layout(self.calls, self, "box")
+
+    column = row = split = child
 
     def prop(self, prefs, name, **kwargs):
         self.calls.append(("prop", name, self))
@@ -319,6 +323,39 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(self.settings.config.service_backends(keys), {})
         self.settings._key_first_changed(self.prefs, None)
         self.cloud.sync_settings.assert_called_once_with()
+
+    def test_privacy_and_support_box_holds_both_switches_and_report_a_problem(self):
+        """Proposal 015: the conversation-log switch (on by default) and Report a Problem live together in one box
+        on the preferences page, the only place the button is drawn."""
+        def box_of(entry):
+            layout = entry[2]
+            while layout is not None and layout.kind != "box":
+                layout = layout.parent
+            return layout
+        self.assertTrue(self.settings.LoopcutPreferences.share_conversations.options["default"])
+        self.assertIn("never used for training", self.settings.LoopcutPreferences.share_conversations.options["description"])
+        for provider in ("LOOPCUT", "CHATGPT", "OPENAI"):
+            with self.subTest(provider=provider):
+                calls = self.draw_preferences(provider, False)
+                entries = [next(c for c in calls if c[:2] == wanted) for wanted in
+                           (("prop", "share_conversations"), ("prop", "share_usage_stats"),
+                            ("operator", "loopcut.report_problem"))]
+                box = box_of(entries[0])
+                self.assertIsNotNone(box)
+                self.assertTrue(all(box_of(entry) is box for entry in entries))
+                self.assertEqual(next(c[1] for c in calls if c[0] == "label" and c[2] is box), "Privacy and Support")
+                labels = " ".join(c[1] for c in calls if c[0] == "label" and box_of(c) is box)
+                self.assertIn("90 days", labels)
+                self.assertIn("never uses them for training", labels)
+
+    def test_the_last_report_shows_in_the_privacy_box(self):
+        session_logs = importlib.import_module(NAME + ".session_logs")
+        self.addCleanup(session_logs._report.update, status="", code="", message="")
+        session_logs._report.update(status="failed", code="", message="Reports aren't available right now. "
+                                                                      "Please email hello@loopcut.org instead.")
+        calls = self.draw_preferences("LOOPCUT", False)
+        self.assertIn("Reports aren't available right now. Please email hello@loopcut.org instead.",
+                      [c[1] for c in calls if c[0] == "label"])
 
     def draw_preferences(self, provider, stored):
         self.prefs.provider = provider

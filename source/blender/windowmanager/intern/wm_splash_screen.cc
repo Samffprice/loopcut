@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "DNA_screen_types.h"
+#include "DNA_theme_types.h"
 #include "DNA_userdef_types.h"
 #include "DNA_windowmanager_types.h"
 
@@ -56,10 +57,125 @@ namespace blender {
 /** \name Splash Screen
  * \{ */
 
+/**
+ * Loopcut: set by the bundled add-on (`WindowManager.splash_modal`) while its first-run setup is
+ * on screen. The splash then only closes through its own buttons and dims the window behind it.
+ */
+static bool splash_modal = false;
+
+void wm_splash_modal_set(const bool modal)
+{
+  if (splash_modal != modal) {
+    splash_modal = modal;
+    WM_main_add_notifier(NC_WINDOW, nullptr); /* Draw or clear the backdrop. */
+  }
+}
+
+bool wm_splash_modal_get()
+{
+  return splash_modal;
+}
+
+/* Loopcut: the setup's brand colors (loopcut.org's palette) over a copy of the user's theme.
+ * Only the modal splash block draws with it (#block_theme_override_set): the user's own theme is
+ * untouched. */
+static bTheme splash_brand_theme;
+
+static void wm_splash_brand_color(uchar dst[4], const uint32_t rgb, const uchar alpha = 255)
+{
+  dst[0] = uchar(rgb >> 16);
+  dst[1] = uchar(rgb >> 8);
+  dst[2] = uchar(rgb);
+  dst[3] = alpha;
+}
+
+static void wm_splash_brand_widget(uiWidgetColors &wcol,
+                                   const uint32_t inner,
+                                   const uint32_t inner_sel,
+                                   const uint32_t text,
+                                   const uint32_t text_sel,
+                                   const uchar outline_alpha)
+{
+  wm_splash_brand_color(wcol.inner, inner);
+  wm_splash_brand_color(wcol.inner_sel, inner_sel);
+  wm_splash_brand_color(wcol.item, inner_sel);
+  wm_splash_brand_color(wcol.text, text);
+  wm_splash_brand_color(wcol.text_sel, text_sel);
+  wm_splash_brand_color(wcol.outline, 0xFFFFFF, outline_alpha);
+  wm_splash_brand_color(wcol.outline_sel, 0xFFFFFF, outline_alpha);
+  wcol.shaded = 0; /* Flat, like the site. */
+}
+
+static const bTheme *wm_splash_brand_theme()
+{
+  constexpr uint32_t background = 0x121213, surface = 0x17171A, raised = 0x232327;
+  constexpr uint32_t raised_hover = 0x2C2C31, deep = 0x0C0C0D, foreground = 0xF2EFE9;
+  constexpr uint32_t teal = 0x51A7AE, muted = 0x9C9CA3;
+  constexpr uchar border = 20, border_strong = 41; /* White at 8% and 16%. */
+
+  splash_brand_theme = *static_cast<const bTheme *>(U.themes.first);
+  ThemeUI &tui = splash_brand_theme.tui;
+  wm_splash_brand_widget(
+      tui.wcol_menu_back, background, background, foreground, foreground, border);
+  wm_splash_brand_widget(tui.wcol_box, surface, surface, foreground, foreground, border);
+  /* Operator buttons: the one primary is filled foreground with background text when pressed in
+   * (depress), the website's primary; others are raised surfaces. */
+  wm_splash_brand_widget(tui.wcol_tool, raised, foreground, foreground, background, border_strong);
+  wm_splash_brand_color(tui.wcol_tool.item, raised_hover);
+  /* Buttons without emboss are quiet actions: muted, the foreground while hovered. Teal is for
+   * links that leave the app (UILayout.link). */
+  wm_splash_brand_widget(tui.wcol_regular, raised, raised_hover, muted, foreground, border_strong);
+  wm_splash_brand_color(tui.link, teal);
+  wm_splash_brand_widget(tui.wcol_option, deep, foreground, foreground, foreground, border_strong);
+  wm_splash_brand_color(tui.wcol_option.item, background);
+  wm_splash_brand_widget(
+      tui.wcol_toggle, raised, foreground, foreground, background, border_strong);
+  wm_splash_brand_widget(
+      tui.wcol_radio, raised, foreground, foreground, background, border_strong);
+  wm_splash_brand_widget(tui.wcol_text, deep, deep, foreground, foreground, border_strong);
+  wm_splash_brand_color(tui.wcol_text.item, teal);
+  wm_splash_brand_widget(
+      tui.wcol_menu, raised, raised_hover, foreground, foreground, border_strong);
+  wm_splash_brand_widget(tui.wcol_menu_item, background, raised_hover, foreground, foreground, 0);
+  /* Bars (UILayout.progress): muted on a track of white at 8%, borderless and nearly square, so
+   * neither a full bar nor a short one reads as a button, a slider or a lone dot. */
+  wm_splash_brand_widget(tui.wcol_progress, 0x2A2A2E, muted, muted, muted, 0);
+  /* A 2 px radius at 2x: larger corners round a short fill away (its radius is clamped to half its
+   * width), which left a 12 px fill looking like a 7 px dot. */
+  tui.wcol_progress.roundness = 0.05f;
+  return &splash_brand_theme;
+}
+
+/** Loopcut: off while the add-on's setup shows its numbered steps, which have a compact header. */
+static bool splash_banner = true;
+
+void wm_splash_banner_set(const bool banner)
+{
+  splash_banner = banner;
+}
+
+bool wm_splash_banner_get()
+{
+  return splash_banner;
+}
+
+bool wm_splash_modal_is_open(const bScreen *screen)
+{
+  return splash_modal && ui::popup_block_is_modal(screen, "splash");
+}
+
 static void wm_block_splash_close(bContext *C, ui::Block *block)
 {
   wmWindow *win = CTX_wm_window(C);
   popup_block_close(C, win, block);
+}
+
+/** Clicking the image closes the splash, except a modal one. */
+static void wm_block_splash_image_close(bContext *C, ui::Block *block)
+{
+  if (!splash_modal) {
+    wm_block_splash_close(C, block);
+  }
 }
 
 static void wm_block_splash_add_label(ui::Block *block, const char *label, int x, int y)
@@ -287,6 +403,44 @@ static int is_using_macos_rosetta()
 }
 #endif /* __APPLE__ */
 
+/** The splash image with the version on it, and the optional banner over it. */
+static void wm_block_splash_add_images(ui::Block *block, const int splash_width)
+{
+  int splash_height;
+
+  /* Would be nice to support caching this, so it only has to be re-read (and likely resized) on
+   * first draw or if the image changed. */
+  ImBuf *ibuf = wm_block_splash_image(splash_width, &splash_height);
+  /* This should never happen, if it does - don't crash. */
+  if (LIKELY(ibuf)) {
+    ui::Button *but = uiDefButImage(
+        block, ibuf, 0, 0.5f * U.widget_unit, splash_width, splash_height, nullptr);
+
+    button_func_set(but, [block](bContext &C) { wm_block_splash_image_close(&C, block); });
+
+    if (!splash_modal) { /* Loopcut: the setup's welcome is not about Blender's version. */
+      wm_block_splash_add_label(block,
+                                BKE_blender_version_string(),
+                                splash_width - 8.0 * UI_SCALE_FAC,
+                                splash_height - 13.0 * UI_SCALE_FAC);
+    }
+  }
+
+  /* Banner image passed through the environment, to overlay on the splash and
+   * indicate a custom Blender version. Transparency can be used. To replace the
+   * full splash screen, see BLENDER_CUSTOM_SPLASH. */
+  int banner_width = 0;
+  int banner_height = 0;
+  ImBuf *bannerbuf = wm_block_splash_banner_image(
+      &banner_width, &banner_height, splash_width, splash_height);
+  if (bannerbuf) {
+    ui::Button *banner_but = uiDefButImage(
+        block, bannerbuf, 0, 0.5f * U.widget_unit, banner_width, banner_height, nullptr);
+
+    button_func_set(banner_but, [block](bContext &C) { wm_block_splash_image_close(&C, block); });
+  }
+}
+
 static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*arg*/)
 {
   const uiStyle *style = ui::style_get_dpi();
@@ -301,37 +455,6 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
 
   int splash_width = style->widget.points * 45 * UI_SCALE_FAC;
   CLAMP_MAX(splash_width, WM_window_native_pixel_x(CTX_wm_window(C)) * 0.7f);
-  int splash_height;
-
-  /* Would be nice to support caching this, so it only has to be re-read (and likely resized) on
-   * first draw or if the image changed. */
-  ImBuf *ibuf = wm_block_splash_image(splash_width, &splash_height);
-  /* This should never happen, if it does - don't crash. */
-  if (LIKELY(ibuf)) {
-    ui::Button *but = uiDefButImage(
-        block, ibuf, 0, 0.5f * U.widget_unit, splash_width, splash_height, nullptr);
-
-    button_func_set(but, [block](bContext &C) { wm_block_splash_close(&C, block); });
-
-    wm_block_splash_add_label(block,
-                              BKE_blender_version_string(),
-                              splash_width - 8.0 * UI_SCALE_FAC,
-                              splash_height - 13.0 * UI_SCALE_FAC);
-  }
-
-  /* Banner image passed through the environment, to overlay on the splash and
-   * indicate a custom Blender version. Transparency can be used. To replace the
-   * full splash screen, see BLENDER_CUSTOM_SPLASH. */
-  int banner_width = 0;
-  int banner_height = 0;
-  ImBuf *bannerbuf = wm_block_splash_banner_image(
-      &banner_width, &banner_height, splash_width, splash_height);
-  if (bannerbuf) {
-    ui::Button *banner_but = uiDefButImage(
-        block, bannerbuf, 0, 0.5f * U.widget_unit, banner_width, banner_height, nullptr);
-
-    button_func_set(banner_but, [block](bContext &C) { wm_block_splash_close(&C, block); });
-  }
 
   const int layout_margin_x = UI_SCALE_FAC * 26;
   ui::Layout &layout = ui::block_layout(block,
@@ -360,8 +483,30 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
 
   block_func_set(block, wm_block_splash_close_on_fileselect, block, nullptr);
 
+  /* Loopcut: the setup centers its button text, as the site does (the flag is read as buttons are
+   * made). A draw that just turned the setup on or off is rebuilt once, to match. */
+  const bool was_modal = splash_modal;
+  if (splash_modal) {
+    block_flag_enable(block, ui::BLOCK_QUICK_SETUP);
+  }
+
   if (mt) {
     ui::menutype_draw(C, mt, &layout);
+  }
+  if (splash_modal != was_modal) {
+    ED_region_tag_refresh_ui(region);
+  }
+
+  /* After drawing: the add-on's draw decides whether this step is modal, and whether it shows
+   * the image (placed above the layout, so outside it). */
+  if (splash_modal) {
+    block_flag_enable(block, ui::BLOCK_MODAL);
+    ui::block_theme_override_set(block, wm_splash_brand_theme());
+  }
+  if (splash_banner) {
+    ui::block_layout_set_current(block, nullptr);
+    wm_block_splash_add_images(block, splash_width);
+    ui::block_layout_set_current(block, &layout);
   }
 
 /* Displays a warning if blender is being emulated via Rosetta (macOS) or XTA (Windows) */
@@ -402,7 +547,8 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
   }
 #endif
 
-  block_bounds_set_centered(block, 0);
+  /* Without the image, which spans the width, the content's own margin goes all around it. */
+  block_bounds_set_centered(block, splash_banner ? 0 : layout_margin_x);
 
   return block;
 }
@@ -424,6 +570,26 @@ void WM_OT_splash(wmOperatorType *ot)
 
   ot->invoke = wm_splash_invoke;
   ot->poll = WM_operator_winactive;
+}
+
+static wmOperatorStatus wm_splash_close_exec(bContext *C, wmOperator * /*op*/)
+{
+  wmWindowManager *wm = CTX_wm_manager(C);
+  bool closed = false;
+  for (wmWindow &win : wm->windows) {
+    closed |= ui::popup_block_close_by_name(C, &win, "splash");
+  }
+  return closed ? OPERATOR_FINISHED : OPERATOR_CANCELLED;
+}
+
+void WM_OT_splash_close(wmOperatorType *ot)
+{
+  ot->name = "Close Splash Screen";
+  ot->idname = "WM_OT_splash_close";
+  ot->description = "Close the splash screen, a modal one included";
+
+  ot->exec = wm_splash_close_exec;
+  ot->flag = OPTYPE_INTERNAL;
 }
 
 /** \} */

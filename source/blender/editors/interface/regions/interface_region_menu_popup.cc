@@ -912,6 +912,32 @@ bool popup_block_name_exists(const bScreen *screen, const StringRef name)
   return false;
 }
 
+bool popup_block_close_by_name(bContext *C, wmWindow *win, const StringRef name)
+{
+  const bScreen *screen = WM_window_get_active_screen(win);
+  for (const ARegion &region : screen->regionbase) {
+    for (Block &block : region.runtime->uiblocks) {
+      if (block.name == name && block.handle) {
+        popup_block_close(C, win, &block);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool popup_block_is_modal(const bScreen *screen, const StringRef name)
+{
+  for (const ARegion &region : screen->regionbase) {
+    for (const Block &block : region.runtime->uiblocks) {
+      if (block.name == name && (block.flag & BLOCK_MODAL)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void popup_menu_close(const Block *block, const bool is_cancel)
 {
   popup_menu_retval_set(block, is_cancel ? RETURN_CANCEL : RETURN_OK, true);

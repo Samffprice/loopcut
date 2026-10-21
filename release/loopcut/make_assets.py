@@ -134,9 +134,11 @@ def splash_svg(font: Path, width: float = 1000) -> str:
 <rect width="1000" height="500" fill="url(#teal)"/>
 <rect width="1000" height="500" fill="url(#orange)"/>
 {_mark_paths(7.6, 480, -130, opacity=0.05)}
+<g transform="translate(36,0)"><!-- The lockup's middle on the canvas's middle (measured from splash.png). -->
 {_mark_paths(2.3, 108, 124)}
 <text x="372" y="282" font-family="LoopcutInter" font-weight="650" font-size="112" letter-spacing="-3" fill="#f2efe9">Loopcut</text>
 <text x="378" y="332" font-family="LoopcutInter" font-weight="400" font-size="25" fill="#a3a3ab">An AI agent that works inside Blender</text>
+</g>
 </g>
 </svg>
 '''

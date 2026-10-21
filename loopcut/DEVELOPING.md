@@ -72,9 +72,19 @@ Blender with six additions, kept small so rebasing onto a new release stays chea
   never writes to stock Blender's preferences, and a first-run flow in the splash screen modelled
   on Cursor's: "Import Blender 5.2 Settings" copies preferences, add-ons, keymap, themes and the
   startup file from the newest stock Blender folder it can read (`blender_import.py`), or "Start
-  Fresh" shows Blender's quick setup; then an optional free Loopcut account, connect a model, privacy, done. The steps are drawn by
+  Fresh" shows Blender's quick setup; then a required free Loopcut account (with a Claim for the
+  trial credits the server granted), how Loopcut works (the ChatGPT plan as the thinking, the Loopcut account as the cloud tools, and with sales open Free and Pro side by side), one model, privacy, and three first projects. The steps are drawn by
   `scripts/addons_core/loopcut/onboarding.py`; the fork's splash menus only call it. Add-ons that did not
-  load after an import are named on the last step.
+  load after an import are named on the last step. While a step shows, the add-on sets
+  `WindowManager.splash_modal` (`wm_splash_screen.cc`): the window behind is dimmed and clicking
+  outside, Escape, Enter, drops and the splash image do not close it (`BLOCK_MODAL`); the add-on closes
+  it with `wm.splash_close`. The step is saved to `onboarding.json` in Loopcut's config folder, so
+  quitting half way resumes there. The steps draw with the fork's layout additions:
+  `UILayout.label_styled` (text at a size, weight and colour, drawn as an image), `box_padded` and
+  `operator_link` (an operator as a text link in a colour), in loopcut.org's palette set on the
+  splash block only (`block_theme_override_set`, never the user's theme). The outline icons in
+  `media/icons` are Lucide's (ISC, the add-on's `THIRD-PARTY-NOTICES.txt`), made by
+  `release/loopcut/make_setup_icons.py`.
 - The product's name and face: `Loopcut.app` (executable `Loopcut`, bundle id
   `io.github.samffprice.loopcut`), "Loopcut (Blender 5.2.2)" in the window title, its own app
   icon, splash and top-bar icon. "Blender" and its logo are the Blender Foundation's trademarks,
@@ -398,6 +408,7 @@ earlier, UI buttons, timers); geometry built directly with bmesh or `from_pydata
 | `Blender -b --factory-startup --python loopcut/harness/attachments_check.py` | ~3s | Attaching images: conversion to a bounded PNG, refusals, nothing left in `bpy.data`. `loopcut/scripts/shot.sh attachments` shows the chips. |
 | `Blender -b --factory-startup --python loopcut/harness/image_budget_check.py` | ~3s | Stored images and request budgets with the real encoder: a PNG render stored as a 1568 px JPEG its card still loads, flat and see-through images kept as PNG, a request of eight renders fitted under the budget and halved after a dropped upload. |
 | `Blender -b --factory-startup --python loopcut/harness/api_docs_check.py` | ~3s | `inspect_api` against the real API, and that the code in its notes still runs. |
+| `Loopcut --enable-event-simulate --python loopcut/harness/onboarding_flow_check.py -- --stage <stage> --out <dir>` | ~15s a stage | The 0.2.6 setup in a `BLENDER_USER_RESOURCES` sandbox with `LOOPCUT_SERVICE_URL` pointing nowhere: modal (an outside click, Esc and Enter leave it open), an import from fake stock settings (`LOOPCUT_STOCK_BLENDER_DIR`) that re-enables every add-on, a missing operator and a step with no button (never modal), resumed after quitting, a failed sign-in and "Continue without an account", an install from before it skipped silently, every screen with fixture data, and every kind of button acting on one click after the pointer rests on it (`--stage clicks`). The docstring has the stages and the command. |
 | `loopcut/scripts/onboarding_check.sh` | ~40s | First run of the build in a throwaway home folder: clicks through a fresh start, imports stock settings and checks they took effect and stock Blender's folder is byte-identical, screenshots every step to `../out/onboarding/`. |
 | `Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/contact_check.py` | ~3s | `check_contact` on fixtures built on the spot (a floating table top, a lamp with a short foot, a chair through a rug, roots, a collection instance, penetrating cubes, a mirrored slab, a one-sided wall, a bowl): every status, depth and fix asserted, each fix applied and checked again; then watched pairs that `run_python` breaks and mends; then the shared_support eval's reading corner (`corner.py`: a side table wound inward, a lamp base's rim level with the chair's feet), whose gaps once read as metres of overlap; an open strap loop (a torus with a gap cut, wound either way) 39 mm clear of a lens barrel, a band round a lens mount, and the strap dipped 10 mm in, which once read as 375 mm. |
 | `Blender -b --factory-startup --python loopcut/harness/camera_check.py` | ~1s | `frame_camera` on scenes made on the spot (a row with an Array, a tall box at 9:16 and with VERTICAL sensor fit, nested children, a collection instance, orthographic, a QUATERNION camera, lens, shift, clip, a region with a shift kept, report_only at several frames of a Track To shot): every evaluated vertex projected with `world_to_camera_view` is inside, the tight margin is the one asked, the subject centred, the report's numbers match; `report_only` changes nothing; one undo step. |
@@ -542,6 +553,31 @@ fresh one without losing the old.
 
 Check: `loopcut/harness/persistence_check.py` (two launches sharing a data folder; see its docstring).
 Harness scripts default `LOOPCUT_DATA_DIR` to a temp folder so they never touch real data.
+
+### Conversation logs and problem reports
+
+`session_logs.py` (contract SPEC §3.12, proposal 015). After each turn, on every model route and signed in
+or not, the conversation goes to `POST /v1/logs` as text: messages, replies, tool calls and results, the
+chat's error, notice, limit and wave cards as events, the turn's worker conversations (referenced from the
+parent by a `worker session` event), and the console lines since the conversation started in this Blender.
+Each upload replaces the last for that conversation; the server keeps it 90 days and never trains on it.
+
+- Never sent: images (an `image omitted` event with kind and size instead), .blend files, credentials. Every
+  key in `credentials.json`, ChatGPT's tokens, key-like environment and `.env` values and key-shaped strings
+  become `[redacted]`, URL queries are cut and the home folder becomes `~`, before gzip. Long fields keep
+  their head and tail to fit 6 MiB decoded / 1 MiB gzipped; at most 2,000 entries, the newest kept.
+- Off with the preference "Share conversations to improve Loopcut" (on by default; also on the first-run
+  privacy screen), with `LOOPCUT_TELEMETRY=off` (the harness sets it), in background Blender, or without an
+  install id. 404 and 426 stop uploads until the next launch, 429 pauses ten minutes, 409 drops that chat.
+- The add-on has no log file: `register()` tees `sys.stdout`/`sys.stderr` into a 4,000-line buffer, and
+  `unregister()` puts the streams back.
+- "Report a Problem…" (`loopcut.report_problem`, `support.py`) lives in Preferences › Add-ons › Loopcut,
+  never in the chat panel (`test_session_logs.PlacementTest`). It sends a note, an optional contact email,
+  the recent console log and the three latest conversations to `POST /v1/reports`, even with sharing off,
+  and puts the returned `LC-…` code on the clipboard.
+
+Tests: `loopcut/tests/test_session_logs.py`; with `LOOPCUT_CONTRACT_DIR` set, the built bodies are
+validated against `conversation-log.schema.json` and `problem-report.schema.json`.
 
 ## Context
 

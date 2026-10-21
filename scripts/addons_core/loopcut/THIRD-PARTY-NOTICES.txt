@@ -1,0 +1,36 @@
+Third-party material in the Loopcut add-on's media/ folder (the first-run setup)
+
+icons/*.png
+  Lucide icons 0.460.0 (lucide-static on npm, https://lucide.dev): search, sparkles,
+  message-circle, loader-circle, circle-alert, check, user, key-round, cloud, laptop,
+  circle-arrow-up, brain, minus, circle-help, box, person-standing, mic, audio-lines, aperture,
+  list-checks, hammer, scan-eye and wrench, rasterised to 64 px and recoloured to Loopcut's
+  palette. Licence below.
+
+alarm-clock.jpg, card_chest.jpg
+  Our own Cycles renders of Poly Haven's CC0 models "Alarm Clock 01" and "Treasure Chest",
+  lit by Poly Haven's CC0 "Studio Small 09" HDRI (polyhaven.com). CC0 needs no notice; it is
+  listed so the source is known.
+
+card_motion.jpg
+  Our own render of the mannequin Loopcut's text to motion puts on SOMA's skeleton
+  (motion_retarget.build_skeleton), posed by hand, in the same studio.
+
+----------------------------------------------------------------------------------------------
+Lucide licence
+
+ISC License
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

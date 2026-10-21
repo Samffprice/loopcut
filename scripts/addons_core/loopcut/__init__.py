@@ -8,7 +8,7 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 2, 5),
+    "version": (0, 2, 6),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
@@ -16,6 +16,11 @@ bl_info = {
 
 
 def register() -> None:
+    try:
+        from . import session_logs
+        session_logs.register()  # First: the console lines conversation logs and problem reports carry.
+    except Exception as ex:
+        print(f"Loopcut: conversation logs not set up: {type(ex).__name__}")
     from . import account, cloud, lifecycle, mainthread, settings, support
     from .ui import host
     settings.register()
@@ -51,10 +56,12 @@ def register() -> None:
 
 
 def unregister() -> None:
-    from . import account, agent, cloud, dev_reload, lifecycle, mainthread, settings, support, telemetry, worker_host
+    from . import (account, agent, cloud, dev_reload, lifecycle, mainthread, session_logs, settings, support, telemetry,
+                   worker_host)
     from .ui import host
     agent.stop()
     telemetry.unregister()
+    session_logs.unregister()  # The console's own streams back.
     worker_host.shutdown_all()
     cloud.unregister()
     account.unregister()

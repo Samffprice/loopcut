@@ -107,6 +107,8 @@ Drop images on the panel (or *+ image*) to attach up to six references per messa
 
 Conversations survive restarts and belong to the file they worked in; *History* lists the others, *New chat* starts fresh. Long sessions stay affordable: older steps are folded, and the model summarizes when needed, so the context shown in the footer stays within budget.
 
+Loopcut keeps a text log of each conversation for 90 days to fix problems and improve the app: no images, .blend files or keys, and never used for training. Turn it off with *Share conversations to improve Loopcut* in *Preferences › Add-ons › Loopcut › Privacy and Support*, where *Report a Problem…* sends us a note (and, if you like, your latest conversations) and gives you a code to quote.
+
 ## Building from source
 
 Loopcut is a fork of [Blender](https://projects.blender.org/blender/blender) 5.2.2 on the `main` branch. The add-on lives in `scripts/addons_core/loopcut/` and hot-reloads; the fork adds an editor type, in-place snapshot restore, a separate settings folder, and its own name and icons.

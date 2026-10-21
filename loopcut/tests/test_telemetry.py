@@ -167,8 +167,9 @@ class PayloadTest(unittest.TestCase):
         self.assertEqual(telemetry.error_code("rate-limited"), "rate_limited")
         self.assertEqual(telemetry.error_code(502), "http_502")
         self.assertIsNone(telemetry.error_code(""))
-        # A code only accompanies a failure.
-        self.assertNotIn("error_code", telemetry.setup_step_props("chatgpt", "chatgpt", True, "timeout"))
+        # A turn's code only accompanies a failure; a setup step's also names the action taken.
+        self.assertEqual(telemetry.setup_step_props("done", "chatgpt", True, "card_motion")["error_code"], "card_motion")
+        self.assertNotIn("error_code", telemetry.setup_step_props("chatgpt", "chatgpt", True, None))
         self.assertNotIn("error_code", telemetry.turn_props("loopcut", "fast", "ok", 1, 0, "x"))
 
     def test_the_envelope_refuses_what_the_server_would(self):

@@ -201,6 +201,8 @@ class Turn:
         self.telemetry: dict = {}
         self.first_item = 0
         self.error_code = ""
+        # Its conversation log (session_logs.py): what ran it, or {} when the conversation is not uploaded.
+        self.conversation_log: dict = {}
 
 
 def _redraw() -> None:
@@ -1384,6 +1386,11 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             telemetry.turn_end(turn, list(session["items"]))  # Off, signed out of stats or headless: nothing.
         except Exception as ex:
             print(f"Loopcut: turn usage event not recorded: {type(ex).__name__}")
+        try:
+            from . import session_logs
+            session_logs.on_turn_end(session, turn)  # Sharing off, LOOPCUT_TELEMETRY off or headless: nothing.
+        except Exception as ex:
+            print(f"Loopcut: conversation log not sent: {type(ex).__name__}")
 
 
 def _error_code(ex) -> str:
@@ -1746,9 +1753,10 @@ def send(text: str) -> bool:
 
 
 def _launch(session: dict, turn: Turn) -> None:
-    from . import telemetry
+    from . import session_logs, telemetry
     turn.started, turn.first_item = time.monotonic(), len(session["items"])
     turn.telemetry = telemetry.turn_start(turn.config)  # Main thread: which kind of model runs this turn.
+    turn.conversation_log = session_logs.turn_start(session, turn.config)  # {} when it is not uploaded.
     session["scroll"], session["confirm_restore"] = 0.0, None
     session["busy"], session["turn"] = True, turn
     session["turn_outcome"] = "running"

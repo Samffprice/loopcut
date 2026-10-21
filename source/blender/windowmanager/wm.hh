@@ -20,6 +20,7 @@
 
 namespace blender {
 
+struct bScreen;
 struct wmDrag;
 struct wmOperator;
 struct wmTimer;
@@ -119,7 +120,17 @@ void wm_autosave_delete();
 /* `wm_splash_screen.cc` */
 
 void WM_OT_splash(wmOperatorType *ot);
+void WM_OT_splash_close(wmOperatorType *ot);
 void WM_OT_splash_about(wmOperatorType *ot);
+
+/** Loopcut: `WindowManager.splash_modal`, for the add-on's first-run setup. Not saved. */
+void wm_splash_modal_set(bool modal);
+bool wm_splash_modal_get();
+/** The modal splash is open in \a screen: dim what is behind it. */
+bool wm_splash_modal_is_open(const bScreen *screen);
+/** Loopcut: `WindowManager.splash_banner`, the splash image above the content. Not saved. */
+void wm_splash_banner_set(bool banner);
+bool wm_splash_banner_get();
 
 /* `wm_stereo.cc` */
 

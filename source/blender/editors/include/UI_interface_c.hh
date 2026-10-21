@@ -58,6 +58,7 @@ struct bNode;
 struct bNodeSocket;
 struct bNodeTree;
 struct bScreen;
+struct bTheme;
 struct MenuType;
 struct rctf;
 struct rcti;
@@ -322,6 +323,14 @@ enum {
    * and inherited by sub-menus from their parent.
    */
   BLOCK_NO_ACCELERATOR_KEYS = 1 << 27,
+  /**
+   * Only the popup's own buttons close it: clicking outside, Escape, Enter and drops do not.
+   * Events outside the popup stay blocked, as for any #BLOCK_LOOP popup. #block_end clears it
+   * when no enabled operator button is left to leave by, so a modal popup can never trap.
+   *
+   * Loopcut: the first-run setup in the splash screen, see `WindowManager.splash_modal`.
+   */
+  BLOCK_MODAL = 1 << 28,
 };
 
 /** #PopupBlockHandle.menuretval */
@@ -1055,6 +1064,10 @@ void uiPupBlockOperator(bContext *C,
 void popup_block_close(bContext *C, wmWindow *win, Block *block);
 
 bool popup_block_name_exists(const bScreen *screen, StringRef name);
+/** Close the open popup whose block is called \a name. True when there was one. */
+bool popup_block_close_by_name(bContext *C, wmWindow *win, StringRef name);
+/** An open popup whose block is called \a name is modal (#BLOCK_MODAL). */
+bool popup_block_is_modal(const bScreen *screen, StringRef name);
 
 /* Blocks
  *
@@ -1097,6 +1110,11 @@ enum {
   BLOCK_THEME_STYLE_POPUP = 1,
 };
 void block_theme_style_set(Block *block, char theme_style);
+/**
+ * Draw \a block with \a theme instead of the user's (null: the user's again). The theme must
+ * outlive the block's drawing. Loopcut: the first-run setup's brand colors in the splash.
+ */
+void block_theme_override_set(Block *block, const bTheme *theme);
 EmbossType block_emboss_get(Block *block);
 void block_emboss_set(Block *block, EmbossType emboss);
 bool block_is_search_only(const Block *block);
@@ -1219,6 +1237,17 @@ bool button_flag_is_set(Button *but, int flag);
 void button_flag2_enable(Button *but, int flag);
 
 void button_drawflag_enable(Button *but, int flag);
+/**
+ * Loopcut: draw a push button as a text link (no backdrop), in \a color (the theme's link color
+ * when null). With \a hover it is underlined and shows the hand cursor while hovered; without, it
+ * looks like a label (a checkbox's). For the first-run setup's quiet actions.
+ */
+void button_link_style_set(Button *but, const uchar color[4], bool hover = true);
+/**
+ * Loopcut: a box whose content is inset by \a padding pixels on every side, in place of the
+ * style's box space. For the first-run setup's cards.
+ */
+Layout &layout_box_padded(Layout &layout, int padding);
 void button_drawflag_disable(Button *but, int flag);
 
 void button_dragflag_enable(Button *but, int flag);

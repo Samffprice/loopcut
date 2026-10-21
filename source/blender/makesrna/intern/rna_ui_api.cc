@@ -59,6 +59,7 @@ enum class TextAlignAnchor : int {
 
 #  include "DNA_asset_types.h"
 
+#  include "BKE_idprop.hh"
 #  include "BKE_report.hh"
 
 #  include "ED_asset_filter.hh"
@@ -67,6 +68,15 @@ enum class TextAlignAnchor : int {
 #  include "ED_object.hh"
 
 #  include "WM_api.hh"
+
+#  include "BLF_api.hh"
+
+#  include "BLI_math_color.h"
+#  include "BLI_string_utf8.h"
+#  include "BLI_vector.hh"
+
+#  include "IMB_imbuf.hh"
+#  include "IMB_imbuf_types.hh"
 
 namespace blender {
 
@@ -596,6 +606,202 @@ static void rna_uiItemL(Layout *layout,
   layout->label(text.value_or(""), icon);
 }
 
+/**
+ * Loopcut: text at a chosen size, weight and color, drawn as an image (labels have one size and
+ * take their color from the theme): the first-run setup's headlines, captions and paragraphs.
+ * Lines split on "\n" and are centered with \a center. The image is a whole number of half rows
+ * tall, so styled lines keep the layout's rhythm; \a tight leaves only the text's own height, for
+ * a caption set close under its label. \a code sets hyphens as tight as the letters around them
+ * (a sign-in code: the UI font's hyphen has wide side bearings at display sizes).
+ */
+struct HyphenInk {
+  int xmin = 0;
+  int xmax = 0;
+};
+
+/** Where the hyphen's ink lies in its advance, found by drawing it (glyph boxes have bearings). */
+static HyphenInk hyphen_ink(const int fontid)
+{
+  const int margin = 4;
+  const int width = int(ceilf(BLF_width(fontid, "-", 1))) + 2 * margin;
+  const int height = BLF_ascender(fontid) - BLF_descender(fontid) + 2 * margin;
+  Vector<uchar> coverage(width * height, 0);
+  const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  BLF_buffer(fontid, nullptr, coverage.data(), width, height, 1, nullptr);
+  BLF_buffer_col(fontid, white);
+  BLF_position(fontid, float(margin), float(margin - BLF_descender(fontid)), 0.0f);
+  BLF_draw_buffer(fontid, "-", 1);
+  BLF_buffer(fontid, nullptr, nullptr, 0, 0, 0, nullptr);
+  HyphenInk ink{width, 0};
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      if (coverage[y * width + x] > 32) {
+        ink.xmin = std::min(ink.xmin, x - margin);
+        ink.xmax = std::max(ink.xmax, x - margin + 1);
+      }
+    }
+  }
+  if (ink.xmax <= ink.xmin) {
+    return {0, int(ceilf(BLF_width(fontid, "-", 1)))};
+  }
+  return ink;
+}
+
+static int styled_line(const int fontid,
+                       const StringRef line,
+                       const HyphenInk *ink,
+                       const bool draw,
+                       const int x = 0,
+                       const int y = 0)
+{
+  if (!ink) {
+    if (draw) {
+      BLF_position(fontid, float(x), float(y), 0.0f);
+      BLF_draw_buffer(fontid, line.data(), line.size());
+    }
+    return int(ceilf(BLF_width(fontid, line.data(), line.size())));
+  }
+  /* Glyph by glyph: each hyphen takes its ink's width and a gap about a letter's side bearing. */
+  const int gap = std::max(1, int(BLF_ascender(fontid) * 0.08f));
+  int pen = x;
+  for (int64_t i = 0; i < line.size();) {
+    const int64_t size = std::max<int64_t>(1, BLI_str_utf8_size_safe(line.data() + i));
+    const StringRef glyph = line.substr(i, size);
+    const bool hyphen = glyph == "-";
+    if (hyphen) {
+      pen += gap - ink->xmin;
+    }
+    if (draw) {
+      BLF_position(fontid, float(pen), float(y), 0.0f);
+      BLF_draw_buffer(fontid, glyph.data(), glyph.size());
+    }
+    pen += hyphen ? ink->xmax + gap : int(ceilf(BLF_width(fontid, glyph.data(), glyph.size())));
+    i += size;
+  }
+  return pen - x;
+}
+
+static void rna_uiItemL_styled(Layout *layout,
+                               const char *text,
+                               const float scale,
+                               const bool bold,
+                               const float color[3],
+                               const bool tight,
+                               const bool center,
+                               const bool code)
+{
+  if (text[0] == '\0') {
+    return;
+  }
+  const uiStyle *style = ui::style_get_dpi();
+  const int fontid = BLF_default();
+  BLF_size(fontid, style->widget.points * scale * UI_SCALE_FAC);
+  BLF_character_weight(fontid, bold ? 700 : 400);
+  const int descender = -BLF_descender(fontid);
+  const int text_height = BLF_ascender(fontid) + descender;
+  const int line_height = int(text_height * 1.35f);
+
+  Vector<StringRef> lines;
+  for (StringRef rest = text; !rest.is_empty();) {
+    const int64_t end = rest.find('\n');
+    lines.append(end == StringRef::not_found ? rest : rest.substr(0, end));
+    rest = end == StringRef::not_found ? StringRef() : rest.substr(end + 1);
+  }
+  const HyphenInk ink = code ? hyphen_ink(fontid) : HyphenInk();
+  Vector<int> widths;
+  int width = 0;
+  for (const StringRef line : lines) {
+    widths.append(styled_line(fontid, line, code ? &ink : nullptr, false));
+    width = std::max(width, widths.last());
+  }
+  width += 2;
+  const int content = text_height + line_height * int(lines.size() - 1);
+  const int row = int(UI_UNIT_Y);
+  const int half_row = row / 2;
+  const int height = tight ? content + 2 :
+                             std::max(row, (content + half_row - 1) / half_row * half_row);
+
+  Vector<uchar> coverage(width * height, 0);
+  const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  BLF_buffer(fontid, nullptr, coverage.data(), width, height, 1, nullptr);
+  BLF_buffer_col(fontid, white);
+  const int top = (height - content) / 2;
+  for (const int64_t i : lines.index_range()) {
+    const int baseline = height - top - text_height + descender - int(i) * line_height;
+    const int x = center ? (width - widths[i]) / 2 : 1;
+    styled_line(fontid, lines[i], code ? &ink : nullptr, true, x, baseline);
+  }
+  BLF_buffer(fontid, nullptr, nullptr, 0, 0, 0, nullptr);
+  ui::fontstyle_set(&style->widget); /* The UI's own size and weight again. */
+
+  /* Premultiplied, as image buttons draw it. */
+  uchar rgb[3];
+  rgb_float_to_uchar(rgb, color);
+  ImBuf *ibuf = IMB_allocImBuf(width, height, ImBufFlags::ByteData);
+  uchar *pixel = ibuf->byte_data_for_write();
+  for (const uchar alpha : coverage) {
+    for (int i = 0; i < 3; i++) {
+      pixel[i] = uchar(rgb[i] * alpha / 255);
+    }
+    pixel[3] = alpha;
+    pixel += 4;
+  }
+
+  /* Its own left-aligned row: an image button stretched by its layout would be scaled. */
+  Layout &line = layout->row(false);
+  line.alignment_set(ui::LayoutAlign::Left);
+  ui::block_layout_set_current(line.block(), &line);
+  ui::uiDefButImage(line.block(), ibuf, 0, 0, width, height, nullptr);
+}
+
+/**
+ * Loopcut: an operator drawn as a text link, sized to its text, in \a color and aligned to its
+ * layout's side: the first-run setup's quiet actions (Back, Skip, Cancel).
+ */
+static PointerRNA rna_uiItemO_link(Layout *layout,
+                                   ReportList *reports,
+                                   const char *opname,
+                                   const char *text,
+                                   const float color[3],
+                                   const bool hover)
+{
+  wmOperatorType *ot = WM_operatortype_find(opname, false);
+  if (!ot || !ot->srna) {
+    BKE_reportf(reports, RPT_ERROR, "UILayout.operator_link(): unknown operator '%s'", opname);
+    return PointerRNA_NULL;
+  }
+  const uiStyle *style = ui::style_get_dpi();
+  const int width = ui::fontstyle_string_width(&style->widget, text) + int(UI_UNIT_X * 0.25f);
+  Layout &line = layout->row(false);
+  const ui::LayoutAlign align = layout->alignment();
+  line.alignment_set(align == ui::LayoutAlign::Expand ? ui::LayoutAlign::Left : align);
+  ui::Block *block = line.block();
+  ui::block_layout_set_current(block, &line);
+  ui::Button *but = ui::uiDefButO_ptr(block,
+                                      ui::ButtonType::But,
+                                      ot,
+                                      wm::OpCallContext::InvokeDefault,
+                                      text,
+                                      0,
+                                      0,
+                                      width,
+                                      UI_UNIT_Y,
+                                      std::nullopt);
+  uchar rgba[4] = {0, 0, 0, 255};
+  rgb_float_to_uchar(rgba, color);
+  ui::button_link_style_set(but, rgba, hover);
+  ui::button_drawflag_enable(but,
+                             align == ui::LayoutAlign::Right ? ui::BUT_TEXT_RIGHT :
+                             align == ui::LayoutAlign::Center ? 0 :
+                                                                ui::BUT_TEXT_LEFT);
+  /* As #Layout::op: the properties exist so the caller can fill them in. */
+  PointerRNA *opptr = ui::button_operator_ptr_ensure(but);
+  if (opptr->data == nullptr) {
+    opptr->data = bke::idprop::create_group("wmOperatorProperties").release();
+  }
+  return *opptr;
+}
+
 static void rna_layout_link(Layout *layout,
                             const char *url,
                             const char *name,
@@ -965,6 +1171,11 @@ static void rna_template_event_from_keymap_item(
 static Layout *rna_uiLayoutBox(Layout *layout)
 {
   return &layout->box();
+}
+
+static Layout *rna_uiLayoutBoxPadded(Layout *layout, const float padding)
+{
+  return &ui::layout_box_padded(*layout, int(padding * UI_SCALE_FAC));
 }
 
 static Layout *rna_uiLayoutSplit(Layout *layout, float factor, bool align)
@@ -1489,6 +1700,21 @@ void RNA_api_ui_layout(StructRNA *srna)
   RNA_def_function_return(func, parm);
 
   /* box layout */
+  func = RNA_def_function(srna, "box_padded", "rna_uiLayoutBoxPadded");
+  RNA_def_float(func,
+                "padding",
+                5.0f,
+                0.0f,
+                100.0f,
+                "Padding",
+                "Inset of the content on every side, in pixels at a UI scale of 1",
+                0.0f,
+                100.0f);
+  parm = RNA_def_pointer(func, "layout", "UILayout", "", "Sub-layout to put items in");
+  RNA_def_function_return(func, parm);
+  RNA_def_function_ui_description(
+      func, "Sublayout in a box whose content is inset by the given padding (Loopcut)");
+
   func = RNA_def_function(srna, "box", "rna_uiLayoutBox");
   parm = RNA_def_pointer(func, "layout", "UILayout", "", "Sub-layout to put items in");
   RNA_def_function_return(func, parm);
@@ -1778,6 +2004,43 @@ void RNA_api_ui_layout(StructRNA *srna)
   api_ui_item_common(func);
   parm = RNA_def_property(func, "icon_value", PROP_INT, PROP_UNSIGNED);
   RNA_def_property_ui_text(parm, "Icon Value", "Override automatic icon of the item");
+
+  func = RNA_def_function(srna, "label_styled", "rna_uiItemL_styled");
+  RNA_def_function_ui_description(
+      func, "Item. A line of text at a size, weight and color of its own (Loopcut: the setup)");
+  parm = RNA_def_string(func, "text", nullptr, 0, "", "Text to display");
+  RNA_def_parameter_flags(parm, PropertyFlag(0), PARM_REQUIRED);
+  RNA_def_float(
+      func, "scale", 1.0f, 0.5f, 4.0f, "Scale", "Size relative to the normal text", 0.5f, 4.0f);
+  RNA_def_boolean(func, "bold", false, "Bold", "");
+  static const float white[3] = {1.0f, 1.0f, 1.0f};
+  parm = RNA_def_float_color(func, "color", 3, white, 0.0f, 1.0f, "Color", "", 0.0f, 1.0f);
+  RNA_def_property_subtype(parm, PROP_COLOR_GAMMA);
+  RNA_def_boolean(func, "tight", false, "Tight", "Only the text's own height, for a caption");
+  RNA_def_boolean(func, "center", false, "Center", "Center each line");
+  RNA_def_boolean(func, "code", false, "Code", "Set hyphens as tight as the letters (a code)");
+
+  func = RNA_def_function(srna, "operator_link", "rna_uiItemO_link");
+  RNA_def_function_ui_description(
+      func, "Item. An operator drawn as a text link in a color (Loopcut: quiet setup actions)");
+  RNA_def_function_flag(func, FUNC_USE_REPORTS);
+  parm = RNA_def_string(func, "operator", nullptr, 0, "", "Identifier of the operator");
+  RNA_def_parameter_flags(parm, PropertyFlag(0), PARM_REQUIRED);
+  parm = RNA_def_string(func, "text", nullptr, 0, "", "Text of the link");
+  RNA_def_parameter_flags(parm, PropertyFlag(0), PARM_REQUIRED);
+  static const float link_color[3] = {0.61f, 0.61f, 0.64f};
+  parm = RNA_def_float_color(
+      func, "color", 3, link_color, 0.0f, 1.0f, "Color", "", 0.0f, 1.0f);
+  RNA_def_property_subtype(parm, PROP_COLOR_GAMMA);
+  RNA_def_boolean(func,
+                  "hover",
+                  true,
+                  "Hover",
+                  "Underlined, with the hand cursor, while hovered (off: it looks like a label)");
+  parm = RNA_def_pointer(
+      func, "properties", "OperatorProperties", "", "Operator properties to fill in");
+  RNA_def_parameter_flags(parm, PropertyFlag(0), PARM_REQUIRED | PARM_RNAPTR);
+  RNA_def_function_return(func, parm);
 
   func = RNA_def_function(srna, "link", "rna_layout_link");
   RNA_def_function_ui_description(func, "Item. Displays a url that can be clicked in the layout.");

@@ -913,6 +913,12 @@ Block *popup_block_refresh(bContext *C, PopupBlockHandle *handle, ARegion *butre
 
   ED_region_update_rect(region);
 
+  if (handle->refresh && (block->flag & BLOCK_MODAL)) {
+    /* Loopcut: the rebuilt setup step leaves the button under a resting pointer inactive until the
+     * pointer moves, so a click right after a rebuild only highlighted it. Look again now. */
+    WM_event_add_mousemove(window);
+  }
+
 #ifndef NDEBUG
   window->runtime->eventstate = event_back;
   window->runtime->event_last_handled = event_last_back;

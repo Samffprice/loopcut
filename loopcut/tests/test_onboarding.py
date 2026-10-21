@@ -4,12 +4,14 @@ Load Blender-facing modules under a private package so the suite's other bpy stu
 agent fixtures are untouched. No browser, HTTP, preferences file or Blender is used.
 """
 
+import contextlib
 import json
 import importlib
 import importlib.util
 import io
 import tempfile
 import threading
+import time
 import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 import sys
@@ -40,19 +42,50 @@ class Splash:
     def label(self, **kwargs):
         self.records.append(("label", kwargs.get("text", "")))
 
-    def prop(self, prefs, name):
+    def prop(self, prefs, name, **kwargs):
         self.records.append(("prop", name))
 
     def operator(self, name, **kwargs):
         props = types.SimpleNamespace()
-        self.records.append(("operator", name, kwargs.get("text", ""), props, self))
+        self.records.append(("operator", name, kwargs.get("text", ""), props, self, kwargs))
         return props
 
     def menu(self, name, **kwargs):
         self.records.append(("menu", name))
 
+    box = column
+
+    def template_icon(self, **kwargs):
+        self.records.append(("icon", kwargs.get("icon_value")))
+
+    def progress(self, **kwargs):
+        self.records.append(("progress", kwargs.get("factor")))
+
+    def grid_flow(self, **kwargs):
+        return type(self)(self.records)
+
     def operators(self):
         return [r for r in self.records if r[0] == "operator"]
+
+
+class StyledSplash(Splash):
+    """The fork's layout API: styled text, padded boxes and operators drawn as text links."""
+    def column(self, **kwargs):
+        return StyledSplash(self.records)
+
+    row = split = box = column
+
+    def box_padded(self, padding=5.0):
+        self.records.append(("box", padding))
+        return StyledSplash(self.records)
+
+    def label_styled(self, text="", color=(1.0, 1.0, 1.0), **kwargs):
+        self.records.append(("label", text, tuple(color), kwargs))
+
+    def operator_link(self, operator, text, color=(0.61, 0.61, 0.64), hover=True):
+        props = types.SimpleNamespace()
+        self.records.append(("operator", operator, text, props, self, {"color": tuple(color), "hover": hover}))
+        return props
 
 
 class OnboardingTest(unittest.TestCase):
@@ -82,15 +115,29 @@ class OnboardingTest(unittest.TestCase):
 
     def setUp(self):
         self.fake.ops.reset_mock()
-        self.onboarding._state.update(step="connect", own_key=False, left_chatgpt=False, error="")
+        self.fake.app.timers.reset_mock()
+        self.onboarding._state.update(step="connect", own_key=False, left_chatgpt=False, error="", no_account=False,
+                                      claimed=False, waiting_since=0.0, credits_asked=0.0, region=None,
+                                      finished=False, imported=None, failed=[], drawn=None)
         self.onboarding._popups.clear()
+        self.onboarding._reported.clear()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.progress = Path(folder.name) / "onboarding.json"
+        p = patch.object(self.onboarding, "_progress_path", return_value=self.progress)
+        p.start()
+        self.addCleanup(p.stop)
         self.account._state.update(status="idle", error="", url="", user_code="")
         self.account._cancel.clear()
+        for name, value in (("_thumbnail", 0), ("_row_mark", {"icon": "LOOPCUT"})):  # No previews outside Blender.
+            p = patch.object(self.onboarding, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
         self.chatgpt_ui._state.update(status="idle", error="", url="")
         self.chatgpt_ui._cancel.clear()
         self.state.ui.clear()
         self.host._runtime.clear()
-        self.prefs = types.SimpleNamespace(provider="LOOPCUT", first_message_sent=False,
+        self.prefs = types.SimpleNamespace(provider="LOOPCUT", first_message_sent=False, share_conversations=True,
                                            base_url="https://model.test/v1", model="test-model")
         self.context = types.SimpleNamespace(region_popup=None)
         for target, name, value in ((self.settings, "preferences", self.prefs),
@@ -104,6 +151,16 @@ class OnboardingTest(unittest.TestCase):
         p = patch.object(self.settings, "config_changed")
         p.start()
         self.addCleanup(p.stop)
+        p = patch.object(self.cloud, "refresh_async")  # The account's credits, fetched on the account step.
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(self.onboarding, "missing_operators", return_value=[])  # The fake bpy registers none.
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(self.onboarding, "_registered", True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.onboarding._state["starting_since"] = 0.0
 
     def press_step(self, splash, text):
         record = next(r for r in splash.operators() if r[1] == 'loopcut.onboarding_step' and r[2] == text)
@@ -113,36 +170,31 @@ class OnboardingTest(unittest.TestCase):
         self.assertTrue(record[4].enabled)
         self.assertEqual(op.execute(self.context), {'FINISHED'})
 
-    def test_setup_and_import_lead_to_optional_account_even_with_a_model(self):
+    def test_setup_and_import_lead_to_the_required_account_step_even_with_a_model(self):
         for previous in ('setup', 'import'):
             self.onboarding._state['step'] = previous
             with patch.object(self.onboarding, '_connected', return_value=True):
                 splash = Splash()
                 self.assertTrue(self.onboarding.draw_splash(splash, self.context, first_run=False))
             self.assertEqual(self.onboarding._state['step'], 'account')
-            self.assertIn(('label', 'Create your free Loopcut account'), splash.records)
+            self.assertEqual(json.loads(self.progress.read_text())['step'], 'account')
+            self.assertIn(('label', 'Create your free account'), splash.records)
+            self.assertIn(('label', '● ○ ○ ○ ○'), splash.records)
             self.assertIn('loopcut.sign_in', [r[1] for r in splash.operators()])
             self.assertNotIn('loopcut.chatgpt_sign_in', [r[1] for r in splash.operators()])
-            self.press_step(splash, 'Skip for now')
-            self.assertEqual(self.onboarding._state['step'], 'connect')
-            self.assertTrue(self.account._cancel.is_set())
-            model = Splash()
-            self.assertTrue(self.onboarding.draw_splash(model, self.context, first_run=False))
-            self.assertIn(('label', 'Connect your ChatGPT plan'), model.records)
-            self.press_step(model, 'Skip for now')
-            privacy = Splash()
-            self.assertTrue(self.onboarding.draw_splash(privacy, self.context, first_run=False))
-            self.press_step(privacy, 'Continue')
-            self.assertEqual(self.onboarding._state['step'], 'done')
+            texts = [r[2] for r in splash.operators()]
+            self.assertNotIn('Skip for now', texts)  # Required: no way past it until a sign-in fails.
+            self.assertNotIn('Continue without an account', texts)
+            self.assertNotIn('Continue', texts)
 
     def test_screenshot_onboarding_fixtures_draw_the_requested_screens(self):
         spec = importlib.util.spec_from_file_location('c11_fixtures', PACKAGE.parents[2] / 'loopcut/harness/c11_shots.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         fixtures = module.fixtures(self.state)
-        for name, title in (('onboarding_account', 'Create your free Loopcut account'),
-                            ('onboarding_account_failed', 'Create your free Loopcut account'),
-                            ('onboarding_connect', 'Connect your ChatGPT plan')):
+        for name, title in (('onboarding_account', 'Create your free account'),
+                            ('onboarding_account_failed', 'Create your free account'),
+                            ('onboarding_connect', 'Choose the model for your chat')):
             ui = fixtures[name]['ui']
             self.onboarding._state['step'] = ui['onboarding_step']
             splash = Splash()
@@ -161,12 +213,18 @@ class OnboardingTest(unittest.TestCase):
                 patch.object(self.account, 'account_line', return_value='person@example.test'):
             splash = Splash()
             self.onboarding.draw_splash(splash, self.context, first_run=False)
-            self.assertIn(('label', 'Signed in as person@example.test'), splash.records)
+            self.assertIn(('label', "You're signed in"), splash.records)
+            self.assertIn(('label', 'person@example.test'), splash.records)
             self.assertNotIn('loopcut.sign_in', [r[1] for r in splash.operators()])
             self.press_step(splash, 'Continue')
+            self.assertEqual(self.onboarding._state['step'], 'how')  # How Loopcut works, then the model.
+            how = Splash()
+            self.onboarding._draw_how(how, self.context)
+            self.press_step(how, 'Continue')
+            self.assertEqual(self.onboarding._state['step'], 'connect')
             model = Splash()
             self.onboarding._draw_connect(model, self.context)
-            self.press_step(model, "Use Loopcut's models")
+            self.press_step(model, "Use Loopcut")
             self.assertEqual(self.prefs.provider, 'LOOPCUT')
             self.assertEqual(self.onboarding._state['step'], 'privacy')
         self.onboarding._state['step'] = 'connect'
@@ -174,7 +232,7 @@ class OnboardingTest(unittest.TestCase):
                 'signed_in': True, 'plan_usage': True, 'email': 'person@example.test'}):
             model = Splash()
             self.onboarding._draw_connect(model, self.context)
-            self.assertIn(('label', 'Signed in with ChatGPT: person@example.test'), model.records)
+            self.assertIn(('label', 'person@example.test'), model.records)  # The ChatGPT option, signed in.
             self.press_step(model, 'Continue')
             self.assertEqual(self.prefs.provider, 'CHATGPT')
             self.assertEqual(self.onboarding._state['step'], 'privacy')
@@ -194,21 +252,27 @@ class OnboardingTest(unittest.TestCase):
                 browser.assert_not_called()
                 self.assertEqual(self.account.status()['status'], 'error')
                 self.assertTrue(log.getvalue())
-                for exit_label in ('Continue', 'Skip for now'):
-                    self.onboarding._state['step'] = 'account'
-                    splash = Splash()
-                    self.onboarding.draw_splash(splash, self.context, first_run=False)
-                    labels = [r[1] for r in splash.records if r[0] == 'label']
-                    self.assertEqual(labels[0], 'Create your free Loopcut account')
-                    self.assertIn("Couldn't reach Loopcut. Try again, or skip", labels)  # Never the raw error.
-                    self.assertNotIn('HTTP', ' '.join(labels))
-                    self.assertNotIn('refused', ' '.join(labels))
-                    self.press_step(splash, exit_label)
-                    model = Splash()
-                    self.onboarding.draw_splash(model, self.context, first_run=False)
-                    self.assertIn('loopcut.chatgpt_sign_in', [r[1] for r in model.operators()])
-                    self.assertIn('loopcut.onboarding_own_key', [r[1] for r in model.operators()])
-                    self.assertNotIn("Couldn't reach Loopcut", str(model.records))
+                self.onboarding._state.update(step='account', no_account=False)
+                splash = Splash()
+                self.onboarding.draw_splash(splash, self.context, first_run=False)
+                labels = [r[1] for r in splash.records if r[0] == 'label']
+                self.assertEqual(labels[:3], ['Set up Loopcut', '● ○ ○ ○ ○', 'Create your free account'])
+                self.assertIn("Couldn't reach Loopcut", labels)  # Never the raw error.
+                self.assertNotIn('HTTP', ' '.join(labels))
+                self.assertNotIn('refused', ' '.join(labels))
+                self.assertIn('Try again', [r[2] for r in splash.operators() if r[1] == 'loopcut.sign_in'])
+                with patch.object(self.onboarding, '_report') as report:
+                    self.press_no_account(splash)
+                report.assert_called_once_with('loopcut_account', 'skip', False, 'sign_in_failed')
+                self.assertTrue(self.onboarding._state['no_account'])
+                model = Splash()
+                self.onboarding.draw_splash(model, self.context, first_run=False)
+                names = [r[1] for r in model.operators()]
+                self.assertIn('loopcut.chatgpt_sign_in', names)
+                self.assertIn('loopcut.onboarding_own_key', names)
+                self.assertNotIn("Use Loopcut", [r[2] for r in model.operators()])
+                self.assertIn('Sign in', [r[2] for r in model.operators()])
+                self.assertNotIn("Couldn't reach Loopcut", str(model.records))
 
     def test_account_poll_failure_is_quiet_and_skip_suppresses_a_late_key(self):
         reply = {'device_code': 'fixture', 'user_code': 'TEST', 'verification_url': 'https://sign-in.test'}
@@ -220,14 +284,14 @@ class OnboardingTest(unittest.TestCase):
         self.assertIn('Sign-in was denied', log.getvalue())
         splash = Splash()
         self.onboarding._draw_account(splash, self.context)
-        self.assertIn(('label', "Couldn't reach Loopcut. Try again, or skip"), splash.records)
-        self.press_step(splash, 'Skip for now')
+        self.assertIn(('label', "Couldn't reach Loopcut"), splash.records)
+        self.press_no_account(splash)
         self.assertEqual(self.onboarding._state['step'], 'connect')
-        # Approval can already be queued on the main thread when Skip is clicked.
+        # Approval can already be queued on the main thread when the user carries on without it.
         self.account._cancel.clear()
         self.onboarding._state['step'] = 'account'
         def skip_before_store(callback):
-            self.press_step(splash, 'Skip for now')
+            self.press_no_account(splash)
             callback()
             return Mock()
         with patch.object(self.account, '_post', side_effect=[reply, {'status': 'approved', 'api_key': 'fixture-only'}]), \
@@ -257,18 +321,30 @@ class OnboardingTest(unittest.TestCase):
             self.account._run_sign_in()
         self.assertEqual(set(post.call_args_list[1].args[1]), {'device_code', 'os', 'arch'})
 
-    def test_account_waiting_and_starting_allow_cancel_and_skip(self):
+    def test_account_waiting_allows_cancel_and_only_a_slow_sign_in_offers_to_go_on(self):
         for status in ('waiting', 'starting'):
             self.account._state.update(status=status, user_code='TEST', url='https://sign-in.test')
-            self.onboarding._state['step'] = 'account'
+            self.onboarding._state.update(step='account', waiting_since=0.0)
             splash = Splash()
             with patch.object(self.onboarding, '_watch_popup') as watch:
                 self.onboarding._draw_account(splash, self.context)
                 watch.assert_called_once_with(self.context)
             self.assertIn('loopcut.cancel_sign_in', [r[1] for r in splash.operators()])
-            self.press_step(splash, 'Skip for now')
+            self.assertNotIn('loopcut.onboarding_no_account', [r[1] for r in splash.operators()])
+            self.onboarding._state['waiting_since'] -= self.onboarding.SIGN_IN_PATIENCE + 1
+            splash = Splash()
+            with patch.object(self.onboarding, '_watch_popup'), patch.object(self.onboarding, '_report') as report:
+                self.onboarding._draw_account(splash, self.context)
+                self.press_no_account(splash)
+            report.assert_called_with('loopcut_account', 'skip', False, 'sign_in_slow')
             self.assertEqual(self.onboarding._state['step'], 'connect')
             self.assertTrue(self.account._cancel.is_set())
+            self.account._cancel.clear()
+
+    def press_no_account(self, splash):
+        record = next(r for r in splash.operators() if r[1] == 'loopcut.onboarding_no_account')
+        self.assertEqual(record[2], 'Continue without an account')
+        self.assertEqual(self.onboarding.LOOPCUT_OT_onboarding_no_account().execute(self.context), {'FINISHED'})
 
     def test_eleven_entries_reach_the_vote_view_from_the_strip_and_back(self):
         from coming_soon_fixture import manifest
@@ -303,20 +379,29 @@ class OnboardingTest(unittest.TestCase):
             self.assertTrue(self.account.keeps_context(self.account.BASE_URL, 'fast'))
             self.assertFalse(self.account.keeps_context('https://byok.example/v1', 'fast'))
 
-    def test_model_step_recommends_chatgpt_and_keeps_own_key(self):
+    def test_model_step_offers_three_routes_and_requires_one(self):
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(self.onboarding.config, "billing_open", return_value=True):
+            splash = Splash()
+            self.assertTrue(self.onboarding.draw_splash(splash, self.context, first_run=False))
+        names = [r[1] for r in splash.operators()]
+        texts = [r[2] for r in splash.operators()]
+        labels = " ".join(r[1] for r in splash.records if r[0] == "label")
+        self.assertIn("● ● ● ○ ○", labels)
+        self.assertIn("Recommended", labels)
+        self.assertIn("Uses your ChatGPT Plus or Pro plan. Cloud tools still use credits.", labels)  # Never paid.
+        self.assertEqual(texts[:3], ["Sign in with ChatGPT", "Use Loopcut", "Add a key"])
+        self.assertIn("loopcut.onboarding_own_key", names)
+        self.assertNotIn("Skip for now", texts)
+        self.assertNotIn("loopcut.sign_in", names)
+        # Signed out (only after "Continue without an account"): a way back to the account, and a way on.
         splash = Splash()
         self.onboarding._draw_sign_in(splash, self.context)
-        names = [r[1] for r in splash.operators()]
-        self.assertNotIn("loopcut.sign_in", names)
-        labels = [r[1] for r in splash.records if r[0] == "label"]
-        self.assertTrue(any(label.startswith("Recommended · Plus or Pro") for label in labels), labels)
-        self.assertIn("Step 2 of 2. Your ChatGPT Plus or Pro plan", labels)
-        # Signed out: the way to Loopcut's free model goes back to the account step, never past it.
-        back = next(r for r in splash.operators() if r[2] == "No ChatGPT plan? Create a free Loopcut account")
+        texts = [r[2] for r in splash.operators()]
+        self.assertNotIn("Use Loopcut", texts)
+        back = next(r for r in splash.operators() if r[2] == "Sign in")
         self.assertEqual(back[3].step, "account")
-        self.assertIn("loopcut.chatgpt_sign_in", names)
-        self.assertIn("loopcut.onboarding_own_key", names)
-        self.assertNotIn("Use Loopcut's models", [r[2] for r in splash.operators()])
+        self.assertIn("Skip for now", texts)
 
     def test_chatgpt_waiting_keeps_refreshing_the_splash(self):
         region = Mock()
@@ -340,13 +425,14 @@ class OnboardingTest(unittest.TestCase):
                 self.account.on_signed_in.clear()
         store.assert_called_once_with(self.account.BASE_URL, "fixture-only")
         self.assertEqual(self.prefs.provider, "LOOPCUT")
-        self.assertEqual(self.onboarding._state["step"], "connect")
+        self.assertEqual(self.onboarding._state["step"], "account")  # Stays for the credits and Continue.
         self.fake.ops.wm.save_userpref.assert_called_once()
 
     def test_chatgpt_sign_in_selects_provider_saves_and_advances(self):
         self.chatgpt_ui._finished({"signed_in": True, "plan_usage": True}, "")
         self.assertEqual(self.prefs.provider, "CHATGPT")
         self.assertEqual(self.onboarding._state["step"], "privacy")
+        self.assertEqual(json.loads(self.progress.read_text())["step"], "privacy")
         self.fake.ops.wm.save_userpref.assert_called_once()
 
     # "For the LLM we always prefer their account, unless they select the Loopcut models" (owner, 2026-10-16).
@@ -375,7 +461,7 @@ class OnboardingTest(unittest.TestCase):
         with self.chatgpt_plan(), patch.object(self.account, "signed_in", return_value=True):
             splash = Splash()
             self.onboarding._draw_sign_in(splash, self.context)
-            self.press_step(splash, "Use Loopcut's models")
+            self.press_step(splash, "Use Loopcut")
             self.assertEqual(self.prefs.provider, "LOOPCUT")
             # Nothing automatic moves it back: a later Loopcut sign-in, the account refresh, ChatGPT's idle finish.
             with patch.object(self.account.credentials, "store"):
@@ -462,7 +548,7 @@ class OnboardingTest(unittest.TestCase):
         with patch.object(self.account, "signed_in", return_value=True):
             splash = Splash()
             self.onboarding._draw_sign_in(splash, self.context)
-        another = next(r for r in splash.operators() if r[2] == "Use another ChatGPT account")
+        another = next(r for r in splash.operators() if r[2] == "Use another account")
         self.assertTrue(another[3].new_account)
         self.assertIn("loopcut.onboarding_own_key", [r[1] for r in splash.operators()])
 
@@ -480,8 +566,43 @@ class OnboardingTest(unittest.TestCase):
         splash = Splash()
         self.onboarding._draw_privacy(splash)
         labels = " ".join(r[1] for r in splash.records if r[0] == "label")
-        self.assertIn("go to Anthropic (Claude)", labels)
-        self.assertIn("Private (A)", labels)
+        self.assertIn("Anthropic (Claude)", labels)  # Where chats go, by name.
+
+    def test_privacy_screen_says_what_is_logged_and_shows_the_switch(self):
+        """Proposal 015: the conversation is logged for every route, so the old "never sees the conversation" and
+        "never the content" lines are gone, and the switch sits beside the usage-stats one."""
+        for provider, signed_in in (("LOOPCUT", True), ("CHATGPT", True), ("CHATGPT", False), ("OPENAI", False),
+                                    ("OLLAMA", False)):
+            with self.subTest(provider=provider, signed_in=signed_in), \
+                    patch.object(self.account, "signed_in", return_value=signed_in):
+                self.prefs.provider = provider
+                splash = Splash()
+                self.onboarding._draw_privacy(splash)
+                labels = " ".join(r[1] for r in splash.records if r[0] == "label")
+                self.assertIn("What leaves your computer", labels)
+                self.assertIn("A picture, a mesh or a prompt.", labels)
+                self.assertIn("Loopcut never uploads your .blend.", labels)
+                self.assertNotIn("Never your .blend.", labels)  # Said once, in its own row.
+                self.assertNotIn("never sees the conversation", labels)
+                self.assertNotIn("never the content", labels)
+                self.assertNotIn("Nothing leaves this computer", labels)
+                props = [r[1] for r in splash.records if r[0] == "prop"]
+                self.assertEqual(props[-3:], ["auto_run", "share_conversations", "share_usage_stats"])
+                self.assertTrue(all(len(r[1]) <= 60 for r in splash.records if r[0] == "label"))  # No paragraphs.
+        for provider, line in (("LOOPCUT", "Loopcut models"), ("CHATGPT", "ChatGPT, on your plan"),
+                               ("OPENAI", "OpenAI, with your key")):
+            self.assertEqual(self.onboarding._route_line(provider), line)
+        for share in (True, False):  # What the chat logs are is said under their switch, on or off.
+            self.prefs.share_conversations = share
+            splash = Splash()
+            self.onboarding._draw_privacy(splash)
+            records = [r[:2] for r in splash.records]
+            switch = records.index(("prop", "share_conversations"))
+            self.assertIn(("label", "Text only, kept 90 days. Never used for training."), records[switch:switch + 4])
+            label = splash.operators()[[r[1] for r in splash.operators()].index("wm.context_toggle") + 1]
+            self.assertEqual((label[2], label[3].data_path), ("Share conversations",  # The label toggles it.
+                             f'preferences.addons["{NAME}"].preferences.share_conversations'))
+            self.assertFalse([r for r in records if "Chat logs" in str(r[1])])
 
     def test_own_key_switches_from_either_sign_in_route_and_can_continue(self):
         for provider in ("LOOPCUT", "CHATGPT"):
@@ -509,7 +630,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertFalse(continuation[4].enabled)
         labels = " ".join(r[1] for r in splash.records if r[0] == "label")
         self.assertIn("Missing model", labels)
-        self.assertIn("Correct the connection fields", labels)
+        self.assertIn("Fix the fields above to continue.", labels)
 
     def test_invalid_model_url_does_not_send_a_key_and_explains_recovery(self):
         self.prefs.provider = "CUSTOM"
@@ -688,11 +809,563 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(self.prefs.provider, "CHATGPT")
         resume.assert_called_once_with()
 
-    def test_done_screen_names_the_missing_half(self):
-        self.assertIn("Loopcut account", self.onboarding.done_nudge(True, False, True))
-        self.assertIn("Sign in with ChatGPT", self.onboarding.done_nudge(False, True, True))
-        self.assertIn("ChatGPT runs the conversation", self.onboarding.done_nudge(True, True, True))
-        self.assertEqual(self.onboarding.done_nudge(False, False, False), "")
+    # --- 0.2.6: a required, modal and resumable setup ---------------------------------------------------------
+
+    def draw_step(self, first_run=False, wm=None):
+        splash = Splash()
+        context = types.SimpleNamespace(region_popup=None, window_manager=wm or types.SimpleNamespace(splash_modal=False))
+        drawn = self.onboarding.draw_splash(splash, context, first_run=first_run)
+        return splash, drawn, context.window_manager
+
+    def fresh_session(self):
+        self.onboarding._state.update(step=None, finished=False)
+
+    def test_quitting_half_way_resumes_at_the_saved_step_with_preferences(self):
+        self.onboarding.save_progress("privacy")
+        self.fresh_session()
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(self.onboarding, "_connected", return_value=True):
+            splash, drawn, wm = self.draw_step()
+        self.assertTrue(drawn)
+        self.assertEqual(self.onboarding._state["step"], "privacy")
+        self.assertIn(("label", "● ● ● ● ○"), splash.records)
+        self.assertTrue(wm.splash_modal)
+
+    def test_resuming_goes_back_to_a_step_whose_requirement_is_gone(self):
+        for saved, signed_in, connected, expected in (("done", True, False, "connect"), ("privacy", False, True, "account"),
+                                                      ("connect", False, False, "account"), ("done", True, True, "done")):
+            with self.subTest(saved=saved, signed_in=signed_in, connected=connected):
+                self.onboarding.save_progress(saved)
+                self.fresh_session()
+                with patch.object(self.account, "signed_in", return_value=signed_in), \
+                        patch.object(self.onboarding, "_connected", return_value=connected):
+                    self.draw_step()
+                self.assertEqual(self.onboarding._state["step"], expected)
+                self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": expected, "done": False})
+
+    def test_installs_from_before_the_setup_with_a_model_or_account_are_marked_done_silently(self):
+        for signed_in, connected in ((True, False), (False, True)):
+            with self.subTest(signed_in=signed_in, connected=connected):
+                self.progress.unlink(missing_ok=True)
+                self.fresh_session()
+                with patch.object(self.account, "signed_in", return_value=signed_in), \
+                        patch.object(self.onboarding, "_connected", return_value=connected), \
+                        patch.object(self.onboarding, "_report") as report:
+                    splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+                self.assertFalse(drawn)  # The normal splash, closing on an outside click as ever.
+                self.assertFalse(wm.splash_modal)
+                self.assertEqual(json.loads(self.progress.read_text())["done"], True)
+                report.assert_not_called()
+                self.assertTrue(self.onboarding._state["finished"])
+
+    def test_an_unconnected_install_from_before_gets_the_setup_and_a_done_one_never_again(self):
+        self.progress.unlink(missing_ok=True)
+        self.fresh_session()
+        with patch.object(self.onboarding, "_connected", return_value=False):
+            splash, drawn, wm = self.draw_step()
+        self.assertTrue(drawn)
+        self.assertEqual(self.onboarding._state["step"], "account")
+        self.assertTrue(wm.splash_modal)
+        self.onboarding.save_progress("done", done=True)
+        self.fresh_session()
+        with patch.object(self.onboarding, "_connected", return_value=False):
+            splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+        self.assertFalse(drawn)
+        self.assertFalse(wm.splash_modal)
+
+    def test_factory_startup_runs_are_never_held_by_the_setup(self):
+        self.onboarding._state["step"] = "account"
+        with patch.object(self.fake.app, "factory_startup", True, create=True), \
+                patch.object(self.fake.app, "background", False, create=True):
+            splash, drawn, wm = self.draw_step()
+            self.assertIsNone(self.onboarding.start())
+        self.assertTrue(drawn)  # Drawn, as the harness screenshots it, but not modal.
+        self.assertFalse(wm.splash_modal)
+        self.fake.app.timers.register.assert_not_called()
+
+    def test_the_watchdog_reopens_a_closed_splash_until_the_setup_ends(self):
+        self.onboarding._state.update(step="account", region=Mock())
+        with patch.object(self.onboarding, "_region_exists", return_value=False), \
+                patch.object(self.onboarding, "_open_splash") as reopen:
+            self.assertEqual(self.onboarding._watch(), self.onboarding._WATCH_SECONDS)
+            reopen.assert_called_once_with()
+        with patch.object(self.onboarding, "_region_exists", return_value=True), \
+                patch.object(self.onboarding, "_open_splash") as reopen:
+            self.onboarding._watch()
+            reopen.assert_not_called()
+        self.onboarding._state.update(step=None, finished=True)
+        self.assertIsNone(self.onboarding._watch())
+
+    def grant(self, hours_ago=1.0, amount=100, balance=100):
+        granted = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours_ago * 3600))
+        return {"balance": balance, "trial": {"amount": amount, "granted_at": granted}}
+
+    def signed_in_account_step(self, credits, billing=True):
+        self.onboarding._state["step"] = "account"
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(self.account, "account_line", return_value="person@example.test"), \
+                patch.object(self.onboarding, "_credits", return_value=credits), \
+                patch.object(self.onboarding.config, "billing_open", return_value=billing):
+            splash, _, _ = self.draw_step()
+        return splash, [r[1] for r in splash.records if r[0] == "label"], [r[2] for r in splash.operators()]
+
+    def test_a_new_accounts_trial_is_claimed_with_a_button_and_shown_in_dollars(self):
+        splash, labels, texts = self.signed_in_account_step(self.grant())
+        self.assertEqual(texts[0], "Claim credits")
+        self.assertIn("100 free credits", labels)
+        self.assertIn("$1.00 for cloud tools", labels)
+        self.assertIn("Skip", texts)  # Cosmetic: never a gate.
+        with patch.object(self.onboarding, "_credits", return_value=self.grant()), \
+                patch.object(self.onboarding.nudges if hasattr(self.onboarding, "nudges") else
+                             importlib.import_module(NAME + ".nudges"), "mark_shown") as seen, \
+                patch.object(self.onboarding, "_report") as report:
+            self.assertEqual(self.onboarding.LOOPCUT_OT_onboarding_claim().execute(self.context), {"FINISHED"})
+        seen.assert_called_once()
+        self.assertEqual(seen.call_args.args[0], "trial")  # The panel's trial card would only repeat it.
+        report.assert_called_once_with("loopcut_account", "loopcut", code="claim")
+        splash, labels, texts = self.signed_in_account_step(self.grant())
+        self.assertIn("100 credits added", labels)  # The claim box's shape: Continue lands where Claim was.
+        self.assertIn("$1.00 for cloud tools", labels)
+        self.assertNotIn("Claim credits", texts)
+        self.assertIn("See plans ↗", texts)  # In the slot Skip had: the screen keeps its height.
+        self.press_step(splash, "Continue")
+        self.assertEqual(self.onboarding._state["step"], "how")
+
+    def test_no_claim_without_a_fresh_unspent_grant_and_the_copy_stays_honest(self):
+        for credits, billing, expected in (
+                ({"balance": 0}, True, "No free credits on this account right now"),  # Deferred or refused.
+                (self.grant(hours_ago=24 * 30, balance=40), True, "You have 40 credits ($0.40)"),
+                (self.grant(balance=60), True, "You have 60 credits ($0.60)"),  # Already spent.
+                (self.grant(), False, "Asset search and Loopcut Fast are free")):  # No sales: no credits.
+            with self.subTest(credits=credits, billing=billing):
+                splash, labels, texts = self.signed_in_account_step(credits, billing)
+                self.assertFalse([t for t in texts if t.startswith("Claim")])
+                self.assertIn(expected, " ".join(labels))
+                self.assertIn("Continue", texts)
+
+    def test_with_the_forks_layout_teal_is_only_for_web_links_and_filled_buttons_have_no_icon(self):
+        """The design bar: quiet actions (Back, Skip, Cancel, Start fresh) are muted text links, teal marks only a
+        link that opens the browser (↗), no filled button carries an icon, and every box has the same padding."""
+        on = self.onboarding
+        live = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+                {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
+        screens = (
+            ("account", False, lambda: None, on._draw_account),
+            ("waiting", False, lambda: self.account._state.update(status="waiting", user_code="TQ7-4KD"),
+             on._draw_account),
+            ("failed", False, lambda: self.account._state.update(status="error", user_code=""), on._draw_account),
+            ("claim", True, lambda: self.account._state.update(status="idle"), on._draw_account),
+            ("claimed", True, lambda: on._state.update(claimed=True), on._draw_account),
+            ("model", True, lambda: None, on._draw_sign_in),
+            ("model waiting", True, lambda: self.chatgpt_ui._state.update(status="waiting"), on._draw_sign_in),
+            ("model error", True, lambda: self.chatgpt_ui._state.update(status="error", error="No Plus or Pro plan"),
+             on._draw_sign_in),
+            ("privacy", True, lambda: None, lambda layout, context: on._draw_privacy(layout)),
+            ("how", True, lambda: None, on._draw_how),
+            ("try", True, lambda: None, on._draw_try))
+        for name, signed_in, arrange, draw in screens:
+            with self.subTest(screen=name), \
+                    patch.object(self.account, "signed_in", return_value=signed_in), \
+                    patch.object(self.account, "account_line", return_value="person@example.test"), \
+                    patch.object(on, "_credits", return_value=self.grant()), \
+                    patch.object(on, "_descriptors", return_value=live), \
+                    patch.object(on, "_connected", return_value=True), \
+                    patch.object(on.config, "billing_open", return_value=True):
+                arrange()
+                splash = StyledSplash()
+                draw(splash, self.context)
+                for record in splash.operators():
+                    options = record[5]
+                    if "color" in options:
+                        expected = (on.TEAL if record[2].endswith("↗") else
+                                    on.FOREGROUND if record[1] == "wm.context_toggle" else on.MUTED)  # A label.
+                        self.assertEqual(options["color"], expected, record[2])
+                        # Only actions look like links when hovered; a checkbox's label does not.
+                        self.assertEqual(options["hover"], record[1] != "wm.context_toggle", record[2])
+                    else:
+                        self.assertFalse(record[2].endswith("↗"), record[2])
+                    if options.get("depress"):
+                        self.assertFalse({"icon", "icon_value"} & set(options), record[2])
+                self.assertTrue([r for r in splash.records if r[0] == "box"])
+                self.assertEqual({r[1] for r in splash.records if r[0] == "box"} - {on.CARD_PADDING},
+                                 {on.BOX_PADDING})
+
+    def test_the_panel_names_loopcut_models_as_the_site_does_even_for_a_legacy_tier(self):
+        """A preference saved by 0.2.4 can hold the "mimo" tier, which the gateway maps to Pro: the model button
+        said "mimo". It says "Loopcut Pro" now, and a known tier "Loopcut Fast"."""
+        with patch.object(self.settings, "preferences", return_value=types.SimpleNamespace(provider="LOOPCUT")), \
+                patch.object(self.account, "_state", {**self.account._state, "models": []}):
+            self.assertEqual(self.settings.model_label("mimo"), "Loopcut Pro")
+            self.assertEqual(self.settings.model_label("fast"), "Loopcut Fast")
+            self.assertEqual(self.account.model_label("mimo"), "Pro")
+
+    def test_messages_in_the_setup_read_as_sentences(self):
+        sentence = self.onboarding._sentence
+        self.assertEqual(sentence("This ChatGPT account has no Plus or Pro plan"),
+                         "This ChatGPT account has no Plus or Pro plan.")
+        self.assertEqual(sentence("Try again later."), "Try again later.")
+        self.assertEqual(sentence("x " * 60), "x " * 34 + "x…")  # Shortened, not given a full stop.
+
+    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+            {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
+
+    def draw_how(self, plan="", billing=True, descriptors=None):
+        on = self.onboarding
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(on, "_account_plan", return_value=plan), \
+                patch.object(on, "_descriptors", return_value=self.LIVE if descriptors is None else descriptors), \
+                patch.object(on.config, "billing_open", return_value=billing):
+            splash = Splash()
+            on._draw_how(splash, self.context)
+        labels = " | ".join(r[1] for r in splash.records if r[0] == "label")
+        return splash, labels, [r[2] for r in splash.operators()]
+
+    def test_how_loopcut_works_sits_between_the_account_and_the_model_and_resumes(self):
+        on = self.onboarding
+        self.assertEqual(on.NUMBERED, ("account", "how", "connect", "privacy", "done"))
+        on._state["step"] = "how"
+        splash, labels, texts = self.draw_how()
+        self.assertIn("● ● ○ ○ ○", labels)  # Step 2 of 5.
+        self.assertEqual(texts, ["Continue", "← Back", "See plans ↗"])
+        self.press_step(splash, "Continue")
+        self.assertEqual(on._state["step"], "connect")
+        with patch.object(on, "_report") as report:  # What Continue reports when usage stats are on.
+            on._report_move_now("how", "connect", "CURRENT")
+        report.assert_called_once_with("chatgpt", None, code="how_continue")
+        with patch.object(self.account, "signed_in", return_value=True):  # The model step's Back returns here.
+            model = Splash()
+            on._draw_sign_in(model, self.context)
+            self.press_step(model, "← Back")
+        self.assertEqual(on._state["step"], "how")
+        self.press_step(splash, "← Back")
+        self.assertEqual(on._state["step"], "account")
+        model = Splash()  # Without an account the setup never showed it: Back goes to the account.
+        on._state["step"] = "connect"
+        on._draw_sign_in(model, self.context)
+        self.press_step(model, "← Back")
+        self.assertEqual(on._state["step"], "account")
+        on.save_progress("how")
+        self.assertEqual(on.load_progress()["step"], "how")
+        with patch.object(self.account, "signed_in", return_value=True):
+            self.assertEqual(on._resume_step("how"), "how")
+        self.assertEqual(on._resume_step("how"), "account")  # Signed out since: the account first.
+
+    def test_how_loopcut_works_splits_the_parts_and_compares_free_and_pro(self):
+        on = self.onboarding
+        with patch.object(on, "_report") as report:
+            splash, labels, texts = self.draw_how()
+            self.draw_how()
+        report.assert_called_once_with("chatgpt", None, code="how_shown")  # Once a session.
+        for text in ("How Loopcut works", "Your ChatGPT plan", "The thinking", "Plan", "Build", "Check", "Fix",
+                     "Runs on your paid ChatGPT plan", "Never uses Loopcut credits", "Your Loopcut account",
+                     "The cloud tools", "3D model", "Motion", "Voice", "Sound", "Render", "Asset search is free",
+                     "Others use credits, price shown first", "No ChatGPT plan? Everything still works.",
+                     "Loopcut Fast does the thinking instead, or add your own API key.", "Free", "No card needed",
+                     "Pro", "$20/mo", "Weekly limit", "Higher weekly limit", "Loopcut Pro model", "Credit top-ups",
+                     "100 credits: 1 model from a photo, or 20 s of motion",
+                     "2,200 credits: 27 models from photos, or 7 min of motion"):
+            self.assertIn(text, labels)
+        for text in ("Two parts work together", "Works with your ChatGPT plan", "Asset search |", "Plus or Pro",
+                     "Credits every month", "Max"):  # No subtitle; only what differs; Max only for Max.
+            self.assertNotIn(text, labels)
+        self.assertNotIn("Your plan", labels)
+        self.assertEqual([r[1] for r in splash.records if r[0] == "progress"], [on.BAR_LEAST, 1.0])
+        self.assertNotIn("connect", [getattr(r[3], "step", "") for r in splash.operators()][1:])  # Explains only.
+
+    def test_how_loopcut_works_without_sales_or_for_a_paid_plan(self):
+        splash, labels, texts = self.draw_how(billing=False)
+        for text in ("The thinking", "The cloud tools", "More coming", "Runs on your paid ChatGPT plan",
+                     "Writes and runs each Blender step",
+                     "Loopcut models do the thinking instead, or add your own API key."):
+            self.assertIn(text, labels)
+        for text in ("Free", "Pro ·", "Loopcut Pro", "$", "credits", "Your plan"):  # No plans, prices, credits.
+            self.assertNotIn(text, labels)
+        self.assertEqual(texts, ["Continue", "← Back"])
+        self.assertFalse([r for r in splash.records if r[0] == "progress"])
+        for plan in ("pro", "max", "free"):
+            splash, labels, texts = self.draw_how(plan)
+            self.assertEqual(labels.count("Your plan"), 1)
+            self.assertEqual("See plans ↗" in texts, plan == "free")  # No upsell to a paid plan.
+
+    def test_a_max_account_compares_free_with_max_not_pro(self):
+        splash, labels, texts = self.draw_how("max")
+        head = labels.split(" | ")
+        self.assertEqual(head[head.index("No card needed") + 1:head.index("No card needed") + 3], ["Max", "Your plan"])
+        for text in ("Highest weekly limit", "6,600 credits: 82 models from photos, or 22 min of motion",
+                     "100 credits: 1 model from a photo, or 20 s of motion"):
+            self.assertIn(text, labels)
+        for text in ("Higher weekly limit", "$20/mo", "2,200 credits", "You have Max"):
+            self.assertNotIn(text, labels)
+        self.assertEqual([r[1] for r in splash.records if r[0] == "progress"], [self.onboarding.BAR_LEAST, 1.0])
+        self.assertEqual(self.onboarding.PLANS["max"], {"credits": 6600, "price": 60})
+
+    def test_the_pro_upsell_claims_only_what_pro_adds(self):
+        """Cloud renders (Cycles and EEVEE) run on any plan's credits: the Pro line must not sell them."""
+        on = self.onboarding
+        self.assertEqual(on.PRO_LINE, "Pro plan: 2,200 credits a month, Loopcut Pro and top-ups")
+        self.assertNotIn("render", on.PRO_LINE.lower())
+        self.assertIn(f"{on.PLANS['pro']['credits']:,} credits", on.PRO_LINE)
+
+    def test_the_plans_and_what_their_credits_make(self):
+        on = self.onboarding
+        self.assertEqual(on.PLANS, {"free": {"credits": 100, "price": 0}, "pro": {"credits": 2200, "price": 20},
+                                    "max": {"credits": 6600, "price": 60}})  # The plans tables, 2026-10-21.
+        self.assertEqual(on._makes(6600, 80, 5.0), "82 models from photos, or 22 min of motion")
+        self.assertEqual(on._unit_prices(self.LIVE), (80, 5.0))
+        self.assertEqual(on._unit_prices([{"name": "image_to_3d", "backend": "byok"}]), (None, None))
+        self.assertEqual(on._makes(100, 80, 5.0), "1 model from a photo, or 20 s of motion")
+        self.assertEqual(on._makes(2200, 80, 5.0), "27 models from photos, or 7 min of motion")
+        self.assertEqual(on._makes(2200, None, 5.0), "7 min of motion")  # A missing price drops its part.
+        self.assertEqual(on._makes(50, 80, None), "")
+        splash, labels, texts = self.draw_how(descriptors=[])
+        self.assertIn("| 2,200 credits |", f"| {labels} |")  # No prices at all: the credits themselves.
+
+    def test_credits_still_loading_say_so_keep_repainting_and_never_block(self):
+        self.onboarding._state["credits_asked"] = time.monotonic()
+        with patch.object(self.onboarding, "_watch_popup") as watch:
+            splash, labels, texts = self.signed_in_account_step(None)
+        watch.assert_called()
+        self.assertIn("Checking your free credits…", labels)
+        self.assertEqual(texts, ["Continue", "See plans ↗"])
+        with patch.object(self.account, "signed_in", return_value=True), \
+                patch.object(self.onboarding, "_credits", return_value=None):
+            self.assertTrue(self.onboarding._credits_pending())
+            self.onboarding._state["credits_asked"] -= self.onboarding.CREDITS_PATIENCE + 1
+            self.assertFalse(self.onboarding._credits_pending())
+
+    def try_screen(self, descriptors, signed_in=True, billing=True, connected=True):
+        self.onboarding._state["step"] = "done"
+        with patch.object(self.account, "signed_in", return_value=signed_in), \
+                patch.object(self.onboarding, "_connected", return_value=connected), \
+                patch.object(self.onboarding, "_descriptors", return_value=descriptors), \
+                patch.object(self.onboarding, "_credits", return_value={"balance": 100}), \
+                patch.object(self.onboarding, "_thumbnail", return_value=7), \
+                patch.object(self.onboarding.settings, "route_label", return_value="your ChatGPT plan"), \
+                patch.object(self.onboarding.config, "billing_open", return_value=billing):
+            splash, drawn, _ = self.draw_step()
+        self.assertTrue(drawn)
+        return splash, " ".join(r[1] for r in splash.records if r[0] == "label")
+
+    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+            {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
+
+    def test_first_project_cards_show_credits_and_dollars_and_both_paid_ones_fit_the_trial(self):
+        splash, labels = self.try_screen(self.LIVE)
+        parts = [r for r in splash.operators() if r[1] == "loopcut.onboarding_try"]
+        texts = [r[2] for r in parts]
+        # Each card: a picture, its title, line and price, and its Start; then Skip.
+        self.assertEqual([r[3].card for r in parts], ["motion", "photo_3d", "model", ""])
+        self.assertEqual(texts, ["Start", "Start", "Start", "Skip for now"])
+        for title in ("Make it move", "Photo to 3D model", "Model a treasure chest"):
+            self.assertIn(title, labels)
+        for price in ("15 credits · $0.15", "80 credits · $0.80", "Free"):  # 3 of 5 s of motion.
+            self.assertIn(price, labels)
+        self.assertTrue(all(r[4].enabled for r in parts))
+        self.assertEqual(splash.records.count(("icon", 7)), 3)  # Every card has its picture, the same size.
+        self.assertIn("● ● ● ●", labels)
+        self.assertIn("You have 100 credits ($1.00)", labels)
+        costs = [self.onboarding.card_cost(card, self.LIVE)[1] for card in self.onboarding.CARDS]
+        self.assertLessEqual(sum(costs), 100)
+        self.assertIn(self.onboarding.PRO_LINE, labels)
+        self.assertIn("wm.url_open", [r[1] for r in splash.operators()])
+        self.assertEqual(texts[-1], "Skip for now")
+        for paragraph in ("Cmd+L", "jumps to the chat", "ChatGPT runs the conversation"):
+            self.assertNotIn(paragraph, labels)
+
+    def test_cards_follow_what_the_account_can_run_and_the_pro_strip_follows_sales(self):
+        splash, labels = self.try_screen(self.LIVE[1:], billing=False)
+        self.assertNotIn("Make it move", labels)  # Not offered to this account: no card.
+        self.assertNotIn(self.onboarding.PRO_LINE, labels)
+        self.assertNotIn("wm.url_open", [r[1] for r in splash.operators()])
+        splash, labels = self.try_screen([], signed_in=False)  # After "Continue without an account".
+        cards = {r[3].card: r for r in splash.operators() if r[1] == "loopcut.onboarding_try"}
+        self.assertFalse(cards["motion"][4].enabled)
+        self.assertIn("Needs a Loopcut account", labels)
+        self.assertTrue(cards["model"][4].enabled)
+        own_key = [{**self.LIVE[1], "backend": "byok"}]
+        self.assertEqual(self.onboarding.card_cost(self.onboarding.CARDS[1], own_key), (True, None))
+
+    def finish_with(self, card_id, signed_in=True, connected=True):
+        self.onboarding._state["step"] = "done"
+        op = self.onboarding.LOOPCUT_OT_onboarding_try()
+        op.card = card_id
+        with patch.object(self.account, "signed_in", return_value=signed_in), \
+                patch.object(self.onboarding, "_connected", return_value=connected), \
+                patch.object(self.onboarding, "_report") as report:
+            self.assertEqual(op.execute(self.context), {"FINISHED"})
+        return report, self.fake.app.timers.register.call_args.args[0]
+
+    def test_a_card_ends_the_setup_closes_the_splash_and_sends_its_request_with_the_photo(self):
+        report, later = self.finish_with("photo_3d")
+        report.assert_called_once_with("done", "loopcut", True, "card_photo_3d")
+        self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": "done", "done": True})
+        self.assertIsNone(self.onboarding._state["step"])
+        window = object()
+        wm = types.SimpleNamespace(splash_modal=True, windows=[window])
+        with patch.object(self.fake, "context", types.SimpleNamespace(
+                    window_manager=wm, temp_override=Mock(return_value=contextlib.nullcontext())), create=True), \
+                patch.object(self.host, "start_request") as start:
+            later()
+        self.assertFalse(wm.splash_modal)
+        self.fake.ops.wm.splash_close.assert_called_once_with()
+        start.assert_called_once()
+        self.assertIs(start.call_args.args[0], window)
+        self.assertIn("attached photo", start.call_args.args[1])
+        self.assertEqual(start.call_args.args[2], (str(self.onboarding.SAMPLE_PHOTO),))
+        self.assertTrue(self.onboarding.SAMPLE_PHOTO.is_file())
+
+    def test_finishing_without_an_account_brings_the_setup_back_next_start(self):
+        report, _ = self.finish_with("", signed_in=False)
+        report.assert_called_once_with("done", "loopcut", True, "no_card")
+        self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": "account", "done": False})
+        self.fresh_session()
+        with patch.object(self.onboarding, "_connected", return_value=True):
+            splash, drawn, _ = self.draw_step()
+        self.assertTrue(drawn)
+        self.assertEqual(self.onboarding._state["step"], "account")
+
+    def test_each_screen_reports_being_shown_once(self):
+        self.onboarding._state["step"] = "account"
+        with patch.object(self.onboarding, "_report") as report:
+            self.draw_step()
+            self.draw_step()
+        report.assert_called_once_with("loopcut_account", None, code="shown")
+
+    # --- P0: the setup never traps, whatever is missing or failing --------------------------------------------
+
+    def test_unregister_and_register_survive_a_preferences_reload(self):
+        """An import rereads preferences, which disables and re-enables every add-on: a failing unregister()
+        left Loopcut half registered, its next register() refused, and the account step without its button."""
+        utils = self.fake.utils
+        with patch.object(utils, "register_class", Mock(), create=True), \
+                patch.object(utils, "unregister_class", Mock(), create=True) as unregister_class, \
+                patch.object(utils.previews, "remove", Mock(), create=True) as remove:
+            self.onboarding._preview["collection"] = object()
+            self.onboarding.unregister()
+            self.assertFalse(self.onboarding._registered)
+            remove.assert_called_once()
+            self.assertEqual(unregister_class.call_count, len(self.onboarding._CLASSES))
+            self.onboarding.register()
+            self.assertTrue(self.onboarding._registered)
+            # Even a failing cleanup unregisters every class, so the next register() is not refused.
+            unregister_class.reset_mock()
+            with patch.object(self.onboarding, "_popups", Mock(clear=Mock(side_effect=RuntimeError("cleanup")))):
+                with self.assertRaises(RuntimeError):
+                    self.onboarding.unregister()
+            self.assertEqual(unregister_class.call_count, len(self.onboarding._CLASSES))
+        self.account.on_signed_in.clear()
+
+    def test_no_function_makes_bpy_local_with_a_dotted_import(self):
+        """`import bpy.utils.previews` inside a function binds `bpy` locally for the whole function: the earlier
+        `bpy.app...` in it raised UnboundLocalError. That broke unregister() and trapped the setup."""
+        import ast
+        for path in sorted(PACKAGE.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for function in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Import):
+                        dotted = [a.name for a in node.names if a.name.startswith("bpy.") and a.asname is None]
+                        self.assertFalse(dotted, f"{path.name}:{node.lineno} {function.name}: use `from bpy... import`")
+
+    def test_any_error_while_drawing_a_step_leaves_a_way_out_and_drops_the_modal(self):
+        self.onboarding._go("account")
+        with patch.object(self.onboarding, "_draw_account", side_effect=KeyError("boom")), \
+                redirect_stderr(io.StringIO()) as log:
+            splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+        self.assertTrue(drawn)
+        self.assertFalse(wm.splash_modal)
+        self.assertIn("KeyError", log.getvalue())
+        self.assertIn(("operator", "wm.splash_close"), [r[:2] for r in splash.operators()])
+        self.assertTrue(any("Something went wrong" in r[1] for r in splash.records if r[0] == "label"))
+        self.assertIsNone(self.onboarding._state["step"])  # This session only; the saved step stays.
+        self.assertEqual(json.loads(self.progress.read_text())["step"], "account")
+
+    def test_a_step_whose_operators_are_missing_is_never_modal_and_rebuilds_when_they_return(self):
+        self.onboarding._state["step"] = "account"
+        self.fake.app.timers.is_registered.return_value = False
+        self.addCleanup(setattr, self.fake.app.timers, "is_registered", Mock())
+        with patch.object(self.onboarding, "missing_operators", return_value=["sign_in"]):
+            splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+            self.assertTrue(drawn)
+            self.assertFalse(wm.splash_modal)
+            labels = [r[1] for r in splash.records if r[0] == "label"]
+            self.assertEqual(labels, ["Loopcut is starting…"])
+            self.assertEqual([r[1] for r in splash.operators()], ["wm.splash_close"])
+            self.fake.app.timers.register.assert_called_with(self.onboarding._rebuild_when_ready,
+                                                             first_interval=self.onboarding._REFRESH_SECONDS,
+                                                             persistent=True)
+            self.onboarding._state["starting_since"] -= self.onboarding.STARTING_PATIENCE + 1
+            with redirect_stdout(io.StringIO()):
+                splash, _, wm = self.draw_step()
+            self.assertIn("Loopcut could not finish starting", " ".join(r[1] for r in splash.records))
+            self.assertFalse(wm.splash_modal)
+        splash, drawn, wm = self.draw_step()  # Registered again: the step and its modal come back.
+        self.assertIn("loopcut.sign_in", [r[1] for r in splash.operators()])
+        self.assertTrue(wm.splash_modal)
+
+    def test_the_watchdog_waits_out_a_reload_and_heals_an_open_splash(self):
+        region = Mock()
+        self.onboarding._state.update(step="account", region=region)
+        with patch.object(self.onboarding, "_open_splash") as reopen, \
+                patch.object(self.onboarding, "_region_exists", return_value=False):
+            with patch.object(self.onboarding, "missing_operators", return_value=["sign_in"]):
+                self.assertEqual(self.onboarding._watch(), self.onboarding._WATCH_SECONDS)
+            with patch.object(self.onboarding, "_registered", False):
+                self.onboarding._watch()
+            reopen.assert_not_called()  # Never a setup drawn half way through re-registering.
+        with patch.object(self.onboarding, "_region_exists", return_value=True):
+            self.onboarding._watch()
+        region.tag_refresh_ui.assert_called_once_with()  # A stale build heals on the next tick.
+        self.onboarding._state["own_key"] = True  # Not under a text field being typed in.
+        with patch.object(self.onboarding, "_region_exists", return_value=True):
+            self.onboarding._watch()
+        region.tag_refresh_ui.assert_called_once_with()
+
+    def test_the_watchdog_rebuilds_only_when_what_the_step_shows_changed(self):
+        """A rebuild under a resting pointer drops the hovered button's state, so the next press only re-arms it:
+        rebuilt on every tick, every button took two clicks (P0, 2026-10-20). Now an unchanged step is left alone."""
+        region = Mock()
+        self.onboarding._state.update(step="account", region=region)
+        self.onboarding._state["drawn"] = self.onboarding._signature()  # As draw_splash leaves it.
+        with patch.object(self.onboarding, "_region_exists", return_value=True):
+            for _ in range(5):
+                self.onboarding._watch()
+                self.onboarding._refresh_popups()
+            region.tag_refresh_ui.assert_not_called()
+            self.account._state.update(status="error", error="Offline")  # The sign-in thread finished.
+            self.onboarding._watch()
+            region.tag_refresh_ui.assert_called_once_with()
+        drawn = Splash()
+        context = types.SimpleNamespace(region_popup=region, window_manager=types.SimpleNamespace(splash_modal=False))
+        self.onboarding.draw_splash(drawn, context, first_run=False)
+        self.assertFalse(self.onboarding._changed())  # Drawing records what it showed.
+
+    def test_report_a_bug_stays_off_the_modal_setup_so_every_button_there_is_a_way_on(self):
+        support = importlib.import_module(NAME + ".support")
+        for modal, drawn in ((True, []), (False, ["loopcut.report_bug"])):
+            menu = types.SimpleNamespace(layout=Splash())
+            support._draw_info(menu, types.SimpleNamespace(window_manager=types.SimpleNamespace(splash_modal=modal)))
+            self.assertEqual([r[1] for r in menu.layout.operators()], drawn)
+
+    def test_after_an_import_the_setup_reopens_only_once_registered_again(self):
+        with patch.object(self.onboarding, "_open_splash") as reopen, \
+                patch.object(self.host, "has_panel", return_value=True), \
+                patch.object(self.onboarding, "_splash_open", return_value=False), \
+                patch.object(self.fake.context, "window_manager", types.SimpleNamespace(windows=[object()]),
+                             create=True):
+            with patch.object(self.onboarding, "_registered", False):
+                self.assertIsNone(self.onboarding._reopen())
+            reopen.assert_not_called()
+            retry = self.fake.app.timers.register.call_args
+            self.assertEqual(retry.kwargs["first_interval"], 0.25)
+            retry.args[0]()  # Registered by then.
+            reopen.assert_called_once_with()
+        context = types.SimpleNamespace(preferences=types.SimpleNamespace(addons={}))
+        addon_utils = types.ModuleType("addon_utils")
+        addon_utils.enable = Mock()
+        with patch.dict(sys.modules, {"addon_utils": addon_utils}):
+            self.onboarding._ensure_enabled(context)
+        addon_utils.enable.assert_called_once_with(self.onboarding.settings.PACKAGE, default_set=True)
 
     def test_preferences_show_the_other_connection_whichever_is_the_model(self):
         class Box(Splash):

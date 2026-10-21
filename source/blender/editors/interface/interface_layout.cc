@@ -273,6 +273,8 @@ struct LayoutItemGridFlow : public Layout {
 
 struct LayoutItemBx : public LayoutColumn {
   Button *roundbox = nullptr;
+  /** Loopcut: the inset of the content, the style's box space when negative. */
+  int padding = -1;
   LayoutItemBx() : LayoutColumn(ItemType::LayoutBox, nullptr) {}
 
   void estimate_impl() override;
@@ -4248,7 +4250,7 @@ void LayoutItemBx::estimate_impl()
 
   LayoutColumn::estimate_impl();
 
-  int boxspace = style->boxspace;
+  int boxspace = this->padding >= 0 ? this->padding : style->boxspace;
   if (this->root()->type == LayoutType::Header) {
     boxspace = 0;
   }
@@ -4260,7 +4262,7 @@ void LayoutItemBx::resolve_impl()
 {
   const uiStyle *style = this->root()->style;
 
-  int boxspace = style->boxspace;
+  int boxspace = this->padding >= 0 ? this->padding : style->boxspace;
   if (this->root()->type == LayoutType::Header) {
     boxspace = 0;
   }
@@ -5195,6 +5197,13 @@ Layout &Layout::menu_pie()
 Layout &Layout::box()
 {
   return *layout_box(this, ButtonType::Roundbox);
+}
+
+Layout &layout_box_padded(Layout &layout, const int padding)
+{
+  LayoutItemBx *box = layout_box(&layout, ButtonType::Roundbox);
+  box->padding = std::max(padding, 0);
+  return *box;
 }
 
 void layout_list_set_labels_active(Layout *layout)

@@ -15,7 +15,10 @@ _VERSION = re.compile(r"(\d+)\.(\d+)")
 
 
 def stock_root(platform: str = sys.platform, environ=os.environ) -> Path | None:
-    """The folder holding stock Blender's per-version settings folders."""
+    """The folder holding stock Blender's per-version settings folders. LOOPCUT_STOCK_BLENDER_DIR stands
+    in for it (the harness's fake stock settings, so a test never reads the real ones)."""
+    if environ.get("LOOPCUT_STOCK_BLENDER_DIR"):
+        return Path(environ["LOOPCUT_STOCK_BLENDER_DIR"])
     if platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "Blender"
     if platform == "win32":

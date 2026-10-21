@@ -3,7 +3,9 @@
 The platform cannot see where people stop: it sees downloads, sign-ups and hosted requests, but not a launch, the
 first-run setup or a turn on a ChatGPT plan or the user's own key. Three events fill that gap:
 - app_start: Blender and add-on versions, OS, processor type and whether this is the first launch; once a session.
-- setup_step: the first-run step reached, the option picked, whether it worked and a short error code.
+- setup_step: the first-run step reached, the option picked, whether it worked and a short code: the error,
+  or which action of the step it was (shown, claim, a first-project card), since steps and choices are a
+  closed list in the contract.
 - turn: which kind of model ran a turn, the model id, how it ended, how long it took and how many tool calls ran.
 
 Every prop comes from an allow-list (enums, booleans, bounded integers, short codes), so no prompt, reply, file or
@@ -137,7 +139,7 @@ def setup_step_props(step: str, choice: str | None, ok: bool, code=None) -> dict
         raise ValueError("Unknown setup step or choice")
     props = {"step": step, "choice": choice, "ok": bool(ok)}
     code = error_code(code)
-    if code and not ok:
+    if code:  # A failure's reason, or the action taken on a step that worked.
         props["error_code"] = code
     return props
 
@@ -330,23 +332,25 @@ def turn_start(cfg) -> dict:
         return {}
 
 
+def outcome_of(outcome: str, code: str | None = None) -> tuple[str, str | None]:
+    """A turn's agent.Turn.outcome and error code as an event's outcome (OUTCOMES) and code. The conversation
+    logs (session_logs.py) use the same values, so a log and its turn event agree."""
+    if outcome == "completed":
+        return "ok", code
+    if outcome == "cancelled":
+        return "cancelled", code
+    if code == "empty_reply":
+        return "empty", code
+    return "error", code or (outcome if outcome in ("step_limit", "no_progress", "budget") else "internal")
+
+
 def turn_end(turn, items: list) -> None:
     """Any thread, once a user's turn has ended (agent._run)."""
     start = getattr(turn, "telemetry", None)
     started = getattr(turn, "started", None)
     if not start or started is None:
         return
-    outcome = getattr(turn, "outcome", "")
-    code = getattr(turn, "error_code", "") or None
-    if outcome == "completed":
-        result = "ok"
-    elif outcome == "cancelled":
-        result = "cancelled"
-    elif code == "empty_reply":
-        result = "empty"
-    else:
-        result = "error"
-        code = code or (outcome if outcome in ("step_limit", "no_progress", "budget") else "internal")
+    result, code = outcome_of(getattr(turn, "outcome", ""), getattr(turn, "error_code", "") or None)
     first = getattr(turn, "first_item", 0) or 0
     tools = sum(1 for item in items[first:] if item.get("kind") == "tool")
     duration = (time.monotonic() - started) * 1000

@@ -1109,6 +1109,18 @@ static void wm_draw_window_offscreen(bContext *C, wmWindow *win, bool stereo)
   }
 }
 
+static void wm_draw_window_dim(wmWindow *win)
+{
+  GPU_blend(GPU_BLEND_ALPHA);
+  const uint pos = GPU_vertformat_attr_add(
+      immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
+  immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
+  immUniformColor4f(0.0f, 0.0f, 0.0f, 0.6f);
+  immRectf(pos, 0.0f, 0.0f, WM_window_native_pixel_x(win), WM_window_native_pixel_y(win));
+  immUnbindProgram();
+  GPU_blend(GPU_BLEND_NONE);
+}
+
 static void wm_draw_window_onscreen(bContext *C, wmWindow *win, int view)
 {
   wmWindowManager *wm = CTX_wm_manager(C);
@@ -1198,6 +1210,11 @@ static void wm_draw_window_onscreen(bContext *C, wmWindow *win, int view)
 
   wm_draw_callbacks(win);
   wmWindowViewport(win);
+
+  /* Loopcut: dim the window behind a modal splash (the first-run setup). */
+  if (wm_splash_modal_is_open(screen)) {
+    wm_draw_window_dim(win);
+  }
 
   /* Blend in floating regions (menus). */
   for (ARegion &region : screen->regionbase) {

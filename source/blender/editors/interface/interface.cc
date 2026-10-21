@@ -24,6 +24,7 @@
 #include "DNA_screen_types.h"
 #include "DNA_userdef_types.h"
 
+#include "BLI_memory_utils.hh"
 #include "BLI_listbase.h"
 #include "BLI_rect.h"
 #include "BLI_set.hh"
@@ -2134,6 +2135,17 @@ void block_end_ex(const bContext *C,
   if (block->layouts.first) {
     block_layout_resolve(block);
   }
+  /* Loopcut: a modal popup keeps a way out, or it is not modal (its operators may be missing,
+   * or all disabled). */
+  if (block->flag & BLOCK_MODAL) {
+    bool usable = false;
+    for (const Button &but : block->buttons()) {
+      usable |= but.optype && !(but.flag & (BUT_DISABLED | UI_HIDDEN));
+    }
+    if (!usable) {
+      block->flag &= ~BLOCK_MODAL;
+    }
+  }
   block_align_calc(block, region);
   if ((block->flag & BLOCK_LOOP) && (block->flag & BLOCK_NUMSELECT) &&
       (block->flag & BLOCK_NO_ACCELERATOR_KEYS) == 0)
@@ -2238,7 +2250,15 @@ static bool but_pixelrect_in_view(const ARegion *region, const rcti *rect)
 
 void block_draw(const bContext *C, Block *block)
 {
+  /* Loopcut: only while this block draws; never the user's theme itself. */
+  theme::theme_draw_override_set(block->theme_override);
+  BLI_SCOPED_DEFER([&] { theme::theme_draw_override_set(nullptr); });
+
   uiStyle style = *style_get_dpi(); /* XXX pass on as arg */
+  if (block->theme_override) {
+    /* Flat text, as on the site: no drop shadow under dark text on light buttons. */
+    style.widget.shadow = 0;
+  }
 
   /* get menu region or area region */
   ARegion *region = CTX_wm_region_popup(C);
@@ -4014,6 +4034,23 @@ void block_emboss_set(Block *block, EmbossType emboss)
 void block_theme_style_set(Block *block, char theme_style)
 {
   block->theme_style = theme_style;
+}
+
+void block_theme_override_set(Block *block, const bTheme *theme)
+{
+  block->theme_override = theme;
+}
+
+void button_link_style_set(Button *but, const uchar color[4], const bool hover)
+{
+  if (but->type != ButtonType::But) {
+    return;
+  }
+  static_cast<ButtonPush *>(but)->draw_as_link = true;
+  static_cast<ButtonPush *>(but)->link_hover = hover;
+  if (color) {
+    copy_v4_v4_uchar(but->col, color);
+  }
 }
 
 bool block_is_search_only(const Block *block)

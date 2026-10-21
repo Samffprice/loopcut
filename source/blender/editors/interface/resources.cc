@@ -1155,23 +1155,32 @@ void init_default()
   btheme->active_theme_area = active_theme_area;
 }
 
+/** Loopcut: see #theme_draw_override_set. */
+static const bTheme *theme_draw_override = nullptr;
+
+void theme_draw_override_set(const bTheme *theme)
+{
+  theme_draw_override = theme;
+  g_theme_state.theme = theme_get();
+}
+
 void theme_set(int spacetype, int regionid)
 {
   if (spacetype) {
     /* later on, a local theme can be found too */
-    g_theme_state.theme = static_cast<bTheme *>(U.themes.first);
+    g_theme_state.theme = theme_get();
     g_theme_state.spacetype = spacetype;
     g_theme_state.regionid = regionid;
   }
   else if (regionid) {
     /* popups */
-    g_theme_state.theme = static_cast<bTheme *>(U.themes.first);
+    g_theme_state.theme = theme_get();
     g_theme_state.spacetype = SPACE_PROPERTIES;
     g_theme_state.regionid = regionid;
   }
   else {
     /* for safety, when theme was deleted */
-    g_theme_state.theme = static_cast<bTheme *>(U.themes.first);
+    g_theme_state.theme = theme_get();
     g_theme_state.spacetype = SPACE_VIEW3D;
     g_theme_state.regionid = RGN_TYPE_WINDOW;
   }
@@ -1179,6 +1188,9 @@ void theme_set(int spacetype, int regionid)
 
 bTheme *theme_get()
 {
+  if (theme_draw_override) {
+    return const_cast<bTheme *>(theme_draw_override);
+  }
   return static_cast<bTheme *>(U.themes.first);
 }
 

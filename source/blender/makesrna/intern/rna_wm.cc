@@ -656,6 +656,8 @@ const EnumPropertyItem rna_enum_wm_report_items[] = {
 
 #  include "MEM_guardedalloc.h"
 
+#  include "wm.hh"
+
 #  ifdef WITH_PYTHON
 #    include "BPY_extern.hh"
 #  endif
@@ -1565,6 +1567,26 @@ static bool rna_WindowManager_is_event_handling_break_get(PointerRNA *ptr)
 {
   wmWindowManager *wm = static_cast<wmWindowManager *>(ptr->data);
   return wm->runtime->break_events_handling;
+}
+
+static bool rna_WindowManager_splash_modal_get(PointerRNA * /*ptr*/)
+{
+  return wm_splash_modal_get();
+}
+
+static void rna_WindowManager_splash_modal_set(PointerRNA * /*ptr*/, const bool value)
+{
+  wm_splash_modal_set(value);
+}
+
+static bool rna_WindowManager_splash_banner_get(PointerRNA * /*ptr*/)
+{
+  return wm_splash_banner_get();
+}
+
+static void rna_WindowManager_splash_banner_set(PointerRNA * /*ptr*/, const bool value)
+{
+  wm_splash_banner_set(value);
 }
 
 static PointerRNA rna_WindowManager_xr_session_state_get(PointerRNA *ptr)
@@ -3048,6 +3070,24 @@ static void rna_def_windowmanager(BlenderRNA *brna)
       prop,
       "Event Handling Break",
       "Remaining events in the queue are delayed until the next main loop iteration");
+
+  /* Loopcut: the bundled add-on's first-run setup. */
+  prop = RNA_def_property(srna, "splash_modal", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(
+      prop, "rna_WindowManager_splash_modal_get", "rna_WindowManager_splash_modal_set");
+  RNA_def_property_ui_text(prop,
+                           "Modal Splash",
+                           "Keep the splash screen open until one of its own buttons closes it: "
+                           "clicking outside, Escape and the splash image do nothing, and the "
+                           "window behind is dimmed. Not saved");
+
+  prop = RNA_def_property(srna, "splash_banner", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(
+      prop, "rna_WindowManager_splash_banner_get", "rna_WindowManager_splash_banner_set");
+  RNA_def_property_ui_text(prop,
+                           "Splash Banner",
+                           "Show the splash image above the splash screen's content. Read after "
+                           "the content is drawn, so a menu's draw can turn it off. Not saved");
 
   RNA_api_wm(srna);
   RNA_api_asset_library_loading_status(srna);

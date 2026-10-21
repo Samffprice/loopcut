@@ -1673,6 +1673,11 @@ bool button_draw_as_link(const Button *button)
   return button->type == ButtonType::But && static_cast<const ButtonPush *>(button)->draw_as_link;
 }
 
+bool button_link_hover(const Button *button)
+{
+  return button_draw_as_link(button) && static_cast<const ButtonPush *>(button)->link_hover;
+}
+
 /**
  * Wrapper around text_clip_middle_ex.
  */
@@ -2623,7 +2628,7 @@ static void widget_draw_text(const uiFontStyle *fstyle,
   }
 #endif
   /* Draw text underline when the link button is active. */
-  if (button_draw_as_link(but) && but->active) {
+  if (button_link_hover(but) && but->active) {
     float4 color;
     rgba_uchar_to_float(color, wcol->text);
     int width = BLF_width(fstyle->uifont_id, drawstr, drawstr_left_len);
@@ -5852,6 +5857,10 @@ void draw_button(const bContext *C, ARegion *region, uiStyle *style, Button *but
 
   const float zoom = 1.0f / but->block->aspect;
   wt->state(wt, &state, but->emboss);
+  if (state.draw_as_link && but->col[3] != 0) {
+    /* Loopcut: a link in its own color (#button_link_style_set); hovering underlines it. */
+    copy_v4_v4_uchar(wt->wcol.text, but->col);
+  }
   if (wt->custom) {
     wt->custom(but, &wt->wcol, rect, &state, roundboxalign, zoom);
   }

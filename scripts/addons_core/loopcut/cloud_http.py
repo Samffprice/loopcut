@@ -6,6 +6,7 @@ redirects disabled so a service redirect cannot forward the account key to anoth
 """
 
 import errno
+import gzip
 import json
 import http.client
 import re
@@ -85,6 +86,17 @@ def contract_headers():
         from . import mainthread
         return mainthread.run_on_main(contract_headers).result(timeout=30)
     return {"x-loopcut-contract": CONTRACT, "x-loopcut-client": client_value()}
+
+
+def json_body(payload) -> bytes:
+    """A request body as Client sends it; callers that must fit a size limit measure this."""
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def gzip_body(data: bytes) -> bytes:
+    """The compressed form a request with compress=True sends (Content-Encoding: gzip). mtime=0 keeps the same
+    body byte-identical, so a measured size is the size sent."""
+    return gzip.compress(data, compresslevel=6, mtime=0)
 
 
 def describe(error):
@@ -212,13 +224,14 @@ class Client:
     def version_headers(self):
         return dict(self.client_headers) if self.client_headers is not None else contract_headers()
 
-    def _request(self, method, path, payload=None, *, headers=None, auth=True, accept="application/json"):
+    def _request(self, method, path, payload=None, *, headers=None, auth=True, accept="application/json",
+                 compress=False):
         parts = urllib.parse.urlsplit(path)
         if (not path.startswith("/") or path.startswith("//") or parts.scheme or parts.netloc
                 or parts.fragment or "\\" in path or any(ord(c) < 32 for c in path)):
             raise ValueError("Service requests need a relative endpoint path")
         supplied = dict(headers or {})
-        reserved = {"authorization", "x-loopcut-contract", "x-loopcut-client", "content-type"}
+        reserved = {"authorization", "x-loopcut-contract", "x-loopcut-client", "content-type", "content-encoding"}
         if reserved.intersection(k.lower() for k in supplied):
             raise ValueError("Contract headers cannot be overridden")
         supplied.update(self.version_headers())
@@ -231,8 +244,11 @@ class Client:
             supplied["Authorization"] = f"Bearer {key}"
         body = None
         if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            body = json_body(payload)
             supplied["Content-Type"] = "application/json"
+            if compress:  # Conversation logs and problem reports (SPEC §3.12): the wire limit is on gzip bytes.
+                body = gzip_body(body)
+                supplied["Content-Encoding"] = "gzip"
         return urllib.request.Request(self.base_url + path, data=body, headers=supplied, method=method)
 
     @contextmanager
@@ -250,8 +266,8 @@ class Client:
         with open_response(request, self.transport, self.timeout) as response:
             yield response
 
-    def request_response(self, method, path, payload=None, *, headers=None, auth=True):
-        request = self._request(method, path, payload, headers=headers, auth=auth)
+    def request_response(self, method, path, payload=None, *, headers=None, auth=True, compress=False):
+        request = self._request(method, path, payload, headers=headers, auth=auth, compress=compress)
         body, status, response_headers = send(request, self.transport, self.timeout)
         if status in {204, 304}:
             return Response(None, status, response_headers)

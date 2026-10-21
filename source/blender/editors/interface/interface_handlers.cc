@@ -5118,7 +5118,7 @@ static int do_but_BUT(bContext *C, Button *but, HandleButtonData *data, const wm
     }
   }
 #endif
-  if (button_draw_as_link(but) && !data->changed_cursor) {
+  if (button_link_hover(but) && !data->changed_cursor) {
     WM_cursor_set(data->window, WM_CURSOR_HAND_POINT);
     data->changed_cursor = true;
   }
@@ -12072,7 +12072,10 @@ static int handle_menu_event(bContext *C,
           WM_tooltip_clear(C, win);
         }
 
-        if (ELEM(event->type, LEFTMOUSE, MIDDLEMOUSE, RIGHTMOUSE)) {
+        /* Loopcut: a modal popup ignores clicks outside it. */
+        if (ELEM(event->type, LEFTMOUSE, MIDDLEMOUSE, RIGHTMOUSE) &&
+            !(block->flag & BLOCK_MODAL))
+        {
           if (ELEM(event->val, KM_PRESS, KM_DBL_CLICK)) {
             if ((is_parent_menu == false) && (U.uiflag & USER_MENUOPENAUTO) == 0) {
               /* for root menus, allow clicking to close */
@@ -12117,8 +12120,10 @@ static int handle_menu_event(bContext *C,
       }
 #endif
       else if (event->type == EVT_ESCKEY && event->val == KM_PRESS) {
-        /* Escape cancels this and all preceding menus. */
-        menu->menuretval = RETURN_CANCEL;
+        /* Escape cancels this and all preceding menus. Loopcut: not a modal popup. */
+        if (!(block->flag & BLOCK_MODAL)) {
+          menu->menuretval = RETURN_CANCEL;
+        }
       }
       else if (ELEM(event->type, EVT_RETKEY, EVT_PADENTER) && event->val == KM_PRESS) {
         Button *but_default = region_find_first_but_test_flag(
@@ -12137,7 +12142,7 @@ static int handle_menu_event(bContext *C,
 
           /* enter will always close this block, we let the event
            * get handled by the button if it is activated, otherwise we cancel */
-          if (but_active == nullptr) {
+          if (but_active == nullptr && !(block->flag & BLOCK_MODAL)) {
             menu->menuretval = RETURN_CANCEL | RETURN_POPUP_OK;
           }
         }
@@ -13059,11 +13064,14 @@ static int popup_handler(bContext *C, const wmEvent *event, void *userdata)
   ARegion *region_popup = CTX_wm_region_popup(C);
   CTX_wm_region_popup_set(C, menu->region);
 
-  if (event->type == EVT_DROP || event->val == KM_DBL_CLICK) {
+  const Block *block_first = static_cast<const Block *>(menu->region->runtime->uiblocks.first);
+  const bool is_modal = block_first && (block_first->flag & BLOCK_MODAL);
+  if ((event->type == EVT_DROP && !is_modal) || event->val == KM_DBL_CLICK) {
     /* EVT_DROP:
      *   If we're handling drop event we'll want it to be handled by popup callee as well,
      *   so it'll be possible to perform such operations as opening .blend files by dropping
      *   them into blender, even if there's opened popup like splash screen (sergey).
+     *   Loopcut: not past a modal popup, which a file load would close.
      * KM_DBL_CLICK:
      *   Continue in case of double click so wm_handlers_do calls handler again with KM_PRESS
      *   event. This is needed to ensure correct button handling for fast clicking (#47532).

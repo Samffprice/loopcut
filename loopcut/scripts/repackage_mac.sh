@@ -110,6 +110,12 @@ grep "Loopcut build OK" "$smoke"
 strip_bytecode  # The smoke check compiles what it imported.
 left="$(find "$app/$res/scripts" "$app/$res/extensions" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) | head -1)"
 [ -z "$left" ] || { echo "bytecode left in the app: $left" >&2; exit 1; }
+# Ad-hoc signature over the whole bundle (no identity attached), after the last Blender run: Blender
+# writes bytecode into the app, which would break the seal. The base app carries only the linker's
+# signature on its binaries, which a downloaded (quarantined) copy fails as "damaged"; signed ad hoc,
+# Gatekeeper offers Open Anyway instead. A Developer ID signature plus notarization would replace this.
+codesign --force --deep --sign - "$app"
+codesign --verify --deep --strict "$app"
 
 ln -s /Applications "$out/stage/Applications"
 dmg="$out/loopcut-$version-arm64.dmg"

@@ -7,7 +7,7 @@ first. Writes out/onboarding/<stage>.png.
 
     --stage first     no Loopcut preferences yet: screenshot, import, screenshot again
     --stage fresh     no preferences: click Start Fresh, then Blender's Continue (needs
-                      --enable-event-simulate); the model step must follow
+                      --enable-event-simulate); the account step must follow
     --stage connect   preferences exist: the model step
     --stage privacy   the privacy step
     --stage done      the closing lines above the normal splash
@@ -133,7 +133,7 @@ elif ARGS.stage == "fresh":
         shot("fresh-2-after")
         if len(ARGS.click_y) > 1:
             check((USER / "config" / "userpref.blend").is_file(), "Continue did not save preferences")
-            check(onboarding._state["step"] in ("connect", "done"), f"step is {onboarding._state['step']} after Continue")
+            check(onboarding._state["step"] == "account", f"step is {onboarding._state['step']} after Continue")
 
     steps(start_fresh, quick_setup, after_continue, quit_ok)
 else:

@@ -31,6 +31,7 @@ struct IconTextOverlay;
 namespace blender {
 
 struct AnimationEvalContext;
+struct bTheme;
 struct ARegion;
 struct bContext;
 struct bContextStore;
@@ -412,6 +413,8 @@ struct ButtonTextBox : public Button {
 /** Derived struct for #ButtonType::But */
 struct ButtonPush : public Button {
   bool draw_as_link = false;
+  /** Loopcut: a link without the hover underline and hand cursor (#button_link_style_set). */
+  bool link_hover = true;
   /** See #button_pushbutton_draw_as_overlay_set(). */
   bool draw_as_overlay = false;
 };
@@ -738,6 +741,9 @@ struct Block {
   char direction = 0;
   /** BLOCK_THEME_STYLE_* */
   char theme_style = 0;
+  /** Loopcut: a theme this block draws with instead of the user's
+   * (#block_theme_override_set). */
+  const bTheme *theme_override = nullptr;
   /** Copied to #Button.emboss */
   EmbossType emboss = EmbossType::Emboss;
   bool auto_open = false;
@@ -817,6 +823,12 @@ struct SafetyRect {
   rctf parent;
   rctf safety;
 };
+
+namespace theme {
+/** Loopcut: #theme_get answers \a theme while a block with #Block::theme_override draws. */
+void theme_draw_override_set(const bTheme *theme);
+}  // namespace theme
+
 /* `interface.cc` */
 
 void fontscale(float *points, float aspect);
@@ -1684,6 +1696,8 @@ Button *button_last(Block *block) ATTR_WARN_UNUSED_RESULT;
 bool button_opens_link(const Button *button);
 std::string button_get_link(const Button *button, bContext *C);
 bool button_draw_as_link(const Button *button);
+/** A link that shows it is hovered: underlined, with the hand cursor. */
+bool button_link_hover(const Button *button);
 
 Button *block_active_but_get(const Block *block);
 bool block_is_menu(const Block *block) ATTR_WARN_UNUSED_RESULT;
