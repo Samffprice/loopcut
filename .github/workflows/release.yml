@@ -5,7 +5,10 @@
 # without one they are only kept as workflow artifacts.
 #
 # Two modes:
-# - full (default) compiles everything.
+# - full (default) compiles everything. Through a compiler cache (ccache) a run only compiles what
+#   changed since the cached build. The cache is saved only by runs on a branch (a tag run's could only
+#   be read by that tag), and every ref reads main's, so dispatch releases with `--ref main` once main is
+#   at the tag (the run checks that it is) to keep main's cache current.
 # - repackage (Windows, minutes) takes base_tag's Windows release (its .zip: the installed tree, already
 #   compiled and signed), swaps in this commit's Python and packages it again with the full build's CPack
 #   configuration; only the new .msi is signed. It refuses when anything but Python changed since the
@@ -46,6 +49,10 @@ on:
         description: "repackage: owner/name of the repository with base_tag's release (empty: this one)"
         type: string
         default: ""
+      compile_only:
+        description: "Compiler cache check: build only these Ninja targets, then stop with a failure on purpose"
+        type: string
+        default: ""
 
 env:
   # Python build helpers must not add caches to the source/install trees.
@@ -72,8 +79,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      # To delete the compiler cache entry a run replaces.
+      actions: write
     env:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      COMPILE_ONLY: ${{ inputs.compile_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +114,10 @@ jobs:
             echo "the add-on says $addon (bl_info in scripts/addons_core/loopcut/__init__.py); bump it first" >&2; exit 1
           fi
           blender/loopcut/scripts/release_tag_check.sh
+          if [ -n "$COMPILE_ONLY" ]; then
+            printf '%s' "$COMPILE_ONLY" | grep -Eq '^[A-Za-z0-9_. -]+$' || { echo "compile_only takes Ninja target names" >&2; exit 1; }
+            [ -z "$RELEASE_TAG" ] || { echo "compile_only builds no release" >&2; exit 1; }
+          fi
           echo "PACKAGE_NAME=loopcut-${RELEASE_TAG:-dev-$GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "libs=$(git -C blender rev-parse "HEAD:lib/${{ matrix.lib }}")" >> "$GITHUB_OUTPUT"
 
@@ -172,6 +186,44 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      # ccache, pinned and checked. It caches MSVC compilations through Blender's WITH_WINDOWS_SCCACHE
+      # (which switches debug info to /Z7, the form a cache can store; see platform_win32.cmake), in depend
+      # mode: no preprocessor run, so a hit costs a lookup and a miss no more than a plain compile.
+      # Precompiled headers are off: ccache cannot cache MSVC's. Its files are kept in the Actions cache.
+      # If anything here fails the build goes on uncached.
+      - name: Compiler cache (Windows)
+        id: ccache
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          version=4.14.1
+          name="ccache-$version-windows-x86_64"
+          curl -fsSL --retry 3 -o ccache.zip "https://github.com/ccache/ccache/releases/download/v$version/$name.zip"
+          echo "6219f3865ca59aec41ee4b678df171d5d35855ecb2b6dbbbd20690b3a68af7b4  ccache.zip" | sha256sum -c
+          python3 -c "import zipfile; zipfile.ZipFile('ccache.zip').extractall('ccache-bin')"
+          rm ccache.zip
+          exe="$(cygpath -m "$PWD/ccache-bin/$name/ccache.exe")"
+          "$exe" --version | head -1
+          echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+          {
+            echo "CCACHE_EXE=$exe"
+            echo "CCACHE_DIR=$(cygpath -w "$GITHUB_WORKSPACE/ccache")"
+            echo "CCACHE_DEPEND=1"
+            # By cl.exe's content, not its date: each runner image reinstalls the same compiler.
+            echo "CCACHE_COMPILERCHECK=content"
+            # No eviction during the build: afterwards the cache is cut to the files this build used.
+            echo "CCACHE_MAXSIZE=0"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore the compiler cache (Windows)
+        id: ccache_restore
+        if: steps.ccache.outcome == 'success'
+        uses: actions/cache/restore@v4
+        with:
+          path: ccache
+          key: ccache-${{ matrix.lib }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ matrix.lib }}-
+
       # Release configuration, minus what a hosted runner cannot build: compiling the CUDA, OptiX, HIP
       # and oneAPI kernels needs the vendors' SDKs. The NVIDIA and AMD device code is still built (it
       # loads the drivers at run time) and uses the kernels from the step above; Intel's oneAPI is off.
@@ -189,12 +241,20 @@ jobs:
           ninja -C build install
           cd build && cpack -G DragNDrop
 
+      # A step time limit below the job's: a compile that runs long fails this step instead of cancelling
+      # the job, so the compiler cache is still saved below.
       - name: Configure and build (Windows)
+        id: build_windows
         if: runner.os == 'Windows'
+        timeout-minutes: 300
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VS=%%i"
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "CACHE_ARGS="
+          if defined CCACHE_EXE set "CACHE_ARGS=-DWITH_WINDOWS_SCCACHE=ON -DWINDOWS_COMPILER_LAUNCHER=%CCACHE_EXE% -DWITH_COMPILER_PRECOMPILED_HEADERS=OFF"
+          rem The restored cache carries the counters of the runs that wrote it: count this run only.
+          if defined CCACHE_EXE "%CCACHE_EXE%" --zero-stats
           cmake -S blender -B build -G Ninja ^
             -C blender/build_files/cmake/config/blender_release.cmake ^
             -DCMAKE_BUILD_TYPE=Release ^
@@ -202,8 +262,81 @@ jobs:
             -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF ^
             -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF ^
             -DOPTIX_ROOT_DIR=%GITHUB_WORKSPACE%\optix ^
+            %CACHE_ARGS% ^
             -DCPACK_OVERRIDE_PACKAGENAME=%PACKAGE_NAME% || exit /b 1
+          if not "%COMPILE_ONLY%"=="" (
+            ninja -C build %COMPILE_ONLY% || exit /b 1
+            echo compile_only: the targets are built; failing on purpose, as a failure after the compile would.
+            exit /b 1
+          )
           ninja -C build install || exit /b 1
+
+      # Everything below about the cache runs even when the build or the run failed or was cancelled, so
+      # what was compiled is kept.
+      - name: Compiler cache use (Windows)
+        if: ${{ always() && env.CCACHE_EXE != '' }}
+        continue-on-error: true
+        env:
+          BUILD_OUTCOME: ${{ steps.build_windows.outcome }}
+          CACHE_START: ${{ steps.ccache.outputs.start }}
+        run: |
+          {
+            echo '### Compiler cache'; echo '```'
+            "$CCACHE_EXE" --show-stats --verbose
+            "$CCACHE_EXE" --show-compression
+            if [ -f build/build.ninja ]; then
+              n=build/build.ninja
+              echo "Compiled files in the whole build: $(grep -cE '^build [^:]+\.obj: (C|CXX)_COMPILER' $n)"
+              echo "Flag sets with /Z7: $(grep -E '^ *FLAGS = ' $n | grep -c '/Z7'), with /Zi: $(grep -E '^ *FLAGS = ' $n | grep -c '/Zi'), with /Yu: $(grep -E '^ *FLAGS = ' $n | grep -c '/Yu')"
+              # CMake puts the launcher in each compile's LAUNCHER variable, not in the rules.
+              echo "Compiles through ccache: $(grep -cE '^ *LAUNCHER = .*ccache\.exe' $n)"
+              echo "Objects written this run: $(find build -name '*.obj' -newermt "@$CACHE_START" | wc -l), $(find build -name '*.obj' -newermt "@$CACHE_START" -printf '%s\n' | awk '{s += $1} END {print s + 0}') bytes"
+            fi
+            # A hit renews its file's time, which is what the cut below keeps.
+            echo "Cache files written or used this run: $(find ccache -type f -newermt "@$CACHE_START" | wc -l) of $(find ccache -type f | wc -l)"
+            echo "Runner: $(nproc) processors, $(awk '/MemTotal/ {print $2 " " $3}' /proc/meminfo) memory, $(df -h . | awk 'NR == 2 {print $4 " free of " $2}') disk"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # After a complete build, keep only what it used: older entries are for sources that changed.
+          # After a failed one keep everything, for the next try.
+          if [ "$BUILD_OUTCOME" = success ]; then
+            "$CCACHE_EXE" --evict-older-than "$(( $(date +%s) - CACHE_START + 300 ))s"
+          fi
+          echo "Compiler cache kept: $(du -sb ccache | cut -f1) bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          # A cache check also measures what a higher compression level would save, on a copy.
+          if [ -n "$COMPILE_ONLY" ]; then
+            for level in 3 6; do
+              rm -rf ccache-level; cp -r ccache ccache-level; start=$(date +%s)
+              CCACHE_DIR="$(cygpath -w "$PWD/ccache-level")" "$CCACHE_EXE" --recompress $level > /dev/null
+              echo "At compression level $level: $(du -sb ccache-level | cut -f1) bytes, recompressed in $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+            done
+            rm -rf ccache-level
+          fi
+
+      - name: Save the compiler cache (Windows)
+        id: ccache_save
+        if: ${{ always() && env.CCACHE_EXE != '' && startsWith(github.ref, 'refs/heads/') }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ccache
+          key: ccache-${{ matrix.lib }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # One compiler cache per branch: the entry this run started from (if this branch's) goes, so two
+      # copies never crowd out the precompiled libraries in the repository's 10 GB. Only once the new
+      # entry is listed: the save action can warn and go on without saving.
+      - name: Drop the compiler cache this run replaced (Windows)
+        if: ${{ always() && steps.ccache_save.outcome == 'success' && steps.ccache_restore.outputs.cache-matched-key != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD_KEY: ${{ steps.ccache_restore.outputs.cache-matched-key }}
+          NEW_KEY: ccache-${{ matrix.lib }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          saved=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$NEW_KEY&ref=$GITHUB_REF" --jq '[.actions_caches[] | select(.key == $ENV.NEW_KEY)] | length')
+          if [ "$saved" != 1 ] || [ "$OLD_KEY" = "$NEW_KEY" ]; then echo "$NEW_KEY is not listed as saved; keeping $OLD_KEY"; exit 0; fi
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches?key=$OLD_KEY&ref=$GITHUB_REF" --silent &&
+            echo "Deleted $OLD_KEY on $GITHUB_REF" || echo "$OLD_KEY is not on $GITHUB_REF (kept)"
 
       # The kernel step above may fail without failing the run; say so where it cannot be missed.
       # Runs after CPack: Blender's isolated Python can create runtime caches.

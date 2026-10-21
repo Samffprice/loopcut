@@ -252,8 +252,13 @@ if(WITH_WINDOWS_SCCACHE AND CMAKE_VS_MSBUILD_COMMAND)
 endif()
 
 if(WITH_WINDOWS_SCCACHE)
-  set(CMAKE_C_COMPILER_LAUNCHER sccache)
-  set(CMAKE_CXX_COMPILER_LAUNCHER sccache)
+  # Loopcut: WINDOWS_COMPILER_LAUNCHER can name another compiler cache, like ccache, which on a hit
+  # skips MSVC's preprocessor (sccache runs it for every file). Both need /Z7, set below.
+  if(NOT WINDOWS_COMPILER_LAUNCHER)
+    set(WINDOWS_COMPILER_LAUNCHER sccache)
+  endif()
+  set(CMAKE_C_COMPILER_LAUNCHER "${WINDOWS_COMPILER_LAUNCHER}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${WINDOWS_COMPILER_LAUNCHER}")
   # sccache will only play nice with Z7.
   set(SYMBOL_FORMAT /Z7)
   set(SYMBOL_FORMAT_RELEASE /Z7)
