@@ -545,6 +545,26 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertEqual([step[0] for step in steps], ['snapshot', 'collect', 'discard'])
         self.assertEqual(self.prepared_inputs(), [])
 
+    def test_python_drivers_are_named_with_what_to_do_and_counted_past_ten_before_any_upload(self):
+        reason = bundles.PYTHON_DRIVER
+        rows = [{'type': 'driver', 'name': f'Object "Rig.{n:03}"', 'path': 'location[2]', 'reason': reason}
+                for n in range(12)]
+        steps, uploads = self.pack(unsupported=rows)
+        consent = unittest.mock.Mock(return_value=True)
+        result = self.execute('render', {'frame_start': 1}, consent=consent)
+        self.assertFalse(result.ok)
+        first, _, extras = result.text.partition('\n')
+        self.assertIn("can't pack this scene: 12 unsupported item(s)", first)
+        self.assertIn('Nothing was uploaded', first)
+        named = json.loads(extras)['error']['unsupported']
+        self.assertEqual(named[0], f'driver Object "Rig.000" location[2]: {reason}')
+        self.assertEqual((len(named), named[-1]), (11, 'and 2 more'))
+        for text in ('simple expression', 'bake'):
+            self.assertIn(text, named[0])
+        consent.assert_not_called()
+        self.assertEqual((uploads, self.requests), ([], []))
+        self.assertEqual(self.client.request('GET', '/mock/state')['jobs'], 0)
+
     def test_limit_card_approve_resends_the_same_bundle_without_repacking(self):
         descriptor = next(d for d in self.runtime.manifest['tools'] if d['name'] == 'render')
         descriptor['apply'] = 'none'

@@ -20,7 +20,7 @@ from pathlib import Path
 STATES = ("signed_out", "first_run", "hints_dismissed", "coming_soon", "coming_soon_clicked",
           "coming_soon_collapsed", "coming_soon_signed_out", "cloud_message", "narrow_job",
           "chatgpt_waiting", "loopcut_waiting", "sign_in_error", "running_extras",
-          "onboarding_account", "onboarding_account_failed", "onboarding_connect")
+          "onboarding_account", "onboarding_account_failed", "onboarding_connect", "onboarding_connect_chatgpt_error")
 
 
 def fixtures(state):
@@ -43,10 +43,12 @@ def fixtures(state):
     result["coming_soon_signed_out"]["ui"]["coming_soon"] = [
         {**r, "state": "notify", "notify_sign_in": True} if n == 0 else r for n, r in enumerate(extras)]
     for name, step in (("onboarding_account", "account"), ("onboarding_account_failed", "account"),
-                       ("onboarding_connect", "connect")):
+                       ("onboarding_connect", "connect"), ("onboarding_connect_chatgpt_error", "connect")):
         result[name]["ui"]["onboarding_step"] = step
     result["onboarding_account_failed"]["ui"]["sign_in"] = {
         "loopcut": {"status": "error", "error": "HTTP 404: accounts unavailable"}}
+    result["onboarding_connect_chatgpt_error"]["ui"]["sign_in"] = {"chatgpt": {  # chatgpt_auth.SIGN_IN_MESSAGES
+        "status": "error", "error": "ChatGPT didn't let this account share its plan with Loopcut."}}
     result["cloud_message"]["ui"]["cloud_message"] = "Update Loopcut to use cloud tools"
     result["narrow_job"].update(items=[state.item_user("Prepare a detailed model of this prop.")])
     result["narrow_job"]["ui"]["cloud_jobs"] = [job]
@@ -164,7 +166,7 @@ def main():
         scale = bpy.context.preferences.system.ui_scale
         width = round((args.narrow_width if name == "narrow_job" else args.width) * scale)
         delta = panel.width - width
-        if abs(delta) > 4:
+        if abs(delta) > 4 and not current["ui"].get("onboarding_step"):  # The splash's width is its own.
             with bpy.context.temp_override(window=window, area=panel):
                 result = bpy.ops.screen.area_move(x=panel.x - 1, y=panel.y + panel.height // 2, delta=delta)
             if result != {"FINISHED"}:

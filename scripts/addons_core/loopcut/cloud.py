@@ -1101,6 +1101,16 @@ def safe_value(value, secrets=()):
     return value
 
 
+# The render service checks the packed scene before rendering (render_job.py SceneRejected) and says only that
+# the bundle was refused. The packer already refuses Python drivers and animation of driver settings before upload;
+# this names what else it refuses.
+_BUNDLE_REFUSED = ("vendor_failed: the render service refused the packed scene, so nothing was rendered; {refunded}. "
+                   "It refuses Python (Python driver expressions, animation that changes driver settings, OSL script "
+                   "nodes), files outside the scene bundle, a missing or invalid scene camera, and frames over "
+                   "4096×4096 px. Tell the user which of these the scene has and how to fix it, fix what you can, "
+                   "then call again. Service detail: {detail}")
+
+
 def _error_message(error):
     account_error = cloud_account.report_error(error)
     if account_error:
@@ -1108,6 +1118,9 @@ def _error_message(error):
     code, extra = error.code, error.extra
     if code == "quote_required":
         return f"quote_required: {extra.get('credits', '?')} credits. Ask the user to approve this quote, then repeat the same inputs with quote_id."
+    if code == "vendor_failed" and extra.get("field") == "input.bundle":
+        return _BUNDLE_REFUSED.format(refunded="credits refunded" if extra.get("refunded") else "no credits charged",
+                                      detail=re.sub(r"\s*To try again,.*", "", str(error))[:300])
     if code == "vendor_failed":
         return "vendor_failed: the vendor failed; credits refunded." if extra.get("refunded") else "vendor_failed: the vendor failed. Try again later."
     if code in ("rate_limited", "concurrency_limit"):
@@ -1231,8 +1244,9 @@ def _bundle_refusal(packed):
         return lines + ([f"and {len(rows) - BUNDLE_NAMED} more"] if len(rows) > BUNDLE_NAMED else [])
     lists = {key: packed[key] for key in ("missing", "unsupported") if packed[key]}
     counts = " and ".join(f"{len(rows)} {key}" for key, rows in lists.items())
-    return cloud_http.CloudError(f"Loopcut can't pack this scene: {counts} input(s), listed below. Relink or pack "
-                                 "them, or remove them from the scene, then call again. Nothing was uploaded.",
+    return cloud_http.CloudError(f"Loopcut can't pack this scene: {counts} item(s), listed below with what each "
+                                 "needs. Relink or pack missing files, fix or remove the rest, then call again. "
+                                 "Nothing was uploaded.",
                                  "bundle_incomplete", extra={key: named(rows) for key, rows in lists.items()})
 
 

@@ -65,6 +65,14 @@ _JWKS_TTL = 3600.0
 # errors-and-recovery#refresh-errors).
 _DEAD_REFRESH = {"invalid_grant", "invalid_refresh_token", "token_expired", "refresh_token_expired",
                  "refresh_token_invalidated", "refresh_token_reused"}
+# Sign-in errors said in plain words: onboarding shows 70 characters of a failed sign-in. In 0.2.5, invalid_grant
+# came at the end of a full browser sign-in, 39 of 41 installs on Windows, and a retry almost never worked
+# (app_events, 2026-10-21). OpenAI doesn't say why it refuses an account (plan, workspace or country: a Plus user
+# was refused too, GitHub issue #2), so the message doesn't guess.
+SIGN_IN_MESSAGES = {
+    "invalid_grant": "ChatGPT didn't let this account share its plan with Loopcut.",
+    "unsupported_country_region_territory": "ChatGPT plan use isn't available in your country.",
+}
 
 
 def is_chatgpt_plan(base_url: str) -> bool:
@@ -75,12 +83,14 @@ def is_chatgpt_plan(base_url: str) -> bool:
 
 class ChatGPTAuthError(RuntimeError):
     """code: the OAuth or API error code when there is one (invalid_grant, access_denied, ...).
+    stage: "token" when the token endpoint refused a sign-in's authorization code, else empty.
     Messages never carry a token."""
 
-    def __init__(self, message: str, code: str = "", status: int | None = None):
+    def __init__(self, message: str, code: str = "", status: int | None = None, stage: str = ""):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.stage = stage
 
 
 class NotSignedIn(ChatGPTAuthError):
@@ -268,6 +278,21 @@ def host_id() -> str:
         value = f"urn:uuid:{uuid.uuid4()}"
         _write_private(path, {**data, "ext_agent_host_id": value, "created": _now_iso()})
         return value
+
+
+def _pending_client() -> str:
+    """The client id a registration was issued before its code exchange failed with invalid_grant; empty if none."""
+    return str(_read_json(folder() / HOST_FILE).get("pending_client_id") or "")
+
+
+def _set_pending_client(client_id: str) -> None:
+    """Keeps (or, given "", forgets) that issued client id for the next sign-in on this computer."""
+    if client_id == _pending_client():
+        return
+    with _FileLock():
+        path = folder() / HOST_FILE
+        data = {k: v for k, v in _read_json(path).items() if k != "pending_client_id"}
+        _write_private(path, {**data, "pending_client_id": client_id} if client_id else data)
 
 
 def _host_flag(name: str) -> bool:
@@ -579,7 +604,9 @@ class SignIn:
         if saved is None and not self.new_account:
             saved = next((r for r in _load_accounts()["accounts"].values()), None)
         self.saved = saved
-        self.client_id = saved["client_id"] if saved and saved.get("client_id") else DYNAMIC_CLIENT
+        # Docs (sign-in): after invalid_grant, a fresh authorization keeps the client id that registration issued.
+        self.pending = "" if saved or self.new_account else _pending_client()
+        self.client_id = saved["client_id"] if saved and saved.get("client_id") else self.pending or DYNAMIC_CLIENT
         self.state, self.nonce = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         self.verifier, challenge = pkce_pair()
         self._server = _CallbackServer(self.port)
@@ -599,6 +626,14 @@ class SignIn:
         if self._server is None:
             raise ChatGPTAuthError("SignIn.wait() before start()")
         try:
+            return self._finish(cancelled)
+        except ChatGPTAuthError as ex:
+            if self.pending and ex.code not in ("cancelled", "timeout"):
+                _set_pending_client("")  # One more try on the kept client id; after that, register afresh.
+            raise
+
+    def _finish(self, cancelled: Callable[[], bool]) -> dict:
+        try:
             query = self._server.wait(time.monotonic() + self.timeout, cancelled)
         finally:
             self._server.close()
@@ -607,7 +642,8 @@ class SignIn:
             if code == "access_denied":
                 raise ChatGPTAuthError("ChatGPT sign-in was declined, so Loopcut can't use your ChatGPT plan. "
                                        "Sign in again to allow it, or pick another provider.", code)
-            raise ChatGPTAuthError(f"ChatGPT sign-in failed: {code} {query.get('error_description', '')}".strip(), code)
+            raise ChatGPTAuthError(SIGN_IN_MESSAGES.get(code)
+                                   or f"ChatGPT sign-in failed: {code} {query.get('error_description', '')}".strip(), code)
         returned_client = query.get("client_id") or ""
         if self.client_id == DYNAMIC_CLIENT:
             if not returned_client or returned_client == DYNAMIC_CLIENT:
@@ -619,9 +655,18 @@ class SignIn:
             client_id = self.client_id
         if not query.get("code"):
             raise ChatGPTAuthError("The sign-in came back without an authorization code")
-        tokens = _post_form(token_endpoint(), {
-            "grant_type": "authorization_code", "client_id": client_id, "code": query["code"],
-            "code_verifier": self.verifier, "redirect_uri": self._server.redirect_uri, "resource": RESOURCE})
+        try:
+            tokens = _post_form(token_endpoint(), {
+                "grant_type": "authorization_code", "client_id": client_id, "code": query["code"],
+                "code_verifier": self.verifier, "redirect_uri": self._server.redirect_uri, "resource": RESOURCE})
+        except ChatGPTAuthError as ex:
+            if ex.code == "invalid_grant" and self.client_id == DYNAMIC_CLIENT:
+                try:
+                    _set_pending_client(client_id)
+                except OSError as kept:  # The sign-in's own error is the one to show.
+                    print(f"Loopcut: could not keep the issued ChatGPT client id: {type(kept).__name__}")
+            raise ChatGPTAuthError(SIGN_IN_MESSAGES.get(ex.code) or str(ex), ex.code, ex.status, "token") from None
+        _set_pending_client("")  # A code went through: any kept id is spent. Writes only when there is one.
         return _save_sign_in(tokens, client_id, self.nonce, self.host, self.saved)
 
 

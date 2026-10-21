@@ -191,8 +191,7 @@ def chatgpt_card(code: str) -> dict | None:
     if code == "subscription_sharing_user_not_eligible":
         return state.item_offer(
             "chatgpt", "This ChatGPT account can't share its plan",
-            "ChatGPT Plus and Pro can; Business and Enterprise need an admin. Loopcut's Fast model is free "
-            "with an account.",
+            "OpenAI decides that by plan, workspace and country. Loopcut's Fast model is free with an account.",
             keep_going + [_action("Use my own key", "own_key")])
     return None
 

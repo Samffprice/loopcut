@@ -12,7 +12,8 @@ arm, leg and finger chains only, so A-pose rigs take a T-pose motion; it is neve
 neck, head or clavicles, where it tilts the pelvis or shrugs the shoulders. Y turns the motion about world Z
 so the first frame faces where the character faces now. The pelvis (midpoint of the thighs) follows the
 source pelvis, scaled by the ratio of leg lengths, from where the character stands. Local rotations are
-written parent first: basis = chain^-1 @ desired.
+written parent first: basis = chain^-1 @ desired. After the bake, Blender's evaluation is checked: when no limb's
+deforming bones follow the motion (mapped controls that drive nothing), the bake is undone and refused.
 
 The parsing, bone maps and rig detection need no Blender (unit tested without it); retarget() and apply()
 run in Blender.
@@ -799,6 +800,12 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     for n in order:
         b = bones[n]
         rel[n] = b.parent.matrix_local.inverted() @ b.matrix_local if b.parent else b.matrix_local.copy()
+    # What a refused bake puts back: the pose, the switches and the animation data.
+    saved = {n: (ob.pose.bones[n].rotation_mode, ob.pose.bones[n].matrix_basis.copy()) for n in needed}
+    saved_switches = [(b, p, ob.pose.bones[b][p]) for b, p, _v in rig.switches
+                      if b in ob.pose.bones and p in ob.pose.bones[b].keys()]
+    ad = ob.animation_data
+    previous = (ad is not None, ad.action if ad else None, getattr(ad, "action_slot", None) if ad else None)
     for n in needed:
         pb = ob.pose.bones[n]
         pb.matrix_basis = Matrix.Identity(4)
@@ -828,7 +835,13 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     pelvis_bones = (tb["thigh_l"], tb["thigh_r"])
     mapped_order = [n for n in order if n in targets]
     muted = _mute_deform(ob) if evaluate else []
+    clamped = 0
     try:
+        # The evaluated rig may not carry the pelvis with the travel bone (constraint-placed thighs: CloudRig's
+        # hinges sent Snow's hips 2 km): an axis it does not carry is never pushed, and each frame's location
+        # stays within two leg lengths of the chain math's.
+        gain = travel_gain(_travel_response(ob, root, pelvis_bones)) if evaluate else (1.0, 1.0, 1.0)
+        reach = 2 * _leg_length({b.name: b.head_local for b in bones}, legs_t)
         for f, pose in enumerate(poses):
             arm, desired = {}, {}
             for n in order:
@@ -850,15 +863,24 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
             chain = arm[b.parent.name] @ rel[root] if b.parent and b.parent.name in arm else rel[root]
             locations.append(chain.to_3x3().inverted() @ (want - p0))
             if evaluate:
+                guess = locations[-1] if any(gain) else Vector()  # A bone that carries nothing stays at rest.
                 start = {n: rotations[n][-2] for n in targets} if f else {n: rotations[n][-1] for n in targets}
-                start_loc = locations[-2] if f else locations[-1]
-                solved, loc = _solve(ob, mapped_order, desired, start, start_loc, root, pelvis_bones, want)
+                start_loc = locations[-2] if f and any(gain) else guess
+                solved, loc = _solve(ob, mapped_order, desired, start, start_loc, root, pelvis_bones, want, gain)
                 for n in targets:
                     rotations[n][-1] = solved[n]
+                if (loc - guess).length > reach:
+                    loc, clamped = guess.copy(), clamped + 1
                 locations[-1] = loc
     finally:
         for modifier in muted:
             modifier.show_viewport = True
+    if not any(gain):
+        warnings.append(f"moving {root} does not move the hips, so the character stays where it stands")
+    elif not all(gain):
+        warnings.append(f"moving {root} does not move the hips along every axis, so part of the travel is lost")
+    if clamped:
+        warnings.append(f"{root} did not settle on {clamped} frames, where it follows the motion's path instead")
 
     frames = [frame_start + i for i in range(len(times))]
     for n, mats in rotations.items():
@@ -869,6 +891,13 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     series += [(f'pose.bones["{_escape(root)}"].location', i, root, [v[i] for v in locations]) for i in range(3)]
     _write(ob, action, frames, series)
     ob.pose.bones[root].location = locations[0]
+    missed, judged = _unreached(ob, rig, scene, frames, poses, k)
+    if missed and len(missed) == judged:
+        _put_back(ob, action, previous, saved, saved_switches)
+        raise MotionError(_refusal(ob, rig, len(pairs), missed))
+    if missed:
+        warnings.append(f"the {' and '.join(missed)} did not follow the motion: their mapped bones do not move "
+                        "the deforming bones (a limb left in IK mode?)")
     return {"action": action, "frames": (frames[0], frames[-1]), "count": len(frames), "fps": fps_scene,
             "mapped": len(pairs), "stashed": stashed, "warnings": warnings, "scale": k, "evaluated": evaluate}
 
@@ -914,10 +943,43 @@ SOLVE_STEPS = 8
 SOLVE_DEGREES = 0.25
 
 
-def _solve(ob, order, desired, start, start_loc, root, pelvis_bones, want):
-    """Correct each mapped bone against the evaluated rig until its armature-space rotation is the desired one:
-    pose = E @ basis, so basis' = basis @ current^-1 @ desired. The travel bone moves the pelvis rigidly."""
+def _travel_response(ob, root, pelvis_bones, step=0.1):
+    """How much of a move of the travel bone along each armature axis reaches the pelvis, on Blender's evaluation
+    with every rotation held: 1 when it carries the pelvis rigidly, 0 when constraints place the thighs."""
     import bpy
+    from mathutils import Vector
+    view_layer = bpy.context.view_layer
+    pb = ob.pose.bones[root]
+
+    def pelvis():
+        view_layer.update()
+        return (ob.pose.bones[pelvis_bones[0]].head + ob.pose.bones[pelvis_bones[1]].head) * 0.5
+
+    saved, before = pb.location.copy(), pelvis()
+    own = (pb.matrix.to_3x3() @ pb.matrix_basis.to_3x3().inverted_safe()).inverted_safe()
+    response = []
+    for axis in range(3):
+        move = Vector((0.0, 0.0, 0.0))
+        move[axis] = step
+        pb.location = saved + own @ move
+        response.append((pelvis() - before)[axis] / step)
+    pb.location = saved
+    view_layer.update()
+    return tuple(response)
+
+
+def travel_gain(response):
+    """Per armature axis, how far to move the travel bone per unit the pelvis is off: the inverse of its response
+    (_travel_response), 1 when rigid, and 0 where under half of a move reaches the pelvis, so it is never pushed."""
+    return tuple(0.0 if r < 0.5 else 1.0 if abs(r - 1.0) < 0.05 else 1.0 / r for r in response)
+
+
+def _solve(ob, order, desired, start, start_loc, root, pelvis_bones, want, gain):
+    """Correct each mapped bone against the evaluated rig until its armature-space rotation is the desired one:
+    pose = E @ basis, so basis' = basis @ current^-1 @ desired. The travel bone moves the pelvis along the axes it
+    carries (gain: travel_gain())."""
+    import bpy
+    from mathutils import Vector
     view_layer = bpy.context.view_layer
     basis = {n: start[n].copy() for n in order}
     loc = start_loc.copy()
@@ -937,10 +999,11 @@ def _solve(ob, order, desired, start, start_loc, root, pelvis_bones, want):
             basis[n] = (basis[n] @ correction).normalized()
             _set_rotation(pbs[n], basis[n])
         pelvis = (ob.pose.bones[pelvis_bones[0]].head + ob.pose.bones[pelvis_bones[1]].head) * 0.5
-        own = root_pb.matrix.to_3x3() @ root_pb.matrix_basis.to_3x3().inverted()
-        offset = want - pelvis
-        loc = loc + own.inverted() @ offset
-        root_pb.location = loc
+        offset = Vector([o * g for o, g in zip(want - pelvis, gain)])
+        if any(gain):
+            own = root_pb.matrix.to_3x3() @ root_pb.matrix_basis.to_3x3().inverted_safe()
+            loc = loc + own.inverted_safe() @ offset
+            root_pb.location = loc
         if math.degrees(worst) < SOLVE_DEGREES and offset.length < 1e-3:
             break
     view_layer.update()
@@ -1003,6 +1066,103 @@ def _write(ob, action, frames, series):
         curve.update()
 
 
+REACH_MOVE = 0.08  # Metres at the character's size: a limb end the source moves less than this is not judged.
+REACH_SHARE = 0.25  # A limb follows when its deforming bones swing at least this share of the source's swing.
+LIMBS = (("left arm", "hand_l", "LeftHand"), ("right arm", "hand_r", "RightHand"),
+         ("left leg", "foot_l", "LeftFoot"), ("right leg", "foot_r", "RightFoot"))
+
+
+def _unreached(ob, rig, scene, frames, poses, k):
+    """After the bake, on Blender's evaluation of up to 16 frames: the limbs whose deforming bones do not follow
+    (mapped controls that drive nothing, such as FK bones on a limb left in IK mode), and how many were judged.
+    Each limb end is the deforming bone nearest its mapped bone, measured from the pelvis, against the source's
+    swing scaled to the character."""
+    bones, tb = ob.data.bones, rig.bones
+    deform = [b for b in bones if b.use_deform]
+    if not deform:
+        return [], 0  # Nothing deforms (props parented to bones): nothing to judge.
+
+    def stand_in(name):
+        head = bones[name].head_local
+        return min(deform, key=lambda b: (b.head_local - head).length).name
+
+    ends = {c: stand_in(tb[c]) for _limb, c, _joint in LIMBS}
+    thighs = [stand_in(tb[f"thigh_{s}"]) for s in "lr"]
+    picks = sorted({round(i * (len(frames) - 1) / 15) for i in range(16)})
+    mw3 = ob.matrix_world.to_3x3()
+    swings = {c: [] for c in ends}
+    current, muted = scene.frame_current, _mute_deform(ob)
+    try:
+        for i in picks:
+            scene.frame_set(frames[i])
+            pbs = ob.pose.bones
+            pelvis = (pbs[thighs[0]].head + pbs[thighs[1]].head) * 0.5
+            for c, n in ends.items():
+                swings[c].append(mw3 @ (pbs[n].head - pelvis))
+    finally:
+        for modifier in muted:
+            modifier.show_viewport = True
+        scene.frame_set(current)
+    measured = []
+    for limb, c, joint in LIMBS:
+        src = [(poses[i][joint][1] - (poses[i]["LeftLeg"][1] + poses[i]["RightLeg"][1]) * 0.5) * k for i in picks]
+        measured.append((limb, max((v - src[0]).length for v in src), max((v - swings[c][0]).length for v in swings[c])))
+    return unfollowed(measured)
+
+
+def unfollowed(swings):
+    """swings: (limb, the source's swing, the deforming bones' swing), metres at the character's size -> the limbs
+    that did not follow, and how many were judged (a limb the source hardly moves is not)."""
+    judged = [(limb, want, got) for limb, want, got in swings if want >= REACH_MOVE]
+    return [limb for limb, want, got in judged if got < REACH_SHARE * want], len(judged)
+
+
+def _put_back(ob, action, previous, saved, switches):
+    """Undo a refused bake: the previous action active again (its stash track gone), the pose and switches as
+    they were, the new action deleted."""
+    import bpy
+    had, old, slot = previous
+    ad = ob.animation_data
+    if ad is not None:
+        ad.action = None
+        if old is not None:
+            stash = next((t for t in reversed(ad.nla_tracks) if t.name.startswith("[Action Stash]")
+                          and any(s.action == old for s in t.strips)), None)
+            if stash is not None:
+                ad.nla_tracks.remove(stash)
+            ad.action = old
+            if slot is not None:
+                try:
+                    ad.action_slot = slot
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
+        if not had:
+            ob.animation_data_clear()
+    bpy.data.actions.remove(action)
+    for bone, prop, value in switches:
+        ob.pose.bones[bone][prop] = value
+    for n, (mode, matrix) in saved.items():
+        pb = ob.pose.bones[n]
+        pb.rotation_mode = mode
+        pb.matrix_basis = matrix
+    bpy.context.view_layer.update()
+
+
+def _refusal(ob, rig, mapped, missed):
+    """Why nothing was applied, and what the user can do about it."""
+    text = (f"Nothing was applied to '{ob.name}': it was matched as a {rig.label} ({mapped} bones), but turning "
+            f"those bones does not move the deforming bones of its {', '.join(missed)}, so the character would not "
+            "move.")
+    if ob.data.get("is_generated_cloudrig") or "cloudrig" in ob.keys():
+        return text + (" It is a CloudRig rig (like Blender Studio's Rain and Snow), which motion retargeting does "
+                       "not support yet: with its arms and legs switched to FK (the rig's IK/FK settings) the limbs "
+                       "follow, but not the hips, spine or travel. Rigify, Auto-Rig Pro, Mixamo, Unreal-style and "
+                       "plain deform-bone humanoids work.")
+    return text + (" If its arms and legs are in IK mode, switch them to FK and apply the motion again; otherwise "
+                   "this rig type is not supported yet. Rigify, Auto-Rig Pro, Mixamo, Unreal-style and plain "
+                   "deform-bone humanoids work.")
+
+
 # ----------------------------------------------------------------------- no target: SOMA's own body
 
 # (weight bone, from joint, to joint, radius in metres at SOMA's size) for the generated mannequin.
@@ -1034,6 +1194,7 @@ def build_skeleton(source, scene, location, name="Motion skeleton"):
     import bpy
     from mathutils import Matrix, Vector
     joints = [j for j in source.bvh.joints if j.parent is not None and not j.name.endswith("End")]
+    forward = source._point(Vector((0.0, 0.0, 1.0))).normalized()  # The way SOMA's rest faces.
     data = bpy.data.armatures.new(name)
     ob = bpy.data.objects.new(name, data)
     scene.collection.objects.link(ob)
@@ -1058,6 +1219,11 @@ def build_skeleton(source, scene, location, name="Motion skeleton"):
                     bone.tail = rest[tail[0].name]
                 elif joint.end is not None:
                     bone.tail = rest[joint.name] + source._point(Vector(joint.end))
+                else:
+                    # A leaf without an End Site (SOMA's Jaw and eyes). A new edit bone's tail is the armature's
+                    # origin, which made each one a 1.6 m bone from the face to the floor: a short one looking ahead.
+                    parent = edit.get(joint.parent.name)
+                    bone.tail = bone.head + forward * max(0.02, 0.25 * parent.length if parent else 0.0)
                 if (bone.tail - bone.head).length < 1e-3:
                     bone.tail = bone.head + Vector((0, 0, 0.02))
             for joint in joints:

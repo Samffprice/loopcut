@@ -41,6 +41,12 @@ class Image(types.SimpleNamespace):
         self.filepath = value
 
 
+
+def scripted(path, index=0, simple=True, mute=False, kind="SCRIPTED"):
+    """A driver F-curve as the packer reads it."""
+    return types.SimpleNamespace(data_path=path, array_index=index, mute=mute,
+                                 driver=types.SimpleNamespace(type=kind, is_simple_expression=simple))
+
 class BundlesTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -531,6 +537,131 @@ class CollectionTest(unittest.TestCase):
                                                     "reason": "Unhandled input path"}])
             self.assertEqual(info["missing"], [{"type": "textures", "name": "gone", "path": str(gone)},
                                                {"type": "external", "path": str(model)}])
+
+    def test_driver_rule_is_the_render_services(self):
+        # Shared with loopcut-web workers/render/render_job.py: muted, not scripted, or a simple expression.
+        for curve, acceptable in ((scripted("x"), True), (scripted("x", simple=False, mute=True), True),
+                                  (scripted("x", simple=False, kind="AVERAGE"), True),
+                                  (scripted("x", simple=False), False)):
+            with self.subTest(curve=curve):
+                self.assertIs(bundles.driver_acceptable(curve), acceptable)
+
+    def driven(self, kind, name, drivers, values=None, **kwargs):
+        """A data-block of an RNA type carrying drivers; values are what its data paths resolve to."""
+        def path_resolve(path):
+            if path not in (values or {}):
+                raise ValueError(f"Path not found: {path}")
+            return values[path]
+        animation = types.SimpleNamespace(drivers=list(drivers), action=None)
+        return self.item(name=name, bl_rna=types.SimpleNamespace(name=kind), animation_data=animation,
+                         path_resolve=path_resolve, **kwargs)
+
+    def test_only_drivers_that_need_python_are_refused_by_name_and_none_is_changed(self):
+        # A free BlenderKit rigged character carries 100 scripted drivers ("var", "1-var" IK/FK switches), all simple
+        # expressions: its cloud render failed on the worker (live 2026-10-21). The service now renders simple ones,
+        # so they pack untouched; one that needs Python is refused here, before any upload, by the same rule.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            snapshot, stage = root / "snapshot.blend", root / "bundle"
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            scene = self.scene()
+            influence = 'pose.bones["mixamorig:LeftUpLeg"].constraints["FK_follow"].influence'
+            rig_drivers = [scripted(influence), scripted("location", 2, simple=False),
+                           scripted('["sway"]', simple=False), scripted("rotation_euler", simple=False),
+                           scripted("scale", simple=False, mute=True), scripted("hide_viewport", kind="AVERAGE")]
+            rig = self.driven("Object", "Armature", rig_drivers, {'["sway"]': 0.5, "rotation_euler": (0, 0, 0)},
+                              library=None, modifiers=[], particle_systems=[])
+            roughness = 'nodes["Principled BSDF"].inputs[2].default_value'
+            tree = self.driven("Shader Node Tree", "Shader Nodetree", [scripted(roughness, simple=False)], library=None)
+            material = self.item(name="Skin", bl_rna=types.SimpleNamespace(name="Material"), library=None,
+                                 node_tree=tree)
+            library = types.SimpleNamespace(name="hero.blend")
+            hero = self.driven("Object", "Hero", [scripted('["blink"]')], library=library, modifiers=[],
+                               particle_systems=[])
+            prop = self.driven("Object", "Prop", [scripted("location", 1, simple=False)], library=library,
+                               modifiers=[], particle_systems=[])
+            data = types.SimpleNamespace(objects=[rig, hero, prop], materials=[material], scenes=[scene],
+                                         libraries=[], all_ids=[rig, hero, prop, material])  # Every ID again.
+            before = [list(block.animation_data.drivers) for block in (rig, tree, hero, prop)]
+            fake = self.blender(data, scene, stage, lambda **kw: [])
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, None)
+            self.assertEqual(info["missing"], [])
+            self.assertEqual(info["unsupported"], [
+                {"type": "driver", "name": 'Object "Armature"', "path": "location[2]", "reason": bundles.PYTHON_DRIVER},
+                {"type": "driver", "name": 'Object "Armature"', "path": '["sway"]', "reason": bundles.PYTHON_DRIVER},
+                {"type": "driver", "name": 'Object "Armature"', "path": "rotation_euler[0]",
+                 "reason": bundles.PYTHON_DRIVER},
+                {"type": "driver", "name": 'Object "Prop"', "path": "location[1]",
+                 "reason": bundles.LINKED_PYTHON_DRIVER},
+                {"type": "driver", "name": 'Material "Skin"', "path": "node_tree." + roughness,
+                 "reason": bundles.PYTHON_DRIVER}])
+            for text in ("simple expression", "bake"):
+                self.assertIn(text, bundles.PYTHON_DRIVER)
+            self.assertIn("making the data local", bundles.LINKED_PYTHON_DRIVER)
+            # Nothing is dropped, baked or rewritten: the bundle is the scene as the user has it.
+            self.assertEqual([list(block.animation_data.drivers) for block in (rig, tree, hero, prop)], before)
+            self.assertEqual([block.animation_data.action for block in (rig, tree, hero, prop)], [None] * 4)
+
+    def test_second_driver_rule_is_the_render_services(self):
+        # Shared with render_job.py animates_drivers: any F-curve whose data path writes into animation data.
+        for path, refused in (("animation_data.drivers[0].mute", True), ("animation_data.drivers[3].driver.type", True),
+                              ("location", False), ('pose.bones["hand"]["ik_fk"]', False),
+                              ('key_blocks["Smile"].value', False), ('nodes["Mix"].inputs[0].default_value', False)):
+            with self.subTest(path=path):
+                self.assertIs(bundles.animates_drivers(types.SimpleNamespace(data_path=path)), refused)
+
+    def test_animation_that_changes_drivers_is_refused_by_name_and_ordinary_animation_packs(self):
+        # Measured on the worker (Blender 5.2.2, 2026-10-21): an action keyframing animation_data.drivers[0].mute turned
+        # a muted Python driver on mid-render. The service refuses keyframes in any action and drivers on any data-block
+        # whose path enters animation data (render_job.py secure_scene, driver_animated), so they are refused here too.
+        def action(name, paths, library=None):
+            bag = types.SimpleNamespace(fcurves=[types.SimpleNamespace(data_path=path, array_index=index)
+                                                 for path, index in paths])
+            layer = types.SimpleNamespace(strips=[types.SimpleNamespace(channelbags=[bag])])
+            return self.item(name=name, bl_rna=types.SimpleNamespace(name="Action"), library=library, layers=[layer])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            snapshot, stage = root / "snapshot.blend", root / "bundle"
+            snapshot.write_bytes(b"snapshot")
+            stage.mkdir()
+            scene = self.scene()
+            drivers = [scripted("location", 2, simple=False, mute=True), scripted('["switch"]'),
+                       scripted("rotation_euler", 1, simple=False),
+                       scripted("animation_data.drivers[0].driver.type", kind="AVERAGE")]
+            cube = self.driven("Object", "Cube", drivers, library=None, modifiers=[], particle_systems=[])
+            sneaky = action("Sneaky", [("location", 0), ("animation_data.drivers[0].mute", 0)])
+            walk = action("Walk", [("location", 1), ('pose.bones["hand"]["ik_fk"]', 0), ('["switch"]', 0)])
+            borrowed = action("Rig", [("animation_data.drivers[1].mute", 0)], library=types.SimpleNamespace(name="r"))
+            legacy = self.item(name="Old", bl_rna=types.SimpleNamespace(name="Action"), library=None)  # No layers.
+            data = types.SimpleNamespace(objects=[cube], actions=[sneaky, walk, borrowed, legacy], scenes=[scene],
+                                         libraries=[], all_ids=[cube, sneaky, walk, borrowed, legacy])
+            fake = self.blender(data, scene, stage, lambda **kw: [])
+            with patch.dict(sys.modules, {"bpy": fake}):
+                info = bundles._collect_opened(snapshot, stage, None)
+            self.assertEqual(info["missing"], [])
+            # The worker refuses Python drivers first, so their rows come first.
+            self.assertEqual(info["unsupported"], [
+                {"type": "driver", "name": 'Object "Cube"', "path": "rotation_euler[1]",
+                 "reason": bundles.PYTHON_DRIVER},
+                {"type": "driver", "name": 'Object "Cube"', "path": "animation_data.drivers[0].driver.type",
+                 "reason": bundles.DRIVER_ANIMATED},
+                {"type": "keyframes", "name": 'Action "Sneaky"', "path": "animation_data.drivers[0].mute",
+                 "reason": bundles.DRIVER_ANIMATED},
+                {"type": "keyframes", "name": 'Action "Rig"', "path": "animation_data.drivers[1].mute",
+                 "reason": bundles.LINKED_DRIVER_ANIMATED}])
+            self.assertIn("Remove the keyframes or drivers on driver settings", bundles.DRIVER_ANIMATED)
+            self.assertIn("making the data local", bundles.LINKED_DRIVER_ANIMATED)
+            # Ordinary keyframes and drivers, a rig's switches included, are not refused.
+            cube.animation_data.drivers[1:] = cube.animation_data.drivers[1:2]
+            data.actions[:] = [walk, legacy]
+            stage = root / "again"
+            stage.mkdir()
+            fake = self.blender(data, scene, stage, lambda **kw: [])
+            with patch.dict(sys.modules, {"bpy": fake}):
+                self.assertEqual(bundles._collect_opened(snapshot, stage, None)["unsupported"], [])
 
     def test_collect_launches_only_an_isolated_child_and_rejects_reusing_staging(self):
         with tempfile.TemporaryDirectory() as temporary:

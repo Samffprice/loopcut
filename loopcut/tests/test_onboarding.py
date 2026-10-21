@@ -546,15 +546,33 @@ class OnboardingTest(unittest.TestCase):
         self.assertIn("loopcut.chatgpt_sign_in", [r[1] for r in splash.operators()])
         self.assertNotIn("Continue on your ChatGPT plan", [r[2] for r in splash.operators()])
 
-    def test_chatgpt_error_offers_another_account_even_with_a_saved_loopcut_account(self):
+    def test_chatgpt_error_offers_a_retry_and_another_account_even_with_a_saved_loopcut_account(self):
         self.prefs.provider = "CHATGPT"
-        self.chatgpt_ui._state.update(status="error", error="Use another account")
+        message = self.chatgpt_ui.chatgpt_auth.SIGN_IN_MESSAGES["invalid_grant"]
+        self.chatgpt_ui._state.update(status="error", error=message)
         with patch.object(self.account, "signed_in", return_value=True):
             splash = Splash()
             self.onboarding._draw_sign_in(splash, self.context)
-        another = next(r for r in splash.operators() if r[2] == "Use another account")
+        self.assertIn(("label", message), splash.records, "the whole message, not cut short")
+        retry = next(r for r in splash.operators() if r[2] == "Try again")
+        self.assertEqual(retry[1], "loopcut.chatgpt_sign_in")
+        self.assertFalse(getattr(retry[3], "new_account", False))  # The plain sign-in keeps an issued client id.
+        another = next(r for r in splash.operators() if r[2] == "Another account")
         self.assertTrue(another[3].new_account)
         self.assertIn("loopcut.onboarding_own_key", [r[1] for r in splash.operators()])
+
+    def test_a_failed_chatgpt_sign_in_reports_where_it_failed_and_shows_the_message_alone(self):
+        auth = self.chatgpt_ui.chatgpt_auth
+        telemetry = importlib.import_module(NAME + ".telemetry")
+        for stage, code in (("token", "token_invalid_grant"), ("", "invalid_grant")):
+            with self.subTest(stage=stage):
+                error = auth.ChatGPTAuthError(auth.SIGN_IN_MESSAGES["invalid_grant"], "invalid_grant", 400, stage)
+                with patch.object(auth, "sign_in", side_effect=error), \
+                        patch.object(telemetry, "setup_step") as event, \
+                        patch.object(self.chatgpt_ui.mainthread, "run_on_main", side_effect=lambda fn: fn()):
+                    self.chatgpt_ui._run_sign_in(False)
+                event.assert_called_once_with("chatgpt", "chatgpt", False, code)
+                self.assertEqual(self.chatgpt_ui.status()["error"], auth.SIGN_IN_MESSAGES["invalid_grant"])
 
     def test_own_key_on_anthropic_links_to_its_keys_lists_its_models_and_shows_its_privacy_note(self):
         self.onboarding._state["own_key"] = True
@@ -1072,7 +1090,7 @@ class OnboardingTest(unittest.TestCase):
         """The design bar: quiet actions (Back, Skip, Cancel, Start fresh) are muted text links, teal marks only a
         link that opens the browser (↗), no filled button carries an icon, and every box has the same padding."""
         on = self.onboarding
-        live = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+        live = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
                 {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
         screens = (
             ("account", False, lambda: None, on._draw_account),
@@ -1131,7 +1149,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(sentence("Try again later."), "Try again later.")
         self.assertEqual(sentence("x " * 60), "x " * 34 + "x…")  # Shortened, not given a full stop.
 
-    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
             {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
 
     def draw_how(self, plan="", billing=True, descriptors=None):
@@ -1187,8 +1205,8 @@ class OnboardingTest(unittest.TestCase):
                      "Others use credits, price shown first", "No ChatGPT plan? Everything still works.",
                      "Loopcut Fast does the thinking instead, or add your own API key.", "Free", "No card needed",
                      "Pro", "$20/mo", "Weekly limit", "Higher weekly limit", "Loopcut Pro model", "Credit top-ups",
-                     "100 credits: 1 model from a photo, or 20 s of motion",
-                     "2,200 credits: 27 models from photos, or 7 min of motion"):
+                     "100 credits: 1 model from a photo, or 50 s of motion",
+                     "2,200 credits: 27 models from photos, or 18 min of motion"):
             self.assertIn(text, labels)
         for text in ("Two parts work together", "Works with your ChatGPT plan", "Asset search |", "Plus or Pro",
                      "Credits every month", "Max"):  # No subtitle; only what differs; Max only for Max.
@@ -1216,8 +1234,8 @@ class OnboardingTest(unittest.TestCase):
         splash, labels, texts = self.draw_how("max")
         head = labels.split(" | ")
         self.assertEqual(head[head.index("No card needed") + 1:head.index("No card needed") + 3], ["Max", "Your plan"])
-        for text in ("Highest weekly limit", "6,600 credits: 82 models from photos, or 22 min of motion",
-                     "100 credits: 1 model from a photo, or 20 s of motion"):
+        for text in ("Highest weekly limit", "6,600 credits: 82 models from photos, or 55 min of motion",
+                     "100 credits: 1 model from a photo, or 50 s of motion"):
             self.assertIn(text, labels)
         for text in ("Higher weekly limit", "$20/mo", "2,200 credits", "You have Max"):
             self.assertNotIn(text, labels)
@@ -1235,12 +1253,12 @@ class OnboardingTest(unittest.TestCase):
         on = self.onboarding
         self.assertEqual(on.PLANS, {"free": {"credits": 100, "price": 0}, "pro": {"credits": 2200, "price": 20},
                                     "max": {"credits": 6600, "price": 60}})  # The plans tables, 2026-10-21.
-        self.assertEqual(on._makes(6600, 80, 5.0), "82 models from photos, or 22 min of motion")
-        self.assertEqual(on._unit_prices(self.LIVE), (80, 5.0))
+        self.assertEqual(on._makes(6600, 80, 2.0), "82 models from photos, or 55 min of motion")
+        self.assertEqual(on._unit_prices(self.LIVE), (80, 2.0))
         self.assertEqual(on._unit_prices([{"name": "image_to_3d", "backend": "byok"}]), (None, None))
-        self.assertEqual(on._makes(100, 80, 5.0), "1 model from a photo, or 20 s of motion")
-        self.assertEqual(on._makes(2200, 80, 5.0), "27 models from photos, or 7 min of motion")
-        self.assertEqual(on._makes(2200, None, 5.0), "7 min of motion")  # A missing price drops its part.
+        self.assertEqual(on._makes(100, 80, 2.0), "1 model from a photo, or 50 s of motion")
+        self.assertEqual(on._makes(2200, 80, 2.0), "27 models from photos, or 18 min of motion")
+        self.assertEqual(on._makes(2200, None, 2.0), "18 min of motion")  # A missing price drops its part.
         self.assertEqual(on._makes(50, 80, None), "")
         splash, labels, texts = self.draw_how(descriptors=[])
         self.assertIn("| 2,200 credits |", f"| {labels} |")  # No prices at all: the credits themselves.
@@ -1271,7 +1289,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertTrue(drawn)
         return splash, " ".join(r[1] for r in splash.records if r[0] == "label")
 
-    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+    LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
             {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
 
     def test_first_project_cards_show_credits_and_dollars_and_both_paid_ones_fit_the_trial(self):
@@ -1283,7 +1301,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(texts, ["Start", "Start", "Start", "Skip for now"])
         for title in ("Make it move", "Photo to 3D model", "Model a treasure chest"):
             self.assertIn(title, labels)
-        for price in ("15 credits · $0.15", "80 credits · $0.80", "Free"):  # 3 of 5 s of motion.
+        for price in ("6 credits · $0.06", "80 credits · $0.80", "Free"):  # 3 of 5 s of motion.
             self.assertIn(price, labels)
         self.assertTrue(all(r[4].enabled for r in parts))
         self.assertEqual(splash.records.count(("icon", 7)), 3)  # Every card has its picture, the same size.

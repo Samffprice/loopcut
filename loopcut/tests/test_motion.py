@@ -34,7 +34,7 @@ def descriptor(name="motion_from_text", **changes):
         "file_inputs": [], "output": {"type": "motion", "formats": ["bvh", "json"]}, "apply": "apply_motion",
         "apply_args": {"type": "object", "properties": {"target_armature": TARGET, "in_place": IN_PLACE},
                        "additionalProperties": False},
-        "cost": {"credits_estimate": 25, "quote_required": False}, "approval": {"confirm_over_credits": 100},
+        "cost": {"credits_estimate": 10, "quote_required": False}, "approval": {"confirm_over_credits": 100},
         "backends": ["managed"], "byok": None, "bundle_input": None}
     value.update(changes)
     return value
@@ -311,6 +311,53 @@ class RigDetectionTest(unittest.TestCase):
         self.assertEqual(mr.smooth([(0, 0, 0), (3, 0, 0), (6, 0, 0)], 3)[1], (3.0, 0.0, 0.0))
         steady = [(0.05 * i, 0.0, 1.0) for i in range(48)]  # A steady walk: in place it must not drift at the ends.
         self.assertLess(max(abs(a[0] - b[0]) for a, b in zip(steady, mr.smooth(steady, 24))), 1e-9)
+
+
+class BakeChecksTest(unittest.TestCase):
+    """The parts of the bake's safety checks that need no Blender; harness/motion_check.py runs the rest."""
+
+    def test_soma_face_joints_are_leaves_without_end_sites(self):
+        # build_skeleton gives these a tail of their own: a new edit bone's tail is the armature's origin, which
+        # made the onboarding mannequin's jaw and eyes 1.6 m bones from the face to the floor.
+        for name in ("gemx_dance_60.bvh", "kimodo_walk_60.bvh"):
+            bvh = mr.parse_bvh((FIXTURES / name).read_text())
+            for joint in mr.SOMA_EXTRA:
+                with self.subTest(name=name, joint=joint):
+                    self.assertEqual((bvh.by_name[joint].children, bvh.by_name[joint].end), ([], None))
+
+    def test_limbs_that_do_not_follow_the_motion(self):
+        working = [("left arm", 0.6, 0.55), ("right arm", 0.5, 0.48), ("left leg", 0.4, 0.3), ("right leg", 0.4, 0.42)]
+        self.assertEqual(mr.unfollowed(working), ([], 4))
+        ik_locked = [("left arm", 0.6, 0.0), ("right arm", 0.5, 0.01), ("left leg", 0.4, 0.0), ("right leg", 0.4, 0.0)]
+        self.assertEqual(mr.unfollowed(ik_locked), (["left arm", "right arm", "left leg", "right leg"], 4))
+        one_arm = [("left arm", 0.6, 0.02), ("right arm", 0.5, 0.5), ("left leg", 0.02, 0.0), ("right leg", 0.03, 0.0)]
+        self.assertEqual(mr.unfollowed(one_arm), (["left arm"], 2))  # Legs the source hardly moves are not judged.
+        self.assertEqual(mr.unfollowed([("left arm", 0.05, 0.0)]), ([], 0))
+
+    def test_travel_bone_is_pushed_only_where_it_carries_the_pelvis(self):
+        self.assertEqual(mr.travel_gain((1.0, 0.98, 1.03)), (1.0, 1.0, 1.0))  # Rigid: the old solve, unchanged.
+        self.assertEqual(mr.travel_gain((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))  # Constraint-placed thighs: never pushed.
+        self.assertEqual(mr.travel_gain((1.0, 1.0, 0.1)), (1.0, 1.0, 0.0))  # Height set elsewhere: travel only.
+        self.assertEqual(mr.travel_gain((0.5, 2.0, 0.49)), (2.0, 0.5, 0.0))  # Partial or scaled: one step lands.
+
+    def test_refusal_says_what_was_not_done_and_what_to_do(self):
+        class Armature:
+            def __init__(self, data, props):
+                self.name, self.data, self.props = "RIG-rain", data, props
+
+            def keys(self):
+                return list(self.props)
+
+        rig = mr.Rig("generic", {})
+        cloudrig = mr._refusal(Armature({"is_generated_cloudrig": True}, {"cloudrig": {}}), rig, 14,
+                               ["left arm", "left leg"])
+        self.assertTrue(cloudrig.startswith("Nothing was applied to 'RIG-rain'"))
+        self.assertIn("humanoid matched by bone names (14 bones)", cloudrig)
+        self.assertIn("left arm, left leg", cloudrig)
+        self.assertIn("CloudRig", cloudrig)
+        other = mr._refusal(Armature({}, {}), rig, 14, ["right arm"])
+        self.assertIn("switch them to FK and apply the motion again", other)
+        self.assertNotIn("CloudRig", other)
 
 
 class ApplyArgsTest(unittest.TestCase):

@@ -4,6 +4,16 @@
 # release tag the installers are added to that release (created as a draft if it does not exist);
 # without one they are only kept as workflow artifacts.
 #
+# Two modes:
+# - full (default) compiles everything.
+# - repackage (Windows, minutes) takes base_tag's Windows release (its .zip: the installed tree, already
+#   compiled and signed), swaps in this commit's Python and packages it again with the full build's CPack
+#   configuration; only the new .msi is signed. It refuses when anything but Python changed since the
+#   commit that build came from (loopcut/scripts/repackage_windows.py), holds the new .msi and .zip to the
+#   base release's (table by table, file by file), and test-installs the .msi over the base one (a job
+#   beside the upload: publish only once the whole run is green).
+#     gh workflow run release.yml --ref vX.Y.Z -f mode=repackage -f base_tag=vA.B.C -f release_tag=vX.Y.Z
+#
 # This repository carries no Git LFS objects of its own: Blender's are fetched from
 # projects.blender.org, the way Blender's `make update` does for any fork hosted elsewhere.
 #
@@ -23,6 +33,19 @@ on:
         description: Release to add the installers to, like v0.1.0 (empty keeps them as artifacts only)
         type: string
         default: ""
+      mode:
+        description: "full compiles; repackage (Windows) reuses base_tag's build with this commit's Python"
+        type: choice
+        options: [full, repackage]
+        default: full
+      base_tag:
+        description: "repackage: the release whose Windows build is reused, like v0.2.6"
+        type: string
+        default: ""
+      base_repo:
+        description: "repackage: owner/name of the repository with base_tag's release (empty: this one)"
+        type: string
+        default: ""
 
 env:
   # Python build helpers must not add caches to the source/install trees.
@@ -40,6 +63,7 @@ concurrency:
 jobs:
   build:
     name: ${{ matrix.name }}
+    if: inputs.mode != 'repackage'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
     # The Azure sign-in for code signing is tied to this environment, which only main, the v* release
@@ -79,12 +103,15 @@ jobs:
           if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "$addon" ]; then
             echo "the add-on says $addon (bl_info in scripts/addons_core/loopcut/__init__.py); bump it first" >&2; exit 1
           fi
+          blender/loopcut/scripts/release_tag_check.sh
           echo "PACKAGE_NAME=loopcut-${RELEASE_TAG:-dev-$GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "libs=$(git -C blender rev-parse "HEAD:lib/${{ matrix.lib }}")" >> "$GITHUB_OUTPUT"
 
+      # Caches are saved only from branches: a run on a tag can read main's caches, but what it saves
+      # only that same tag could read, and the repository has 10 GB for all of them.
       - name: Restore precompiled libraries
         id: libs
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: blender/lib/${{ matrix.lib }}
           key: blender-libs-${{ matrix.lib }}-${{ steps.names.outputs.libs }}
@@ -96,6 +123,13 @@ jobs:
           git lfs install
           python3 build_files/utils/make_update.py --no-blender ${{ steps.libs.outputs.cache-hit == 'true' && '--no-libraries' || '' }}
           git lfs checkout
+
+      - name: Save precompiled libraries
+        if: steps.libs.outputs.cache-hit != 'true' && startsWith(github.ref, 'refs/heads/')
+        uses: actions/cache/save@v4
+        with:
+          path: blender/lib/${{ matrix.lib }}
+          key: blender-libs-${{ matrix.lib }}-${{ steps.names.outputs.libs }}
 
       # Cycles on NVIDIA and AMD cards needs kernels compiled with the vendors' SDKs, which take hours
       # and tools a hosted runner lacks. Loopcut does not change Cycles, so the kernels of the
@@ -187,34 +221,11 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then blender=build/bin/Loopcut.app/Contents/MacOS/Loopcut; else blender=build/bin/blender.exe; fi
           "$blender" -b --factory-startup --python-expr "import bpy, loopcut; assert hasattr(bpy.types, 'SpaceLoopcut'); print('Loopcut build OK', bpy.app.version_string)"
 
-      # Code signing with Microsoft Artifact Signing: account loopcutsign (South Central US), certificate
-      # profile loopcutrelease, through SignTool and Microsoft's plugin for it, both pinned. Only the
-      # Azure CLI sign-in is tried. It comes after the build because its token lasts about an hour.
+      # Code signing with Microsoft Artifact Signing (loopcut/scripts/windows_signing_tools.ps1). It comes
+      # after the build because the Azure sign-in's token lasts about an hour.
       - name: Signing tools (Windows)
         if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tools = Join-Path $env:GITHUB_WORKSPACE signing
-          nuget install Microsoft.Windows.SDK.BuildTools -Version 10.0.28000.2705 -OutputDirectory $tools -NonInteractive
-          if ($LASTEXITCODE) { throw "nuget install failed" }
-          nuget install Microsoft.ArtifactSigning.Client -Version 1.0.146 -OutputDirectory $tools -NonInteractive
-          if ($LASTEXITCODE) { throw "nuget install failed" }
-          $signtool = "$tools\Microsoft.Windows.SDK.BuildTools.10.0.28000.2705\bin\10.0.28000.0\x64\signtool.exe"
-          $dlib = "$tools\Microsoft.ArtifactSigning.Client.1.0.146\bin\x64\Azure.CodeSigning.Dlib.dll"
-          foreach ($file in $signtool, $dlib) { if (-not (Test-Path $file)) { throw "Missing $file" } }
-          $metadata = "$tools\metadata.json"
-          @{
-            Endpoint = 'https://scus.codesigning.azure.net'
-            CodeSigningAccountName = 'loopcutsign'
-            CertificateProfileName = 'loopcutrelease'
-            CorrelationId = "$env:GITHUB_REPOSITORY run $env:GITHUB_RUN_ID"
-            ExcludeCredentials = @('EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
-              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
-              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential')
-          } | ConvertTo-Json | Set-Content -Encoding utf8 $metadata
-          "LOOPCUT_SIGNTOOL=$signtool", "LOOPCUT_SIGN_DLIB=$dlib", "LOOPCUT_SIGN_METADATA=$metadata",
-            "LOOPCUT_SIGN_CACHE=$tools\cache" | Add-Content $env:GITHUB_ENV
+        run: pwsh -NoProfile -File blender/loopcut/scripts/windows_signing_tools.ps1
 
       - name: Sign in to Azure for signing (Windows)
         if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
@@ -259,10 +270,257 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # An add-on-only release: base_tag's Windows build with this commit's Python, no compile.
+  repackage:
+    name: windows-x64 (repackage)
+    if: inputs.mode == 'repackage'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    environment: windows-signing
+    permissions:
+      # Write only so a draft base release can be read (drafts need push access); nothing here pushes.
+      contents: write
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      PLATFORMS: ${{ inputs.platforms }}
+      BASE_TAG: ${{ inputs.base_tag }}
+      BASE_REPO: ${{ inputs.base_repo || github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: blender
+          lfs: false
+
+      - name: Check the inputs
+        run: |
+          [ "$PLATFORMS" = windows-x64 ] || { echo "::error::mode repackage builds windows-x64 only (the Mac's is repackage_mac.sh)"; exit 1; }
+          printf '%s' "$BASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::base_tag must look like v0.1.0, got: $BASE_TAG"; exit 1; }
+          printf '%s' "$BASE_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "::error::base_repo must look like owner/name"; exit 1; }
+          if [ -n "$RELEASE_TAG" ] && ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release_tag must look like v0.1.0, got: $RELEASE_TAG"; exit 1
+          fi
+          addon="$(blender/loopcut/scripts/addon_version.sh)"
+          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "$addon" ]; then
+            echo "::error::the add-on says $addon (bl_info in scripts/addons_core/loopcut/__init__.py); bump it first"; exit 1
+          fi
+          blender/loopcut/scripts/release_tag_check.sh
+          {
+            echo "PACKAGE_NAME=loopcut-${RELEASE_TAG:-dev-$GITHUB_RUN_NUMBER}"
+            echo "ADDON_VERSION=$addon"
+            echo "BASE_ROOT=base/tree/loopcut-$BASE_TAG-windows64"
+          } >> "$GITHUB_ENV"
+
+      # The base release's .zip (the whole installed tree, programs already signed) and .msi, checked
+      # against GitHub's digests of them.
+      - name: Download the base release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p base
+          # A published release by its tag; a draft (visible with push access) from the list.
+          gh api "repos/$BASE_REPO/releases/tags/$BASE_TAG" > base/release.json 2>/dev/null ||
+            gh api --paginate "repos/$BASE_REPO/releases" --jq ".[] | select(.tag_name == \"$BASE_TAG\")" > base/release.json
+          for ext in zip msi; do
+            name="loopcut-$BASE_TAG-windows64.$ext"
+            digest="$(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(next((a.get("digest") or "" for a in r["assets"] if a["name"] == sys.argv[2]), ""))' base/release.json "$name")"
+            [ -n "$digest" ] || { echo "::error::$BASE_REPO $BASE_TAG has no $name (or GitHub gave no digest for it)"; exit 1; }
+            gh release download "$BASE_TAG" --repo "$BASE_REPO" --pattern "$name" --dir base
+            echo "${digest#sha256:}  base/$name" | sha256sum -c
+          done
+          7z x -y -obase/tree "base/loopcut-$BASE_TAG-windows64.zip" > /dev/null
+          test -f "$BASE_ROOT/blender.exe"
+
+      # The base build names the commit it was compiled from (Blender's build hash): the base tag's, or
+      # for a tag a re-cut moved, an earlier commit in its history. Everything else follows from that
+      # commit: nothing outside the Python may have changed since it.
+      - name: Check that only the Python changed since the base build
+        run: |
+          base_version="$(grep -Eo '"version": \([0-9]+, [0-9]+, [0-9]+\)' "$BASE_ROOT"/*/scripts/addons_core/loopcut/__init__.py |
+            tr -d '(),' | awk '{print "v" $2 "." $3 "." $4}')"
+          [ "$base_version" = "$BASE_TAG" ] || { echo "::error::the base release's add-on is $base_version, not $BASE_TAG"; exit 1; }
+          hash="$("$BASE_ROOT/blender.exe" --version | tr -d '\r' | awk '$1 == "build" && $2 == "hash:" {print $3}')"
+          printf '%s' "$hash" | grep -Eq '^[0-9a-f]{7,40}$' || { echo "::error::no build hash in the base's blender.exe --version"; exit 1; }
+          if [ "$BASE_REPO" = "$GITHUB_REPOSITORY" ]; then src=origin; auth=(); else src="https://github.com/$BASE_REPO"; auth=(-c "http.https://github.com/.extraheader="); fi
+          git -C blender "${auth[@]}" fetch --quiet --no-tags --depth=1 "$src" "refs/tags/$BASE_TAG"
+          base="$(git -C blender rev-parse 'FETCH_HEAD^{commit}')"
+          case "$base" in
+            "$hash"*) ;;
+            *)
+              echo "::notice::The base build is $hash, not $BASE_TAG's $base: looking in the tag's history."
+              git -C blender "${auth[@]}" fetch --quiet --no-tags --depth=30 "$src" "refs/tags/$BASE_TAG"
+              base="$(git -C blender rev-parse --verify --quiet "$hash^{commit}")" ||
+                { echo "::error::commit $hash (the base build's) is not in $BASE_TAG's last 30 commits"; exit 1; } ;;
+          esac
+          echo "Base build: $BASE_REPO $BASE_TAG, compiled from $base" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "BASE_COMMIT=$base" >> "$GITHUB_ENV"
+          python3 blender/loopcut/scripts/repackage_windows.py check "$base" HEAD
+
+      - name: Swap in this commit's Python
+        run: |
+          python3 blender/loopcut/scripts/repackage_windows.py apply "$BASE_COMMIT" HEAD "$BASE_ROOT" changes.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The full build's check, plus the version and the bundled extensions; then out with anything the run
+      # wrote into the tree (bytecode), since this tree is what gets packaged.
+      - name: Smoke test
+        run: |
+          # Meanwhile, the base .msi's tables, for the component split and the comparison below.
+          pwsh -NoProfile -File blender/loopcut/scripts/msi_tables.ps1 "base/loopcut-$BASE_TAG-windows64.msi" base-msi.json &
+          tables=$!
+          find "$BASE_ROOT" | sort > tree-before.txt
+          "$BASE_ROOT/blender.exe" -b --factory-startup --python-exit-code 1 --python-expr "
+          import bpy, loopcut
+          from loopcut import bundled_addons
+          assert hasattr(bpy.types, 'SpaceLoopcut')
+          version = 'v%d.%d.%d' % tuple(loopcut.bl_info['version'])
+          assert version == '$ADDON_VERSION', version
+          missing = [p['id'] for p in bundled_addons.packages() if not p['present']]
+          assert not missing, missing
+          print('Loopcut build OK', version, bpy.app.version_string)
+          " > smoke.log 2>&1 && grep -q "Loopcut build OK" smoke.log || { tail -30 smoke.log; exit 1; }
+          grep "Loopcut build OK" smoke.log
+          find "$BASE_ROOT" | sort | comm -13 tree-before.txt - > tree-new.txt
+          echo "The smoke test wrote $(wc -l < tree-new.txt) files and folders into the tree; removing them."
+          sort -r tree-new.txt | while IFS= read -r path; do rm -rf "$path"; done
+          wait "$tables"
+
+      # Into a folder per CPack component, as the full build stages them (see windows_repackage/CMakeLists.txt).
+      - name: Sort the files into the base build's components
+        run: |
+          python3 blender/loopcut/scripts/repackage_windows.py split "$BASE_ROOT" base-msi.json base/staged
+          {
+            echo "REPACK_SOURCE=$(cygpath -m "$GITHUB_WORKSPACE/blender")"
+            echo "REPACK_TREE=$(cygpath -m "$GITHUB_WORKSPACE/base/staged")"
+          } >> "$GITHUB_ENV"
+
+      - name: Signing tools
+        if: env.AZURE_CLIENT_ID != ''
+        run: pwsh -NoProfile -File blender/loopcut/scripts/windows_signing_tools.ps1
+
+      - name: Sign in to Azure for signing
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Configure only (loopcut/scripts/windows_repackage), with the compiler set up as for the full build.
+      - name: Configure the packaging (no compile)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          for %%d in (repack repack-zip) do (
+            cmake -S "%REPACK_SOURCE%/loopcut/scripts/windows_repackage" -B %%d -G Ninja ^
+              "-DLOOPCUT_SOURCE_DIR=%REPACK_SOURCE%" "-DLOOPCUT_TREE=%REPACK_TREE%" ^
+              "-DCPACK_OVERRIDE_PACKAGENAME=%PACKAGE_NAME%" || exit /b 1
+          )
+
+      # CPack as in the full build: the same pre-build hooks (bytecode out; sign_windows.ps1 leaves the
+      # programs, already signed, alone and would sign any new one), then the .msi is signed: one signature.
+      # The .zip is made beside the .msi (a second configured folder), and WiX skips its validation pass:
+      # the comparison below holds the .msi to the base release's, which passed it.
+      - name: Package
+        working-directory: repack
+        run: |
+          if [ -n "$AZURE_CLIENT_ID" ]; then
+            sign=(-D "CPACK_PRE_BUILD_SCRIPTS=$REPACK_SOURCE/build_files/cmake/loopcut_release_hygiene.cmake;$REPACK_SOURCE/loopcut/scripts/cpack_sign.cmake")
+          elif [ -n "$RELEASE_TAG" ]; then
+            echo "::error title=No signing secrets::The windows-signing environment has no Azure secrets, and a release must be signed."; exit 1
+          else
+            sign=()
+            echo "::warning title=Unsigned installer::No signing secrets in the windows-signing environment; the .msi is unsigned (its programs keep the base's signatures)."
+          fi
+          (cd ../repack-zip && cpack -G ZIP "${sign[@]}" > ../cpack-zip.log 2>&1) &
+          zip=$!
+          cpack -G WIX "${sign[@]}" -D "CPACK_WIX_LIGHT_EXTRA_FLAGS=-dcl:medium;-sval"
+          wait "$zip" || { cat ../cpack-zip.log; exit 1; }
+          cat ../cpack-zip.log
+          mv ../repack-zip/loopcut-*.zip .
+
+      # Gates: the new packages must equal the base release's apart from the swapped files, and the .msi
+      # must keep the base's UpgradeCode, version and every other row, with a new ProductCode.
+      - name: Compare with the base release
+        run: |
+          pwsh -NoProfile -File blender/loopcut/scripts/msi_tables.ps1 "repack/$PACKAGE_NAME-windows64.msi" new-msi.json
+          python3 blender/loopcut/scripts/repackage_windows.py msi-compare base-msi.json new-msi.json changes.txt \
+            "base/loopcut-$BASE_TAG-windows64.zip" msi-compare.txt
+          python3 blender/loopcut/scripts/repackage_windows.py zipdiff "base/loopcut-$BASE_TAG-windows64.zip" \
+            "repack/$PACKAGE_NAME-windows64.zip" changes.txt | tee zip-compare.txt
+          { echo '### Compared with the base release'; echo '```'; tail -n 40 msi-compare.txt; tail -n 3 zip-compare.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign the installer
+        if: env.AZURE_CLIENT_ID != ''
+        run: pwsh -NoProfile -File blender/loopcut/scripts/sign_windows.ps1 "repack/$PACKAGE_NAME-windows64.msi"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loopcut-windows-x64
+          path: |
+            repack/loopcut-*.zip
+            repack/loopcut-*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repackage-evidence
+          path: |
+            changes.txt
+            msi-compare.txt
+            zip-compare.txt
+            base-msi.json
+            new-msi.json
+            smoke.log
+            tree-new.txt
+            base/loopcut-*.msi
+          retention-days: 14
+
+  # Installs the base release, then the new .msi over it, the way users update (msi_upgrade_test.ps1).
+  # Runs beside the upload: the release stays a draft until it is published by hand, after this passes.
+  upgrade-test:
+    name: windows-x64 (upgrade install test)
+    needs: repackage
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: blender
+          lfs: false
+          sparse-checkout: |
+            loopcut/scripts
+            scripts/addons_core/loopcut
+      - uses: actions/download-artifact@v4
+        with:
+          name: loopcut-windows-x64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: repackage-evidence
+          path: evidence
+      - name: Install the base release, then the new one over it
+        run: |
+          pwsh -NoProfile -File blender/loopcut/scripts/msi_upgrade_test.ps1 evidence/base/loopcut-*.msi dist/loopcut-*.msi dist/loopcut-*.zip \
+            "$(blender/loopcut/scripts/addon_version.sh)" logs
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: upgrade-test-logs
+          path: logs
+          retention-days: 14
+
   release:
     name: Add to the release
-    if: inputs.release_tag != ''
-    needs: build
+    if: ${{ !cancelled() && !failure() && inputs.release_tag != '' }}
+    needs: [build, repackage]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -270,6 +528,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: loopcut-*
           merge-multiple: true
       # A new release starts as a draft: nothing is public until you press Publish on its page.
       - name: Upload to the release, creating a draft if there is none

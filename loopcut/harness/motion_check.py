@@ -9,6 +9,9 @@ the FK controls through constraints), the pelvis path scaled by leg length, and 
 Rigs: SOMA (no armature targeted), Mixamo (T-pose, rolled bones, a previous action to stash), Mixamo lying
 along -Y (as glTF imports it), Unreal (UE5 names, A-pose, turned and moved, one Euler bone), Auto-Rig Pro
 controls (IK to FK switch), a Character Creator-like rig (name heuristic) and a generated Rigify rig.
+SOMA's generated skeleton has no bone longer than a leg bone (its jaw and eyes end in the head). Then a walk;
+controls that drive no deforming bone are refused with the bake undone, and a travel bone that does not carry
+constraint-placed thighs stays put.
 --render writes 8 frames per rig, seen from the front of the body, for a contact sheet (ffmpeg tile);
 --ybot also renders the motion on a Mixamo character from a local GLB (never committed: Adobe's licence).
 """
@@ -363,6 +366,10 @@ def run_rig(kind, bvh_text, meta, bvh, args):
               f"soma: no armature targeted makes a skeleton with a generated body ({line[:90]}…)")
         check(not any("Y Bot" in o.name or "mixamo" in o.name.lower() for o in bpy.data.objects),
               "soma: no licensed character is imported")
+        bones = ob.data.bones
+        long = [b.name for b in bones if b.length > 0.5]  # The thighs and shins are about 43 cm.
+        inside = all((bones[n].tail_local - bones["Head"].head_local).length < 0.25 for n in mr.SOMA_EXTRA)
+        check(not long and inside, f"soma: every bone ends near its joint, the jaw and eyes in the head (long: {long})")
         names = {c: mr.SOMA[c] for c in mr.CANONICAL}
         return ob, names, line, 0.0
     scene.cursor.location = (-1.5, 0, 0)
@@ -475,6 +482,48 @@ def walk_checks(args):
             check(not fingers, "walk: no finger curves for a body-only motion")
 
 
+def drive_checks(args):
+    """Rigs that break what the chain math assumes: controls that drive no deforming bone (as on a limb left in
+    IK mode) are refused and the bake undone; a travel bone that does not carry constraint-placed thighs stays put
+    instead of running away (CloudRig's hinges once sent Snow's hips 2 km)."""
+    text = (FIXTURES / "kimodo_walk_60.bvh").read_text()
+    meta = {"fps": 30, "fingers_animated": False}
+    P = soma_points(mr.parse_bvh(text))
+    rows = mixamo_rows(P)
+    names = [r[0] for r in rows]
+
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    loose = [(f"D{n:02d}", f"D{names.index(p):02d}" if p else None, h, t, True) for n, (_b, p, h, t, _d) in enumerate(rows)]
+    ob = make_armature("Puppet", [(b, p, h, t, False) for b, p, h, t, _d in rows] + loose)
+    old = bpy.data.actions.new("Idle")
+    ob.animation_data_create().action = old
+    actions = len(bpy.data.actions)
+    try:
+        mr.apply(text, meta, target=ob, title="walk")
+        refused = ""
+    except mr.MotionError as ex:
+        refused = str(ex)
+    check(refused.startswith("Nothing was applied to 'Puppet'") and "FK" in refused,
+          f"puppet: controls that drive no deforming bone are refused ({refused[:70]}…)")
+    pose = max(abs(a - b) for pb in ob.pose.bones for ra, rb in zip(pb.matrix_basis, Matrix.Identity(4))
+               for a, b in zip(ra, rb))
+    check(ob.animation_data.action == old and not ob.animation_data.nla_tracks and len(bpy.data.actions) == actions
+          and pose < 1e-6, "puppet: the refused bake is undone (its action active again, no stash, the pose as it was)")
+
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    hinged = [(b, None if b.endswith("UpLeg") else p, h, t, d) for b, p, h, t, d in rows]
+    anchors = [(f"Anchor{b[10:-5]}", None, h, t, False) for b, _p, h, t, _d in rows if b.endswith("UpLeg")]
+    ob = make_armature("Hinged", hinged + anchors)
+    for side in ("Left", "Right"):
+        con = ob.pose.bones[f"mixamorig:{side}UpLeg"].constraints.new("COPY_LOCATION")
+        con.target, con.subtarget = ob, f"Anchor{side}"
+    line = mr.apply(text, meta, target=ob, title="walk")
+    reach = max(abs(p.co[1]) for c in _curves(ob.animation_data.action)
+                if c.data_path == 'pose.bones["mixamorig:Hips"].location' for p in c.keyframe_points)
+    check(reach < 0.5 and "stays where it stands" in line,
+          f"hinged thighs: the travel bone stays within {reach:.2f} m and the result says the character stays put")
+
+
 def render(ob, kind, out_dir, frames=8, size=(360, 480)):
     """frames evenly spread, seen from the front of the body (its mean facing turned 30 degrees)."""
     scene = bpy.context.scene
@@ -564,6 +613,11 @@ def main():
         except Exception:
             traceback.print_exc()
             check(False, "walk checks ran without an error")
+        try:
+            drive_checks(args)
+        except Exception:
+            traceback.print_exc()
+            check(False, "drive checks ran without an error")
     if args.ybot:
         try:
             ybot(args.ybot, text, meta, args.render)

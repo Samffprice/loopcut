@@ -16,6 +16,9 @@ Blender version supplies them, including the factory startup's essentials brush 
 Implicit point caches and unknown external path types are reported rather than guessed.
 Paths Blender lists but never reads are not inputs: where an appended ID came from (its weak
 reference, as BlenderKit leaves), a sound strip's own copy of a path, and empty fields.
+The render service runs no Python: a driver that would need it is reported as unsupported, by the
+service's own rule (driver_acceptable), so the call is refused before anything is uploaded. So is
+animation of driver settings (animates_drivers), which could switch such a driver on mid-render.
 The manifest/hash/upload side imports no bpy and uses only the standard library.
 Image paths use filepath_raw: filepath would reload and discard recovered painted pixels.
 Dirty still/tiled images are saved only into staging, keeping those checkpoint buffers.
@@ -343,6 +346,101 @@ def _not_inputs(bpy, base, library_paths):
     return paths
 
 
+# Drivers. The render service runs no Python, so it refuses a driver that needs it (render_job.py secure_scene).
+# Rigs carry many scripted drivers: BlenderKit's free rigged characters have 100 each ("var" and "1-var" IK/FK
+# switches), all simple expressions, which Blender evaluates without Python (fcurve_driver.cc tries that first).
+PYTHON_DRIVER = ("Python driver expression; the cloud renderer runs no Python. Replace it with a simple expression "
+                 "(such as var * 2 or 1 - var) or bake the property to keyframes")
+LINKED_PYTHON_DRIVER = PYTHON_DRIVER + ", in the library file or after making the data local"
+# A driver's mute and type are animatable: keyframing animation_data.drivers[0].mute turned a muted Python driver on
+# mid-render on the worker (Blender 5.2.2, 2026-10-21), after its load-time check had passed it.
+DRIVER_ANIMATED = ("Animation that changes driver settings (such as a driver's mute or type), which can switch a "
+                   "Python driver on mid-render; the cloud renderer refuses it. Remove the keyframes or drivers on "
+                   "driver settings and leave each driver as it should render")
+LINKED_DRIVER_ANIMATED = DRIVER_ANIMATED + ", in the library file or after making the data local"
+
+
+def driver_acceptable(fcurve):
+    """The render service's driver rule, identical to its own (loopcut-web workers/render/render_job.py): a driver
+    renders there when its F-curve is muted, it is not a scripted expression, or its expression is simple. Data
+    from a linked library follows the same rule."""
+    return bool(fcurve.mute or fcurve.driver.type != "SCRIPTED" or fcurve.driver.is_simple_expression)
+
+
+def animates_drivers(fcurve):
+    """The render service's second rule, identical to its own (render_job.py animates_drivers): it refuses keyframes
+    or a driver whose data path writes into animation data, such as animation_data.drivers[0].mute."""
+    return "animation_data" in fcurve.data_path
+
+
+def _action_curves(action):
+    """Every F-curve of a layered (Blender 5.x) action, in every layer, strip and slot, as the render service reads
+    it."""
+    for layer in getattr(action, "layers", ()):
+        for strip in layer.strips:
+            for channelbag in getattr(strip, "channelbags", ()):
+                yield from channelbag.fcurves
+
+
+def _driver_holders(bpy):
+    """(holder, host) for every data-block and embedded node tree that can carry drivers, as the render service
+    walks them; host is the data-block that names the holder. Once each: bpy.data.all_ids lists every ID again."""
+    holders, seen = [], set()
+    collection_type = getattr(getattr(bpy, "types", None), "bpy_prop_collection", list)
+    for name in dir(bpy.data):
+        collection = getattr(bpy.data, name, None)
+        if name.startswith("_") or not isinstance(collection, collection_type):
+            continue
+        for block in collection:
+            for holder in (block, getattr(block, "node_tree", None)):
+                key = holder.as_pointer() if hasattr(holder, "as_pointer") else id(holder)
+                if holder is not None and key not in seen:
+                    seen.add(key)
+                    holders.append((holder, block))
+    return holders
+
+
+def _driver_path(holder, curve):
+    """data_path[index] for an array item, data_path for a single value."""
+    try:
+        value = holder.path_resolve(curve.data_path)
+    except (AttributeError, ValueError, TypeError):
+        value = None
+    array = curve.array_index > 0 or (hasattr(value, "__len__") and not isinstance(value, str))
+    return curve.data_path + (f"[{curve.array_index}]" if array else "")
+
+
+def _refused_row(kind, host, path, reason, linked_reason):
+    """An unsupported row named by its data-block's type and name and its data path: driver Object "Armature"
+    location[2]. Linked data gets the reason that says where to fix it."""
+    block = getattr(getattr(host, "bl_rna", None), "name", None) or type(host).__name__
+    return {"type": kind, "name": f'{block} "{host.name}"', "path": path,
+            "reason": reason if getattr(host, "library", None) is None else linked_reason}
+
+
+def _refused_drivers(bpy):
+    """Unsupported rows for the drivers the render service refuses, then for the animation of driver settings it
+    refuses: drivers on any holder, and keyframes in any action (keyframes Action "Rig" animation_data.drivers[0].mute),
+    as render_job.py secure_scene scans them."""
+    rows, animated = [], []
+    for holder, host in _driver_holders(bpy):
+        animation = getattr(holder, "animation_data", None)
+        for curve in list(animation.drivers) if animation is not None else ():
+            python, changes = not driver_acceptable(curve), animates_drivers(curve)
+            if not (python or changes):
+                continue
+            path = ("" if holder is host else "node_tree.") + _driver_path(holder, curve)
+            if python:
+                rows.append(_refused_row("driver", host, path, PYTHON_DRIVER, LINKED_PYTHON_DRIVER))
+            if changes:
+                animated.append(_refused_row("driver", host, path, DRIVER_ANIMATED, LINKED_DRIVER_ANIMATED))
+    animated.extend(_refused_row("keyframes", action, _driver_path(action, curve), DRIVER_ANIMATED,
+                                 LINKED_DRIVER_ANIMATED)
+                    for action in getattr(bpy.data, "actions", ()) for curve in _action_curves(action)
+                    if animates_drivers(curve))
+    return rows + animated
+
+
 def _collect_opened(blend_path, staging_dir, original_path=None):
     """Child only. The only save target is staging/scene.blend, with remapping disabled."""
     import bpy
@@ -484,6 +582,7 @@ def _collect_opened(blend_path, staging_dir, original_path=None):
             unsupported.append({"type": "external", "path": str(path), "reason": "Unhandled input path"})
         else:
             missing.append({"type": "external", "path": str(path)})
+    unsupported.extend(_refused_drivers(bpy))
     scene = bpy.context.scene
     result = {"blender": ".".join(map(str, bpy.app.version)),
               "scene": {"name": scene.name, "camera": scene.camera.name if scene.camera else None,

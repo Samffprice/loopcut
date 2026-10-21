@@ -74,8 +74,8 @@ _MESSAGES = {
         "Your ChatGPT plan's usage limit for Loopcut is reached (your plan's limit, or the weekly limit set for "
         f"Loopcut). New requests are paused. Manage usage: {chatgpt_auth.USAGE_URL}",
     "subscription_sharing_user_not_eligible":
-        "This ChatGPT account or workspace can't share its plan with Loopcut (ChatGPT Plus or Pro can; Business "
-        "and Enterprise need an admin's approval). Pick another provider.",
+        "ChatGPT says this account can't share its plan with Loopcut. OpenAI decides that by plan, workspace "
+        "and country. Pick another provider.",
     "subscription_sharing_invalid_user":
         "ChatGPT could not validate this sign-in. Sign in with ChatGPT again.",
     "subscription_sharing_usage_unavailable":

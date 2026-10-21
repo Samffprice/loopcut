@@ -144,7 +144,7 @@ class BetaGatesTest(unittest.TestCase):
             names = [entry[1] for entry in layout.calls if entry[0] == 'operator']
             self.assertEqual('loopcut.blenderkit_get_key' in names, not beta)
             texts = [entry[1] for entry in layout.calls if entry[0] == 'label']
-            self.assertIn('Loopcut 0.2.6' + (' beta' if beta else ''), texts)
+            self.assertIn('Loopcut 0.2.7' + (' beta' if beta else ''), texts)
             if beta:
                 self.assert_no_purchase(texts)
                 self.assertNotIn('Workers and routing run on Loopcut plans', texts)
@@ -204,18 +204,18 @@ class BetaGatesTest(unittest.TestCase):
         self.assertIn('tester@example.test  ·  Pro plan', before)
 
     def test_version_display_and_machine_versions_are_separate(self):
-        self.assertEqual(self.config.version_label(), '0.2.6 beta')
-        self.assertIn('0.2.6 beta', [p.get('text') for p in self.display()['prims']])
-        self.assertEqual(self.update.current_version(), (0, 2, 6))
-        self.assertTrue(self.cloud_http.contract_headers()['x-loopcut-client'].startswith('loopcut-addon/0.2.6 blender/5.2.0 os/'))
-        release = {'version': (0, 2, 7), 'label': '0.2.7', 'asset': None}
+        self.assertEqual(self.config.version_label(), '0.2.7 beta')
+        self.assertIn('0.2.7 beta', [p.get('text') for p in self.display()['prims']])
+        self.assertEqual(self.update.current_version(), (0, 2, 7))
+        self.assertTrue(self.cloud_http.contract_headers()['x-loopcut-client'].startswith('loopcut-addon/0.2.7 blender/5.2.0 os/'))
+        release = {'version': (0, 2, 8), 'label': '0.2.8', 'asset': None}
         status = {'release': release, 'status': 'available', 'dismissed': False, 'error': '', 'progress': 0}
-        self.assertIn('0.2.7 beta', self.update.banner_for(status, False)['text'])
-        self.assertIn('0.2.7 beta', self.update.status_line(status, (0, 2, 6)))
+        self.assertIn('0.2.8 beta', self.update.banner_for(status, False)['text'])
+        self.assertIn('0.2.8 beta', self.update.status_line(status, (0, 2, 7)))
         for state in ('idle', 'current'):
-            self.assertIn('0.2.6 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 6)))
+            self.assertIn('0.2.7 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 7)))
         with patch.object(self.config, 'BETA', False):  # The label alone; sales follow billing_open.
-            self.assertEqual(self.config.version_label(), '0.2.6')
+            self.assertEqual(self.config.version_label(), '0.2.7')
             self.assertNotIn('beta', self.update.banner_for(status, False)['text'])
 
     def test_config_environment_switches(self):
@@ -243,7 +243,7 @@ class BetaGatesTest(unittest.TestCase):
                 self.draw_help(expect_loopcut=True)
                 splash = Splash()
                 self.support._draw_info(types.SimpleNamespace(layout=splash), None)
-                self.assertIn(('label', 'Loopcut 0.2.6 beta'), splash.records)
+                self.assertIn(('label', 'Loopcut 0.2.7 beta'), splash.records)
                 self.assertEqual(splash.operators()[0][1], 'loopcut.report_bug')
                 with patch.object(self.config, 'BUG_REPORT_URL', 'https://example.test/form'):
                     self.support.LOOPCUT_OT_report_bug().execute(None)

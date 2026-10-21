@@ -137,8 +137,8 @@ class FakeAuth(BaseHTTPRequestHandler):
             FakeAuth.seen.setdefault("authorize", []).append(params)
             cfg = FakeAuth.config
             back = {"state": params["state"]}
-            if cfg.get("deny"):
-                back["error"] = "access_denied"
+            if cfg.get("deny") or cfg.get("callback_error"):
+                back["error"] = cfg.get("callback_error") or "access_denied"
             else:
                 code = f"code-{len(FakeAuth.seen['authorize'])}"
                 cfg.setdefault("codes", {})[code] = params
@@ -173,6 +173,8 @@ class FakeAuth(BaseHTTPRequestHandler):
             started = cfg.get("codes", {}).get(form.get("code"))
             if not started:
                 return self._json(400, {"error": "invalid_grant", "error_description": "unknown code"})
+            if cfg.get("exchange_errors"):  # Refused codes, one per exchange, in order.
+                return self._json(400, {"error": cfg["exchange_errors"].pop(0), "error_description": "refused"})
             challenge = b64url(hashlib.sha256(form["code_verifier"].encode()).digest())
             issued = cfg.get("issue", "oaiapp_test1") if started["client_id"] == chatgpt_auth.DYNAMIC_CLIENT else started["client_id"]
             if (challenge != started["code_challenge"] or form["redirect_uri"] != started["redirect_uri"]
@@ -443,6 +445,61 @@ class SignInTest(Base):
             self.sign_in()
         self.assertEqual(caught.exception.code, "access_denied")
         self.assertNotIn("/api/accounts/oauth/token", FakeAuth.seen)
+
+    def refused(self, **kwargs) -> chatgpt_auth.ChatGPTAuthError:
+        with self.assertRaises(chatgpt_auth.ChatGPTAuthError) as caught:
+            self.sign_in(**kwargs)
+        return caught.exception
+
+    def test_a_refused_code_says_why_and_the_retry_keeps_the_issued_client(self):
+        FakeAuth.config["exchange_errors"] = ["invalid_grant"]
+        error = self.refused()
+        self.assertEqual((error.code, error.stage, error.status), ("invalid_grant", "token", 400))
+        self.assertEqual(str(error), chatgpt_auth.SIGN_IN_MESSAGES["invalid_grant"])
+        self.assertIsNone(chatgpt_auth.active_record())
+        self.assertTrue(self.sign_in()["signed_in"])
+        retry = FakeAuth.seen["authorize"][1]
+        self.assertEqual(retry["client_id"], "oaiapp_test1")  # Docs: a fresh authorization, same issued id.
+        self.assertNotIn("agent_name_hint", retry)
+        self.assertNotIn("login_hint", retry)
+        self.assertEqual(chatgpt_auth.active_record()["client_id"], "oaiapp_test1")
+        self.assertEqual(chatgpt_auth._pending_client(), "")
+
+    def test_a_second_refusal_on_the_kept_client_registers_afresh(self):
+        FakeAuth.config["exchange_errors"] = ["invalid_grant", "invalid_grant"]
+        self.refused()
+        self.assertEqual(self.refused().stage, "token")
+        self.assertEqual(chatgpt_auth._pending_client(), "")
+        self.assertTrue(self.sign_in()["signed_in"])
+        self.assertEqual([p["client_id"] for p in FakeAuth.seen["authorize"]],
+                         ["dynamic_agent_client", "oaiapp_test1", "dynamic_agent_client"])
+
+    def test_a_timeout_keeps_the_client_and_another_account_registers_afresh(self):
+        FakeAuth.config["exchange_errors"] = ["invalid_grant"]
+        self.refused()
+        attempt = chatgpt_auth.SignIn(port=0, timeout=0.3)
+        attempt.start()
+        with self.assertRaises(chatgpt_auth.ChatGPTAuthError):
+            attempt.wait()
+        self.assertEqual(chatgpt_auth._pending_client(), "oaiapp_test1")
+        FakeAuth.config["issue"] = "oaiapp_test2"
+        self.sign_in(new_account=True)
+        self.assertEqual(FakeAuth.seen["authorize"][-1]["client_id"], "dynamic_agent_client")
+        self.assertEqual(chatgpt_auth.active_record()["client_id"], "oaiapp_test2")
+        self.assertEqual(chatgpt_auth._pending_client(), "")
+
+    def test_callback_errors_have_no_stage_and_a_blocked_country_says_so(self):
+        FakeAuth.config["callback_error"] = "unsupported_country_region_territory"
+        error = self.refused()
+        self.assertEqual((error.code, error.stage), ("unsupported_country_region_territory", ""))
+        self.assertIn("isn't available in your country", str(error))
+        self.assertNotIn("/api/accounts/oauth/token", FakeAuth.seen)
+        self.assertEqual(chatgpt_auth._pending_client(), "")
+
+    def test_sign_in_messages_fit_a_setup_row(self):
+        for code, message in chatgpt_auth.SIGN_IN_MESSAGES.items():
+            self.assertLessEqual(len(message), 70, code)  # onboarding._sentence's limit.
+            self.assertTrue(message.endswith("."), code)
 
     def test_a_stray_callback_with_another_state_is_ignored(self):
         FakeAuth.config["stray_first"] = True
@@ -783,7 +840,7 @@ class StreamTest(Base):
         FakeResponses.script = [(403, error_body("subscription_sharing_user_not_eligible"))]
         with self.assertRaises(llm.LLMError) as caught:
             self.stream()
-        self.assertIn("Plus or Pro", str(caught.exception))
+        self.assertIn("plan, workspace and country", str(caught.exception))  # Not "Plus can": issue #2 was on Plus.
         self.assertEqual(len(FakeResponses.requests), 1)
 
     def test_401_refreshes_once_then_retries(self):

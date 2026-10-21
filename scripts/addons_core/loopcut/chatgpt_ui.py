@@ -57,12 +57,12 @@ def _run_sign_in(new_account: bool) -> None:
     except chatgpt_auth.ChatGPTAuthError as ex:
         error = "" if ex.code == "cancelled" else str(ex)
         code = ex.code or (f"http_{ex.status}" if ex.status else "sign_in_failed")
+        if ex.stage == "token":  # Refused at the code exchange, not on the way back from the browser.
+            code = "token_" + code
     except Exception:  # The worker thread must always report back.
         import traceback
         traceback.print_exc()
         error, code = "ChatGPT sign-in could not finish.", "internal"
-    if error:
-        error += " Try Sign in with ChatGPT again, or choose another provider."
     if code != "cancelled" and not _cancel.is_set():  # Whether ChatGPT sign-in worked: a setup_step usage event.
         telemetry.setup_step("chatgpt", "chatgpt", bool(result and result.get("signed_in")) and not error,
                              None if result and not error else code or "not_signed_in")

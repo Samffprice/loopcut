@@ -972,7 +972,7 @@ JOIN_UNITS = 1.0       # The "+" between the two parts, in units.
 JOIN_OFFSET = 8.9      # Separator factor above the "+": its middle on the parts' middle (measured at 2x).
 CAPTION = 0.85         # The icon rows' captions, of the body text's size: five fit one part's width.
 PLAN_LABELS = 0.262    # The comparison's first column, of the box's width; the bars' captions start where it ends,
-#                        with room for the longest ("6,600 credits: 82 models from photos, or 22 min of motion").
+#                        with room for the longest ("6,600 credits: 82 models from photos, or 55 min of motion").
 BAR_NAME = 24          # The plan's name before its bar, in pixels at UI scale 1 ("Free" and its image margin).
 BAR_GAP = 3
 BAR_SCALE = 0.4        # The credit bars' height, of a row.
@@ -1016,7 +1016,7 @@ def _unit_prices(descriptors: list[dict]) -> tuple[int | None, float | None]:
 
 
 def _makes(credits: int, per_model: int | None, per_second: float | None) -> str:
-    """What a month of credits makes, in real output: "27 models from photos, or 7 min of motion". A price that
+    """What a month of credits makes, in real output: "27 models from photos, or 18 min of motion". A price that
     is missing drops its part rather than guess."""
     parts = []
     if per_model and credits >= per_model:
@@ -1218,7 +1218,11 @@ def _draw_sign_in(layout, context) -> None:
     elif chatgpt["status"] == "error" and chatgpt["error"]:
         right = _option(column, "ChatGPT", _sentence(chatgpt["error"]), _icon("person"), "Recommended", "error",
                         DANGER)
-        right.operator("loopcut.chatgpt_sign_in", text="Use another account", depress=True).new_account = True
+        row = right.split(factor=0.45)  # A plain row gave the link the width and cut the button to "Try ag…".
+        row.operator("loopcut.chatgpt_sign_in", text="Try again", depress=True)  # Keeps an issued client id.
+        another = row.row()
+        another.alignment = "RIGHT"
+        _link(another, "loopcut.chatgpt_sign_in", "Another account").new_account = True
     elif _on_chatgpt_plan():
         right = _option(column, "ChatGPT", chatgpt_ui.account_line(), _icon("done"), "Recommended")
         props = right.operator("loopcut.onboarding_step", text="Continue", depress=True)
@@ -1338,7 +1342,7 @@ def _draw_privacy(layout) -> None:
 
 # The Try it screen's first projects. tool: the cloud tool a card runs, priced by its manifest estimate; a
 # per-second tool's estimate covers its default length (MOTION_DEFAULT_SECONDS), so "seconds" scales it. With
-# the default 80-credit model and 3 seconds of motion (15), both paid cards fit in 100 trial credits.
+# the default 80-credit model and 3 seconds of motion (6), both paid cards fit in 100 trial credits.
 # thumbnail: in media/, square, in the sample photo's studio look: our renders of the clay mannequin text to motion
 # puts on an empty scene, mid-jump with a pale ghost of its crouch, and of Poly Haven's CC0 "Treasure Chest", and the
 # photo.

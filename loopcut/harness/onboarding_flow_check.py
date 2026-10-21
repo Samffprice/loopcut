@@ -389,7 +389,8 @@ elif ARGS.stage == "failed":
     def closed():
         check(not wm().splash_modal, "still modal after finishing")
         check(not onboarding._splash_open(), "the splash did not close")
-        check(progress() == {"version": 1, "step": "account", "done": False}, f"progress is {progress()}")
+        check(progress() == {"version": 1, "step": "account", "done": False, "privacy_seen": 1},  # Its privacy step
+              f"progress is {progress()}")                                                   # was passed.
         shot("closed-not-done")
 
     steps(start_sign_in, failed, failed_screen, lambda: None, model_step, privacy_step, lambda: None, try_step,
@@ -460,7 +461,7 @@ else:  # screens and clicks: the same fixture
 
     granted = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     credits = {"balance": 100, "trial": {"amount": 100, "granted_at": granted}}
-    live = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 25}},
+    live = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
             {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
     signed_in = {"value": False}
     from loopcut import chatgpt_ui

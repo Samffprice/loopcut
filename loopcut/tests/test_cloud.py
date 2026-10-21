@@ -1072,6 +1072,34 @@ class DispatchTest(RuntimeFixture):
                 if code == 'tool_disabled':
                     refresh.assert_called_once()
 
+    def test_refused_scene_bundle_says_what_the_render_service_refuses(self):
+        # Live 2026-10-21: a rigged BlenderKit character's render failed on the worker (a scripted driver) and the
+        # model saw only "the vendor failed", so the user heard "it failed to bundle" and no reason.
+        message = ('The service rejected the input (input.bundle). Vendor detail: invalid_input. Your credits were '
+                   'refunded. To try again, start a new job with a new idempotency_key.')
+        error = cloud_http.CloudError(message, 'vendor_failed', extra={'field': 'input.bundle', 'refunded': True})
+        first, _, extras = cloud.error_text(error).partition('\n')
+        for part in ('refused the packed scene', 'credits refunded', 'Python driver', 'driver settings', 'camera',
+                     'Tell the user', 'Vendor detail: invalid_input'):
+            self.assertIn(part, first)
+        self.assertNotIn('idempotency_key', first)  # The add-on picks new keys itself.
+        self.assertEqual(json.loads(extras)['error']['field'], 'input.bundle')
+        other = cloud_http.CloudError('Vendor failed', 'vendor_failed', extra={'refunded': True})
+        self.assertTrue(cloud.error_text(other).startswith('vendor_failed: the vendor failed; credits refunded.'))
+
+    def test_animated_driver_settings_are_named_with_what_to_do_before_upload(self):
+        # The render service refuses driver_animated (render_job.py); the packer names each one the same way it names
+        # a Python driver, with what to do, and nothing is uploaded.
+        from loopcut import bundles
+        rows = [{'type': 'keyframes', 'name': 'Action "Sneaky"', 'path': 'animation_data.drivers[0].mute',
+                 'reason': bundles.DRIVER_ANIMATED}]
+        first, _, extras = cloud.error_text(cloud._bundle_refusal({'missing': [], 'unsupported': rows})).partition('\n')
+        self.assertIn("can't pack this scene: 1 unsupported item(s)", first)
+        self.assertIn('Nothing was uploaded', first)
+        error = json.loads(extras)['error']
+        self.assertEqual((error['code'], error['unsupported']), ('bundle_incomplete', [
+            f'keyframes Action "Sneaky" animation_data.drivers[0].mute: {bundles.DRIVER_ANIMATED}']))
+
     def test_long_returns_handle_and_applies_exactly_once(self):
         self.ready(latency='long')
         job = {'id': 'job_1', 'status': 'running', 'progress': {'pct': 0, 'message': 'Queued'}}
