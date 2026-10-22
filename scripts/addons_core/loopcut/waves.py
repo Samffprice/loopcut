@@ -184,6 +184,7 @@ class Job:
     (session["jobs"]). A turn that only adds checks has one too: the finish gate runs on it."""
 
     def __init__(self, session: dict, roles: config.Roles):
+        self.session = session
         turn = session.get("turn_number") or 1
         n = 1 + sum(1 for log in session["jobs"] if log.get("turn") == turn)
         while (jobs_root() / session["id"] / f"{turn}-{n}").exists():
@@ -209,6 +210,7 @@ class Job:
         self.lock = threading.Lock()                    # crew, scheduler, stopped: the job's thread, collect and Stop.
         self.scheduler: threading.Thread | None = None
         self.stopped = False                            # Stop: nothing more starts or merges.
+        self.steers: list[str] = []                     # User corrections; each worker reads its own cursor.
         self.on_main: Callable | None = None            # fn -> fn() on the main thread, for the finish gate's drain.
         self.held: list[tuple[str, dict]] = []          # Live checks naming a worker still running: run once it merges.
         self.sheets = 0
@@ -312,6 +314,7 @@ class Wave:
     started: float = 0.0
     crew: list = dataclasses.field(default_factory=list)  # Its workers (start).
     entry: dict | None = None  # Its JobLog entry: filled in as its workers report.
+    steer_index: int = 0       # Earlier corrections are already in this wave's opening user messages.
 
 
 def _mentions(brief: dict, shared: dict) -> str:
@@ -350,6 +353,8 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
         raise config.ConfigError("Workers require the Loopcut service")
     cloud.hosted_index(required=True)  # Also for same-role continuations, which keep earlier notes.
     job = job_for(session, turn)
+    with job.lock:
+        steer_index = len(job.steers)
     number = session.setdefault("wave_count", 0) + 1
     folder = job.folder / f"w{number}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -381,7 +386,7 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
     turn.delegations.append([b["deliverable"] for b in plan["workers"]])
     return Wave(session=session, turn=turn, job=job, number=number, id=wave_id, folder=folder, plan=plan,
                 spawn=spawn, openings=openings, item=item, message_index=message_index,
-                item_index=item_index, checkpoint=checkpoint, threads=threads)
+                item_index=item_index, checkpoint=checkpoint, threads=threads, steer_index=steer_index)
 
 
 # ------------------------------------------------------------------ the child, the merge, the checks
@@ -405,6 +410,7 @@ class _HostRuntime:
         parent = {name: self._parent_tool(wave, name, worker.cancelled) for name in ("search_assets", "look_at_reference")}
         parent["fetch_asset"] = lambda arguments: wave.on_main(lambda: _fetch_asset(arguments))
         self.tools = worker_host.WorkerRuntime(child, parent)
+        self.is_cancelled = worker.cancelled
         self.warnings: list = []
 
     @staticmethod
@@ -423,8 +429,8 @@ class _HostRuntime:
         return reply
 
     def start(self) -> None:
-        self.tools.child.start()
-        self.warnings = list(self._call("init", 60, None).get("warnings") or [])
+        self.tools.child.start(is_cancelled=self.is_cancelled)
+        self.warnings = list(self._call("init", 60, self.is_cancelled).get("warnings") or [])
 
     def run_tool(self, name: str, arguments: str, is_cancelled):
         return self.tools.run_tool(name, arguments, is_cancelled)
@@ -483,6 +489,7 @@ class Worker:
     def __init__(self, wave: Wave, brief: dict, index: int):
         self.wave, self.brief, self.index, self.id = wave, brief, index, brief["id"]
         self.row = wave.item["rows"][index]
+        self.steer_index = wave.steer_index
         roles = wave.turn.roles
         self.model = roles.worker.model
         self.session = state.new_session()
@@ -576,6 +583,9 @@ class Worker:
                     break
         job = self.wave.job
         with job.lock:
+            # A failed boot can open first_reply just as Stop cancels the waiting siblings.
+            if self.cancelled() or job.stopped:
+                raise llm.Cancelled()
             running = sum(w.thread is not None and w.finished is None for w in job.crew)
         left = job.budget.take_step(self.started, worker_steps=self.steps, running=running,
                                     priced=pricing.usd(self.model, {"input": 0}) is not None)
@@ -587,9 +597,20 @@ class Worker:
         if self.t["first_request"] is None:
             self.t["first_request"] = self._now()
         self.steps += 1
-        self.row["steps"] = self.steps
+        # Read after the first-reply wait, too: queued workers may have waited through a correction.
+        with job.lock:
+            if self.cancelled() or job.stopped:
+                raise llm.Cancelled()
+            notes = job.steers[self.steer_index:]
+            self.steer_index += len(notes)
+        for text in notes:
+            item = state.item_user(text)
+            self.session["items"].append(item)
+            with self.turn.notes_lock:
+                self.turn.notes.append((f"{workers.STEER_INSTRUCTION}\n\n{text}", item))
 
     def on_usage(self, usage: dict) -> None:
+        self.row["steps"] = self.steps  # A reply has arrived; an outstanding request is not a step yet.
         if self.t["first_reply"] is None:
             self.t["first_reply"] = self._now()
             self.first_call_cached = int(usage.get("cached") or 0)
@@ -613,6 +634,8 @@ class Worker:
     def run_tool(self, name: str, arguments: str):
         if name not in self.allowed:
             return tools.ToolResult(f"{name} is not one of your tools.", ok=False)
+        self.row["summary"] = agent._describe(llm.ToolCall("", name, arguments), self.spec.schemas)[0]
+        agent._redraw()
         if name == "report_back":
             if self.report is None:
                 self.report = workers.parse_report(agent._arguments(arguments))
@@ -621,7 +644,7 @@ class Worker:
             return tools.ToolResult("Not run: you already reported back.", ok=False)
         if self.crashed:
             return tools.ToolResult("Not run: your Blender stopped.", ok=False)
-        while not self.ready.wait(POLL):  # The child boots while the first request is out.
+        while not self.ready.wait(POLL):  # No tools before startup completes.
             if self.cancelled():
                 raise llm.Cancelled()
         try:
@@ -676,22 +699,29 @@ class Worker:
     # -- the thread
 
     def _boot(self) -> None:
+        """Startup belongs to the worker thread, outside job.lock. Model calls wait for it;
+        cancellation must unwind it before the worker can finish and its wave can be reaped."""
+        from .worker_host import WorkerUnavailable
         self.ready.clear()
         self.boot_error = None
         self.t["spawn"] = self.t["spawn"] if self.t["spawn"] is not None else self._now()
-
-        def boot():
-            try:
-                self.runtime.start()
-                self.t["ready"] = self._now()
-            except Exception as ex:
-                self.boot_error = ex
-            finally:
-                self.ready.set()
-        threading.Thread(target=boot, name=f"loopcut-boot-{self.id}", daemon=True).start()
+        try:
+            if self.cancelled():
+                raise llm.Cancelled()
+            self.runtime = self.wave.make_runtime(self.wave, self)
+            self.runtime.start()
+            self.t["ready"] = self._now()
+        except Exception as ex:
+            self.boot_error = ex
+            if not self.cancelled() and isinstance(ex, WorkerUnavailable):
+                self.wave.session["workers_unavailable"] = True
+                print(f"Loopcut: worker startup failed: {ex}")
+        finally:
+            self.ready.set()
 
     def start(self) -> None:
         self.started = self.wave.job.budget.clock()
+        self.row["started_at"] = time.time()
         self.set_status("starting")
         self.thread = threading.Thread(target=self._work, name=f"loopcut-worker-{self.id}", daemon=True)
         self.thread.start()
@@ -715,14 +745,31 @@ class Worker:
                 print(f"Loopcut: could not stop worker {self.id}: {ex!r}")
 
     def _work(self) -> None:
+        from .worker_host import ChildCrashed, UNAVAILABLE_NOTE, WorkerUnavailable
         wave = self.wave
         try:
             for attempt in (0, 1):
-                self.runtime = wave.make_runtime(wave, self)
+                if self.cancelled():
+                    raise llm.Cancelled()
+                if wave.session.get("workers_unavailable"):
+                    self.set_status("failed", UNAVAILABLE_NOTE)
+                    return
                 self._boot()
-                self.set_status("working")
-                agent.run_loop(self.session, self.turn, self.spec, self.run_tool, lambda session: None,
-                               getattr(wave, "alike", None))
+                # Verify startup before spending a model request. Only environment failures suppress retries.
+                if self.cancelled() or isinstance(self.boot_error, llm.Cancelled):
+                    raise llm.Cancelled()
+                if isinstance(self.boot_error, WorkerUnavailable):
+                    self.set_status("failed", UNAVAILABLE_NOTE)
+                    return
+                if isinstance(self.boot_error, ChildCrashed):
+                    self._crashed("init", str(self.boot_error), self.boot_error.kept)
+                elif self.boot_error:
+                    raise self.boot_error
+                else:
+                    # A sibling's failed boot must not discard this child's successful startup/work.
+                    self.set_status("working")
+                    agent.run_loop(self.session, self.turn, self.spec, self.run_tool, lambda session: None,
+                                   getattr(wave, "alike", None))
                 if not (self.crashed and attempt == 0 and not self.cancelled()):
                     break
                 self.kill()
@@ -732,11 +779,14 @@ class Worker:
                 self.crashed = ""
                 self.turn = self._new_turn(self.turn.cancel)
             self._end()
+        except llm.Cancelled:
+            self._stopped()
         except Exception as ex:  # Never lose a worker silently: it fails, the wave goes on.
             import traceback
             traceback.print_exc()
             self.set_status("failed", f"internal error: {ex!r}"[:160])
         finally:
+            self.row["summary"] = self.summary()
             if self.status in ("starting", "working", "checking"):
                 self.set_status("stopped" if self.cancelled() else "failed")
             self.kill()
@@ -744,6 +794,7 @@ class Worker:
             if self.index == 0:
                 wave.first_reply.set()  # Worker 1 failed before replying: the others go anyway.
             conversations.FOLDERS.pop(self.session["id"], None)
+            self.row["elapsed"] = max(0.0, self.wave.job.budget.clock() - self.started)
             self.finished = time.monotonic()
 
     def _end(self) -> None:
@@ -1110,7 +1161,7 @@ def render_worker(report: dict) -> str:
     checks = report["checks"]
     total = checks["passed"] + checks["failed"]
     head = (f"[{report['worker']}] {report['deliverable']} · {report['role']} · {report['status']} · "
-            f"{report['steps']} steps"
+            f"{report['steps']} step{'s' if report['steps'] != 1 else ''}"
             + (f" · checks {checks['passed']}/{total}" if total else "" if checks.get("deferred") else " · no checks")
             + (f" · {', '.join(checks['deferred'])} deferred to the live run" if checks.get("deferred") else "")
             + (f" · {report['note']}" if report.get("note") else ""))
@@ -1270,10 +1321,18 @@ def contact_sheet(folder: Path, crew: list, on_main, name: str = "sheet.png") ->
                    + (f"; last, labelled reference, the user's {reference['name']}." if shown else "."))
 
 
+def unavailable_note(session: dict) -> str:
+    """Keep collection and ownership visible until every existing worker has been reported."""
+    from .worker_host import UNAVAILABLE_NOTE
+    job = getattr(session.get("turn"), "job", None)
+    return _still_running(_busy(job), job) if job is not None else UNAVAILABLE_NOTE + " Continue in the main Blender."
+
+
 def _still_running(busy: list, job: Job | None = None) -> str:
     """Every worker of the turn as done (reported), running or queued, with why the queued ones wait,
     and what to do meanwhile."""
-    if not busy:
+    unavailable = job is not None and job.session.get("workers_unavailable")
+    if not busy and not unavailable:
         return "Every worker has reported."
     running = [w for w in busy if _state(w) == "running"]
     queued = [w for w in busy if _state(w) == "queued"]
@@ -1283,9 +1342,22 @@ def _still_running(busy: list, job: Job | None = None) -> str:
         lines.append("Still running: " + ", ".join(f"{w.id} ({w.steps} step{'s' if w.steps != 1 else ''}, wave "
                                                    f"{w.wave.number})" for w in running) + ".")
     if queued:
-        slots = job.max_workers if job is not None else len(running)
-        lines.append(f"Queued: {', '.join(f'{w.id} (wave {w.wave.number})' for w in queued)}, waiting for a free "
-                     f"slot ({slots} run at once); each starts, in that order, as a running worker finishes.")
+        names = ', '.join(f'{w.id} (wave {w.wave.number})' for w in queued)
+        if unavailable:
+            lines.append(f"Queued: {names}; these workers will be stopped without starting.")
+        else:
+            slots = job.max_workers if job is not None else len(running)
+            lines.append(f"Queued: {names}, waiting for a free slot ({slots} run at once); each starts, "
+                         "in that order, as a running worker finishes.")
+    if unavailable:
+        from .worker_host import UNAVAILABLE_NOTE
+        ready = _ready(job)
+        if ready:
+            lines.append("Ready to collect: " + ", ".join(w.id for w in ready) + ".")
+        if busy or ready:
+            return " ".join([UNAVAILABLE_NOTE, *lines, "Use delegate wait true to collect the remaining results "
+                             "before editing their objects in the main Blender."])
+        return UNAVAILABLE_NOTE + " Every worker has reported; continue in the main Blender."
     return " ".join(lines + ["Review the results above now and send fixes back with continues; delegate wait "
                              "true returns the next results."])
 
@@ -1308,7 +1380,7 @@ def render_report(job: Job, sections: list[list[str]], live: list, held: list, b
         lines.append(f"Checks that wait for {', '.join(waiting)} to merge: {', '.join(label for label, _, _ in held)}.")
     lines.append(_still_running(busy, job))
     budget = job.budget
-    lines.append(f"Job budget used: {budget.steps} worker steps"
+    lines.append(f"Job budget used: {budget.steps} worker step{'s' if budget.steps != 1 else ''}"
                  + (f", ${budget.usd:.3f}/${budget.max_usd:.2f}" if budget.max_usd else "") + ".")
     return "\n".join(lines + ([sheet_line] if sheet_line else []))
 
@@ -1450,6 +1522,14 @@ def pending(job: Job) -> bool:
         return any(not w.reported for w in job.crew)
 
 
+def steer(job: Job, text: str) -> None:
+    """Broadcast without draining the orchestrator's notes. Workers read before their next request;
+    their cursor survives a child retry, whose conversation already contains earlier corrections."""
+    with job.lock:
+        if not job.stopped:
+            job.steers.append(text)
+
+
 def _state(worker: Worker) -> str:
     return "finished" if worker.finished is not None else "queued" if worker.thread is None else "running"
 
@@ -1484,6 +1564,10 @@ def _schedule(job: Job, is_cancelled) -> None:
                 job.scheduler = None
                 return
             for worker in queued:
+                if worker.wave.session.get("workers_unavailable"):
+                    from .worker_host import UNAVAILABLE_NOTE
+                    worker.never_started(UNAVAILABLE_NOTE)
+                    continue
                 if len(running) >= job.max_workers:
                     break
                 reason = "cancelled" if worker.cancelled() else job.budget.spent()

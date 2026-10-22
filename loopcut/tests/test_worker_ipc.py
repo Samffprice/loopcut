@@ -1,12 +1,15 @@
 """worker_ipc.py, the protocol between the user's Blender and a worker's child Blender: framing over a
-real pipe (newlines inside strings, a 1 MB payload), messages, the child's command line and its
+real socket (newlines inside strings, a 1 MB payload), messages, the child's command line and its
 scrubbed environment. No Blender; the real child is covered by loopcut/harness/worker_host_check.py."""
 
+import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -21,18 +24,15 @@ sys.modules.setdefault("bpy", fake_bpy)
 from loopcut import config, worker_ipc as ipc  # noqa: E402
 
 
-def pipe_channels() -> tuple:
-    """(parent, child) channels over two real pipes, as worker_host and worker_child hold them."""
-    req_r, req_w = os.pipe()
-    resp_r, resp_w = os.pipe()
-    parent = ipc.Channel(os.fdopen(resp_r, "rb"), os.fdopen(req_w, "wb"))
-    child = ipc.Channel.from_fds(req_r, resp_w)
-    return parent, child
+def socket_channels() -> tuple:
+    """(parent, child) channels over a socket pair; works on Windows as well as POSIX."""
+    parent, child = socket.socketpair()
+    return ipc.Channel.from_socket(parent), ipc.Channel.from_socket(child)
 
 
 class Framing(unittest.TestCase):
     def setUp(self):
-        self.parent, self.child = pipe_channels()
+        self.parent, self.child = socket_channels()
 
     def tearDown(self):
         self.parent.close()
@@ -63,7 +63,7 @@ class Framing(unittest.TestCase):
         self.assertEqual([self.child.receive()["id"] for _ in range(5)], [1, 2, 3, 4, 5])
 
     def test_eof_is_none(self):
-        self.parent.writer.close()
+        self.parent.close()
         self.assertIsNone(self.child.receive())
 
     def test_encoded_message_is_one_line(self):
@@ -113,15 +113,175 @@ class Messages(unittest.TestCase):
         self.assertEqual(ipc.timeout_for("tool", "get_scene_info", run_timeout=10), 40)
 
 
+class Authentication(unittest.TestCase):
+    """Real socket I/O with the listening address mocked, so these also run without network permission."""
+
+    def test_bad_token_rejected_before_valid_child_and_listener_closed(self):
+        bad_client, bad_server = socket.socketpair()
+        good_client, good_server = socket.socketpair()
+        for connection in (bad_client, bad_server, good_client, good_server):
+            self.addCleanup(connection.close)
+        with mock.patch.object(ipc.socket, "socket") as factory:
+            listener = ipc.Listener()
+        factory.return_value.bind.assert_called_once_with(("127.0.0.1", 0))
+        listener.socket.accept.side_effect = [(bad_server, ("127.0.0.1", 1)), (good_server, ("127.0.0.1", 2))]
+        bad_client.sendall(b"x" * 64)
+        good_client.sendall(listener.token.encode("ascii"))
+        parent = listener.accept(mock.Mock(poll=lambda: None), timeout=2)
+        self.addCleanup(parent.close)
+        self.assertEqual(bad_client.recv(1), b"")
+        self.assertEqual(good_client.recv(2), b"OK")
+        listener.socket.close.assert_called_once()
+        self.assertFalse(parent.connection.get_inheritable())
+        child = ipc.Channel.from_socket(good_client)
+        self.addCleanup(child.close)
+        child.send({"id": 1, "op": "init"})
+        self.assertEqual(parent.receive(), {"id": 1, "op": "init"})
+
+    def test_connect_authenticates_then_returns_blocking_channel(self):
+        client, server = socket.socketpair()
+        self.addCleanup(server.close)
+        server.sendall(b"OK")
+        with mock.patch.object(ipc.socket, "create_connection", return_value=client) as connect:
+            channel = ipc.connect(12345, "a" * 64)
+        self.addCleanup(channel.close)
+        self.assertEqual(server.recv(64), b"a" * 64)
+        connect.assert_called_once_with(("127.0.0.1", 12345), timeout=60.0)
+        self.assertIsNone(client.gettimeout())
+        self.assertFalse(client.get_inheritable())
+
+    def test_failed_authentication_closes_connection(self):
+        client, server = socket.socketpair()
+        self.addCleanup(server.close)
+        server.sendall(b"NO")
+        with mock.patch.object(ipc.socket, "create_connection", return_value=client), \
+                self.assertRaises(ipc.ProtocolError):
+            ipc.connect(12345, "a" * 64)
+        self.assertEqual(client.fileno(), -1)
+
+    def test_dead_child_and_timeout_do_not_wait_forever(self):
+        with mock.patch.object(ipc.socket, "socket"):
+            listener = ipc.Listener()
+        self.addCleanup(listener.close)
+        with self.assertRaisesRegex(ipc.ProtocolError, "exited before connecting"):
+            listener.accept(mock.Mock(poll=lambda: 7, returncode=7), timeout=1)
+        with self.assertRaises(TimeoutError):
+            listener.accept(mock.Mock(poll=lambda: None), timeout=0)
+
+    def test_slow_authentication_is_bounded(self):
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        server.settimeout(0.02)
+        client.sendall(b"a")
+        with self.assertRaises(TimeoutError):
+            ipc._receive_exact(server, 64)
+
+    def test_close_unblocks_reader(self):
+        parent, child = socket_channels()
+        self.addCleanup(child.close)
+        replies = []
+        thread = threading.Thread(target=lambda: replies.append(parent.receive()), daemon=True)
+        thread.start()
+        parent.close()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(replies, [None])
+
+    def test_windows_read_errors_read_as_eof(self):
+        """Windows fails reads with a reset when the peer dies, and with WinError 10060 across our own close."""
+        class Failing:
+            def __init__(self, error):
+                self.error = error
+
+            def readline(self):
+                raise self.error
+
+        for error in (ConnectionResetError(10054, "reset"), ConnectionAbortedError(10053, "aborted")):
+            self.assertIsNone(ipc.Channel(Failing(error), None).receive())
+        timed_out = ipc.Channel(Failing(TimeoutError(10060, "timed out")), None)
+        with self.assertRaises(TimeoutError):
+            timed_out.receive()  # Not closing: a real failure stays one.
+        timed_out.closing = True
+        self.assertIsNone(timed_out.receive())
+
+
 class ChildCommand(unittest.TestCase):
     def test_command_line(self):
-        command = ipc.child_command("/B/Blender", "/j/w1/spawn.blend", "/a/worker_child.py", "/j", "armchair", 5, 8)
-        self.assertEqual(command[:5], ["/B/Blender", "-b", "--factory-startup", "--disable-autoexec",
-                                       "/j/w1/spawn.blend"])
-        self.assertLess(command.index("/j/w1/spawn.blend"), command.index("--python"))
+        command = ipc.child_command("/B/Blender", "/j/w1/spawn.blend", "/a/worker_child.py", "/j", "armchair", 1234)
+        self.assertEqual(command[:4], ["/B/Blender", "-b", "--factory-startup", "--disable-autoexec"])
+        self.assertGreater(command.index("/j/w1/spawn.blend"), command.index("--"))
+        self.assertNotIn("--token", command)
         self.assertEqual(command[command.index("--python-exit-code") + 1], "1")
         self.assertEqual(command[command.index("--python") + 1], "/a/worker_child.py")
-        self.assertEqual(ipc.parse_child_args(command), {"job": "/j", "worker": "armchair", "in": 5, "out": 8})
+        self.assertEqual(ipc.parse_child_args(command), {"job": "/j", "worker": "armchair", "port": 1234,
+                                                        "spawn": "/j/w1/spawn.blend", "parent": os.getpid()})
+
+    def test_stdin_token_requires_exactly_one_valid_secret(self):
+        self.assertEqual(ipc.read_token(io.BytesIO(b"a" * 64 + b"\n")), "a" * 64)
+        for invalid in (b"", b"a" * 64, b"a" * 63 + b"\n", b"a" * 65 + b"\n", b"g" * 64 + b"\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ipc.ProtocolError):
+                ipc.read_token(io.BytesIO(invalid))
+
+    def test_addon_and_scene_loading_follow_authentication(self):
+        from loopcut import worker_child
+        events = []
+        args = {"parent": 123, "spawn": "/j/w1/spawn.blend"}
+        channel = mock.Mock()
+        blender = mock.Mock()
+        package = types.SimpleNamespace()
+        blender.ops.wm.open_mainfile.side_effect = lambda **kw: events.append("scene") or {"FINISHED"}
+        with mock.patch.object(worker_child, "_connect", side_effect=lambda: (
+                events.append("connect") or args, channel, ipc)), \
+                mock.patch.object(worker_child, "_load_package", side_effect=lambda: events.append("addon") or package), \
+                mock.patch.object(worker_child, "_watch_parent"), mock.patch.object(worker_child, "bpy", blender), \
+                mock.patch.object(worker_child, "Worker") as worker:
+            worker.return_value.serve.side_effect = lambda ch: events.append("serve")
+            worker_child.main()
+        self.assertIs(package.worker_ipc, ipc)
+        self.assertIs(sys.modules["loopcut.worker_ipc"], ipc)
+        self.assertEqual(events, ["connect", "addon", "scene", "serve"])
+        blender.ops.wm.open_mainfile.assert_called_once_with(filepath=args["spawn"], use_scripts=False)
+        channel.close.assert_called_once()
+
+    def test_addon_and_scene_failures_log_before_closing_authenticated_channel(self):
+        from loopcut import worker_child
+        for stage in ("addon", "scene"):
+            with self.subTest(stage=stage):
+                channel, blender = mock.Mock(), mock.Mock()
+                log = io.StringIO()
+                channel.close.side_effect = lambda: self.assertIn("RuntimeError", log.getvalue())
+                blender.ops.wm.open_mainfile.return_value = {"CANCELLED"}
+                with mock.patch.object(worker_child, "_connect", return_value=(
+                        {"parent": 123, "spawn": "/missing.blend"}, channel, ipc)), \
+                        mock.patch.object(worker_child, "_load_package",
+                                          side_effect=RuntimeError("bad addon") if stage == "addon" else None), \
+                        mock.patch.object(worker_child, "_watch_parent"), \
+                        mock.patch.object(worker_child, "bpy", blender), \
+                        mock.patch.object(worker_child.sys, "stderr", log), \
+                        mock.patch.object(worker_child, "Worker") as worker, self.assertRaises(RuntimeError):
+                    worker_child.main()
+                channel.close.assert_called_once()
+                worker.assert_not_called()
+
+    def test_bootstrap_uses_stdin_without_loading_addon(self):
+        from loopcut import worker_child
+        command = ipc.child_command("blender", "/j/w1/spawn.blend", "worker_child.py", "/j", "w", 1234)
+        stream = io.BytesIO(b"a" * 64 + b"\n")
+        self.addCleanup(sys.modules.pop, "_loopcut_worker_ipc", None)
+        with mock.patch.object(worker_child.sys, "argv", command), \
+                mock.patch.object(worker_child.sys, "stdin", types.SimpleNamespace(buffer=stream)), \
+                mock.patch.object(ipc.socket, "create_connection") as connection, \
+                mock.patch.object(worker_child, "_load_package") as load:
+            connection.return_value.recv.return_value = b"OK"
+            connection.return_value.gettimeout.return_value = None
+            args, channel, protocol = worker_child._connect()
+        load.assert_not_called()
+        self.assertEqual(args["port"], 1234)
+        self.assertIs(type(channel), protocol.Channel)
+        connection.return_value.sendall.assert_called_once_with(b"a" * 64)
+        self.assertTrue(stream.closed)
+        channel.close()
 
     def test_parse_refuses_missing_arguments(self):
         with self.assertRaises(ipc.ProtocolError):
@@ -132,7 +292,7 @@ class ChildCommand(unittest.TestCase):
     def test_worker_ids_are_folder_names(self):
         for good in ("armchair", "Side_Table-2", "w1"):
             self.assertTrue(ipc.valid_worker_id(good), good)
-        for bad in ("", "../x", "a/b", ".hidden", "x" * 41, "tab\t", None):
+        for bad in ("", "../x", "a/b", ".hidden", "x" * 41, "tab\t", "line\n", "con", "NUL", "COM1", "lpt9", None):
             self.assertFalse(ipc.valid_worker_id(bad), bad)
         self.assertEqual(ipc.worker_dir(Path("/j/w2/spawn.blend"), "lamp"), Path("/j/w2/lamp"))
 
@@ -156,7 +316,8 @@ class ChildEnv(unittest.TestCase):
         self.folder.cleanup()
 
     def test_only_the_allowed_variables(self):
-        self.assertEqual(set(self.env), {"PATH", "HOME", "LANG", "TMPDIR", "LOOPCUT_WORKER", "LOOPCUT_ENV_FILE"})
+        self.assertEqual(set(self.env), {"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP",
+                                         "LOOPCUT_WORKER", "LOOPCUT_ENV_FILE"})
         self.assertEqual(self.env["PATH"], PARENT_ENV["PATH"])
         self.assertEqual(self.env["LOOPCUT_WORKER"], "1")
         self.assertEqual(self.env["TMPDIR"], str(self.job / "w1" / "armchair" / "tmp"))
@@ -178,6 +339,19 @@ class ChildEnv(unittest.TestCase):
         env = ipc.child_env(self.job, self.job / "w1" / "a", {"PATH": "/bin"})
         self.assertNotIn("HOME", env)
         self.assertNotIn("LANG", env)
+
+    def test_windows_environment_preserves_os_paths_and_isolates_temp(self):
+        parent = {"SystemRoot": r"C:\Windows", "windir": r"C:\Windows", "Path": r"C:\Blender",
+                  "USERPROFILE": r"C:\Users\Person", "LOCALAPPDATA": r"C:\Users\Person\AppData\Local",
+                  "APPDATA": r"C:\Users\Person\AppData\Roaming", "TEMP": "wrong", "TMP": "wrong",
+                  "API_TOKEN": "private", "PYTHONPATH": "wrong"}
+        env = ipc.child_env(self.job, self.job / "w1" / "a", parent)
+        for key in ("SYSTEMROOT", "WINDIR", "PATH", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            self.assertIn(key, env)
+        self.assertEqual(env["SYSTEMROOT"], r"C:\Windows")
+        self.assertEqual({env[k] for k in ("TMPDIR", "TMP", "TEMP")}, {str(self.job / "w1" / "a" / "tmp")})
+        self.assertNotIn("API_TOKEN", env)
+        self.assertNotIn("PYTHONPATH", env)
 
     def test_env_file_holds_only_the_run_timeout(self):
         path = ipc.write_env_file(self.job, 45)
@@ -203,17 +377,34 @@ class ChildEnv(unittest.TestCase):
 # A stand-in for Blender that speaks the protocol: started with child_command's arguments, it serves
 # the ops from worker_child with canned replies. `tool` names ask for behaviour: slow sleeps, die exits,
 # segv writes a crash report where Blender does (its TMPDIR) and exits; worker "rude" leaves unasked at exit.
-FAKE_CHILD = """#!{python}
+FAKE_CHILD = """
 import json, os, sys, time
-args = sys.argv[sys.argv.index("--") + 1:]
-opts = dict(zip(args[::2], args[1::2]))
-inp, out = os.fdopen(int(opts["--in"]), "rb"), os.fdopen(int(opts["--out"]), "wb")
-for line in inp:
-    request = json.loads(line)
+sys.path.insert(0, {addons!r})
+from loopcut import worker_ipc as ipc
+opts = ipc.parse_child_args(sys.argv)
+if opts["worker"] == "no_connect":
+    time.sleep(30)
+if opts["worker"] == "early_exit":
+    sys.exit(7)
+with sys.stdin.buffer as credentials:
+    token = ipc.read_token(credentials)
+channel = ipc.connect(opts["port"], token)
+while True:
+    request = channel.receive()
+    if request is None:
+        break
     op, name = request["op"], request.get("name")
     reply = {{"id": request["id"], "ok": True, "peak_rss_mb": 123.0}}
     if op == "init":
-        reply.update(pid=os.getpid(), undo="undo", stamped=3, env=sorted(os.environ))
+        if opts["worker"] == "bad_init":
+            reply.update(ok=False, error="init failed")
+        if opts["worker"] == "dead_init":
+            os._exit(6)
+        if opts["worker"] == "slow_init":
+            time.sleep(30)
+        reply.update(pid=os.getpid(), undo="undo", stamped=3, env=sorted(os.environ),
+                     secret_in_argv=token in sys.argv, secret_in_env=token in os.environ.values(),
+                     stdin_closed=sys.stdin.closed)
     elif op == "tool" and name == "slow":
         time.sleep(30)
     elif op == "tool" and request["arguments"].get("die"):
@@ -224,7 +415,7 @@ for line in inp:
         with open(os.path.join(os.environ["TMPDIR"], "spawn.crash.txt"), "w") as report:
             report.write("# backtrace " + str(request["step"]))
         os._exit(11)
-    elif op == "exit" and opts["--worker"] == "rude":
+    elif op == "exit" and opts["worker"] == "rude":
         os._exit(0)
     elif op == "tool":
         reply.update(text="ran " + name + " " + json.dumps(request["arguments"], sort_keys=True),
@@ -235,28 +426,32 @@ for line in inp:
         reply.update(results=[])
     elif op == "broken":
         pass
-    out.write((json.dumps(reply) + "\\n").encode())
-    out.flush()
+    channel.send(reply)
     if op == "exit":
         os._exit(0)
 """
 
 
 class FakeChildren(unittest.TestCase):
-    """worker_host.Child and WorkerRuntime against FAKE_CHILD: pipes, routing, crashes and cancel."""
+    """worker_host.Child and WorkerRuntime against FAKE_CHILD: sockets, routing, crashes and cancel."""
 
     @classmethod
     def setUpClass(cls):
         from loopcut import tools, worker_host
         cls.tools, cls.host = tools, worker_host
-        cls.folder = tempfile.TemporaryDirectory()
-        cls.binary = Path(cls.folder.name) / "fake_blender"
-        cls.binary.write_text(FAKE_CHILD.format(python=sys.executable))
-        cls.binary.chmod(0o755)
+        cls.folder = tempfile.TemporaryDirectory(prefix="loopcut space ü ")
+        script = Path(cls.folder.name) / "fake_blender.py"
+        script.write_text(FAKE_CHILD.format(addons=str(Path(ipc.__file__).parent.parent)), encoding="utf-8")
+        cls.binary = sys.executable
+        command = ipc.child_command
+        cls.command_patch = mock.patch.object(ipc, "child_command", side_effect=lambda *args:
+                                              [sys.executable, str(script), *command(*args)[1:]])
+        cls.command_patch.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.host.shutdown_all()
+        cls.command_patch.stop()
         cls.folder.cleanup()
 
     def child(self, worker="w", run_timeout=60.0):
@@ -276,6 +471,9 @@ class FakeChildren(unittest.TestCase):
         self.assertIn("ready", child.t)
         self.assertEqual(child.peak_rss_mb, 123.0)
         self.assertFalse([name for name in ready["env"] if ipc.is_secret(name)])
+        self.assertFalse(ready["secret_in_argv"])
+        self.assertFalse(ready["secret_in_env"])
+        self.assertTrue(ready["stdin_closed"])
         record = json.loads((child.folder / self.host.RECORD).read_text())
         self.assertEqual((record["pid"], record["owner"]), (child.pid, os.getpid()))
         runtime = self.host.WorkerRuntime(child, {})
@@ -356,6 +554,7 @@ class FakeChildren(unittest.TestCase):
         child.spawn_path.write_bytes(b"BLENDER spawn")
         child.call("init")
         runtime = self.host.WorkerRuntime(child, {})
+        self.addCleanup(lambda: runtime.child.kill())
         runtime.step = 7
         died = runtime.run_tool("run_python", json.dumps({"segv": True}))
         kit = child.folder / "crash-1"
@@ -417,6 +616,8 @@ class FakeChildren(unittest.TestCase):
         child = self.child("dies")
         child.call("init", {"prefix": "Lamp"})
         runtime = self.host.WorkerRuntime(child, {})
+        # restart replaces runtime.child; child() only registered cleanup for the original.
+        self.addCleanup(lambda: runtime.child.kill())
         died = runtime.run_tool("run_python", json.dumps({"die": True}))
         self.assertEqual(died.crashed, "exited")
         self.assertIn("code 5", died.text)
@@ -439,9 +640,240 @@ class FakeChildren(unittest.TestCase):
         self.assertIsNotNone(child.process.poll())
         self.assertEqual(child.dead, "cancelled")
 
+    def test_restart_cancel_reaps_real_child_that_never_connects(self):
+        from loopcut import llm
+        child = self.child("restart_cancel")
+        child.call("init")
+        runtime = self.host.WorkerRuntime(child, {})
+        self.addCleanup(lambda: runtime.child.kill())
+        command, popen = ipc.child_command, self.host.subprocess.Popen
+        cancel = threading.Event()
+        replacements = []
+
+        def no_connect(*args):
+            argv = command(*args)
+            argv[argv.index("--worker") + 1] = "no_connect"
+            return argv
+
+        def spawn(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            replacements.append(process)
+            self.addCleanup(process.wait, timeout=5)
+            self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+            # Cancel after a real process exists, before start enters Listener.accept.
+            cancel.set()
+            return process
+
+        with mock.patch.object(ipc, "child_command", side_effect=no_connect), \
+                mock.patch.object(self.host.subprocess, "Popen", side_effect=spawn), self.assertRaises(llm.Cancelled):
+            runtime.restart(is_cancelled=cancel.is_set)
+        self.assertEqual(len(replacements), 1)
+        self.assertIsNotNone(replacements[0].poll())
+        self.assertTrue(replacements[0].stdin.closed)
+        self.assertFalse(self.host._live)
+
     def test_bad_ids_are_refused(self):
         with self.assertRaises(ValueError):
             self.host.Child("/j", "../escape", "/j/w1/spawn.blend", "modeling", binary="/bin/false", run_timeout=1)
+
+    def test_connection_failure_is_startup_failure_and_reaps_child(self):
+        for worker in ("early_exit", "no_connect"):
+            with self.subTest(worker=worker), mock.patch.dict(ipc.TIMEOUTS, init=0.2), \
+                    self.assertRaises(self.host.WorkerUnavailable):
+                self.child(worker)
+        self.assertFalse(self.host._live)
+
+    def test_init_error_exit_and_timeout_keep_crash_kits(self):
+        for worker in ("bad_init", "dead_init", "slow_init"):
+            with self.subTest(worker=worker):
+                child = self.child(worker)
+                with self.assertRaises(self.host.ChildCrashed) as crash:
+                    child.call("init", timeout=0.2)
+                self.assertIsNotNone(child.process.poll())
+                record = json.loads((Path(crash.exception.kept) / "crash.json").read_text())
+                self.assertEqual(record["op"], "init")
+
+
+class StartupFailures(unittest.TestCase):
+    """Spawn cleanup and pre-tool failures without needing Blender or a network listener."""
+
+    def setUp(self):
+        from loopcut import worker_host
+        self.host = worker_host
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.child = worker_host.Child(folder.name, "w", Path(folder.name) / "w1" / "spawn.blend",
+                                       "modeling", binary=sys.executable, run_timeout=1)
+        self.addCleanup(self.child.kill)
+
+    def test_spawn_oserror_and_valueerror_close_listener(self):
+        for error in (OSError("cannot spawn"), ValueError("unsupported option")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(ipc, "Listener") as listener, \
+                    mock.patch.object(self.host.subprocess, "Popen", side_effect=error) as popen:
+                listener.return_value.port, listener.return_value.token = 12345, "a" * 64
+                with self.assertRaises(self.host.WorkerUnavailable):
+                    self.child.start()
+                self.assertNotIn("pass_fds", popen.call_args.kwargs)
+                self.assertNotIn("start_new_session", popen.call_args.kwargs)
+                self.assertTrue(popen.call_args.kwargs["close_fds"])
+                listener.return_value.close.assert_called_once()
+                self.assertNotIn(self.child, self.host._live)
+
+    def test_failed_connection_terminates_and_reaps_process(self):
+        process = mock.Mock(pid=123, poll=lambda: None, stdin=io.BytesIO())
+        with mock.patch.object(ipc, "Listener") as listener, \
+                mock.patch.object(self.host.subprocess, "Popen", return_value=process):
+            listener.return_value.port, listener.return_value.token = 12345, "a" * 64
+            listener.return_value.accept.side_effect = TimeoutError("no connection")
+            with self.assertRaises(self.host.WorkerUnavailable):
+                self.child.start()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once()
+        listener.return_value.close.assert_called_once()
+        self.assertNotIn(self.child, self.host._live)
+        self.child.process = None
+
+    def test_windows_start_records_identity_and_passes_secret_only_on_stdin(self):
+        from loopcut import worker_process
+        process = mock.Mock(pid=123, poll=lambda: None, stdin=io.BytesIO())
+        windows = types.SimpleNamespace(**(vars(os) | {"name": "nt"}))
+        with mock.patch.object(self.host, "os", windows), mock.patch.object(ipc, "Listener") as listener, \
+                mock.patch.object(worker_process, "windows_creation", return_value=42) as creation, \
+                mock.patch.object(self.host.subprocess, "Popen", return_value=process) as popen, \
+                mock.patch.object(self.host.threading, "Thread"):
+            listener.return_value.port, listener.return_value.token = 12345, "a" * 64
+
+            def accept(*args):
+                self.assertTrue(process.stdin.closed)
+                return mock.Mock()
+
+            listener.return_value.accept.side_effect = accept
+            # Observe the bytes before the parent's close, without changing the pipe protocol.
+            original_close = process.stdin.close
+
+            def close():
+                if not process.stdin.closed:
+                    self.assertEqual(process.stdin.getvalue(), b"a" * 64 + b"\n")
+                    original_close()
+
+            with mock.patch.object(process.stdin, "close", side_effect=close):
+                self.child.start()
+        creation.assert_called_once_with(123)
+        record = json.loads((self.child.folder / self.host.RECORD).read_text(encoding="utf-8"))
+        self.assertEqual(record["windows_created"], 42)
+        self.assertNotIn("pass_fds", popen.call_args.kwargs)
+        self.assertNotIn("startupinfo", popen.call_args.kwargs)
+        self.assertNotIn("start_new_session", popen.call_args.kwargs)
+        self.assertEqual(popen.call_args.kwargs["stdin"], self.host.subprocess.PIPE)
+        self.assertNotIn("a" * 64, str(popen.call_args))
+        self.assertNotIn("--token", popen.call_args.args[0])
+
+    def test_cancel_before_spawn_does_not_become_unavailable(self):
+        from loopcut import llm
+        with mock.patch.object(self.host.subprocess, "Popen") as popen, self.assertRaises(llm.Cancelled):
+            self.child.start(is_cancelled=lambda: True)
+        popen.assert_not_called()
+
+    def test_init_eof_protocol_error_timeout_and_refusal_keep_diagnostics(self):
+        for message in (None, ipc.ProtocolError("garbled"), {"id": 99, "ok": True},
+                        {"id": 1, "ok": False, "error": "init failed"}, "timeout"):
+            with self.subTest(message=message):
+                self.child.dead = self.child.stopping = ""
+                self.child.next_id = 1
+                self.child.process = mock.Mock(pid=123, poll=lambda: None, wait=lambda **kw: 7)
+                self.child.channel = mock.Mock()
+                if message != "timeout":
+                    self.child.replies.put(message)
+                with self.assertRaises(self.host.ChildCrashed) as crash:
+                    self.child.call("init", timeout=0.01)
+                kit = Path(crash.exception.kept)
+                record = json.loads((kit / "crash.json").read_text())
+                self.assertEqual(record["op"], "init")
+                self.assertTrue((kit / "worker.log.tail.txt").is_file())
+                self.child.process = None
+
+    def test_parent_programming_error_does_not_become_unavailable(self):
+        with mock.patch.object(ipc, "child_command", side_effect=ValueError("bad command builder")), \
+                mock.patch.object(ipc, "Listener"), self.assertRaisesRegex(ValueError, "bad command builder"):
+            self.child.start()
+
+    def test_spawn_connection_and_init_share_one_deadline(self):
+        process = mock.Mock(pid=123, poll=lambda: None, stdin=io.BytesIO())
+        with mock.patch.object(ipc, "Listener") as listener, \
+                mock.patch.object(self.host.subprocess, "Popen", return_value=process), \
+                mock.patch.object(self.host.threading, "Thread"), \
+                mock.patch.object(self.host.time, "monotonic", return_value=100.0) as clock:
+            listener.return_value.token = "a" * 64
+            self.child.start()
+            self.assertEqual(self.child.startup_deadline, 100.0 + ipc.TIMEOUTS["init"])
+            self.assertEqual(listener.return_value.accept.call_args.args[1], ipc.TIMEOUTS["init"])
+            clock.return_value = self.child.startup_deadline + 1
+            with self.assertRaises(self.host.ChildCrashed) as crash:
+                self.child.call("init", timeout=60)
+            self.assertEqual(crash.exception.reason, "timeout")
+        self.child.process = None
+
+    def test_restart_cancel_while_replacement_is_connecting(self):
+        from loopcut import llm
+        cancel = threading.Event()
+        process = mock.Mock(pid=123, poll=lambda: None, stdin=io.BytesIO())
+        listener = ipc.Listener.__new__(ipc.Listener)
+        listener.token, listener.port, listener.socket = "a" * 64, 12345, mock.Mock()
+
+        def connecting():
+            cancel.set()
+            raise socket.timeout()
+
+        listener.socket.accept.side_effect = connecting
+        runtime = self.host.WorkerRuntime(self.child, {})
+        started = time.monotonic()
+        with mock.patch.object(ipc, "Listener", return_value=listener), \
+                mock.patch.object(self.host.subprocess, "Popen", return_value=process), \
+                mock.patch.object(self.host.Child, "call") as init, self.assertRaises(llm.Cancelled):
+            runtime.restart(is_cancelled=cancel.is_set)
+        self.assertLess(time.monotonic() - started, 2)
+        init.assert_not_called()
+        listener.socket.accept.assert_called_once()
+        listener.socket.close.assert_called_once()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once()
+        self.assertTrue(process.stdin.closed)
+        self.assertFalse(self.host._live)
+
+    def test_windows_liveness_uses_safe_probe_and_does_not_run_ps(self):
+        from loopcut import jobs
+        with mock.patch.object(self.host, "os", types.SimpleNamespace(name="nt")), \
+                mock.patch.object(jobs, "_alive", return_value=True) as alive, \
+                mock.patch.object(self.host.subprocess, "run") as run:
+            self.assertTrue(self.host._alive(123))
+            alive.assert_called_once_with(123)
+            self.assertEqual(self.host._command_of(123), "")
+            self.assertIsNone(self.child.rss_mb())
+            run.assert_not_called()
+
+    def test_missing_resource_is_optional_even_for_init_reply(self):
+        from loopcut import worker_child
+        worker = worker_child.Worker.__new__(worker_child.Worker)
+        for name in ("init", "tool", "check", "finish"):
+            setattr(worker, name, lambda payload: {})
+        channel = mock.Mock()
+        channel.receive.side_effect = [{"id": 1, "op": "init"}, {"id": 2, "op": "exit"}]
+        with mock.patch.dict(sys.modules, resource=None), \
+                mock.patch.object(worker_child, "_leave", side_effect=SystemExit), self.assertRaises(SystemExit):
+            worker.serve(channel)
+        self.assertEqual(channel.send.call_args_list[0].args[0], {"id": 1, "ok": True, "peak_rss_mb": None})
+
+    def test_windows_watchdog_detects_dead_parent_with_unchanged_ppid(self):
+        from loopcut import jobs, worker_child
+        with mock.patch.object(worker_child, "os", mock.Mock(name="nt", getppid=lambda: 123)) as os_mock, \
+                mock.patch.object(worker_child.threading, "Thread") as thread, \
+                mock.patch.object(worker_child.time, "sleep"), mock.patch.object(jobs, "_alive", return_value=False):
+            os_mock.name = "nt"
+            os_mock._exit.side_effect = SystemExit
+            worker_child._watch_parent(123)
+            with self.assertRaises(SystemExit):
+                thread.call_args.kwargs["target"]()
+            os_mock._exit.assert_called_once_with(3)
 
 
 class AssetSplit(unittest.TestCase):

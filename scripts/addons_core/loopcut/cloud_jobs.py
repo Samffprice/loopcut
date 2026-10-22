@@ -483,7 +483,7 @@ def _background(client, job, cancel, on_progress):
 
 
 def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: dict,
-        on_progress=None, cancel=None, client=None, confirm_token=None) -> dict:
+        on_progress=None, cancel=None, client=None, confirm_token=None, quote=False) -> dict:
     """Upload, submit once (retry a lost reply with the same key), follow and verify outputs.
 
     quote_id, bundle (an already uploaded manifest hash), and optional idempotency_key are
@@ -491,6 +491,7 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     returned in CloudError.extra; a failed or canceled job returns none, as its key only replays that
     job (SPEC §3.4). Ordinary separate calls always get fresh UUIDs. confirm_token: the user
     approved past a server limit (cloud_account._run_confirmed); it goes once, as the x-loopcut-confirm header.
+    quote: price this call first and raise quote_required with the quote (a quote_required tool always does).
     """
     if (not isinstance(project, dict) or not isinstance(project.get("id"), str) or not project["id"]
             or type(project.get("no_generation")) is not bool):
@@ -544,7 +545,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
         raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
     # Quotes and jobs pass the same server limits; the user's approval past one goes as this header (C47).
     confirm = {"headers": {"x-loopcut-confirm": confirm_token}} if confirm_token else {}
-    if (descriptor.get("cost") or {}).get("quote_required") and not arguments.get("quote_id"):
+    # A quote_required tool always, and any tool when asked (cloud_account.authorize prices every paid call).
+    if ((descriptor.get("cost") or {}).get("quote_required") or quote) and not arguments.get("quote_id"):
         quote = client.request("POST", "/v1/quotes", payload, **confirm)
         if (not isinstance(quote.get("quote_id"), str) or type(quote.get("credits")) is not int
                 or quote["credits"] < 0 or not isinstance(quote.get("expires_at"), str)):
@@ -619,6 +621,8 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
             from . import glb
             path = directory / f"input-{n}.glb"
             glb._export(path, [ob, *ob.children_recursive])
+        elif (attached := attached_image(value)) is not None:
+            path = attached
         else:
             from . import files
             path = files.check(files.resolve(value))
@@ -626,6 +630,28 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
                 raise _input_error("Scene reference or file was not found", field)
         found[field] = path
     return found
+
+
+def attached_image(name: str) -> Path | None:
+    """The file of an image attached to this conversation, by the name its reference card gives it: the model sees
+    the name, never a path, so "turn the attached photo into a model" had nothing it could pass (0.2.8's photo Try it
+    card searched the disk, then generated from a text prompt). The original file the user attached while it is
+    there (what try_samples recognises), else the copy stored with the conversation. None for any other name."""
+    from . import conversations, state
+    session = state.session()
+    for reference in reversed(session.get("references") or []):
+        if reference.get("name") != name or reference.get("video"):
+            continue
+        source = Path(reference["source"]) if reference.get("source") else None
+        if source is not None and source.is_file():
+            return source
+        try:
+            stored = conversations.image_path(session["id"], reference.get("full") or reference["ref"])
+        except (conversations.ConversationError, KeyError):
+            continue
+        if stored.is_file():
+            return stored
+    return None
 
 
 def _accepts_video(row):

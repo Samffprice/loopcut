@@ -3,6 +3,7 @@
     python3 -m unittest discover -s tests -v
 """
 
+import dataclasses
 import json
 import os
 import sys
@@ -22,7 +23,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, context, conversations, llm, state, tools, workspace  # noqa: E402
+from loopcut import agent, checkpoints, config, context, conversations, llm, state, tools, waves, workspace  # noqa: E402
 from loopcut.ui import layout  # noqa: E402
 
 
@@ -161,6 +162,8 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.requests.clear()
         SCRIPT.headers.clear()
         state.ui["account"] = None
+        state.ui.pop("allowance_notice", None)
+        state.ui.pop("warned_session_allowance", None)
         self.session = state.reset()
         self.ran: list[tuple[str, str]] = []
         self.checkpoint_calls: list[int] = []  # How many tools had run when each was requested.
@@ -315,10 +318,8 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_a_note_too_late_to_fold_in_starts_the_next_turn(self):
         resent = []
-        agent._resend_on_main = resent.append
-        fold = agent._fold_notes
-        agent._fold_notes = lambda session, turn: None  # As if the note came during the final request.
-        try:
+        with mock.patch.object(agent, "_resend_on_main", side_effect=resent.append), \
+                mock.patch.object(agent, "_fold_notes"):  # As if the note came during the final request.
             SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
                                text_reply("Done.")]
             turn = self.start("add a cube")
@@ -327,21 +328,19 @@ class AgentLoopTest(unittest.TestCase):
             item = self.session["items"][-1]
             agent.decide(True)
             turn.thread.join(5)
-        finally:
-            agent._fold_notes = fold
         self.assertEqual(resent, ["and a sphere"])
         self.assertNotIn(item, self.session["items"], "the queued item is replaced by the turn it starts")
         self.assertFalse(self.session["busy"])
 
     def test_a_note_left_over_after_a_stop_goes_back_to_the_input(self):
         restored = []
-        agent._restore_input_on_main = restored.append
-        SCRIPT.replies.append(tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}))
-        turn = self.start("add a cube")
-        self.awaiting()
-        self.assertTrue(agent.send("wait"))
-        agent.stop()
-        turn.thread.join(5)
+        with mock.patch.object(agent, "_restore_input_on_main", side_effect=restored.append):
+            SCRIPT.replies.append(tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}))
+            turn = self.start("add a cube")
+            self.awaiting()
+            self.assertTrue(agent.send("wait"))
+            agent.stop()
+            turn.thread.join(5)
         self.assertEqual(restored, ["wait"])
         self.assertFalse(any(i.get("queued") for i in self.session["items"]))
 
@@ -1934,18 +1933,40 @@ class AgentLoopTest(unittest.TestCase):
         # on where Loopcut's allowance stopped (M7): sign in to it, or switch to it when already signed in.
         display = layout.build(self.session, 400, 600, 1.0, LayoutTest.measure, "m")
         buttons = [h for h in display["hits"] if h["id"].startswith("item") and ".limit." in h["id"]]
-        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "sign_in", "resume"])
+        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "sign_in", "own_key", "limit_retry"])
         self.assertEqual(buttons[1]["action"], ("sign_in", "chatgpt"))
         self.assertIn("Have ChatGPT Plus or Pro? It can run Loopcut now.", str(display["prims"]))
         display = layout.build(self.session, 400, 600, 1.0, LayoutTest.measure, "m", ui={"chatgpt_plan": True})
         buttons = [h for h in display["hits"] if h["id"].startswith("item") and ".limit." in h["id"]]
-        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "limit_chatgpt", "resume"])
+        self.assertEqual([h["action"][0] for h in buttons], ["limit_upgrade", "limit_chatgpt", "own_key", "limit_retry"])
         # A second 402 from a provider that says nothing structured still gets a card, without a button.
         SCRIPT.replies += [(402, {"error": {"message": "Insufficient credit.", "type": "billing"}})]
         turn = self.start("try again")
         turn.thread.join(5)
         card = self.session["items"][-1]
         self.assertEqual((card["kind"], card["reason"], card["upgrade"]), ("limit", "billing", None))
+
+    def test_hosted_refusal_refreshes_meter_and_still_sends_to_the_server(self):
+        reset = "2099-10-21T18:00:00Z"
+        SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "1.0",
+                               "x-loopcut-session-resets-at": reset})
+        SCRIPT.replies += [(402, {"error": {"message": "Chat allowance used.", "code": "session_limit",
+                                            "plan": "free", "resets_at": reset}}), text_reply("Allowance is available.")]
+        from loopcut import mainthread
+        def immediate(fn):
+            from concurrent.futures import Future
+            future = Future()
+            future.set_result(fn())
+            return future
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                mock.patch.object(mainthread, "run_on_main", side_effect=immediate):
+            self.start("make a large model").thread.join(5)
+            self.assertEqual(state.ui["account"]["session"], {"used": 1.0, "resets_at": reset})
+            self.assertEqual(layout.ring_shares({}, 1000, state.ui["account"])[1][1], 0.0)
+            self.assertTrue(agent.resume())
+            self.session["turn"].thread.join(5)
+            self.assertEqual(len(SCRIPT.requests), 2)
+            self.assertNotIn("allowance_notice", state.ui)
 
     def test_resume_makes_the_request_again_without_adding_a_message(self):
         SCRIPT.replies += [(402, {"error": {"message": "Used up.", "code": "week_limit", "plan": "free"}}),
@@ -1975,23 +1996,31 @@ class AgentLoopTest(unittest.TestCase):
 
     @mock.patch.object(agent.config, "billing_open", lambda: True)
     def test_usage_headers_update_the_account_and_warn_once_when_the_week_is_nearly_used(self):
-        SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
-                               "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})
-        SCRIPT.replies += [text_reply("One."), text_reply("Two.")]
-        turn = self.start("hello")
-        turn.thread.join(5)
-        self.assertEqual(state.ui["account"]["plan"], "free")
-        self.assertEqual(state.ui["account"]["week"], {"used": 0.842, "resets_at": "2026-09-23T00:00:00Z"})
-        notices = [i for i in self.session["items"] if i["kind"] == "notice"]
-        self.assertEqual(len(notices), 1)
-        self.assertIn("About 16% of this week's free allowance is left", notices[0]["text"])
-        self.assertEqual(notices[0]["action_label"], "See plans")
-        self.assertIn("/pricing?from=app&reason=low_allowance", notices[0]["url"])
-        turn = self.start("again")
-        turn.thread.join(5)
-        self.assertEqual(len([i for i in self.session["items"] if i["kind"] == "notice"]), 1, "warned once")
-        self.assertEqual(layout.usage_note(state.ui["account"]), ("84% of week used", 0.842))
-        self.assertEqual(layout.usage_note({"week": {"used": 0.2}, "session": {"used": 0.5}}), ("", 0.5))
+        from loopcut import mainthread
+        def immediate(fn):
+            from concurrent.futures import Future
+            future = Future()
+            future.set_result(fn())
+            return future
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                mock.patch.object(mainthread, "run_on_main", side_effect=immediate):
+            SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
+                                   "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})
+            SCRIPT.replies += [text_reply("One."), text_reply("Two.")]
+            turn = self.start("hello")
+            turn.thread.join(5)
+            self.assertEqual(state.ui["account"]["plan"], "free")
+            self.assertEqual(state.ui["account"]["week"], {"used": 0.842, "resets_at": "2026-09-23T00:00:00Z"})
+            notices = [i for i in self.session["items"] if i["kind"] == "notice"]
+            self.assertEqual(len(notices), 1)
+            self.assertIn("About 16% of this week's free allowance is left", notices[0]["text"])
+            self.assertEqual(notices[0]["action_label"], "See plans")
+            self.assertIn("/pricing?from=app&reason=low_allowance", notices[0]["url"])
+            turn = self.start("again")
+            turn.thread.join(5)
+            self.assertEqual(len([i for i in self.session["items"] if i["kind"] == "notice"]), 1, "warned once")
+            self.assertEqual(layout.usage_note(state.ui["account"]), ("84% of week used", 0.842))
+            self.assertEqual(layout.usage_note({"week": {"used": 0.2}, "session": {"used": 0.5}}), ("", 0.5))
 
     def test_http_error_is_shown_not_swallowed(self):
         SCRIPT.replies.append((403, {"error": {"message": "This key was revoked."}}))
@@ -2132,6 +2161,219 @@ class AgentLoopTest(unittest.TestCase):
             self.assertIn("apply_build", [t["function"]["name"] for t in request["tools"]])
 
 
+class QueuedHelperNoteTest(unittest.TestCase):
+    """Exercise the real turn wait and teardown without binding a model server socket."""
+
+    def setUp(self):
+        from loopcut import mainthread
+        self.session = state.new_session()
+        self.turn = agent.Turn()
+        self.turn.config = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast",
+                                         reasoning_effort="low", auto_run=True, auto_look=False,
+                                         max_steps=0, context_budget=40_000)
+        self.session.update(busy=True, turn=self.turn)
+        self.session["messages"].append({"role": "user", "content": "make an object"})
+        self.helper = types.SimpleNamespace(id="a", turn=agent.Turn(), thread=None, finished=None, kill=mock.Mock())
+        self.helper.never_started = lambda: setattr(self.helper, "finished", time.monotonic())
+        self.job = types.SimpleNamespace(lock=threading.Lock(), steers=[], stopped=False, crew=[self.helper],
+                                         waves=[], log={}, write=mock.Mock(), on_main=None)
+        self.turn.job = self.job
+        self.entered, self.return_wave = threading.Event(), threading.Event()
+        self.requests = []
+        self.callbacks = []
+        self.resent, self.restored = [], []
+        self.resend_on_main = agent._resend_on_main
+        self.spec = agent.LoopSpec(role="orchestrator", system=lambda session: "", schemas=lambda: [],
+                                   save=lambda session: None, asks=False, checkpoints=False, changes_card=False,
+                                   scene_changed=lambda result: False, on_end=waves.end_turn)
+        # Keep a private session and callback queue until finish() has stopped the turn, then
+        # restore the previous hooks and session even if a race assertion fails.
+        for patcher in (mock.patch.object(state, "_session", self.session),
+                        mock.patch.object(mainthread, "run_on_main", side_effect=self.callbacks.append),
+                        mock.patch.object(agent, "_redraw"),
+                        mock.patch.object(agent, "_request", side_effect=self.request),
+                        mock.patch.object(agent, "_resend_on_main", side_effect=self.resend),
+                        mock.patch.object(agent, "_restore_input_on_main", side_effect=self.restored.append)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.thread = None
+        self.addCleanup(self.finish)
+
+    def finish(self):
+        self.turn.cancel.set()
+        self.return_wave.set()
+        if self.thread:
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive(), "turn did not finish during cleanup")
+
+    def request(self, session, turn, cfg, spec):
+        self.requests.append([dict(m) for m in session["messages"]])
+        if len(self.requests) == 1:
+            return llm.Completion(tool_calls=[llm.ToolCall("c1", "delegate", "{}")])
+        return llm.Completion(text="done")
+
+    def wait_for_helpers(self, name, arguments):
+        self.entered.set()
+        waves._wait(self.job, self.turn.cancel.is_set, self.return_wave.is_set)
+        return tools.ToolResult("Helpers finished")
+
+    def start(self):
+        self.thread = threading.Thread(target=agent.run_loop,
+                                       args=(self.session, self.turn, self.spec, self.wait_for_helpers))
+        self.thread.start()
+        self.assertTrue(self.entered.wait(2), "orchestrator did not reach its helper wait")
+
+    def resend(self, text):
+        self.assertTrue(self.job.stopped)
+        self.assertTrue(self.helper.turn.cancel.is_set())
+        self.helper.kill.assert_called()
+        self.assertFalse(self.session["busy"], "the next turn starts only after cancellation cleanup")
+        self.resent.append(text)
+
+    def test_correction_reaches_the_next_orchestrator_request_after_the_wave_returns(self):
+        self.start()
+        self.assertTrue(agent.send("make it smaller"))
+        self.assertEqual(self.job.steers, ["make it smaller"])
+        queued = self.session["items"][-1]
+        self.assertTrue(queued["queued"])
+        self.return_wave.set()
+        self.thread.join(2)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.turn.outcome, "completed")
+        steers = [m["content"] for m in self.requests[1] if m.get(context.STEER)]
+        self.assertEqual(steers, ["<steer>make it smaller</steer>"])
+        self.assertNotIn("queued", queued)
+        self.assertEqual(self.resent, [])
+
+    def test_send_now_stops_helpers_then_sends_all_notes_once(self):
+        self.start()
+        agent.send("smaller")
+        agent.send("also red")
+        self.assertTrue(agent.send_queued_now())
+        self.assertFalse(agent.send_queued_now(), "a second click must not resend the same note")
+        self.thread.join(2)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.turn.outcome, "cancelled")
+        self.assertEqual(self.resent, ["smaller\nalso red"])
+        self.assertEqual(self.restored, [])
+        self.assertEqual(len(self.requests), 1, "the cancelled turn must not make another model request")
+        self.assertFalse(any(i.get("queued") for i in self.session["items"]))
+        self.assertEqual(self.session["messages"][-1]["role"], "tool", "cancel closes the delegate call")
+
+    def test_ordinary_stop_keeps_returning_the_note_to_the_input(self):
+        self.start()
+        agent.send("smaller")
+        agent.stop()
+        self.thread.join(2)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.turn.outcome, "cancelled")
+        self.assertEqual(self.restored, ["smaller"])
+        self.assertEqual(self.resent, [])
+        self.assertTrue(self.job.stopped)
+
+    def test_stale_send_now_action_does_nothing(self):
+        self.assertFalse(agent.send_queued_now())
+        self.assertFalse(self.turn.cancel.is_set())
+
+    def complete_with_pending_note(self, click_first):
+        """A note arrives during the final reply; the real teardown schedules the next turn."""
+        def final_reply(*args):
+            self.entered.set()
+            if not self.return_wave.wait(2):
+                raise RuntimeError("final reply was not released")
+            return llm.Completion(text="done")
+
+        with mock.patch.object(agent, "_request", side_effect=final_reply), \
+                mock.patch.object(agent, "_resend_on_main", side_effect=self.resend_on_main) as resent:
+            self.start()
+            self.assertTrue(agent.send("smaller"))
+            if click_first:
+                self.assertTrue(agent.send_queued_now())
+            self.return_wave.set()
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive())
+            self.assertEqual(self.turn.outcome, "cancelled" if click_first else "completed")
+            resent.assert_called_once_with("smaller")
+            self.assertIsNone(self.session["turn"])
+            self.assertFalse(agent.send_queued_now(), "completion already handed the note to automatic resend")
+            self.assertEqual(len(self.callbacks), 1)
+            with mock.patch.object(agent, "send", return_value=True) as sent:
+                self.callbacks[0]()
+            sent.assert_called_once_with("smaller")
+        self.assertFalse(any(i.get("queued") for i in self.session["items"]))
+        self.assertFalse(self.turn.notes)
+        self.assertEqual(self.restored, [])
+
+    def test_completion_before_send_now_click_resends_once(self):
+        self.complete_with_pending_note(click_first=False)
+        self.assertFalse(self.turn.cancel.is_set())
+
+    def test_send_now_click_before_completion_resends_once(self):
+        self.complete_with_pending_note(click_first=True)
+        self.assertTrue(self.job.stopped)
+
+    def test_send_captured_before_retirement_retries_normal_sending(self):
+        captured, resume = threading.Barrier(2), threading.Barrier(2)
+        note_lock = threading.Lock()
+        result = []
+
+        class PausedSenderLock:
+            def __enter__(self):
+                if threading.current_thread() is sender:
+                    captured.wait(2)  # send() captured the old turn, but has not validated it.
+                    resume.wait(2)
+                note_lock.acquire()
+
+            def __exit__(self, *args):
+                note_lock.release()
+
+        self.turn.notes_lock = PausedSenderLock()
+        sender = threading.Thread(target=lambda: result.append(agent.send("smaller")), daemon=True)
+        with mock.patch.object(agent, "_request", return_value=llm.Completion(text="done")), \
+                mock.patch.object(agent, "_configure"), \
+                mock.patch.object(agent, "_project_roots", return_value=()), \
+                mock.patch.object(agent, "_scene_context", return_value="scene"), \
+                mock.patch.object(agent, "_scene_snapshot", return_value=None), \
+                mock.patch.object(agent, "_setup_line", return_value=""), \
+                mock.patch.object(agent, "_addons_line", return_value=""), \
+                mock.patch.object(checkpoints, "begin_turn"), \
+                mock.patch.object(conversations, "save"), \
+                mock.patch.object(agent, "_launch") as launched:
+            sender.start()
+            try:
+                captured.wait(2)
+                agent.run_loop(self.session, self.turn, self.spec)
+                self.assertIsNone(self.session["turn"])
+                self.assertFalse(self.turn.notes)
+            finally:
+                resume.wait(2)
+                sender.join(2)
+            self.assertFalse(sender.is_alive())
+            self.assertEqual(result, [True])
+            launched.assert_called_once()
+            self.assertIsNot(launched.call_args.args[1], self.turn)
+        self.assertFalse(self.turn.notes, "a retired turn cannot acquire new notes")
+        self.assertEqual([i["text"] for i in self.session["items"] if i["kind"] == "user"], ["smaller"])
+        self.assertEqual(self.session["messages"][-1]["content"], "scene\n\nsmaller")
+        self.assertFalse(any(i.get("queued") for i in self.session["items"]))
+        self.assertEqual(self.resent, [])
+
+    def test_send_now_claims_notes_before_a_racing_fold(self):
+        agent.send("smaller")
+        self.assertTrue(agent.send_queued_now())
+        agent._fold_notes(self.session, self.turn)
+        self.assertEqual(len(self.turn.notes), 1)
+        self.assertFalse(any(m.get(context.STEER) for m in self.session["messages"]))
+        agent.run_loop(self.session, self.turn, self.spec)
+        self.assertEqual(self.resent, ["smaller"])
+
+    def test_a_folded_note_makes_a_stale_action_harmless(self):
+        agent.send("smaller")
+        agent._fold_notes(self.session, self.turn)
+        self.assertFalse(agent.send_queued_now())
+        self.assertFalse(self.turn.cancel.is_set())
+
+
 class FakeJob:
     """What the finish gate needs of waves.Job: no workers to wait for."""
     crew, on_main = [], None
@@ -2155,6 +2397,315 @@ class FakeJob:
 
     def write(self):
         pass
+
+
+class LimitStateTest(unittest.TestCase):
+    def setUp(self):
+        snapshot = mock.patch.dict(state.ui, {"account": None})
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+        state.ui.pop("allowance_notice", None)
+        state.ui.pop("warned_session_allowance", None)
+        self.session = state.reset()
+        self.cfg = agent.config.Config("test-key", agent.config.SERVICE_BASE_URL, "fast", "low", False, False, 0, 24000)
+        from loopcut import mainthread
+        def immediate(fn):
+            from concurrent.futures import Future
+            future = Future()
+            future.set_result(fn())
+            return future
+        for patcher in (mock.patch.object(mainthread, "run_on_main", side_effect=immediate),
+                        mock.patch.object(agent, "_update_account", side_effect=lambda info: state.ui.update(account=info)),
+                        mock.patch.object(agent, "_redraw")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def configure(self, turn, session):
+        turn.config = self.cfg
+
+    def send(self, text, attachments=()):
+        session = self.session
+        session.update(input=text, attachments=list(attachments))
+        with mock.patch.object(agent, "_configure", side_effect=self.configure), \
+                mock.patch.object(agent, "_project_roots", return_value=()), \
+                mock.patch.object(agent, "_scene_context", return_value="scene"), \
+                mock.patch.object(agent, "_scene_snapshot", return_value=None), \
+                mock.patch.object(agent, "_setup_line", return_value=""), \
+                mock.patch.object(agent, "_addons_line", return_value=""), \
+                mock.patch.object(conversations, "save"), mock.patch.object(agent, "_launch") as launch:
+            self.assertTrue(agent.send(text))
+        turn = launch.call_args.args[1]
+        session.update(input="", busy=True, turn=turn)  # host._submit clears the submitted draft.
+        return turn
+
+    def refuse(self, turn, reason="session_limit", changes=None):
+        info = {"plan": "free", "session": {"used": 0.82, "resets_at": "2099-10-21T18:00:00Z"},
+                "week": {"used": 0.52, "resets_at": "2099-10-25T18:00:00Z"}}
+        refusal = llm.LLMError("Used up.", 402, reason, {"plan": "free"}, account=info)
+        spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [], save=mock.Mock(), reference_card=False)
+        with mock.patch.object(agent, "_request", side_effect=refusal) as request, \
+                mock.patch.object(agent, "_changes_item", return_value=changes):
+            agent.run_loop(self.session, turn, spec)
+        request.assert_called_once()
+        return info
+
+    def test_first_hosted_refusal_restores_exact_draft_and_attachments_without_new_history(self):
+        for reason in state.HOSTED_LIMITS:
+            with self.subTest(reason=reason):
+                self.session = state.reset()
+                old = state.item_assistant()
+                old["text"] = "Earlier answer."
+                self.session["items"] = [old]
+                self.session["messages"] = [{"role": "assistant", "content": old["text"]}]
+                attachments = [{"name": "reference.png", "ref": "ref.png", "full": "full.png"},
+                               {"name": "clip.mp4", "ref": "sheet.jpg", "video": {"id": "clip", "fps": 24, "in_frame": 1, "out_frame": 48,
+                                                                       "size": [1280, 720], "folder": "clip", "name": "clip.mp4",
+                                                                       "source": "/tmp/clip.mp4", "frames": 48, "beats_line": ""}}]
+                before = (list(self.session["items"]), list(self.session["messages"]), self.session["turn_number"])
+                for _ in range(3):
+                    turn = self.send("  make more details  ", attachments)
+                    self.refuse(turn, reason)
+                    self.assertEqual(self.session["input"], "  make more details  ")
+                    self.assertEqual(self.session["attachments"], attachments)
+                    self.assertEqual(self.session["references"], [])
+                    self.assertEqual((self.session["items"], self.session["messages"], self.session["turn_number"]), before)
+                    self.assertFalse(state.can_resume(self.session))
+                    self.assertEqual(state.ui["allowance_notice"]["item"]["reason"], reason)
+                self.assertEqual(state.ui["account"]["session"]["used"], 0.82)
+
+    def test_refusal_overrides_only_its_window_until_next_success_with_or_without_headers(self):
+        for window in ("session", "week"):
+            for success_info in (None, {"plan": "free", "session": {"used": 0.3, "used_with_reservations": 0.5},
+                                       "week": {"used": 0.2, "used_with_reservations": 0.4}}):
+                with self.subTest(window=window, success_info=success_info):
+                    self.session = state.reset()
+                    turn = self.send("make a chair")
+                    reported = self.refuse(turn, reason=window + "_limit")
+                    notice = state.ui["allowance_notice"]
+                    self.assertEqual(state.ui["account"], reported, "refusals never overwrite reported usage")
+                    self.assertEqual(layout.ring_shares({}, 1, reported, notice)[1][1], 0)
+                    self.assertIn(f"{window.capitalize()}: 100% used, 0% left", layout.usage_lines({}, 1, reported, notice))
+                    other = "Week: 52% used, 48% left" if window == "session" else "Session: 82% used, 18% left"
+                    self.assertIn(other, layout.usage_lines({}, 1, reported, notice))
+                    agent._hosted_reply(turn, self.cfg, success_info, success=True)
+                    self.assertNotIn("allowance_notice", state.ui)
+                    expected = success_info or reported
+                    self.assertEqual(layout.usage_lines({}, 1, state.ui["account"], state.ui.get("allowance_notice")),
+                                     layout.usage_lines({}, 1, expected))
+
+    def test_later_refusal_removes_this_turns_heads_up_but_keeps_history_and_other_notices(self):
+        for reason in ("session_limit", "week_limit"):
+            with self.subTest(reason=reason):
+                self.session = state.reset()
+                state.ui.pop("warned_session_allowance", None)
+                older = state.item_notice("About 18% of this session's chat allowance is left.")
+                unrelated = state.item_notice("Scene saved.")
+                self.session["items"].append(older)
+                turn = self.send("continue")
+                info = {"plan": "free", "session": {"used": 0.82}, "week": {"used": 0.84}}
+                agent._hosted_reply(turn, self.cfg, info, success=True, session=self.session)
+                self.assertEqual(len(turn.allowance_notices), 2)
+                self.session["items"].append(unrelated)
+                self.refuse(turn, reason)
+                self.assertEqual([i for i in self.session["items"] if i["kind"] == "notice"], [older, unrelated])
+                self.assertEqual(self.session["items"][-1]["reason"], reason)
+
+    def test_refusing_the_other_window_keeps_both_overrides_until_success(self):
+        turn = self.send("continue")
+        turn.hosted_requests = 1
+        self.refuse(turn, "session_limit")
+        # A resume may reuse the same limit card for the other window.
+        retry = agent.Turn()
+        retry.config = self.cfg
+        info = self.refuse(retry, "week_limit")
+        lines = layout.usage_lines({}, 1, info, state.ui["allowance_notice"])
+        self.assertIn("Session: 100% used, 0% left", lines)
+        self.assertIn("Week: 100% used, 0% left", lines)
+        from datetime import datetime, timezone
+        after_session_reset = datetime(2099, 10, 22, tzinfo=timezone.utc).timestamp()
+        lines = layout.usage_lines({}, 1, info, state.ui["allowance_notice"], after_session_reset)
+        self.assertIn("Session: 82% used, 18% left", lines)
+        self.assertIn("Week: 100% used, 0% left", lines)
+        agent._hosted_reply(retry, self.cfg, success=True)
+        self.assertEqual(layout.usage_lines({}, 1, info, state.ui.get("allowance_notice")), layout.usage_lines({}, 1, info))
+
+    def test_worker_refusal_removes_heads_up_from_the_shared_parent_turn(self):
+        parent = self.send("make a model")
+        agent._hosted_reply(parent, self.cfg, {"plan": "free", "session": {"used": 0.82}},
+                            success=True, session=self.session)
+        worker = agent.Turn()
+        worker.chat = (self.session, parent)
+        agent._hosted_refusal(state.new_session(), worker, state.item_limit("Used up.", "session_limit", "free", "", None))
+        self.assertFalse(any(i["kind"] == "notice" for i in self.session["items"]))
+
+    def test_real_request_path_restores_the_first_refusal_then_clears_notice_on_success(self):
+        from prompt_index_fixture import index_patch
+        spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [], save=mock.Mock(), reference_card=False)
+        turn = self.send("  make a chair  ")
+        refusal = llm.LLMError("Used up.", 402, "session_limit", {"plan": "free"}, account={"plan": "free"})
+        with index_patch(), mock.patch.object(llm, "stream_chat", side_effect=refusal) as stream, \
+                mock.patch.object(agent, "_changes_item", return_value=None):
+            agent.run_loop(self.session, turn, spec)
+            stream.assert_called_once()
+        self.assertEqual(self.session["items"], [])
+        self.assertEqual(self.session["messages"], [])
+        self.assertEqual(self.session["input"], "  make a chair  ")
+        turn = self.send(self.session["input"])
+        def complete(**kwargs):
+            kwargs["on_text"]("Done.")
+            return llm.Completion(text="Done.")
+        with index_patch(), mock.patch.object(llm, "stream_chat", side_effect=complete) as stream, \
+                mock.patch.object(agent, "_changes_item", return_value=None):
+            agent.run_loop(self.session, turn, spec)
+            stream.assert_called_once()
+        self.assertEqual([i["kind"] for i in self.session["items"]], ["user", "assistant"])
+        self.assertNotIn("allowance_notice", state.ui)
+
+    def test_reference_request_refusal_restores_the_draft_without_trying_the_main_request(self):
+        turn = self.send("copy this", [{"name": "ref.png", "ref": "ref.png"}])
+        spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [], save=mock.Mock())
+        refusal = llm.LLMError("Used up.", 402, "week_limit", {"plan": "free"}, account={"plan": "free"})
+        with mock.patch.object(agent, "_reference_card", side_effect=refusal) as reference, \
+                mock.patch.object(agent, "_request") as request, mock.patch.object(agent, "_changes_item", return_value=None):
+            agent.run_loop(self.session, turn, spec)
+        reference.assert_called_once()
+        request.assert_not_called()
+        self.assertEqual(self.session["input"], "copy this")
+        self.assertEqual(self.session["attachments"], [{"name": "ref.png", "ref": "ref.png"}])
+        self.assertEqual(self.session["items"], [])
+
+    def test_later_refusal_keeps_limit_and_scene_changes_and_resume_contacts_server(self):
+        turn = self.send("make a large model")
+        turn.hosted_requests = 1
+        changes = state.item_changes("49 objects added", [], "")
+        self.refuse(turn, changes=changes)
+        self.assertEqual([i["kind"] for i in self.session["items"]], ["user", "limit", "changes"])
+        with mock.patch.object(agent, "_configure", side_effect=self.configure), \
+                mock.patch.object(agent, "_project_roots", return_value=()), mock.patch.object(agent, "_launch") as launch:
+            self.assertTrue(agent.resume())
+            launch.assert_called_once()
+        # Another refusal before any work reuses the latest card.
+        self.refuse(launch.call_args.args[1])
+        self.assertEqual(sum(i["kind"] == "limit" for i in self.session["items"]), 1)
+
+    def test_display_never_blocks_send_with_unknown_reset_or_any_model_or_provider(self):
+        for reset in ("", "bad date", "2099-10-21T18:00:00Z"):
+            for route, model in ((self.cfg.base_url, "fast"), (self.cfg.base_url, "pro"),
+                                 (agent.config.CHATGPT_PLAN_BASE_URL, "gpt"), ("https://own.test/v1", "own")):
+                with self.subTest(reset=reset, route=route, model=model):
+                    card = state.item_limit("Used up.", "session_limit", "free", reset, None)
+                    state.ui["allowance_notice"] = {"item": card, "conversation": "another"}
+                    self.cfg = dataclasses.replace(self.cfg, base_url=route, model=model)
+                    self.session = state.reset()
+                    self.send("continue building")
+                    self.assertIs(state.ui["allowance_notice"]["item"], card, "sending never mutates account display")
+
+    def test_success_clears_notice_even_without_usage_headers(self):
+        turn = agent.Turn()
+        state.ui["allowance_notice"] = {"item": {}, "conversation": self.session["id"]}
+        agent._hosted_reply(turn, self.cfg, success=True)
+        self.assertNotIn("allowance_notice", state.ui)
+        self.assertEqual(turn.hosted_requests, 1)
+
+    def test_late_account_reply_after_sign_out_or_provider_change_cannot_restore_notice_or_meter(self):
+        for current_account in (None, {"plan": "free", "email": "another account"}):
+            with self.subTest(current_account=current_account):
+                self.session = state.reset()
+                turn = self.send("make a chair")
+                state.clear_allowance_notice(invalidate=True)
+                state.ui["account"] = current_account
+                self.refuse(turn)
+                self.assertNotIn("allowance_notice", state.ui)
+                self.assertEqual(state.ui["account"], current_account)
+                self.assertEqual(self.session["input"], "make a chair")
+                state.ui["allowance_notice"] = {"item": {"text": "New account's notice"}, "conversation": "new"}
+                agent._hosted_reply(turn, self.cfg, success=True)
+                self.assertIn("allowance_notice", state.ui, "an old account's success cannot clear new account state")
+
+    def test_refusal_without_headers_uses_known_limit_then_refreshes_account(self):
+        turn = agent.Turn()
+        turn.config = self.cfg
+        reset = "2099-10-21T18:00:00Z"
+        refusal = llm.LLMError("Used up.", 402, "session_limit", {"plan": "free", "resets_at": reset})
+        spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [], save=mock.Mock(), reference_card=False)
+        account = types.SimpleNamespace(refresh_account=mock.Mock())
+        reported = {"plan": "free", "session": {"used": 0.82, "resets_at": reset}}
+        state.ui["account"] = reported
+        with mock.patch.object(agent, "_request", side_effect=refusal), \
+                mock.patch.object(agent, "_changes_item", return_value=None), \
+                mock.patch.dict(sys.modules, {"loopcut.account": account}), \
+                mock.patch("loopcut.account", account, create=True):
+            agent.run_loop(self.session, turn, spec)
+        self.assertIn("allowance_notice", state.ui)
+        account.refresh_account.assert_called_once()
+        self.assertEqual(state.ui["account"], reported)
+        self.assertEqual(layout.ring_shares({}, 1, reported, state.ui["allowance_notice"])[1][1], 0)
+        agent._hosted_reply(turn, self.cfg, success=True)
+        self.assertAlmostEqual(layout.ring_shares({}, 1, reported, state.ui.get("allowance_notice"))[1][1], 0.18)
+
+    def test_new_draft_and_mid_turn_notes_survive_a_first_request_refusal_in_the_original_chat(self):
+        turn = self.send("make a chair", [{"name": "ref", "ref": "ref.png"}])
+        item = state.item_user("add a cushion")
+        turn.notes.append((item["text"], item))
+        self.session["items"].append(item)
+        self.session["input"] = "and arms"
+        original = self.session
+        other = state.reset()
+        other["input"] = "another conversation's draft"
+        self.refuse(turn)
+        self.assertEqual(original["input"], "make a chair\nadd a cushion\nand arms")
+        self.assertEqual(other["input"], "another conversation's draft")
+        self.assertEqual(original["items"], [])
+        self.assertEqual(original["messages"], [])
+
+    def test_non_hosted_refusal_keeps_normal_history_and_does_not_create_account_notice(self):
+        self.cfg = dataclasses.replace(self.cfg, base_url="https://own.test/v1")
+        turn = self.send("make a chair")
+        self.refuse(turn)
+        self.assertEqual([i["kind"] for i in self.session["items"]], ["user", "limit"])
+        self.assertNotIn("allowance_notice", state.ui)
+
+    def test_session_heads_up_once_per_reset_across_chats_without_a_purchase(self):
+        reset = "2099-10-21T18:00:00Z"
+        info = {"plan": "free", "session": {"used": 0.79, "resets_at": reset}}
+        agent._warn_low_allowance(self.session, self.session["items"], info)
+        self.assertEqual(self.session["items"], [])
+        info["session"]["used"] = 0.8
+        for billing in (False, True):
+            with mock.patch.object(agent.config, "billing_open", return_value=billing):
+                agent._warn_low_allowance(self.session, self.session["items"], info)
+        self.assertEqual(len(self.session["items"]), 1)
+        notice = self.session["items"][0]
+        self.assertIn("About 20% of this session's chat allowance is left.", notice["text"])
+        self.assertIn(state.reset_label(reset), notice["text"])
+        self.assertEqual(notice["url"], "")
+        fresh = state.new_session()
+        agent._warn_low_allowance(fresh, fresh["items"], info)
+        self.assertEqual(fresh["items"], [], "one warning per server session window, across chats")
+        info["session"]["resets_at"] = "2099-10-22T18:00:00Z"
+        agent._warn_low_allowance(fresh, fresh["items"], info)
+        self.assertEqual(len(fresh["items"]), 1)
+
+    def test_heads_up_uses_reservation_total_and_falls_back_on_malformed_values(self):
+        for window in ("session", "week"):
+            for reserved in (0.82, "0.82", None, "bad", float("nan"), float("inf"), -1, True, [], {}):
+                with self.subTest(window=window, reserved=reserved):
+                    state.ui.pop("warned_session_allowance", None)
+                    session = state.new_session()
+                    valid = reserved in (0.82, "0.82")
+                    info = {"plan": "free", window: {"used": 0.62 if valid else 0.82,
+                                                     "used_with_reservations": reserved}}
+                    agent._warn_low_allowance(session, session["items"], info)
+                    self.assertEqual(len(session["items"]), 1)
+                    self.assertIn("About 18%", session["items"][0]["text"])
+            for reported in ({"used": 0.82, "used_with_reservations": 0},
+                             {"used": 0.82, "used_with_reservations": 1.2},
+                             {"used": float("nan")}, [], "bad"):
+                with self.subTest(window=window, reported=reported):
+                    state.ui.pop("warned_session_allowance", None)
+                    session = state.new_session()
+                    agent._warn_low_allowance(session, session["items"], {window: reported})
+                    self.assertEqual(session["items"], [])
 
 
 class ToolCardLabelTest(unittest.TestCase):

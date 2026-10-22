@@ -173,6 +173,7 @@ def draw_area() -> None:
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
                             "key_needed": key_needed,
+                            "allowance_notice": state.ui.get("allowance_notice"),
                             "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
                             "context_budget": budget, "model_options": options, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
                             "hints_dismissed": onboarding.hints_dismissed(),
@@ -248,6 +249,7 @@ def _cloud_panel_state(session: dict) -> dict:
     return {"coming_soon": rows, "vote_notice": cloud.vote_notice(),
             "cloud_message": message if message == saved["message"] else "",
             "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"],
+            "credit_balance": service.get("credit_balance"),
             "today": service.get("today", "")}
 
 
@@ -529,8 +531,10 @@ def _do_action(session: dict, action) -> None:
         prefs = settings.preferences()  # The user's own pick: their ChatGPT plan carries the turn on (M7).
         if prefs is not None and not session["busy"]:
             prefs.provider = "CHATGPT"
+            state.clear_allowance_notice(invalidate=True)
             config_changed()
-            agent.resume()
+            if _local_limit_action(session, index) and state.can_resume(session):
+                agent.resume()
     elif kind == "cloud_dismiss":
         from .. import cloud
         cloud.dismiss_ui_message(index)
@@ -580,9 +584,13 @@ def _do_action(session: dict, action) -> None:
         _close_popups()
         _open_settings()
     elif kind == "open_url":
-        url = state.notice_for_display(session["items"][index])["url"]
+        item = state.notice_for_display(session["items"][index])
+        url = item["url"]
         if url:
-            account.open_browser(url)
+            if "plan_upgrade" in item and config.billing_open():
+                _start_upgrade(session, item)
+            else:
+                account.open_browser(url)
     elif kind == "guard_show":
         from .. import cost_guard
         item = session["items"][index]
@@ -594,10 +602,20 @@ def _do_action(session: dict, action) -> None:
     elif kind == "open_account":
         account.open_browser(config.account_url())
     elif kind == "limit_upgrade" and config.billing_open():
-        _start_upgrade(session, session["items"][index])
+        item = session["items"][index] if isinstance(index, int) else state.ui.get("allowance_notice", {}).get("item")
+        if item:
+            _start_upgrade(session if _local_limit_action(session, index) else None, item)
     elif kind == "limit_fast":
         settings.set_tier(account.default_model())
-        agent.resume()
+        if _local_limit_action(session, index) and state.can_resume(session):
+            agent.resume()
+    elif kind == "limit_retry":
+        if _local_limit_action(session, index) and state.can_resume(session):
+            stopped = session["messages"][-1]
+            def refreshed():
+                if state.session() is session and state.can_resume(session) and session["messages"][-1] is stopped:
+                    agent.resume()
+            account.refresh_account(refreshed)
     elif kind == "resume":
         agent.resume()
     elif kind == "attach":
@@ -613,9 +631,14 @@ def _do_action(session: dict, action) -> None:
         agent.decide(False, index=index)
     elif kind == "stop_turn":
         agent.stop()
+    elif kind == "send_queued_now":
+        agent.send_queued_now()
     elif kind == "toggle":
         item = session["items"][index]
         item["expanded"] = not item.get("expanded", False)
+    elif kind == "toggle_details":
+        item = session["items"][index]
+        item["details_expanded"] = not item.get("details_expanded", False)
     elif kind in {"restore_ask", "edit_ask"}:
         session["confirm_restore"], session["confirm_edit"] = index, kind == "edit_ask"
     elif kind == "restore_cancel":
@@ -725,24 +748,32 @@ def _offer_action(session: dict, index: int, choice: int) -> None:
         item["resolved"] = nudges.DISMISSED
 
 
-def _start_upgrade(session: dict, item: dict) -> None:
-    """Open the plans page and wait for the plan to change; then the turn goes on by itself,
-    so the user comes back to Blender to find the work under way."""
+def _local_limit_action(session: dict, index) -> bool:
+    return state.session() is session and (isinstance(index, int) or index == session["id"])
+
+
+def _start_upgrade(session: dict | None, item: dict) -> None:
+    """Watch the plan and catalogue; resume only the same stopped turn belonging to this card."""
     if not config.billing_open():
         return
-    account.open_browser(item["upgrade"]["url"])
+    account.open_browser(item["url"] if "plan_upgrade" in item else item["upgrade"]["url"])
     item["status"] = "waiting"
+    stopped = session["messages"][-1] if session is not None and state.can_resume(session) and item["kind"] == "limit" else None
 
     def upgraded(payload: dict) -> None:
         if item.get("status") != "waiting":
             return
         item["status"] = "done"
-        item["text"] = f"You are on the {str(payload.get('plan') or '').capitalize()} plan now. Continuing."
-        conversations.save(session)
-        if state.session() is session:
+        item["text"] = f"You are on the {str(payload.get('plan') or '').capitalize()} plan now."
+        if "plan_upgrade" in item:
+            item["action_label"] = ""
+        if session is not None:
+            conversations.save(session)
+        if (stopped is not None and state.session() is session and state.can_resume(session)
+                and session["messages"][-1] is stopped):
             agent.resume()
 
-    account.watch_plan(item["plan"], upgraded)
+    account.watch_plan(item.get("plan_upgrade", item.get("plan", "")), upgraded)
 
 
 def _close_area_later(window, area) -> None:

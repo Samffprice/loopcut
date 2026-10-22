@@ -11,13 +11,17 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlparse
 
+from . import allowance
+
 
 class LLMError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, code: str = "", details: dict | None = None):
+    def __init__(self, message: str, status: int | None = None, code: str = "", details: dict | None = None,
+                 account: dict | None = None):
         super().__init__(message)
         self.status = status
         self.code = code            # The API's error code, e.g. week_limit.
         self.details = details or {}  # The whole error object: Loopcut's gateway adds plan, resets_at, upgrade.
+        self.account = account  # Usage headers also arrive on refusals.
 
 
 class Cancelled(Exception):
@@ -131,11 +135,12 @@ def account_from_headers(headers) -> dict | None:
         return None
 
     def window(name: str) -> dict:
-        try:
-            used = float(headers.get(f"x-loopcut-{name}-used", ""))
-        except ValueError:
-            used = None
-        return {"used": used, "resets_at": headers.get(f"x-loopcut-{name}-resets-at") or None}
+        result = {"used": allowance.fraction(headers.get(f"x-loopcut-{name}-used")),
+                  "resets_at": headers.get(f"x-loopcut-{name}-resets-at") or None}
+        reserved = allowance.fraction(headers.get(f"x-loopcut-{name}-used-with-reservations"))
+        if reserved is not None:
+            result["used_with_reservations"] = reserved
+        return result
 
     return {"plan": str(plan), "session": window("session"), "week": window("week")}
 
@@ -172,7 +177,8 @@ def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: f
             if last or (ex.code not in RETRY_STATUSES and not (ex.code == 413 and on_drop())):
                 error = _error_payload(body)
                 raise LLMError(f"HTTP {ex.code}: {_error_detail(body)}", ex.code,
-                               str(error.get("code") or error.get("type") or ""), error) from ex
+                               str(error.get("code") or error.get("type") or ""), error,
+                               account_from_headers(ex.headers)) from ex
             delay = RETRY_DELAYS[attempt]
             if retry_after.replace(".", "", 1).isdigit():
                 delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)

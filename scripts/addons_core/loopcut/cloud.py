@@ -140,8 +140,12 @@ def _manifest(value):
     return deepcopy(value)
 
 
-def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, policy=None, supported=True):
-    """Return executable descriptors with a backend, using key-presence snapshots only."""
+def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, policy=None, supported=True,
+                on_the_house=()):
+    """Return executable descriptors with a backend, using key-presence snapshots only. on_the_house: tools a setup
+    Try it card's turn calls for free (try_samples), offered on the managed route even when the account's balance is
+    below their estimate; only a refusal for credits is lifted, and a call the sample does not answer is an ordinary
+    one that the server refuses for want of credits."""
     keys_set, preferred, policy = keys_set or {}, preferred or {}, policy or {}
     if not supported:
         return []
@@ -172,10 +176,13 @@ def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, pol
         has_key = bool(byok and byok["available"] and "byok" in descriptor.get("backends", []))
         route = descriptor
         free = (descriptor.get("cost") or {}).get("credits_estimate") == 0 and not descriptor["cost"].get("quote_required")
-        selection = catalog.choose_backend(route, signed_in_with_credits=funded or (signed_in and free),
+        house = (name in on_the_house and name in remote and descriptor.get("unavailable_reason") == "credits"
+                 and bool(manifest.get("flags", {}).get("services")))
+        selection = catalog.choose_backend(route, signed_in_with_credits=funded or (signed_in and (free or house)),
                     preferred_backend=preferred.get(name), has_key=has_key)
         backend = selection["backend"]
-        if backend == "managed" and (not descriptor.get("available") or not manifest.get("flags", {}).get("services")):
+        if backend == "managed" and not house and (not descriptor.get("available")
+                                                   or not manifest.get("flags", {}).get("services")):
             # An off switch for managed services need not take away the user's local vendor route.
             backend = catalog.choose_backend(route, signed_in_with_credits=False,
                         preferred_backend=preferred.get(name), has_key=has_key)["backend"]
@@ -187,6 +194,18 @@ def merge_tools(manifest, *, signed_in=False, keys_set=None, preferred=None, pol
                       available=True, status=descriptor["status"])
         result.append(chosen)
     return result
+
+
+def on_the_house_tools() -> set:
+    """The tool of the setup Try it card whose turn is running (agent.Turn.try_it), which try_samples answers for
+    free: the account needs no credits for it. Empty outside such a turn."""
+    try:
+        from . import state, try_samples
+        session = state._session or {}  # Never creates one.
+        sample = try_samples.CARDS.get(getattr(session.get("turn"), "try_it", "") or "") if session.get("busy") else None
+    except Exception:  # No session yet (registration, tests): nothing is on the house.
+        return set()
+    return {sample["tool"]} if sample else set()
 
 
 def _packs_scene(descriptor):
@@ -205,7 +224,8 @@ def schema(descriptor):
         properties[name] = {"type": "string", "description": (
             "Scene reference: a movie clip or video strip name, or a video file path. "
             if video else
-            "Scene reference: an object name to export, an image datablock name, or a capture/render file path. ")
+            "Scene reference: an object name to export, an image datablock name, the name of an image attached to "
+            "this conversation, or a capture/render file path. ")
             + "The client resolves and uploads this file. Accepted types: " + ", ".join(field.get("accept", []))}
         if field["required"] and name not in required:
             required.append(name)
@@ -375,11 +395,13 @@ class Runtime:
             print(f"Loopcut: could not read the cloud catalog cache: {ex}")
         self._load_skills(fetch=False)
 
-    def descriptors(self):
+    def descriptors(self, on_the_house=None):
+        """on_the_house: tools offered without credits (merge_tools); by default the running Try it card's tool."""
+        house = on_the_house_tools() if on_the_house is None else on_the_house
         with self.lock:
             return merge_tools(self.manifest, signed_in=self.signed_in, keys_set=self.keys_set,
                                preferred=self.preferred, policy={**self.policy, "no_generation": self.no_generation(),
-                               "private_mode": self.private_mode()}, supported=self.supported)
+                               "private_mode": self.private_mode()}, supported=self.supported, on_the_house=house)
 
     def no_generation(self):
         with self.lock:

@@ -7,6 +7,7 @@ take the conversation with it.
 
 import time
 import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from . import config
@@ -20,6 +21,42 @@ ui = {"view": "chat", "history": [], "mentions": [], "picker": None, "model_menu
       "hover": None, "mouse": None,
       "account": None}  # Plan and window usage as the gateway last reported it; account.update_usage.
 hosts: set[int] = set()  # Pointers of the areas showing the panel. Same lifetime rules as the session.
+HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit"}
+
+
+def latest_limit(items: list) -> int | None:
+    """The latest limit offers recovery until resolved; older limits stay history."""
+    n = next((n for n in range(len(items) - 1, -1, -1) if items[n].get("kind") == "limit"), None)
+    return n if n is not None and items[n].get("status") != "done" and not items[n].get("resolved") else None
+
+
+def clear_allowance_notice(*, invalidate: bool = False) -> None:
+    """Display state only. The gateway decides whether every send/resume is allowed."""
+    notice = ui.pop("allowance_notice", None)
+    if notice:
+        notice["item"]["resolved"] = True
+    if invalidate:
+        ui["allowance_generation"] = ui.get("allowance_generation", 0) + 1
+
+
+def can_resume(session: dict) -> bool:
+    messages = session.get("messages") or []
+    return bool(not session.get("busy") and messages and messages[-1].get("role") != "assistant")
+
+
+def reset_label(resets_at: str, now: float | None = None) -> str:
+    """An explicit local date, or a short relative wait within a day; portable on Windows."""
+    try:
+        reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        if len(resets_at) == 10:
+            return resets_at  # A calendar date has no time or timezone to convert.
+        reset = reset.replace(tzinfo=reset.tzinfo or timezone.utc).astimezone()
+        seconds = reset.timestamp() - (time.time() if now is None else now)
+        if 0 < seconds < 86400:
+            return f"in about {max(1, round(seconds / 3600))} h" if seconds >= 3600 else "in under an hour"
+        return reset.strftime("%a %d %b, %H:%M") + " (your time)"
+    except (ValueError, TypeError):
+        return resets_at
 
 
 def new_session() -> dict:

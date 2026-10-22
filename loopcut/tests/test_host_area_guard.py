@@ -52,6 +52,7 @@ class HostAreaGuardTest(unittest.TestCase):
                      types=N(Area=N(bl_rna=N(properties={"type": N(enum_items=enums)}))),
                      ops=N(ed=N(undo_push=mock.Mock())))
         self.enterContext(mock.patch.object(tools, "bpy", self.bpy))
+        self.enterContext(mock.patch.object(tools, "_python_namespace", side_effect=lambda: {"bpy": self.bpy}))
         # Use the real registry functions without importing the drawing and operator machinery.
         self.host = types.ModuleType("loopcut.ui.host")
         self.host.NATIVE, self.host.HOST_UI_TYPE = False, "TEXT_EDITOR"

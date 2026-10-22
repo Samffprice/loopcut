@@ -684,6 +684,31 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(self.names(value, keys_set={'OPENAI_API_KEY': True})['image_generate'], 'byok')
         self.assertEqual(self.names(manifest(account=None), keys_set={'FAL_KEY': True})['retopology'], 'byok')
 
+    def test_a_try_it_cards_tool_is_offered_without_credits_and_nothing_else_is_lifted(self):
+        # The setup's free cards (try_samples): only a refusal for credits is lifted, only for the named tool.
+        value = manifest(tool(available=False, unavailable_reason='credits'), tool('sfx', available=False, unavailable_reason='credits'),
+                         account={'credits': {'balance': 25}})
+        self.assertEqual(self.names(value, signed_in=True), {})
+        self.assertEqual(self.names(value, signed_in=True, on_the_house={'image_generate'}), {'image_generate': 'managed'})
+        self.assertEqual(self.names(value, on_the_house={'image_generate'}), {})  # Signed out: still nothing.
+        for reason in ('plan', 'private_mode', 'no_generation', 'disabled'):
+            refused = manifest(tool(available=False, unavailable_reason=reason), account={'credits': {'balance': 0}})
+            self.assertEqual(self.names(refused, signed_in=True, on_the_house={'image_generate'}), {}, reason)
+        off = manifest(tool(available=False, unavailable_reason='credits'), flags={'services': False})
+        self.assertEqual(self.names(off, signed_in=True, on_the_house={'image_generate'}), {})
+
+    def test_the_running_try_it_cards_tool_is_on_the_house(self):
+        from loopcut import state
+        turn = types.SimpleNamespace(try_it='photo_3d')
+        with patch.object(state, '_session', {'busy': True, 'turn': turn}):
+            self.assertEqual(cloud.on_the_house_tools(), {'image_to_3d'})
+        with patch.object(state, '_session', {'busy': False, 'turn': turn}):
+            self.assertEqual(cloud.on_the_house_tools(), set())  # Between turns.
+        with patch.object(state, '_session', {'busy': True, 'turn': types.SimpleNamespace(try_it='')}):
+            self.assertEqual(cloud.on_the_house_tools(), set())  # An edited prompt is the user's own request.
+        with patch.object(state, '_session', None):
+            self.assertEqual(cloud.on_the_house_tools(), set())
+
     def test_no_generation_account_and_explicit_project_override(self):
         value = manifest(tool(), tool('assist_tool', kind='assist', backends=['managed']),
                          account={'credits': {'balance': 100}, 'settings': {'no_generation': True}})
@@ -953,7 +978,11 @@ class DispatchTest(RuntimeFixture):
         def resolve(descriptor, arguments, out_dir):
             self.calls.append(('resolve', threading.get_ident(), arguments))
             return {'reference': Path(out_dir) / 'ref.png'} if arguments.get('reference') else {}
-        def run(descriptor, arguments, files, *, project, on_progress=None, cancel=None, client=None):
+        def run(descriptor, arguments, files, *, project, on_progress=None, cancel=None, client=None, quote=False):
+            if quote and not arguments.get('quote_id'):  # authorize prices every paid call first, as the server quotes.
+                self.calls.append(('quote', threading.get_ident(), project))
+                raise cloud_http.CloudError('Approve the quote', 'quote_required',
+                                            extra={'quote_id': 'qt_1', 'credits': 6, 'expires_at': '2099-01-01T00:00:00Z'})
             self.calls.append(('run', threading.get_ident(), project))
             if on_progress:
                 on_progress({'pct': 40, 'message': 'Working'})
@@ -1007,6 +1036,16 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(result.text, 'No generation is on for this account or project.')
         self.assertEqual(self.calls, [])
 
+    @staticmethod
+    def quoting(run):
+        """A fake run that first answers authorize's quote as the server does (every paid call is quoted)."""
+        def priced(descriptor, arguments, files, *, quote=False, **kwargs):
+            if quote and not arguments.get('quote_id'):
+                raise cloud_http.CloudError('Approve the quote', 'quote_required',
+                                            extra={'quote_id': 'qt_1', 'credits': 6, 'expires_at': '2099-01-01T00:00:00Z'})
+            return run(descriptor, arguments, files, **kwargs)
+        return priced
+
     def run_step(self, prepared):
         from loopcut import mainthread
         result, pending = [], queue.Queue()
@@ -1046,7 +1085,7 @@ class DispatchTest(RuntimeFixture):
         result = self.run_step(tools.execute('loopcut_cloud__image_generate', '{"prompt":"test"}'))
         self.assertTrue(result.ok)
         self.assertEqual(result.text, 'Imported result.')
-        self.assertEqual([c[0] for c in self.calls], ['resolve', 'run', 'apply'])
+        self.assertEqual([c[0] for c in self.calls], ['resolve', 'quote', 'run', 'apply'])  # Priced, then run.
         self.assertEqual([self.calls[0][1], self.calls[-1][1]], [main, main])
         self.assertNotEqual(self.calls[1][1], main)
 
@@ -1103,7 +1142,7 @@ class DispatchTest(RuntimeFixture):
     def test_long_returns_handle_and_applies_exactly_once(self):
         self.ready(latency='long')
         job = {'id': 'job_1', 'status': 'running', 'progress': {'pct': 0, 'message': 'Queued'}}
-        self.module.run = lambda *args, **kwargs: deepcopy(job)
+        self.module.run = self.quoting(lambda *args, **kwargs: deepcopy(job))
         self.module.job_status = lambda handle: deepcopy(job)
         result = self.run_step(cloud.execute('loopcut_cloud__image_generate', {'prompt': 'test'}))
         handle = json.loads(result.text)['job_id']
@@ -1117,7 +1156,7 @@ class DispatchTest(RuntimeFixture):
     @patch.object(config, 'billing_open', lambda: True)
     def test_long_error_keeps_extras_and_reports_to_originating_card_once(self):
         self.ready(latency='long')
-        self.module.run = lambda *args, **kwargs: {'id': 'job_1', 'status': 'running'}
+        self.module.run = self.quoting(lambda *args, **kwargs: {'id': 'job_1', 'status': 'running'})
         notices = []
         with cloud_account.approval_context(lambda details: notices.append(details) or True):
             cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'prop'}).then(lambda: False, lambda fn: fn())

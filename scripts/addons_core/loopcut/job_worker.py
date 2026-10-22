@@ -109,6 +109,7 @@ def encode_movie(spec: dict, output: Path, frames: list[dict], scratch: Path) ->
         bpy.ops.render.render(write_still=True, scene=scene.name)
         image_record(probe, spec["width"], spec["height"])
     probe.unlink()
+    bpy.data.scenes.remove(scene)  # Release the verification strip's decoder before renaming its file on Windows.
     record["decode_checked_frames"] = checked
     os.replace(temporary, final)
     return {**record, "bytes": final.stat().st_size, "sha256": jobs.digest(final)}

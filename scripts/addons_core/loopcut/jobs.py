@@ -317,7 +317,7 @@ def launch(path: Path) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith("LOOPCUT_")}
         with (path / "supervisor.log").open("ab") as log:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                       start_new_session=True, env=env)
+                                       start_new_session=os.name != "nt", env=env)
         _children.append(process)
         atomic_json(lease / "owner.json", {"pid": process.pid})
     except (OSError, ValueError):

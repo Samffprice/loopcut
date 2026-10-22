@@ -48,6 +48,29 @@ class LogicTest(unittest.TestCase):
             self.assertEqual(account.credits_label({"account": {"credits": {"balance": balance}}}, True), "")
         self.assertEqual(account.credits_label({"account": {"credits": {"balance": 5, "resets_at": "bad"}}}, True), "5 credits ($0.05)")
 
+    def test_panel_data_keeps_the_empty_shape_without_a_known_balance(self):
+        empty = {"credits": "", "today": "", "message": ""}
+        self.assertEqual(account.panel_data(None), empty)
+        for manifest in ({}, {"account": None}, {"account": {}},
+                         *({"account": {"credits": {"balance": value}}}
+                           for value in (None, True, -1, float("nan"), "42"))):
+            for billing in (False, True):
+                with self.subTest(manifest=manifest, billing=billing), \
+                        patch.object(config, "billing_open", return_value=billing):
+                    runtime = types.SimpleNamespace(manifest=manifest, signed_in=True, lock=threading.Lock())
+                    self.assertEqual(account.panel_data(runtime), empty)
+
+    def test_panel_data_retains_a_known_zero_balance_and_hides_it_after_sign_out(self):
+        runtime = types.SimpleNamespace(manifest={"account": {"credits": {"balance": 0}}},
+                                        signed_in=True, lock=threading.Lock())
+        for billing in (False, True):
+            with self.subTest(billing=billing), patch.object(config, "billing_open", return_value=billing):
+                runtime.signed_in = True
+                self.assertEqual(account.panel_data(runtime)["credit_balance"], 0)
+                runtime.signed_in = False
+                self.assertEqual(account.panel_data(runtime),
+                                 {"credits": "", "credit_balance": None, "today": "", "message": ""})
+
     def test_managed_threshold_is_strict_and_card_names_the_estimate(self):
         for credits, required in ((0, False), (49, False), (50, False), (51, True)):
             detail = account.approval_details(descriptor(cost={"credits_estimate": credits}))
@@ -231,11 +254,14 @@ class MockAccountTest(unittest.TestCase):
     @patch.object(config, "billing_open", lambda: True)
     def test_manifest_credits_refresh_and_signed_out_hide(self):
         self.assertIn("1,840 credits", account.panel_data(self.runtime)["credits"])
+        self.assertEqual(account.panel_data(self.runtime)["credit_balance"], 1840)
         self.client.request("POST", "/mock/control", {"balance": 1200})
         self.assertTrue(self.runtime.refresh())
         self.assertIn("1,200 credits", account.panel_data(self.runtime)["credits"])
+        self.assertEqual(account.panel_data(self.runtime)["credit_balance"], 1200)
         self.runtime.signed_in = False
         self.assertEqual(account.panel_data(self.runtime)["credits"], "")
+        self.assertIsNone(account.panel_data(self.runtime)["credit_balance"])
 
     def test_patch_both_settings_round_trip_and_updates_availability(self):
         settings = account.patch_settings(self.runtime, {"no_generation": True, "private_mode": False})

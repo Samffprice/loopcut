@@ -50,10 +50,10 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     {"type": "function", "function": {
         "name": "run_python",
         "description": (
-            "Run Python in the live Blender session, a new namespace each call (`bpy` imported; reuse code via a "
-            "Text block); bpy.ops have a 3D viewport "
-            "context (or another editor's, see `editor`). Prefer the data API over bpy.ops. Returns print "
-            "output, any traceback, and `Scene changes`: what really changed, measured from the scene. "
+            "Run Python in the live Blender session, a new namespace each call (`bpy`, `math`, `bmesh`, "
+            "`mathutils`, `Vector`, `Matrix` preloaded; reuse code via a Text block); "
+            "bpy.ops have a 3D viewport context (or another editor's, see `editor`). "
+            "Prefer the data API over bpy.ops. Returns prints, any traceback and the measured `Scene changes`. "
             "One undo step per call."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "description": "Python source to execute"},
@@ -457,6 +457,19 @@ def _model_traceback(ex: BaseException) -> str:
     return text + (f"NOTE: {note}\n" if note else "")
 
 
+def _python_namespace() -> dict:
+    """What every run_python call starts with: models often reuse these from an earlier step's imports."""
+    namespace = {"bpy": bpy, "math": math, "__name__": "__loopcut__"}
+    try:  # Always present in Blender; absent only in tests that run without it.
+        import bmesh
+        import mathutils
+    except ImportError:
+        return namespace
+    namespace.update(bmesh=bmesh, mathutils=mathutils, Vector=mathutils.Vector, Matrix=mathutils.Matrix,
+                     Euler=mathutils.Euler, Quaternion=mathutils.Quaternion)
+    return namespace
+
+
 def run_python(code: str, summary: str = "", capture: str = "", editor: str = "") -> ToolResult:
     # Running model-written code is the product; the approval gate lives in agent.py.
     from . import config, contact, cost_guard, live_file, op_notes, scene_diff, shape_key_guard
@@ -477,7 +490,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
             # live_file: a save elsewhere is a copy, so the user's open file and their next save stay theirs.
             with (contextlib.redirect_stdout(stdout), cost_guard.watching_ops(), op_notes.watching_ops(),
                   live_file.watching_ops()):
-                exec(compiled, {"bpy": bpy, "__name__": "__loopcut__"})
+                exec(compiled, _python_namespace())
         except _RunTimeout:
             ok = False
             stdout.write(f"\nStopped: the code ran for more than {deadline.seconds:g} s, which usually means a "
@@ -754,9 +767,33 @@ LABEL_SIZE = 12        # Font size in pixels at 640 wide.
 _HIDDEN_TYPES = {"CAMERA", "LIGHT", "EMPTY", "SPEAKER", "LIGHT_PROBE"}
 
 
+def _has_geometry_bounds(obj) -> bool:
+    if obj.type in _HIDDEN_TYPES | {"ARMATURE", "LATTICE"}:
+        return False
+    corners = obj.bound_box
+    # Blender uses eight identical (-1, -1, -1) corners when no box is available.
+    return any(tuple(corner) != tuple(corners[0]) for corner in corners[1:])
+
+
+def _framing_targets(objects) -> list:
+    """Geometry-free parents stand for their visible descendants, never their origin/display box."""
+    targets = {}
+    for obj in objects:
+        if _has_geometry_bounds(obj):
+            targets[obj.name] = obj
+        else:
+            for child in obj.children_recursive:
+                if child.visible_get() and _has_geometry_bounds(child):
+                    targets[child.name] = child
+    return list(targets.values())
+
+
 def _bounding_sphere(objects) -> tuple["Vector", float]:
     from mathutils import Vector
-    corners = [obj.matrix_world @ Vector(corner) for obj in objects for corner in obj.bound_box]
+    targets = _framing_targets(objects)
+    if not targets:
+        raise ToolError("Nothing visible to frame.")
+    corners = [obj.matrix_world @ Vector(corner) for obj in targets for corner in obj.bound_box]
     low = Vector(min(c[i] for c in corners) for i in range(3))
     high = Vector(max(c[i] for c in corners) for i in range(3))
     center = (low + high) / 2
@@ -907,12 +944,12 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: b
     rv3d = space.region_3d
     framed = angle in _VIEW_EULERS or angle == "sheet"
 
-    visible = [o for o in scene.objects if o.visible_get() and o.type not in _HIDDEN_TYPES]
+    visible = [o for o in scene.objects if o.visible_get() and _has_geometry_bounds(o)]
     if focus and framed:
         missing = [name for name in focus if name not in bpy.data.objects]
         if missing:
             raise ToolError(f"No such object(s): {', '.join(missing)}")
-        targets = [bpy.data.objects[name] for name in focus]
+        targets = _framing_targets(bpy.data.objects[name] for name in focus)
     else:
         targets = visible
     if framed and not targets:

@@ -797,6 +797,7 @@ def validate_wave(wave: dict, words: str, live: dict) -> list[str]:
     """Why this wave must not start, one line per problem, each naming its field; [] when it may.
     wave: normalise_wave's. words: user_words. live: live_facts' shape ({"objects": {name: {"type",
     "box", "data"?}}, "materials": [...], "names": [...], "world"?})."""
+    from .worker_ipc import valid_worker_id
     errors = []
     shared, workers = wave["shared"], wave["workers"]
     objects, materials, names = live.get("objects", {}), set(live.get("materials", ())), live.get("names", ())
@@ -837,11 +838,14 @@ def validate_wave(wave: dict, words: str, live: dict) -> list[str]:
             continue
         wid = worker.get("id")
         label = f"workers[{index}]" + (f" ({wid})" if isinstance(wid, str) else "")
-        if not (isinstance(wid, str) and _ID.match(wid)):
+        if not (isinstance(wid, str) and _ID.fullmatch(wid)):
             errors.append(f"{label}.id: letters, digits, - and _, up to 32")
-        elif wid in seen_ids:
+        elif not valid_worker_id(wid):
+            errors.append(f"{label}.id: reserved Windows filename; choose another id")
+        elif wid.casefold() in seen_ids:
             errors.append(f"{label}.id: used twice")
-        seen_ids.add(wid)
+        if isinstance(wid, str):
+            seen_ids.add(wid.casefold())
         deliverable = worker.get("deliverable")
         if not (isinstance(deliverable, str) and deliverable.strip()):
             errors.append(f"{label}.deliverable: the name of what it builds")
@@ -1362,6 +1366,13 @@ def _last_assistant(messages: list) -> int:
     return next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "assistant"), 0)
 
 
+WAIT_SCHEMA = {"type": "function", "function": {
+    "name": "delegate",
+    "description": "Collect existing workers' next results. Starting new workers is disabled for this session.",
+    "parameters": {"type": "object", "properties": {"wait": {"type": "boolean", "enum": [True]}},
+                   "required": ["wait"], "additionalProperties": False}}}
+
+
 def waits(name: str, arguments: dict) -> bool:
     """delegate wait with no briefs: the running workers' next results. It starts nothing, so it is not
     asked about (the delegate that started them was)."""
@@ -1385,6 +1396,8 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         if job is None or not waves.pending(job):
             return tools.ToolResult("Nothing to wait for: every worker has reported.")
         return tools.ToolResult("Waiting for the workers.", then=functools.partial(waves.collect, job))
+    if session.get("workers_unavailable"):
+        return tools.ToolResult(waves.unavailable_note(session), ok=False)
     if not isinstance(wave, dict):
         return tools.ToolResult("delegate refused: wave must be an object {shared, workers}; or wait true, with no "
                                 "wave, for the running workers' next results.", ok=False)

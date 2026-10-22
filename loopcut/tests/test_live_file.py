@@ -150,6 +150,7 @@ class LiveFileTest(unittest.TestCase):
     def test_run_python_keeps_the_open_file_and_tells_the_model(self):
         from loopcut import config, contact, scene_diff, shape_key_guard
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(tools, "_python_namespace", side_effect=lambda: {"bpy": tools.bpy}))
             for owner, name, value in (
                     (tools, "_editor_context", contextlib.nullcontext()),
                     (config, "run_timeout", 60), (cost_guard, "begin", None),

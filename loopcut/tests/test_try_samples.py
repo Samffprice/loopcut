@@ -43,6 +43,28 @@ class SampleTest(unittest.TestCase):
         self.assertIsNone(try_samples.match("", "image_to_3d", {"image": str(self.photo)}))  # Not a card's turn.
         self.assertIsNone(try_samples.match("model", "image_to_3d", {"image": str(self.photo)}))
 
+    def test_the_attached_photo_is_passed_by_its_name(self):
+        # The model sees an attachment's name, never its path (0.2.8: "Scene reference or file was not found", then a
+        # search of the disk and a paid text-only call). The name resolves to the attached file, which the card matches.
+        from loopcut import conversations, state
+        stored = self.tmp / "images" / "abc.png"
+        stored.parent.mkdir()
+        stored.write_bytes(b"stored copy")
+        session = {"id": "c1", "references": [
+            {"ref": "loopcut-image:abc.png", "full": "loopcut-image:abc.png", "name": "alarm-clock.jpg", "pinned": True,
+             "source": str(try_samples.SAMPLE_PHOTO)},
+            {"ref": "loopcut-image:abc.png", "name": "gone.jpg", "pinned": True, "source": str(self.tmp / "gone.jpg")}]}
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(images={}, objects={}))
+        with patch.object(state, "_session", session), patch.dict(sys.modules, {"bpy": fake}), \
+                patch.object(conversations, "image_path", return_value=stored):
+            self.assertEqual(cloud_jobs.attached_image("alarm-clock.jpg"), try_samples.SAMPLE_PHOTO)
+            self.assertEqual(cloud_jobs.attached_image("gone.jpg"), stored)  # The original moved: the stored copy.
+            self.assertIsNone(cloud_jobs.attached_image("other.jpg"))
+            files = cloud_jobs.resolve_files({"file_inputs": [{"field": "image", "required": False,
+                                                               "accept": ["image/jpeg", "image/png"]}]},
+                                             {"image": "alarm-clock.jpg"}, self.tmp / "job")
+        self.assertEqual(try_samples.match("photo_3d", "image_to_3d", files)["card"], "photo_3d")
+
     def test_a_build_without_the_files_runs_the_ordinary_call(self):
         with patch.object(try_samples, "SAMPLES", self.tmp / "missing"):
             self.assertIsNone(try_samples.match("motion", "motion_from_text", {}))

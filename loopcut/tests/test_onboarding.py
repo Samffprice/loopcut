@@ -470,7 +470,8 @@ class OnboardingTest(unittest.TestCase):
             # Nothing automatic moves it back: a later Loopcut sign-in, the account refresh, ChatGPT's idle finish.
             with patch.object(self.account.credentials, "store"):
                 self.account._store_key("fixture-only")
-            with patch.object(self.account, "_get", return_value={}), patch.object(self.account, "_redraw"):
+            with patch.object(self.account, "_get", return_value={}), patch.object(self.account, "_redraw"), \
+                    patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: fn()):
                 self.account._refresh_account("fixture-only")
             self.chatgpt_ui._finished(None, "")
         self.assertEqual(self.prefs.provider, "LOOPCUT")
@@ -478,7 +479,8 @@ class OnboardingTest(unittest.TestCase):
     def test_account_refresh_and_chatgpt_sign_out_keep_the_chatgpt_provider(self):
         self.prefs.provider = "CHATGPT"
         with self.chatgpt_plan(), patch.object(self.account, "_get", return_value={}), \
-                patch.object(self.account, "_redraw"):
+                patch.object(self.account, "_redraw"), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: fn()):
             self.account._refresh_account("fixture-only")
         self.assertEqual(self.prefs.provider, "CHATGPT")
         with self.chatgpt_plan(signed_in=False):
@@ -824,12 +826,224 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(card["resolved"], nudges.DISMISSED)
         self.host._do_action(session, ("offer", (9, 0)))  # A stale hit after the list changed: nothing.
 
+    def limit_card(self):
+        return self.state.item_limit("Used up.", "session_limit", "free", "",
+                                     {"label": "Upgrade to Pro", "url": "https://loopcut.org/pricing"})
+
     def test_limit_card_switches_to_the_chatgpt_plan_and_goes_on(self):
-        session = self.state.new_session()
+        session = self.state.reset()
+        session["items"] = [self.limit_card()]
+        session["messages"] = [{"role": "tool", "content": "Stopped here."}]
         with patch.object(self.host.agent, "resume") as resume, patch.object(self.host, "config_changed"):
             self.host._do_action(session, ("limit_chatgpt", 0))
         self.assertEqual(self.prefs.provider, "CHATGPT")
         resume.assert_called_once_with()
+
+    def test_foreign_card_actions_change_account_or_provider_and_preserve_the_current_draft(self):
+        for kind in ("limit_upgrade", "limit_chatgpt", "limit_fast", "limit_retry", "sign_in", "own_key"):
+            for stopped in (False, True):
+                with self.subTest(kind=kind, stopped=stopped), patch.object(self.host.config, "billing_open", return_value=True):
+                    origin = self.state.new_session()
+                    card = self.limit_card()
+                    origin["items"] = [card]
+                    session = self.state.reset()
+                    session.update(input="  current draft  ", attachments=[{"name": "ref.png", "ref": "ref.png"}])
+                    if stopped:
+                        session["messages"] = [{"role": "user", "content": "Other stopped turn."}]
+                    self.state.ui["allowance_notice"] = {"item": card, "conversation": origin["id"]}
+                    self.prefs.provider = "LOOPCUT"
+                    with patch.object(self.host.agent, "resume") as resume, \
+                            patch.object(self.account, "watch_plan") as watch, \
+                            patch.object(self.account, "open_browser") as browser, \
+                            patch.object(self.account, "refresh_account") as refresh, \
+                            patch.object(self.settings, "set_tier") as tier, \
+                            patch.object(self.host, "_open_settings"), patch.object(self.host, "config_changed"), \
+                            patch.object(self.host.conversations, "save") as save:
+                        action = (kind, "chatgpt" if kind == "sign_in" else None)
+                        self.host._do_action(session, action)
+                        if kind == "limit_upgrade":
+                            browser.assert_called_once_with(card["upgrade"]["url"])
+                            watch.assert_called_once()
+                            watch.call_args.args[1]({"plan": "pro"})
+                            save.assert_not_called()  # No foreign card is saved into this conversation.
+                        elif kind == "limit_chatgpt":
+                            self.assertEqual(self.prefs.provider, "CHATGPT")
+                        elif kind == "limit_fast":
+                            tier.assert_called_once()
+                        elif kind == "sign_in":
+                            self.fake.ops.loopcut.chatgpt_sign_in.assert_called_once_with()
+                        resume.assert_not_called()
+                        refresh.assert_not_called()
+                        self.assertEqual(session["input"], "  current draft  ")
+                        self.assertEqual(session["attachments"], [{"name": "ref.png", "ref": "ref.png"}])
+                    self.fake.ops.reset_mock()
+
+    def test_retry_refreshes_usage_before_resuming_only_the_same_stopped_turn(self):
+        session = self.state.reset()
+        session["items"] = [self.limit_card()]
+        session["messages"] = [{"role": "tool", "content": "Stopped here."}]
+        session["input"] = "keep this draft"
+        with patch.object(self.host.agent, "resume") as resume, patch.object(self.account, "refresh_account") as refresh:
+            self.host._do_action(session, ("limit_retry", 0))
+            refresh.assert_called_once()
+            resume.assert_not_called()
+            refresh.call_args.args[0]()
+            resume.assert_called_once()
+            resume.reset_mock()
+            self.host._do_action(session, ("limit_retry", 0))
+            self.state.reset()  # Changing chats during the HTTP refresh never resumes the new chat.
+            refresh.call_args.args[0]()
+            resume.assert_not_called()
+        self.assertEqual(session["input"], "keep this draft")
+
+    def test_retry_refreshes_same_plan_available_usage_then_dispatches_resume(self):
+        session = self.state.reset()
+        session["items"] = [self.limit_card()]
+        session["messages"] = [{"role": "tool", "content": "Stopped here."}]
+        session["input"] = "keep the draft"
+        events = []
+        def get(path, key):
+            events.append(path)
+            return {"plan": "free", "session": {"used": 0.2}} if path == "/v1/me" else {"data": [{"id": "fast"}]}
+        def resumed():
+            self.assertEqual(self.state.ui["account"]["session"]["used"], 0.2)
+            events.append("resume")
+        with patch.dict(self.account._state, account={"plan": "free", "session": {"used": 1.0}}), \
+                patch.object(self.account.credentials, "api_key", return_value="fixture"), \
+                patch.object(self.account, "_get", side_effect=get), patch.object(self.account, "_redraw"), \
+                patch.object(self.account.threading, "Thread", side_effect=lambda target, args=(), **kw:
+                             types.SimpleNamespace(start=lambda: target(*args))), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: fn()), \
+                patch.object(self.host.agent, "resume", side_effect=resumed):
+            self.host._do_action(session, ("limit_retry", 0))
+        self.assertEqual(events, ["/v1/me", "/v1/models", "resume"])
+        self.assertEqual(session["input"], "keep the draft")
+
+    def test_upgrade_watch_resumes_only_its_original_stopped_turn(self):
+        for change in ("none", "conversation", "turn"):
+            with self.subTest(change=change), patch.object(self.host.config, "billing_open", return_value=True):
+                session = self.state.reset()
+                session["items"] = [self.limit_card()]
+                session["messages"] = [{"role": "tool", "content": "Stopped here."}]
+                with patch.object(self.host.agent, "resume") as resume, patch.object(self.account, "watch_plan") as watch, \
+                        patch.object(self.account, "open_browser"), patch.object(self.host.conversations, "save"):
+                    self.host._do_action(session, ("limit_upgrade", 0))
+                    if change == "conversation":
+                        self.state.reset()["messages"] = [{"role": "user", "content": "Another stopped chat."}]
+                    elif change == "turn":
+                        session["messages"].append({"role": "user", "content": "A newer turn."})
+                    watch.call_args.args[1]({"plan": "pro"})
+                    self.assertEqual(resume.call_count, int(change == "none"))
+
+    def test_locked_model_upgrade_dispatch_starts_the_same_watch_without_resuming_a_turn(self):
+        with patch.object(self.host.config, "billing_open", return_value=True), patch.object(self.settings, "_changed"), \
+                patch.object(self.account, "models", return_value=[{"id": "pro", "label": "Pro", "available": False,
+                                                                   "unlock_plan": {"id": "pro", "name": "Pro"}}]):
+            session = self.state.reset()
+            session["messages"] = [{"role": "user", "content": "An older stopped turn."}]
+            self.state.ui["account"] = {"plan": "free"}
+            self.settings.set_tier("pro")
+            notice = session["items"][-1]
+            with patch.object(self.account, "open_browser") as browser, patch.object(self.account, "watch_plan") as watch, \
+                    patch.object(self.host.agent, "resume") as resume, patch.object(self.host.conversations, "save"):
+                self.host._do_action(session, ("open_url", 0))
+                browser.assert_called_once_with(notice["url"])
+                self.assertEqual(watch.call_args.args[0], "free")
+                watch.call_args.args[1]({"plan": "pro"})
+                resume.assert_not_called()
+
+    def test_plan_watch_refreshes_models_before_reporting_the_upgrade(self):
+        jobs = []
+        catalogue = {"data": [{"id": "pro", "available": True}], "default": "pro"}
+        with patch.dict(self.account._state, account={"plan": "free"}, models=[{"id": "pro", "available": False}]), \
+                patch.object(self.account.credentials, "api_key", return_value="fixture"), \
+                patch.object(self.account, "_get", side_effect=[{"plan": "pro"}, catalogue]) as get, \
+                patch.object(self.account.threading, "Thread", side_effect=lambda target, **kw: types.SimpleNamespace(start=target)), \
+                patch.object(self.account.time, "sleep"), patch.object(self.account.mainthread, "run_on_main", side_effect=jobs.append), \
+                patch.object(self.account, "_redraw"):
+            changed = Mock(side_effect=lambda payload: self.assertTrue(self.account.models()[0]["available"]))
+            self.account.watch_plan("free", changed)
+            self.assertEqual([c.args[0] for c in get.call_args_list], ["/v1/me", "/v1/models"])
+            changed.assert_not_called()
+            self.state.clear_allowance_notice(invalidate=True)  # Switching providers keeps the account/model refresh alive.
+            jobs.pop(0)()
+            changed.assert_called_once_with({"plan": "pro"})
+            self.assertEqual(self.account.default_model(), "pro")
+            self.settings.choose_model("pro")
+            self.assertEqual(self.prefs.tier, "pro")
+
+    def test_account_refresh_is_authoritative_and_ignores_a_late_reply_after_sign_out(self):
+        for sign_out in (False, True):
+            with self.subTest(sign_out=sign_out), patch.dict(self.account._state, account={"plan": "free"}), \
+                    patch.object(self.account, "_redraw"):
+                jobs = []
+                card = self.limit_card()
+                self.state.ui["allowance_notice"] = {"item": card, "conversation": "old"}
+                payload = {"plan": "free", "session": {"used": 0.2}}
+                done = Mock()
+                with patch.object(self.account, "_get", side_effect=[payload, {"data": [{"id": "fast"}]}]), \
+                        patch.object(self.account.mainthread, "run_on_main", side_effect=jobs.append):
+                    self.account._refresh_account("fixture", done)
+                if sign_out:
+                    with patch.object(self.account.credentials, "store"):
+                        self.account.sign_out()
+                jobs.pop(0)()
+                if sign_out:
+                    self.assertIsNone(self.state.ui.get("account"))
+                    self.assertNotIn("allowance_notice", self.state.ui)
+                    done.assert_not_called()
+                else:
+                    self.assertEqual(self.state.ui["account"], payload)
+                    done.assert_called_once_with()
+                    self.assertIn("allowance_notice", self.state.ui, "same-plan refresh is display only and never gates a request")
+
+    def test_changed_plan_clears_notice_and_refreshes_cached_model_locks(self):
+        with patch.dict(self.account._state, account={"plan": "free"}), \
+                patch.object(self.account, "refresh_account") as refresh:
+            self.state.ui["allowance_notice"] = {"item": self.limit_card(), "conversation": "old"}
+            self.account.update_usage({"plan": "pro"})
+            self.assertNotIn("allowance_notice", self.state.ui)
+            refresh.assert_called_once_with()
+
+    def test_account_refresh_preserves_reservations_and_refusal_until_reset_or_plan_change(self):
+        reset = "2099-10-21T18:00:00Z"
+        for window in ("session", "week"):
+            for change in ("same", "reset", "plan", "sign_out"):
+                with self.subTest(window=window, change=change), patch.dict(self.account._state, account=None):
+                    card = self.limit_card()
+                    card.update(reason=window + "_limit", resets_at=reset)
+                    self.state.ui["allowance_notice"] = {"item": card}
+                    payload = {"plan": "free", window: {"used": 0.62, "used_with_reservations": 0.82, "resets_at": reset}}
+                    with patch.object(self.account, "_get", side_effect=[payload, {"data": [{"id": "fast"}]}]), \
+                            patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: fn()), \
+                            patch.object(self.account, "_redraw"):
+                        self.account._refresh_account("fixture")
+                    self.assertEqual(self.state.ui["account"], payload)
+                    self.assertIn(f"{window.capitalize()}: 100% used", self.account.usage_lines())
+                    if change == "reset":
+                        payload = {**payload, window: {**payload[window], "resets_at": "2099-10-22T18:00:00Z"}}
+                    elif change == "plan":
+                        payload = {**payload, "plan": "pro"}
+                    elif change == "sign_out":
+                        payload = None
+                    self.account._set_account(payload)
+                    if change == "same":
+                        self.assertIn("allowance_notice", self.state.ui)
+                    else:
+                        self.assertNotIn("allowance_notice", self.state.ui)
+                        if payload:
+                            self.assertIn(f"{window.capitalize()}: 82% used", self.account.usage_lines())
+                        else:
+                            self.assertEqual(self.account.usage_lines(), [])
+
+    def test_account_reservation_fields_are_optional_and_parse_defensively(self):
+        for reserved, expected in ((0.82, 82), ("0.82", 82), (0, 0), (1.2, 100),
+                                   (None, 62), ("bad", 62), (float("nan"), 62), (float("inf"), 62),
+                                   (-1, 62), (True, 62), ([], 62), ({}, 62)):
+            with self.subTest(reserved=reserved), patch.dict(self.account._state, account=None):
+                self.account._set_account({"plan": "free", "session": {"used": 0.62, "used_with_reservations": reserved},
+                                           "week": {"used": 0.42}})
+                self.assertEqual(self.account.usage_lines(), [f"Session: {expected}% used", "Week: 42% used"])
 
     # --- 0.2.6: a required, modal and resumable setup ---------------------------------------------------------
 

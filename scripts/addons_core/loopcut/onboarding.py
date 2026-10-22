@@ -1400,8 +1400,8 @@ def _descriptors() -> list[dict]:
     runtime = cloud._runtime
     if runtime is None or not account.signed_in():
         return []
-    try:
-        return runtime.descriptors()
+    try:  # A free card's tool is offered at any balance: its card's call is on the house (try_samples).
+        return runtime.descriptors(on_the_house={c["tool"] for c in CARDS if c.get("free") and c["tool"]})
     except Exception as ex:  # A card hides rather than the screen failing.
         print(f"Loopcut: could not read the cloud tools: {ex!r}")
         return []

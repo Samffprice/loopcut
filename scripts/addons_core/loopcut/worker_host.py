@@ -2,12 +2,12 @@
 
 A worker's model calls stay in the user's Blender, where the keys are; its scene tools run in a
 child Blender opened on the wave's spawn copy (07_m4_design §2.7). Child owns the process: it
-starts it with the two pipes, reads replies on a thread of its own, and turns a timeout, EOF or a
+starts it with an authenticated loopback connection, reads replies on a thread, and turns a timeout, EOF or a
 garbled reply into ChildCrashed after killing it. WorkerRuntime is what the worker loop calls
 instead of tools.execute: network tools and report_back in the parent, scene tools in the child,
 import_asset split between them (fetch here, load there).
 
-A child dies with its parent: EOF on its request pipe, or a watchdog seeing its parent change. One
+A child dies with its parent: EOF on its connection, or a watchdog seeing its parent exit. One
 stuck in a long native call can miss both, so reap_orphans kills what an earlier Blender left
 behind, and shutdown_all (atexit, and the add-on's unregister) kills this one's.
 
@@ -36,11 +36,13 @@ CHILD_TOOLS = {"run_python", "get_scene_info", "get_object_info", "inspect_api",
                "capture_viewport", "check_brief", "inspect_uv", "uv_unwrap", "inspect_texture", "bake_paint_masks",
                "stylize_material"}
 PARENT_TOOLS = {"search_assets", "look_at_reference", "report_back"}
-KILL_GRACE = 2.0     # SIGTERM, then SIGKILL after this many seconds.
+KILL_GRACE = 2.0     # Terminate, then force-kill after this many seconds (POSIX).
 POLL = 0.1           # How often a waiting call looks at is_cancelled.
 RECORD = "child.json"
 CRASH_NOTE = ("Your Blender crashed during {tool}; the scene is back at the start of your brief, and nothing you "
               "built is kept.")
+UNAVAILABLE_NOTE = ("New workers are unavailable on this machine because startup failed. "
+                    "Starting workers is disabled for this session.")
 CRASH_KIT = "crash-{n}"   # In the worker's folder, one per crash: what Child._keep saves.
 CRASH_BLEND_MB = 200      # The last .blend is copied into the kit up to this size; a bigger one is only named.
 LOG_TAIL = 80             # Lines of worker.log kept beside the crash report.
@@ -58,6 +60,10 @@ class ChildCrashed(Exception):
         self.reason, self.detail, self.kept = reason, detail, kept
 
 
+class WorkerUnavailable(Exception):
+    """An explicitly classified spawn/transport failure before scene or add-on initialization."""
+
+
 def _binary() -> str:
     import bpy
     return bpy.app.binary_path
@@ -69,7 +75,7 @@ class Child:
     def __init__(self, job_dir, worker_id: str, spawn_path, role: str, *, binary: str | None = None,
                  script: Path | None = None, run_timeout: float | None = None):
         if not worker_ipc.valid_worker_id(worker_id):
-            raise ValueError(f"worker id {worker_id!r} must be letters, digits, _ or -")
+            raise ValueError(f"worker id {worker_id!r} must be a portable folder name using letters, digits, _ or -")
         self.job_dir, self.worker_id, self.role = Path(job_dir), worker_id, role
         self.spawn_path = Path(spawn_path)
         self.folder = worker_ipc.worker_dir(self.spawn_path, worker_id)
@@ -85,6 +91,7 @@ class Child:
         self.next_id = 1
         self.init_payload: dict | None = None
         self.ready: dict | None = None     # The init reply.
+        self.startup_deadline: float | None = None  # One budget for spawn, connection and init.
         self.peak_rss_mb = 0.0             # From the child's own getrusage, reported with every reply.
         self.t = {}                        # time.time() of spawn, ready, end.
         self.dead = ""                     # Why the child is gone, once it is.
@@ -93,34 +100,60 @@ class Child:
 
     # ------------------------------------------------------------------ process
 
-    def start(self) -> "Child":
-        self.folder.mkdir(parents=True, exist_ok=True)
-        (self.folder / "tmp").mkdir(exist_ok=True)
-        worker_ipc.write_env_file(self.job_dir, self.run_timeout)
-        req_r, req_w = os.pipe()
-        resp_r, resp_w = os.pipe()
-        command = worker_ipc.child_command(self.binary, self.spawn_path, self.script, self.job_dir,
-                                           self.worker_id, req_r, resp_w)
+    def start(self, is_cancelled=None) -> "Child":
+        def check_cancelled():
+            if is_cancelled is not None and is_cancelled():
+                from . import llm
+                raise llm.Cancelled()
+
+        listener = None
         try:
+            check_cancelled()
+            self.startup_deadline = time.monotonic() + worker_ipc.TIMEOUTS["init"]
+            self.folder.mkdir(parents=True, exist_ok=True)
+            (self.folder / "tmp").mkdir(exist_ok=True)
+            worker_ipc.write_env_file(self.job_dir, self.run_timeout)
+            try:
+                listener = worker_ipc.Listener()
+            except OSError as ex:
+                raise WorkerUnavailable(f"could not listen for worker: {ex}") from ex
+            command = worker_ipc.child_command(self.binary, self.spawn_path, self.script, self.job_dir,
+                                               self.worker_id, listener.port)
             with (self.folder / "worker.log").open("ab") as log:
-                self.process = subprocess.Popen(
-                    command, pass_fds=(req_r, resp_w), close_fds=True, stdin=subprocess.DEVNULL, stdout=log,
-                    stderr=subprocess.STDOUT, env=worker_ipc.child_env(self.job_dir, self.folder),
-                    start_new_session=False)
-        except OSError:
-            for fd in (req_w, resp_r):
-                os.close(fd)
+                environment = worker_ipc.child_env(self.job_dir, self.folder)
+                try:
+                    self.process = subprocess.Popen(
+                        command, close_fds=True, stdin=subprocess.PIPE, stdout=log,
+                        stderr=subprocess.STDOUT, env=environment)
+                except (OSError, ValueError) as ex:
+                    raise WorkerUnavailable(f"could not spawn worker: {ex}") from ex
+            self.t["spawn"] = time.time()
+            with _live_lock:
+                _live.add(self)  # Shutdown/cancellation must also reap a child still connecting.
+            created = None
+            if os.name == "nt":
+                from .worker_process import windows_creation
+                created = windows_creation(self.process.pid)
+            _atomic_json(self.folder / RECORD, {"pid": self.process.pid, "owner": os.getpid(), "job": str(self.job_dir),
+                                                "worker": self.worker_id, "started": self.t["spawn"],
+                                                "windows_created": created})
+            try:
+                # 65 bytes fit in an empty pipe on every platform; close immediately to deliver EOF.
+                with self.process.stdin as credentials:
+                    credentials.write((listener.token + "\n").encode("ascii"))
+                self.channel = listener.accept(self.process, max(0.0, self.startup_deadline - time.monotonic()),
+                                               check_cancelled)
+            except (OSError, worker_ipc.ProtocolError) as ex:
+                raise WorkerUnavailable(f"could not connect worker: {ex}") from ex
+            threading.Thread(target=self._read, name=f"loopcut-child-{self.worker_id}", daemon=True).start()
+        except BaseException:
+            self.kill(reason="startup failed")
             raise
         finally:
-            os.close(req_r)  # The child's ends: with them closed here, the child's exit is our EOF.
-            os.close(resp_w)
-        self.t["spawn"] = time.time()
-        self.channel = worker_ipc.Channel(os.fdopen(resp_r, "rb"), os.fdopen(req_w, "wb"))
-        _atomic_json(self.folder / RECORD, {"pid": self.process.pid, "owner": os.getpid(), "job": str(self.job_dir),
-                                            "worker": self.worker_id, "started": self.t["spawn"]})
-        threading.Thread(target=self._read, name=f"loopcut-child-{self.worker_id}", daemon=True).start()
-        with _live_lock:
-            _live.add(self)
+            if self.process is not None and self.process.stdin is not None:
+                self.process.stdin.close()
+            if listener is not None:
+                listener.close()
         return self
 
     def _read(self) -> None:
@@ -131,14 +164,14 @@ class Child:
             except worker_ipc.ProtocolError as ex:
                 self.replies.put(ex)
                 break
-            except (OSError, ValueError):  # The pipe broke: the same as EOF.
+            except (OSError, ValueError):  # The connection broke: the same as EOF.
                 message = None
             if message is None:
                 self.replies.put(None)
                 break
             self.replies.put(message)
         try:
-            channel.reader.close()  # Here, not in kill(): closing it under a blocked readline would wait on it.
+            channel.reader.close()  # EOF or a protocol error: release the read stream.
         except OSError:
             pass
 
@@ -150,8 +183,8 @@ class Child:
         return self.process is not None and self.process.poll() is None and not self.dead
 
     def rss_mb(self) -> float | None:
-        """Resident memory now, from ps; None when the child is gone or ps is not there."""
-        if not self.alive():
+        """Resident memory now, from ps; None when unsupported or the child is gone."""
+        if os.name == "nt" or not self.alive():
             return None
         try:
             out = subprocess.run(["ps", "-o", "rss=", "-p", str(self.pid)], capture_output=True, text=True, timeout=5)
@@ -166,10 +199,7 @@ class Child:
         self.dead = self.dead or reason
         self.t.setdefault("end", time.time())
         if self.channel:
-            try:
-                self.channel.writer.close()  # The child sees EOF; the reader thread closes its end.
-            except OSError:
-                pass
+            self.channel.close()
         with _live_lock:
             _live.discard(self)
 
@@ -188,6 +218,8 @@ class Child:
             self.init_payload = payload
         if timeout is None:
             timeout = worker_ipc.timeout_for(op, payload.get("name", ""), payload.get("arguments"), self.run_timeout)
+        if op == "init" and self.startup_deadline is not None:
+            timeout = min(timeout, max(0.0, self.startup_deadline - time.monotonic()))
         self.request = (op, str(payload.get("name") or ""))
         number, self.next_id = self.next_id, self.next_id + 1
         try:
@@ -223,13 +255,15 @@ class Child:
             if op == "init" and reply.ok:
                 self.ready = reply.data
                 self.t["ready"] = time.time()
+            elif op == "init":
+                self._crash("init", reply.error)
             return {**reply.data, "ok": reply.ok, **({} if reply.ok else {"error": reply.error})}
 
     def _exit_detail(self) -> str:
         try:
             code = self.process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            return "closed its pipe"
+            return "closed its connection"
         return f"exited with code {code}" + ("; see worker.log" if code else "")
 
     def _crash(self, reason: str, detail: str):
@@ -298,13 +332,13 @@ class Child:
 
 
 def kill_all(children, grace: float = KILL_GRACE, reason: str = "killed") -> None:
-    """SIGTERM every live child at once, then SIGKILL whatever is left after `grace` seconds: a
+    """Terminate every live child at once, then force-kill whatever is left after `grace` seconds: a
     wave's children go down together, not one grace period after another."""
     live = [c for c in children if c.process is not None and c.process.poll() is None]
     for child in live:
         child.stopping = child.stopping or reason
         try:
-            child.process.send_signal(signal.SIGTERM)
+            child.process.terminate()  # SIGTERM on POSIX, TerminateProcess on Windows.
         except OSError:
             pass
     deadline = time.monotonic() + grace
@@ -337,16 +371,13 @@ atexit.register(shutdown_all)
 def _alive(pid) -> bool:
     if type(pid) is not int or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    from . import jobs
+    return jobs._alive(pid)  # Uses a process handle on Windows; os.kill(pid, 0) can terminate it there.
 
 
 def _command_of(pid: int) -> str:
+    if os.name == "nt":
+        return ""
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -356,7 +387,8 @@ def _command_of(pid: int) -> str:
 
 def reap_orphans(root) -> list[int]:
     """Kill worker Blenders an earlier Blender left running: a <job>/w<n>/<worker>/child.json under
-    `root` whose owner is dead while its child still runs worker_child.py for that job. A child of
+    `root` whose owner is dead while its child still runs worker_child.py for that job (POSIX), or
+    still has the recorded process creation time (Windows). A child of
     a Blender that is still alive (another window, another eval) is never touched. Returns the pids
     killed."""
     killed = []
@@ -368,8 +400,14 @@ def reap_orphans(root) -> list[int]:
         pid, owner = data.get("pid"), data.get("owner")
         if owner == os.getpid() or _alive(owner):
             continue
-        command = _command_of(pid) if _alive(pid) else ""
-        if CHILD_SCRIPT.name in command and f"--job {data.get('job')}" in command:
+        if os.name == "nt":
+            from .worker_process import windows_kill
+            if windows_kill(pid, data.get("windows_created")):
+                killed.append(pid)
+        elif _alive(pid):
+            command = _command_of(pid)
+            if CHILD_SCRIPT.name not in command or f"--job {data.get('job')}" not in command:
+                continue
             try:
                 os.kill(pid, signal.SIGKILL)
                 killed.append(pid)
@@ -485,7 +523,7 @@ class WorkerRuntime:
         old = self.child
         old.kill(reason=old.dead or "restarted")
         child = Child(old.job_dir, old.worker_id, old.spawn_path, old.role, binary=old.binary, script=old.script,
-                      run_timeout=old.run_timeout).start()
+                      run_timeout=old.run_timeout).start(is_cancelled=is_cancelled)
         reply = child.call("init", old.init_payload or {}, is_cancelled=is_cancelled)
         child.peak_rss_mb = max(child.peak_rss_mb, old.peak_rss_mb)
         self.child, self.crashed = child, ""

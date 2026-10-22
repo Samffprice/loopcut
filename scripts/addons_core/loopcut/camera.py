@@ -131,6 +131,10 @@ def _geometry(targets, depsgraph) -> tuple[dict, list]:
             continue
         owner = (instance.parent if instance.is_instance else obj).original
         names = rows_of.get(owner) if targets else [owner.name]
+        if not owner.visible_get(view_layer=depsgraph.view_layer):
+            # Explicit hidden geometry keeps the existing bounding-box fallback below. A parent
+            # includes only visible descendants, including when hidden objects are still evaluated.
+            names = None
         local = _local_points(obj, budget) if names else None
         if local is not None:
             for name in names:

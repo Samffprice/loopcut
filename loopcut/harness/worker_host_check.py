@@ -22,7 +22,7 @@ worker_host.Child and driven through WorkerRuntime, as the worker loop will. Cas
 - crash kit: a child that segfaults leaves <worker>/crash-1 with Blender's crash report, the spawn
   copy, the log's tail and crash.json; after restart() the deliverable is gone and finish says so;
 - Stop: cancelling kills every child's call and process in under 3 s;
-- a SIGKILLed parent (a helper process that starts the child, then is killed) leaves no child
+- a force-killed parent (a helper process that starts the child, then is killed) leaves no child
   after 5 s, idle (EOF) or busy in model code (the watchdog);
 - reap_orphans kills a stuck child whose owner is dead, and nothing else;
 - the child cannot see keys: the parent's LOOPCUT_API_KEY, other *_KEY/*_TOKEN variables, or a
@@ -70,14 +70,17 @@ import bpy
 sys.path.insert(0, str(Path(__file__).parent))
 import checkout
 checkout.use()
-from loopcut import llm, worker_host, worker_ipc  # noqa: E402
+from loopcut import llm, worker_host, worker_ipc, worker_process  # noqa: E402
 
 os.environ.setdefault("LOOPCUT_PROMPT_INDEX", str(Path(__file__).parent / "fixtures" / "prompt-index.json"))
+if os.name == "nt":
+    # Let the CI's software OpenGL selection reach children, within this harness only.
+    worker_ipc.KEEP_ENV += ("GALLIUM_DRIVER",)
 
 MEASURE = "--measure" in sys.argv
 KEEP = "--keep" in sys.argv
 BINARY = bpy.app.binary_path
-PYTHON = sys.executable if Path(sys.executable).name.startswith("python") else "python3"
+PYTHON = sys.executable if Path(sys.executable).name.startswith("python") else ("python" if os.name == "nt" else "python3")
 ROLES = ("modeling", "materials", "lighting", "camera", "animation")
 LABEL_BOX = (15, 18, 25)
 FAKE = "-".join(("check", "fake", "value"))  # Planted in the parent; the child must never see it.
@@ -203,9 +206,7 @@ def gone(pid: int, seconds: float) -> float | None:
     """Seconds until pid is gone, or None if it is still there after `seconds`."""
     started = time.monotonic()
     while time.monotonic() - started < seconds:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not worker_host._alive(pid):
             return time.monotonic() - started
         time.sleep(0.05)
     return None
@@ -710,7 +711,12 @@ def broken_mesh(job, spawn):
 def crash_kit(job, spawn):
     child, runtime = start(job, spawn, "segv", prefix="Chest", deliverable="Chest")
     assert run(runtime, CHEST).ok
-    died = run(runtime, "import ctypes\nctypes.string_at(0)")
+    # Windows ctypes turns every exception in a foreign call into OSError except a breakpoint, which it leaves
+    # unhandled so a debugger can attach: with none attached it reaches Blender's crash handler, as a real fault
+    # does (faulthandler._sigsegv() aborts with exit code 3 and no crash report, CI 2026-10-22).
+    fault = ("import ctypes\nctypes.windll.kernel32.DebugBreak()" if os.name == "nt"
+             else "import ctypes\nctypes.string_at(0)")
+    died = run(runtime, fault)
     assert died.crashed == "exited" and died.crash_kept, (died.crashed, died.text)
     kit = Path(died.crash_kept)
     assert kit == child.folder / "crash-1", kit
@@ -760,7 +766,8 @@ def stop(job, spawn, count: int):
 HELPER = """
 import sys, time
 sys.path.insert(0, {addons!r})
-from loopcut import worker_host
+from loopcut import worker_host, worker_ipc
+worker_ipc.KEEP_ENV = {keep_env!r}
 child = worker_host.Child({job!r}, {worker!r}, {spawn!r}, "modeling", binary={binary!r}, run_timeout=60).start()
 assert child.call("init", {{"warm": False}})["ok"]
 if {busy!r}:
@@ -778,19 +785,23 @@ def killed_parent(job, spawn):
         worker = "orphan-busy" if busy else "orphan-idle"
         script = work / f"helper_{worker}.py"
         script.write_text(HELPER.format(addons=addons, job=str(job), worker=worker, spawn=str(spawn), binary=BINARY,
-                                        busy=busy), encoding="utf-8")
+                                        busy=busy, keep_env=worker_ipc.KEEP_ENV), encoding="utf-8")
         helper = subprocess.Popen([PYTHON, str(script)], stdout=subprocess.PIPE, text=True)
         try:
             pid = int(helper.stdout.readline().strip())
+            created = worker_process.windows_creation(pid) if os.name == "nt" else None
         finally:
-            os.kill(helper.pid, signal.SIGKILL)
+            helper.kill()  # TerminateProcess on Windows, SIGKILL on POSIX.
             helper.wait()
         took = gone(pid, 5.0)
         if took is None:
-            os.kill(pid, signal.SIGKILL)
-        assert took is not None, f"{worker}: child {pid} outlived its SIGKILLed parent by 5 s"
+            if os.name == "nt":
+                worker_process.windows_kill(pid, created)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        assert took is not None, f"{worker}: child {pid} outlived its force-killed parent by 5 s"
         how = "busy in model code: the watchdog" if busy else "idle: EOF"
-        measure(f"child of a SIGKILLed parent gone in {took:.2f} s ({how})")
+        measure(f"child of a force-killed parent gone in {took:.2f} s ({how})")
     note("WORKER killed parent: ok (no child after 5 s, idle or busy)")
 
 
@@ -810,8 +821,13 @@ def reap(job):
         if looks_like_worker:
             argv += [worker_host.CHILD_SCRIPT.name, "--job", str(root / "job")]
         sleepers[name] = subprocess.Popen(argv)
-        (record_dir / worker_host.RECORD).write_text(json.dumps({"pid": sleepers[name].pid, "owner": owner,
-                                                                 "job": str(root / "job"), "worker": name}))
+        record = {"pid": sleepers[name].pid, "owner": owner, "job": str(root / "job"), "worker": name}
+        if os.name == "nt":
+            created = worker_process.windows_creation(sleepers[name].pid)
+            assert created is not None, f"could not query creation time for {name}"
+            # Windows identifies workers by creation time, not command line. Mismatch simulates PID reuse.
+            record["windows_created"] = created if looks_like_worker else created - 1
+        (record_dir / worker_host.RECORD).write_text(json.dumps(record))
     time.sleep(0.3)
     try:
         killed = worker_host.reap_orphans(root)

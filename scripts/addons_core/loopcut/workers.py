@@ -58,6 +58,9 @@ SCHEMAS_OWN = [
 _SHARED_TOOLS = ("run_python", "get_scene_info", "get_object_info", "inspect_api", "look_at_reference")
 MAX_SUMMARY = 300
 MAX_REQUESTS = 3
+STEER_INSTRUCTION = ("Reconsider requirements that conflict with this correction. Change only what clearly applies "
+                     "to your deliverable. Report unclear or unrelated requests to the orchestrator. "
+                     "Your ownership and merge restrictions still apply.")
 
 
 def schemas() -> list[dict]:

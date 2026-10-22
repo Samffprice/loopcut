@@ -29,7 +29,7 @@ def supervise(path: Path) -> int:
                    "--", str(path)]
         with (path / "worker.log").open("ab") as log:
             child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                     start_new_session=True)
+                                     start_new_session=os.name != "nt")
         jobs.atomic_json(path / "lease" / "child.json", {"pid": child.pid})
         while True:
             (path / "lease" / "heartbeat").touch()

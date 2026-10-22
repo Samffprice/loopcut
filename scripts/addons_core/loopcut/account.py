@@ -20,13 +20,14 @@ import urllib.request
 import bpy
 import bpy.utils.previews
 
-from . import config, credentials, mainthread, state
+from . import allowance, config, credentials, mainthread, state
 
 SERVICE_URL = config.SERVICE_URL
 BASE_URL = f"{SERVICE_URL}/v1"
 WATCH_EVERY = 4.0          # Seconds between looks at /v1/me while the user upgrades in the browser.
 WATCH_FOR = 15 * 60.0      # How long to keep looking.
 _watch_generation = 0
+_credential_generation = 0  # Account refreshes survive model/provider changes, but never a different sign-in.
 MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))  # Until /v1/models answers.
 # Tier ids earlier clients saved, as the gateway maps them (LEGACY_MODEL_ALIASES in its chat route): 0.2.4 offered
 # "mimo", which is Pro now. A preference still holding one is labelled as the tier it reaches.
@@ -180,10 +181,12 @@ def _run_sign_in() -> None:
                 continue
             if outcome == "approved" and polled.get("api_key"):
                 key = str(polled["api_key"])
-                mainthread.run_on_main(lambda: None if _cancel.is_set() else _store_key(key)).result()
+                generation = mainthread.run_on_main(lambda: None if _cancel.is_set() else _store_key(key)).result()
+                if _cancel.is_set():
+                    return
                 _state.update(status="idle", user_code="", url="", error="")
                 _setup_event(True)
-                _refresh_account(key)
+                _refresh_account(key, generation=generation)
                 return
             raise AccountError("Sign-in was denied" if outcome == "denied" else "The sign-in code expired; try again",
                                "denied" if outcome == "denied" else "expired")
@@ -213,9 +216,13 @@ def _own_route_works(prefs) -> bool:
     return True
 
 
-def _store_key(key: str) -> None:
+def _store_key(key: str) -> int:
     """Main thread: the credentials folder comes from bpy, and the preferences page changes."""
     from . import chatgpt_auth, settings
+    global _credential_generation
+    _credential_generation += 1
+    state.clear_allowance_notice(invalidate=True)
+    generation = _credential_generation
     credentials.store(BASE_URL, key)
     prefs = settings.preferences()
     # A signed-in ChatGPT plan stays the model, and so does a working key of the user's own (an install from
@@ -235,6 +242,7 @@ def _store_key(key: str) -> None:
         except Exception:  # One listener must not stop the sign-in from completing.
             import traceback
             traceback.print_exc()
+    return generation
 
 
 def mark_icon() -> int:
@@ -253,18 +261,43 @@ def _load_mark() -> None:
 
 
 def _set_account(payload: dict | None) -> None:
+    global _credential_generation
+    notice = state.ui.get("allowance_notice")
+    previous_plan = (_state["account"] or {}).get("plan") or ((notice or {}).get("item") or {}).get("plan")
+    if payload is None:
+        _credential_generation += 1
+        state.clear_allowance_notice(invalidate=True)
+        state.ui.pop("warned_session_allowance", None)
+    elif previous_plan and payload.get("plan") and payload["plan"] != previous_plan:
+        state.clear_allowance_notice()
+    elif notice and notice["item"].get("reason") in allowance.LIMIT_WINDOWS \
+            and not allowance.refused_windows(payload, notice):
+        state.clear_allowance_notice()
     _state["account"] = payload
     _state["fetched_at"] = time.monotonic()
     state.ui["account"] = payload  # The panel footer reads it without touching bpy.
 
 
-def _refresh_account(key: str) -> None:
+def _refresh_account(key: str, on_done=None, generation: int | None = None) -> None:
+    generation = _credential_generation if generation is None else generation
+    payload, catalogue = None, None
     try:
-        _set_account(_get("/v1/me", key))
-        _set_models(_get("/v1/models", key))
+        payload = _get("/v1/me", key)
+        catalogue = _get("/v1/models", key)
     except AccountError as ex:
         _state["error"] = str(ex)
-    _redraw()
+
+    def apply():
+        if generation != _credential_generation:
+            return
+        if payload is not None:
+            _set_account(payload)
+        if catalogue is not None:
+            _set_models(catalogue)
+        if on_done:
+            on_done()
+        _redraw()
+    mainthread.run_on_main(apply)
 
 
 def _set_models(payload: dict) -> None:
@@ -295,6 +328,7 @@ def models() -> list[dict]:
         out.append({"id": str(r["id"]), "label": str(r.get("display_name") or r["id"]),
                     "blurb": str(r.get("blurb") or ""), "note": "  ·  ".join(parts),
                     "available": bool(r.get("available", True)),
+                    "unlock_plan": dict(unlock),
                     "default": bool(r.get("default"))})
     return out
 
@@ -318,7 +352,10 @@ def model_label(model_id: str) -> str:
 def update_usage(info: dict) -> None:
     """Fold what a gateway reply's headers said (plan, session and week usage) into the account,
     so the panel stays current without a request to /v1/me."""
+    previous = (_state["account"] or {}).get("plan")
     _set_account({**(_state["account"] or {}), **info})
+    if info.get("plan") and info["plan"] != previous:
+        refresh_account()  # Model availability is account-specific too.
 
 
 def watch_plan(previous: str, on_change) -> None:
@@ -328,6 +365,7 @@ def watch_plan(previous: str, on_change) -> None:
     global _watch_generation
     _watch_generation += 1
     generation = _watch_generation
+    account_generation = _credential_generation
     key = credentials.api_key(BASE_URL)
     if not key:
         return
@@ -341,10 +379,18 @@ def watch_plan(previous: str, on_change) -> None:
             except AccountError:
                 continue
             if str(payload.get("plan") or "") not in ("", previous):
-                if generation == _watch_generation:
+                try:
+                    catalogue = _get("/v1/models", key)
+                except AccountError:
+                    continue  # Do not finish the watch with the old plan's model locks.
+                def apply():
+                    if generation != _watch_generation or account_generation != _credential_generation:
+                        return
                     _set_account(payload)
-                    mainthread.run_on_main(lambda: on_change(payload))
+                    _set_models(catalogue)
+                    on_change(payload)
                     _redraw()
+                mainthread.run_on_main(apply)
                 return
 
     threading.Thread(target=watch, name="loopcut-plan-watch", daemon=True).start()
@@ -371,7 +417,9 @@ def cancel_sign_in() -> None:
 def sign_out() -> None:
     """Forgets the key on this computer. The account page on the site can revoke it as well."""
     from . import settings
+    cancel_sign_in()
     credentials.store(BASE_URL, "")
+    stop_watching()
     _set_account(None)
     _state.update(error="", status="idle", models=None, default_model="fast")
     settings.config_changed()
@@ -379,10 +427,13 @@ def sign_out() -> None:
     cloud.refresh_async()
 
 
-def refresh_account() -> None:
+def refresh_account(on_done=None) -> None:
     key = credentials.api_key(BASE_URL)
     if key:
-        threading.Thread(target=_refresh_account, args=(key,), name="loopcut-account", daemon=True).start()
+        generation = _credential_generation
+        threading.Thread(target=_refresh_account, args=(key, on_done, generation), name="loopcut-account", daemon=True).start()
+    elif on_done:
+        on_done()
 
 
 def account_line() -> str:
@@ -402,10 +453,10 @@ def usage_lines() -> list[str]:
     if not account:
         return []
     lines = []
+    refused = allowance.refused_windows(account, state.ui.get("allowance_notice"))
     for key, label in (("session", "Session"), ("week", "Week")):
-        window = account.get(key) or {}
-        used = window.get("used")
-        if isinstance(used, (int, float)):
+        used = 1.0 if key in refused else allowance.used(account.get(key))
+        if used is not None:
             lines.append(f"{label}: {round(used * 100):d}% used")
     return lines
 

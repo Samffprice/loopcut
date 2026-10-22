@@ -4,6 +4,7 @@ import sys
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -27,6 +28,168 @@ def ids(display, kind):
 
 def hit(display, id):
     return next(h for h in display["hits"] if h["id"] == id)
+
+
+class LimitRecoveryTest(unittest.TestCase):
+    def test_refused_window_ring_and_tooltip_are_exhausted_without_mutating_usage(self):
+        account = {"plan": "free", "session": {"used": 0.82, "used_with_reservations": 0.92},
+                   "week": {"used": 0.48, "used_with_reservations": 0.58}}
+        before = deepcopy(account)
+        for window in ("session", "week"):
+            for reported in (account, None):
+                with self.subTest(window=window, reported=reported):
+                    card = self.card(window + "_limit")
+                    display = build(account=reported, allowance_notice={"item": card, "conversation": "other"})
+                    rings = [p for p in display["prims"] if p["t"] == "ring"]
+                    self.assertEqual(len(rings), 2)
+                    self.assertEqual((rings[1]["id"], rings[1]["share"]), ("input.ring." + window, 0.0))
+                    self.assertIn(f"{window.capitalize()}: 100% used, 0% left", hit(display, "input.rings")["tip"])
+        self.assertEqual(account, before)
+
+    def test_refusal_override_expires_at_reset_even_without_an_account_refresh(self):
+        from datetime import datetime, timezone
+        reset = datetime(2099, 10, 21, 18, tzinfo=timezone.utc).timestamp()
+        for window in ("session", "week"):
+            with self.subTest(window=window):
+                card = self.card(window + "_limit")
+                account = {"plan": "free", "session": {"used": 0.82}, "week": {"used": 0.42}}
+                notice = {"item": card}
+                before = build(account=account, allowance_notice=notice, now=reset - 1)
+                self.assertIn(f"{window.capitalize()}: 100% used, 0% left", hit(before, "input.rings")["tip"])
+                after = build(account=account, allowance_notice=notice, now=reset)
+                self.assertEqual(hit(after, "input.rings")["tip"], hit(build(account=account), "input.rings")["tip"])
+                self.assertFalse(any(p["id"].startswith("input.limit") for p in after["prims"]))
+
+    def test_unknown_reset_keeps_override_and_resolved_or_other_limits_do_not_override(self):
+        account = {"session": {"used": 0.82}}
+        for reset in ("", "bad date"):
+            card = self.card()
+            card["resets_at"] = reset
+            notice = {"item": card}
+            self.assertEqual(layout.ring_shares({}, 1, account, notice)[1][1], 0)
+            card["resolved"] = True
+            self.assertAlmostEqual(layout.ring_shares({}, 1, account, notice)[1][1], 0.18)
+        for reason in ("model_not_in_plan", "billing"):
+            self.assertAlmostEqual(layout.ring_shares({}, 1, account, {"item": self.card(reason)})[1][1], 0.18)
+
+    def test_old_cached_reset_does_not_cancel_a_fresh_refusal(self):
+        account = {"plan": "free", "session": {"used": 0.82, "resets_at": "2099-10-20T18:00:00Z"}}
+        self.assertEqual(layout.ring_shares({}, 1, account, {"item": self.card()})[1][1], 0)
+
+    def card(self, reason="session_limit"):
+        with patch.object(layout.config, "billing_open", return_value=True):
+            return state.item_limit("Chat allowance used.", reason, "free", "2099-10-21T18:00:00Z",
+                                    {"label": "Upgrade to Pro", "url": "https://loopcut.org/pricing"})
+
+    @patch.object(layout.config, "billing_open", lambda: True)
+    def test_newest_unresolved_limit_keeps_actions_after_scene_changes_and_notices(self):
+        session = state.new_session()
+        session["items"] = [self.card(), self.card(), state.item_changes("49 objects added", [], ""),
+                            state.item_notice("Scene saved.")]
+        drawn = build(session, chatgpt_plan=True)
+        self.assertFalse(any(h["id"].startswith("item0.limit.") for h in drawn["hits"]))
+        self.assertEqual(hit(drawn, "item1.limit.upgrade")["action"], ("limit_upgrade", 1))
+        self.assertEqual(hit(drawn, "item1.limit.chatgpt")["action"], ("limit_chatgpt", 1))
+        session["items"][1]["resolved"] = True
+        self.assertFalse(any(".limit.upgrade" in h["id"] for h in build(session)["hits"]),
+                         "resolving the latest card never revives older limits")
+        session["items"][1].update(resolved=False, status="done")
+        self.assertFalse(any(".limit.upgrade" in h["id"] for h in build(session)["hits"]))
+
+    @patch.object(layout.config, "billing_open", lambda: True)
+    def test_model_limit_keeps_fast_action_after_scene_changes(self):
+        session = state.new_session()
+        session["items"] = [self.card("model_not_in_plan"), state.item_changes("Objects added", [], "")]
+        self.assertEqual(hit(build(session), "item0.limit.fast")["action"], ("limit_fast", 0))
+
+    def test_credit_explanation_only_with_a_positive_balance(self):
+        session = state.new_session()
+        session["items"] = [self.card()]
+        sentence = "Your credits pay for cloud tools and do not add chat time."
+        for balance in (None, 0, 100):
+            drawn = build(session, credit_balance=balance)
+            text = " ".join(p.get("text", "") for p in drawn["prims"])
+            self.assertEqual(sentence in text, balance == 100)
+
+    def test_input_recovery_actions_stay_visible_and_match_card_at_narrow_width(self):
+        session = state.new_session()
+        card = self.card()
+        session["items"] = [card, state.item_changes("49 objects added", [], "")]
+        session["input"] = "make more details"
+        session["cursor"] = len(session["input"])
+        for width in (260, 420):
+            for billing in (False, True):
+                with self.subTest(width=width, billing=billing), \
+                        patch.object(layout.config, "billing_open", return_value=billing):
+                    drawn = layout.build(session, width, 900, 1, measure, ui={"allowance_notice": {"item": card, "conversation": session["id"]}, "chatgpt_plan": True})
+                    inputs = [h for h in drawn["hits"] if h["id"].startswith("input.limit.")]
+                    cards = [h for h in drawn["hits"] if h["id"].startswith("item0.limit.")]
+                    self.assertEqual([h["action"] for h in inputs], [h["action"] for h in cards])
+                    self.assertEqual(any(h["action"][0] == "limit_upgrade" for h in inputs), billing)
+                    text = " ".join(p.get("text", "") for p in drawn["prims"] if p["id"].startswith("input.limit.text"))
+                    self.assertIn("Resets " + state.reset_label(card["resets_at"]), text)
+                    for h in inputs:
+                        self.assertGreaterEqual(h["y"], 0)
+                        self.assertLess(h["y"] + h["h"], drawn["input"]["y"])
+                        self.assertLessEqual(h["x"] + h["w"], width)
+        # The account notice still offers recovery in a brand new conversation.
+        session["items"] = []
+        with patch.object(layout.config, "billing_open", return_value=True):
+            self.assertEqual(hit(build(session, allowance_notice={"item": card, "conversation": "another"}), "input.limit.upgrade")["action"],
+                             ("limit_upgrade", None))
+
+    def test_retry_requires_a_stopped_turn_in_this_conversation(self):
+        session = state.new_session()
+        card = self.card()
+        session["items"] = [card]
+        self.assertFalse(any(h["action"][0] == "limit_retry" for h in build(session)["hits"]))
+        session["messages"] = [{"role": "tool", "content": "Stopped after a tool."}]
+        self.assertEqual(hit(build(session), "item0.limit.retry")["action"], ("limit_retry", 0))
+        session["items"] = []
+        foreign = {"item": card, "conversation": "another"}
+        self.assertFalse(any(h["action"][0] == "limit_retry" for h in build(session, allowance_notice=foreign)["hits"]))
+        local = {"item": card, "conversation": session["id"]}
+        self.assertEqual(hit(build(session, allowance_notice=local), "input.limit.retry")["action"],
+                         ("limit_retry", session["id"]))
+        session["messages"].append({"role": "assistant", "content": "Done."})
+        self.assertFalse(any(h["action"][0] == "limit_retry" for h in build(session, allowance_notice=local)["hits"]))
+
+    def test_notice_names_concrete_options_and_explains_credits(self):
+        session = state.new_session()
+        card = self.card()
+        card["resets_at"] = ""
+        drawn = build(session, allowance_notice={"item": card, "conversation": session["id"]}, credit_balance=100)
+        text = " ".join(p.get("text", "") for p in drawn["prims"])
+        self.assertIn("Use my own API key", text)
+        self.assertIn("Sign in with ChatGPT", text)
+        self.assertNotIn("Try another route", text)
+        self.assertIn("Your credits pay for cloud tools and do not add chat time.", text)
+
+    def test_limit_card_formats_its_reset_in_local_time_too(self):
+        session = state.new_session()
+        card = self.card()
+        session["items"] = [card]
+        text = " ".join(p.get("text", "") for p in build(session)["prims"])
+        self.assertIn(state.reset_label(card["resets_at"]), text)
+        self.assertNotIn(card["resets_at"], text)
+
+    def test_reset_labels_use_explicit_local_date_or_short_relative_wait(self):
+        from datetime import datetime
+        reset = datetime(2026, 10, 22, 13, 0).astimezone()
+        stamp = reset.isoformat()
+        self.assertEqual(state.reset_label(stamp, now=reset.timestamp() - 2 * 86400),
+                         "Thu 22 Oct, 13:00 (your time)")
+        self.assertEqual(state.reset_label(stamp, now=reset.timestamp() - 4 * 3600), "in about 4 h")
+        self.assertEqual(state.reset_label(stamp, now=reset.timestamp() - 1200), "in under an hour")
+        self.assertEqual(state.reset_label("bad date"), "bad date")
+        self.assertEqual(state.reset_label(""), "")
+
+    def test_date_only_reset_keeps_its_calendar_date(self):
+        from datetime import datetime, timezone
+        midnight = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
+        for now in (midnight - 1200, midnight + 2 * 86400):
+            with self.subTest(now=now):
+                self.assertEqual(state.reset_label("2026-10-12", now=now), "2026-10-12")
 
 
 class InputPointTest(unittest.TestCase):
@@ -457,6 +620,23 @@ class FooterTest(unittest.TestCase):
                                "This conversation: 30.0k in, 2.0k out",
                                "Session: 25% used, 75% left", "Week: 50% used, 50% left"])
 
+    def test_reservations_drive_ring_tooltip_and_usage_note_with_defensive_fallback(self):
+        for value, expected in ((0.91, 0.91), ("0.9", 0.9), (0, 0), (1.2, 1),
+                                (None, 0.82), ("bad", 0.82), (float("nan"), 0.82),
+                                (float("inf"), 0.82), (-1, 0.82), (True, 0.82), ({}, 0.82), ([], 0.82)):
+            with self.subTest(value=value):
+                account = {key: {"used": 0.82, "used_with_reservations": value} for key in ("session", "week")}
+                display = build(account=account)
+                ring = next(p for p in display["prims"] if p["id"] == "input.ring.session")
+                self.assertAlmostEqual(ring["share"], 1 - expected)
+                for label in ("Session", "Week"):
+                    self.assertIn(f"{label}: {round(expected * 100)}% used, {round((1 - expected) * 100)}% left",
+                                  hit(display, "input.rings")["tip"])
+                self.assertEqual(layout.usage_note(account)[1], expected)
+        for window in (None, [], "bad", {"used": "nan", "used_with_reservations": False}):
+            display = build(account={"session": window, "week": window})
+            self.assertEqual(len([p for p in display["prims"] if p["t"] == "ring"]), 1)
+
     def test_without_an_account_there_is_one_ring(self):
         rings = [p for p in build()["prims"] if p["t"] == "ring"]
         self.assertEqual([r["id"] for r in rings], ["input.ring.context"])
@@ -517,6 +697,79 @@ class QueuedTest(unittest.TestCase):
         self.assertIn("item0.queued", ids(build(session), "prims"))
         del item["queued"]
         self.assertNotIn("item0.queued", ids(build(session), "prims"))
+
+    def test_note_explains_delivery_and_offers_one_action_while_helpers_run(self):
+        session = chat(wave(worker("a", "working")), busy=True)
+        note = dict(state.item_user("make it smaller"), queued=True)
+        session["items"].append(note)
+        display = build(session)
+        delivery = lambda display: " ".join(p["text"] for p in display["prims"]
+                                            if p["id"].startswith("item1.delivery."))
+        self.assertEqual(delivery(display),
+                         "Queued for the main agent; helper can read this before another request")
+        self.assertEqual(hit(display, "item1.send_now")["action"], ("send_queued_now", 1))
+        self.assertEqual(texts(display)["item1.send_now.label.l0"], "Stop helper and send now")
+        self.assertEqual([h["id"] for h in display["hits"] if h["id"].startswith("item1.")],
+                         ["item1.send_now"])
+        session["items"][0]["rows"][0]["status"] = "done"
+        display = build(session)
+        self.assertEqual(delivery(display), "Queued for the main agent")
+        self.assertNotIn("item1.send_now", ids(display, "hits"))
+
+    def test_delivery_is_conditional_during_work_checking_and_merging(self):
+        for status in ("working", "checking", "merging"):
+            for count in (1, 2):
+                with self.subTest(status=status, count=count):
+                    session = chat(wave(*(worker(str(n), status) for n in range(count))), busy=True)
+                    note = dict(state.item_user("smaller"), queued=True)
+                    session["items"].append(note)
+                    before = deepcopy(note)
+                    display = build(session)
+                    delivery = " ".join(p["text"] for p in display["prims"]
+                                        if p["id"].startswith("item1.delivery."))
+                    helper = "helper" if count == 1 else "helpers"
+                    self.assertEqual(delivery,
+                                     f"Queued for the main agent; {helper} can read this before another request")
+                    self.assertEqual(texts(display)["item1.send_now.label.l0"], f"Stop {helper} and send now")
+                    self.assertEqual(note, before, "the parent's card remains queued after helper delivery")
+
+    def test_sending_note_explains_the_stop_and_cannot_be_sent_twice(self):
+        session = chat(wave(worker("a", "working")), busy=True)
+        session["items"].append(dict(state.item_user("smaller"), queued=True, sending=True))
+        display = build(session)
+        delivery = " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item1.delivery."))
+        self.assertEqual(delivery, "Stopping helper; queued for the main agent")
+        self.assertNotIn("item1.send_now", ids(display, "hits"))
+
+    def test_note_and_action_wrap_within_a_narrow_card(self):
+        session = chat(wave(worker("a", "working")), busy=True)
+        note = dict(state.item_user("smaller"), queued=True)
+        session["items"].append(note)
+        for width, scale in ((240, 1), (420, 1.5)):
+            frame = layout.Frame(width, 600, scale, measure, session=session)
+            height = layout._item_user(frame, 1, note, 0, 0, width)
+            label = " ".join(p["text"] for p in frame.prims if p["id"].startswith("item1.send_now.label"))
+            self.assertEqual(label, "Stop helper and send now")
+            for p in frame.prims:
+                if p["t"] == "text":
+                    self.assertLessEqual(p["x"] + measure("ui", p["size"], p["text"]), width)
+                    self.assertLessEqual(p["y"] + p["h"], height)
+
+
+class DelegateDetailsTest(unittest.TestCase):
+    def test_arguments_stay_behind_details_even_in_an_open_or_awaiting_card(self):
+        for status in ("running", "awaiting", "done"):
+            item = state.item_tool("delegate", "Ask helpers", '{"workers": []}')
+            item.update(status=status, expanded=True)
+            session = chat(item)
+            display = build(session)
+            self.assertNotIn("item0.tool.code.bg", ids(display, "prims"))
+            self.assertEqual(hit(display, "item0.tool.details")["action"], ("toggle_details", 0))
+            self.assertEqual(texts(display)["item0.tool.details.label"], "Details")
+            item["details_expanded"] = True
+            display = build(session)
+            self.assertIn("item0.tool.code.bg", ids(display, "prims"))
+            self.assertEqual(texts(display)["item0.tool.details.label"], "Hide details")
 
 
 class StreamingIndicatorTest(unittest.TestCase):
@@ -1085,6 +1338,37 @@ def chat(item, busy=False):
 
 
 class WaveCardTest(unittest.TestCase):
+    def test_live_elapsed_time_latest_action_and_singular_step(self):
+        row = worker("a", "working", started_at=100, steps=1, summary="Adjust the shape")
+        session = chat(wave(row), busy=True)
+        display = build(session, now=165)
+        self.assertEqual(texts(display)["item0.wave.row0.detail"], "1m 05s · modeling · 1 step")
+        self.assertEqual(texts(display)["item0.wave.row0.summary.l0"], "Adjust the shape")
+        display = build(session, now=166)
+        self.assertIn("1m 06s", texts(display)["item0.wave.row0.detail"])
+        row.update(status="done", elapsed=66, steps=2)
+        self.assertEqual(texts(build(session, now=999))["item0.wave.row0.detail"],
+                         "1m 06s · modeling · 2 steps")
+
+    def test_reloaded_worker_does_not_keep_counting_time(self):
+        row = worker("a", "stopped", started_at=100, steps=1)
+        self.assertEqual(texts(build(chat(wave(row)), now=999))["item0.wave.row0.detail"], "modeling · 1 step")
+
+    def test_finished_row_keeps_status_final_summary_rounded_duration_role_steps_and_checks(self):
+        row = worker("a", "done", merged=True, started_at=100, elapsed=65.6, steps=2, checks="1/1",
+                     summary="Finished the shape.")
+        session = chat(wave(row))
+        for now in (166, 999, 9999):
+            display = build(session, now=now)
+            self.assertEqual(texts(display)["item0.wave.row0.status"], "merged")
+            self.assertEqual(texts(display)["item0.wave.row0.detail"], "1m 06s · modeling · 2 steps · checks 1/1")
+            self.assertEqual(texts(display)["item0.wave.row0.summary.l0"], "Finished the shape.")
+        for elapsed, expected in ((0.9, "modeling · 2 steps · checks 1/1"),
+                                  (1.1, "1s · modeling · 2 steps · checks 1/1"),
+                                  (59.6, "1m 00s · modeling · 2 steps · checks 1/1")):
+            row["elapsed"] = elapsed
+            self.assertEqual(texts(build(session, now=9999))["item0.wave.row0.detail"], expected)
+
     def test_a_row_per_worker_with_deliverable_status_steps_checks_and_note(self):
         item = wave(worker("armchair", "done", steps=14, checks="5/5"),
                     worker("floor_lamp", "working", steps=3, role="lighting", note="Rolled back an edit to Rug"))

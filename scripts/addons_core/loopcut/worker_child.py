@@ -1,10 +1,13 @@
 """A worker's background Blender. worker_host.Child starts it on the wave's spawn copy:
 
-    Blender -b --factory-startup --disable-autoexec <wave>/spawn.blend --python-exit-code 1 \\
-        --python worker_child.py -- --job <job> --worker <id> --in <fd> --out <fd>
+    Blender -b --factory-startup --disable-autoexec --python-exit-code 1 \\
+        --python worker_child.py -- --job <job> --worker <id> --spawn <wave>/spawn.blend --port <port> --parent <pid>
+
+The authentication token arrives on redirected stdin. Connect before loading the add-on or scene,
+so their failures keep the normal crash diagnostics and do not disable workers for the conversation.
 
 It runs the worker's scene tools and nothing else: no model calls, no keys (worker_ipc.child_env),
-no network. Requests come one per line on fd `in`, replies go out on fd `out` (worker_ipc); the
+no external network. Requests and replies use an authenticated loopback socket (worker_ipc); the
 serve loop runs on Blender's main thread, so bpy is safe with no timers. Ops:
 
 - init: stamp every local datablock with its spawn name (ownership.stamp_all), keep the spawn
@@ -18,7 +21,7 @@ serve loop runs on Blender's main thread, so bpy is safe with no timers. Ops:
   measures (facts), the deliverable when it does not exist (missing) and the contact sheet cell;
 - exit: leave at once.
 
-It dies with its parent: EOF on `in`, or a watchdog thread seeing its parent process change.
+It dies with its parent: EOF on the connection, or a watchdog thread seeing its parent exit.
 """
 
 import json
@@ -47,16 +50,18 @@ CRAFT_LOOK = ("Your checks pass. Your deliverable as the user will see it, in co
               "view. Compare it with the brief's style before you report.")
 
 
-def _watch_parent() -> None:
-    """Leave when the parent is gone: reparented (to launchd or init) means it died, even SIGKILLed.
+def _watch_parent(parent: int) -> None:
+    """Leave when the parent is gone: liveness on Windows, reparenting to launchd/init on POSIX.
     A thread, so it also fires while the serve loop waits; not while a native call holds the GIL,
     which is what worker_host.reap_orphans is for."""
-    parent = os.getppid()
+    from loopcut import jobs
 
     def watch():
         while True:
             time.sleep(WATCH_SECONDS)
-            if os.getppid() != parent:
+            # Windows retains the original parent PID after exit; it never reparents to init.
+            gone = not jobs._alive(parent) if os.name == "nt" else os.getppid() != parent
+            if gone:
                 os._exit(3)
     threading.Thread(target=watch, name="loopcut-worker-watchdog", daemon=True).start()
 
@@ -80,9 +85,13 @@ def _load_package():
     return module
 
 
-def _peak_rss_mb() -> float:
-    import resource
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+def _peak_rss_mb() -> float | None:
+    # Optional telemetry must never prevent the init/tool reply on Windows.
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, OSError):
+        return None
     return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)  # Bytes on macOS, KB on Linux.
 
 
@@ -141,7 +150,7 @@ class Worker:
                 channel.send(worker_ipc.Reply(-1, False, error=str(ex)).to_message())
                 continue
             if message is None:
-                _leave(0)  # The parent closed the pipe: it is gone or done with us.
+                _leave(0)  # The parent closed the connection: it is gone or done with us.
             try:
                 request = worker_ipc.Request.from_message(message)
             except worker_ipc.ProtocolError as ex:
@@ -513,15 +522,37 @@ def _leave(code: int) -> None:
     os._exit(code)  # No Blender shutdown: nothing is saved, no handlers run.
 
 
-def main() -> None:
-    _watch_parent()
-    _load_package()
-    from loopcut import worker_ipc
+def _connect():
+    # Load only the stdlib transport before authenticating, without executing the add-on package.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_loopcut_worker_ipc", PACKAGE / "worker_ipc.py")
+    worker_ipc = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = worker_ipc
+    spec.loader.exec_module(worker_ipc)
     args = worker_ipc.parse_child_args(sys.argv)
-    for fd in (args["in"], args["out"]):
-        os.set_inheritable(fd, False)  # A subprocess model code starts must not hold our pipes open.
-    channel = worker_ipc.Channel.from_fds(args["in"], args["out"])
-    Worker(args).serve(channel)
+    with sys.stdin.buffer as credentials:
+        token = worker_ipc.read_token(credentials)
+    return args, worker_ipc.connect(args["port"], token), worker_ipc
+
+
+def main() -> None:
+    args, channel, protocol = _connect()
+    try:
+        package = _load_package()
+        # Reuse the bootstrap module: Channel.receive and Worker.serve must share ProtocolError.
+        package.worker_ipc = protocol
+        sys.modules["loopcut.worker_ipc"] = protocol
+        _watch_parent(args["parent"])
+        if "FINISHED" not in bpy.ops.wm.open_mainfile(filepath=args["spawn"], use_scripts=False):
+            raise RuntimeError("could not open the worker's spawn scene")
+        Worker(args).serve(channel)
+    except Exception:
+        # Keep initialization failures in worker.log before EOF lets the parent reap this process.
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
+    finally:
+        channel.close()
 
 
 if __name__ == "__main__":

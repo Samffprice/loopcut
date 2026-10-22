@@ -281,6 +281,17 @@ class StartTurnTest(unittest.TestCase):
             self.assertEqual((turn.routed, turn.route_tried, session["messages"][-1][router.ROUTED]), (None, True, -1))
             self.assertIsNone(session["routing"])
 
+    def test_hosted_allowance_refusal_ends_the_turn_without_trying_the_orchestrator(self):
+        for reason in state.HOSTED_LIMITS:
+            with self.subTest(reason=reason):
+                session, turn = session_with(CORNER), a_turn()
+                model = FakeModel(llm.LLMError("Used up.", 402, reason))
+                with self.assertRaises(llm.LLMError) as error:
+                    router.start_turn(session, turn, CFG, lambda: False, model)
+                self.assertEqual(error.exception.code, reason)
+                self.assertEqual(len(model.requests), 1)
+                self.assertNotIn(router.ROUTED, session["messages"][-1])
+
     def test_a_stop_during_the_call_stops_the_turn(self):
         session, turn = session_with(CORNER), a_turn()
         with self.assertRaises(llm.Cancelled):

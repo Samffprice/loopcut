@@ -1,0 +1,112 @@
+# Worker Blenders on real Windows (2026-10-22): delegation never worked there (pass_fds), and this Mac can only
+# simulate the Windows branch. Runs the worker IPC tests, the plain-Python smoke test and the real-Blender worker
+# check against stock Blender 5.2.2. Only the add-on, its tests and the harness are checked out, without blobs
+# for the rest of the Blender tree.
+name: Windows workers
+
+on:
+  push:
+    branches: [fix/fs-windows-workers]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BLENDER_VERSION: "5.2.2"
+  # Stable release published 2026-02-22. SHA-256 is the GitHub release asset's published digest:
+  # https://api.github.com/repos/pal1000/mesa-dist-win/releases/assets/360211467
+  MESA_VERSION: "25.3.6"
+  MESA_URL: "https://github.com/pal1000/mesa-dist-win/releases/download/25.3.6/mesa3d-25.3.6-release-msvc.7z"
+  MESA_SHA256: "ca56d92bb2254a9a25557c95cfe27f02071a77b26daff4cbf9bc125ed3347fb5"
+  GALLIUM_DRIVER: llvmpipe
+
+jobs:
+  workers:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          filter: blob:none
+          sparse-checkout: |
+            scripts/addons_core/loopcut
+            loopcut/tests
+            loopcut/harness
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"  # The Python inside Blender 5.2.
+      - name: Temp folder the artifact step can find (the worker check uses tempfile.mkdtemp)
+        run: |
+          $t = Join-Path $env:RUNNER_TEMP "worker-tmp"
+          New-Item -ItemType Directory -Force $t | Out-Null
+          "TEMP=$t" >> $env:GITHUB_ENV
+          "TMP=$t" >> $env:GITHUB_ENV
+
+      - name: Worker IPC unit tests
+        working-directory: loopcut/tests
+        run: python -m unittest -v test_worker_ipc test_worker_startup
+
+      - name: Plain-Python IPC smoke test
+        run: python loopcut/tests/worker_ipc_smoke.py
+
+      - name: Cache Blender and Mesa
+        id: blender-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/blender
+          key: blender-${{ env.BLENDER_VERSION }}-windows-x64-mesa-${{ env.MESA_VERSION }}-${{ env.MESA_SHA256 }}
+
+      - name: Download Blender
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        run: |
+          $name = "blender-$env:BLENDER_VERSION-windows-x64"
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Invoke-WebRequest "https://download.blender.org/release/Blender5.2/$name.zip" -OutFile $zip
+          New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP "blender") | Out-Null
+          tar -xf $zip -C (Join-Path $env:RUNNER_TEMP "blender")
+
+      - name: Install Mesa llvmpipe next to Blender (no GPU on the runner)
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "mesa3d-$env:MESA_VERSION-release-msvc.7z"
+          Invoke-WebRequest $env:MESA_URL -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash
+          if ($actual -ne $env:MESA_SHA256) { throw "Mesa SHA-256 mismatch: $actual" }
+          $mesa = Join-Path $env:RUNNER_TEMP "mesa"
+          7z x $archive "-o$mesa" -y
+          if ($LASTEXITCODE -ne 0) { throw "Mesa extraction failed: $LASTEXITCODE" }
+          $blender = Join-Path $env:RUNNER_TEMP "blender\blender-$env:BLENDER_VERSION-windows-x64"
+          # Mesa 25.x's WGL loader and Gallium driver include llvmpipe; libglapi.dll is no longer needed.
+          foreach ($dll in @("opengl32.dll", "libgallium_wgl.dll")) {
+            Copy-Item (Join-Path $mesa "x64\$dll") -Destination $blender -ErrorAction Stop
+          }
+
+      - name: Real-Blender worker check, every case (informational)
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP "blender\blender-$env:BLENDER_VERSION-windows-x64\blender.exe"
+          & $exe -b --factory-startup --python-exit-code 1 --python loopcut/harness/worker_host_check.py -- --keep 2>&1 | Tee-Object -FilePath worker-check-all.log
+          exit $LASTEXITCODE
+
+      - name: Real-Blender worker check, required cases
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP "blender\blender-$env:BLENDER_VERSION-windows-x64\blender.exe"
+          & $exe -b --factory-startup --python-exit-code 1 --python loopcut/harness/worker_host_check.py -- --keep "round trip" rollback timeout "crash kit" stop keys tracking "killed parent" reap "import split" 2>&1 | Tee-Object -FilePath worker-check-required.log
+          exit $LASTEXITCODE
+
+      - name: Keep the logs and worker folders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-worker-check
+          path: |
+            worker-check-*.log
+            ${{ runner.temp }}/worker-tmp/loopcut-worker-check-*
+          if-no-files-found: ignore
+          retention-days: 14

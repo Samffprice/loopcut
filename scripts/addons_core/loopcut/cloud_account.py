@@ -237,10 +237,19 @@ def refusal(descriptor, policy):
             "disabled": "Tool unavailable."}.get(reason, "")
 
 
+def quoted(descriptor):
+    """Whether a managed call is priced by a server quote before its card shows: every paid tool, not only those
+    marked quote_required. credits_estimate prices a tool's default arguments (5 s of motion, a final model); the
+    quote prices this call's (3 s, a draft), and the job is charged what it says, so card and charge agree."""
+    cost = descriptor.get("cost") or {}
+    return bool(cost.get("quote_required")) or (_amount(cost.get("credits_estimate")) and cost["credits_estimate"] > 0)
+
+
 def approval_details(descriptor, quote=None):
     """Pure card text and the server's decision; the threshold is strictly greater-than. required says whether
     the server's own threshold asks; spending.decide adds the user's "Ask above", the chat budget and the burst
-    guard (C47). A quoted tool is decided on its quote, like an estimate."""
+    guard (C47). A quoted call is decided on its quote, like an estimate; without one (a quick check before the
+    call, cloud.needs_approval) a tool not marked quote_required is decided on its estimate."""
     if descriptor.get("backend") == "byok":
         provider = (descriptor.get("byok") or {}).get("provider", "vendor")
         vendor = {"openai": "OpenAI", "gemini": "Google Gemini", "elevenlabs": "ElevenLabs"}.get(provider, provider)
@@ -249,7 +258,7 @@ def approval_details(descriptor, quote=None):
     threshold = (descriptor.get("approval") or {}).get("confirm_over_credits", 50)
     if not _amount(threshold):
         raise cloud_http.CloudError("Invalid tool credit estimate", "invalid_response")
-    if cost.get("quote_required"):
+    if cost.get("quote_required") or quote is not None:
         if quote is None:
             return {"required": True, "text": "Getting a credit quote…", "credits": None, "threshold": threshold}
         if (not isinstance(quote, dict) or not isinstance(quote.get("quote_id"), str) or not quote["quote_id"]
@@ -316,7 +325,7 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
     try:
         # Quotes pass the same server limits as jobs (C47); an approved refusal's token also admits the job.
         _confirmed(lambda token: module.run(descriptor, clean, files, project=project, cancel=cancel, client=client,
-                                            **({"confirm_token": token} if token else {})),
+                                            quote=True, **({"confirm_token": token} if token else {})),
                    descriptor, arguments, cancel)
     except cloud_http.CloudError as ex:
         if ex.code != "quote_required":
@@ -345,7 +354,7 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
         if pending['quote']:
             arguments['quote_id'] = pending['quote']['quote_id']
     quote = None
-    if descriptor.get("backend") == "managed" and (descriptor.get("cost") or {}).get("quote_required"):
+    if descriptor.get("backend") == "managed" and quoted(descriptor):
         with runtime.lock:
             quote_id = arguments.get('quote_id')
             if runtime.quote_requests.get(quote_id) == arguments.fingerprint:
@@ -703,10 +712,14 @@ def panel_data(runtime):
         return {"credits": "", "today": "", "message": ""}
     with runtime.lock:
         billing = config.billing_open()
-        return {"credits": credits_label(runtime.manifest, runtime.signed_in) if billing else "",
+        data = {"credits": credits_label(runtime.manifest, runtime.signed_in) if billing else "",
                 "today": today_label(runtime.manifest, runtime.signed_in) if billing else "",
                 "message": "Saving account settings…" if getattr(runtime, "account_saving", False)
                 else getattr(runtime, "account_message", "")}
+        credit_balance = balance(runtime.manifest)
+        if credit_balance is not None:
+            data["credit_balance"] = credit_balance if runtime.signed_in else None
+        return data
 
 
 def tool_rows(runtime):

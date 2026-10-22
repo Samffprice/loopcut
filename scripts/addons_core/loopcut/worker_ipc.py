@@ -1,19 +1,21 @@
 """The protocol between the user's Blender and a worker's background Blender, with no Blender in it.
 
 A worker's model calls stay in the parent; its tools run in a child Blender started on the wave's
-spawn copy (07_m4_design §2.7). The two talk over a pair of inherited anonymous pipes: UTF-8 JSON,
+spawn copy (07_m4_design §2.7). The two talk over an authenticated loopback socket: UTF-8 JSON,
 one object per line, one request in flight, images passed as file paths. The child's stdout and
 stderr go to worker.log, so Blender's own prints never touch the protocol. json.dumps escapes a
 newline inside a string, so a line is always one whole message whatever the text holds.
 
-Checked on day 1 (Blender 5.2.2, macOS): Blender keeps fds passed with pass_fds open and prints
-nothing into them, so the multiprocessing.connection fallback the design kept in reserve is not
-needed.
+Only redirected standard streams are inherited. A fresh random token, delivered over stdin,
+admits one child, after which the listener closes. The transport works on Windows, macOS and Linux.
 """
 
 import json
 import os
 import re
+import secrets
+import socket
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,7 +30,7 @@ IMPORT_TOOLS = {"import_asset"}
 BAKE_TOOLS = {"bake_paint_masks"}  # 9.7 s on the calibration chest; ray tracing a heavy scene is slower.
 # The only variables a child inherits. Everything else, keys above all, stays in the parent: the
 # child's model-written code could print any of it.
-KEEP_ENV = ("PATH", "HOME", "LANG")
+KEEP_ENV = ("PATH", "HOME", "LANG", "SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
 SECRET_NAME = re.compile(r"(^|_)(KEY|TOKEN|SECRET|PASSWORD)S?$", re.IGNORECASE)
 WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")  # A folder name, from the orchestrator's brief.
 ENV_FILE = "child.env"
@@ -55,14 +57,18 @@ def decode(line: bytes) -> dict:
 
 
 class Channel:
-    """One side of the pipe pair: binary file objects, one message per line."""
+    """Binary streams over a socket, one message per line."""
 
-    def __init__(self, reader, writer):
+    def __init__(self, reader, writer, connection=None):
         self.reader, self.writer = reader, writer
+        self.connection = connection
+        self.closing = False
 
     @classmethod
-    def from_fds(cls, fd_in: int, fd_out: int) -> "Channel":
-        return cls(os.fdopen(fd_in, "rb"), os.fdopen(fd_out, "wb"))
+    def from_socket(cls, connection) -> "Channel":
+        connection.settimeout(None)  # Buffered readline must not time out part way through a message.
+        connection.set_inheritable(False)
+        return cls(connection.makefile("rb"), connection.makefile("wb"), connection)
 
     def send(self, message: dict) -> None:
         self.writer.write(encode(message))
@@ -70,17 +76,107 @@ class Channel:
 
     def receive(self) -> dict | None:
         """The next message, or None at EOF: the other side is gone."""
-        line = self.reader.readline()
+        try:
+            line = self.reader.readline()
+        except (ConnectionResetError, ConnectionAbortedError):
+            return None  # Windows reports a peer that died as a reset, not as EOF (CI, 2026-10-22).
+        except OSError:
+            if self.closing:
+                return None  # Windows fails a read blocked across our own shutdown (WinError 10060) instead of EOF.
+            raise
         if not line:
             return None
         return decode(line)
 
     def close(self) -> None:
+        # Wake a blocked reader before closing its buffered stream (which otherwise waits for it).
+        self.closing = True
+        if self.connection is not None:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         for stream in (self.writer, self.reader):
             try:
                 stream.close()
             except OSError:
                 pass
+        if self.connection is not None:
+            self.connection.close()
+
+
+def _receive_exact(connection, length: int) -> bytes:
+    data = b""
+    timeout = connection.gettimeout()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while len(data) < length:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("worker authentication timed out")
+            connection.settimeout(left)
+        part = connection.recv(length - len(data))
+        if not part:
+            raise ProtocolError("connection closed during authentication")
+        data += part
+    return data
+
+
+class Listener:
+    """A single-use, loopback-only rendezvous. Unauthenticated clients never reach the JSON parser."""
+
+    def __init__(self):
+        self.token = secrets.token_hex(32)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.socket.bind(("127.0.0.1", 0))
+            self.socket.listen(4)
+            self.port = self.socket.getsockname()[1]
+        except BaseException:
+            self.close()
+            raise
+
+    def accept(self, process, timeout: float, check_cancelled=None) -> Channel:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if check_cancelled is not None:
+                check_cancelled()
+            if process.poll() is not None:
+                raise ProtocolError(f"child exited before connecting (code {process.returncode})")
+            self.socket.settimeout(min(0.1, max(0.001, deadline - time.monotonic())))
+            try:
+                connection, _ = self.socket.accept()
+            except socket.timeout:
+                continue
+            try:
+                connection.settimeout(min(1.0, max(0.001, deadline - time.monotonic())))
+                token = _receive_exact(connection, len(self.token))
+                if not secrets.compare_digest(token, self.token.encode("ascii")):
+                    connection.close()
+                    continue
+                connection.sendall(b"OK")
+                channel = Channel.from_socket(connection)
+            except (OSError, ProtocolError):
+                connection.close()
+                continue
+            self.close()  # The token cannot admit another connection.
+            return channel
+        raise TimeoutError("worker connection timed out")
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+def connect(port: int, token: str, timeout: float = TIMEOUTS["init"]) -> Channel:
+    connection = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        connection.sendall(token.encode("ascii"))
+        if _receive_exact(connection, 2) != b"OK":
+            raise ProtocolError("worker authentication failed")
+        return Channel.from_socket(connection)
+    except BaseException:
+        connection.close()
+        raise
 
 
 # ------------------------------------------------------------------ messages
@@ -147,7 +243,9 @@ def timeout_for(op: str, name: str = "", arguments: dict | None = None, run_time
 # ------------------------------------------------------------------ starting a child
 
 def valid_worker_id(worker: str) -> bool:
-    return isinstance(worker, str) and bool(WORKER_ID.match(worker))
+    # Windows device names are reserved even with an extension, including directory names.
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    return isinstance(worker, str) and bool(WORKER_ID.fullmatch(worker)) and worker.upper() not in reserved
 
 
 def worker_dir(spawn_path: Path, worker: str) -> Path:
@@ -155,23 +253,43 @@ def worker_dir(spawn_path: Path, worker: str) -> Path:
     return Path(spawn_path).parent / worker
 
 
-def child_command(binary, spawn_path, script, job, worker: str, fd_in: int, fd_out: int) -> list[str]:
-    return [str(binary), "-b", "--factory-startup", "--disable-autoexec", str(spawn_path),
+def child_command(binary, spawn_path, script, job, worker: str, port: int) -> list[str]:
+    # Open the scene only after authentication: a broken scene is not a machine-wide IPC failure.
+    return [str(binary), "-b", "--factory-startup", "--disable-autoexec",
             "--python-exit-code", "1", "--python", str(script),
-            "--", "--job", str(job), "--worker", worker, "--in", str(fd_in), "--out", str(fd_out)]
+            "--", "--job", str(job), "--worker", worker, "--spawn", str(spawn_path), "--port", str(port),
+            "--parent", str(os.getpid())]
 
 
 def parse_child_args(argv: list[str]) -> dict:
-    """The child's side of child_command: {"job", "worker", "in", "out"} from what follows "--"."""
+    """The child's side of child_command: paths, port and the original parent PID. No secrets."""
     if "--" not in argv:
         raise ProtocolError("no arguments after --")
     rest, found = argv[argv.index("--") + 1:], {}
+    if len(rest) % 2:
+        raise ProtocolError("missing argument value")
     for flag, value in zip(rest[::2], rest[1::2]):
         found[flag.lstrip("-")] = value
-    missing = [k for k in ("job", "worker", "in", "out") if k not in found]
+    missing = [k for k in ("job", "worker", "spawn", "port", "parent") if k not in found]
     if missing:
         raise ProtocolError(f"missing {', '.join(missing)}")
-    return {"job": found["job"], "worker": found["worker"], "in": int(found["in"]), "out": int(found["out"])}
+    try:
+        port, parent = int(found["port"]), int(found["parent"])
+        if not 0 < port < 65536 or parent <= 0:
+            raise ValueError()
+        if not valid_worker_id(found["worker"]):
+            raise ValueError()
+    except ValueError:
+        raise ProtocolError("invalid worker connection arguments") from None
+    return {**found, "port": port, "parent": parent}
+
+
+def read_token(stream) -> str:
+    """Read the fixed-size bootstrap secret from redirected binary stdin, never argv or env."""
+    token = stream.readline(66)
+    if not re.fullmatch(rb"[0-9a-f]{64}\n", token):
+        raise ProtocolError("invalid worker authentication input")
+    return token[:-1].decode("ascii")
 
 
 def is_secret(name: str) -> bool:
@@ -192,10 +310,11 @@ def write_env_file(job_dir, run_timeout: float) -> Path:
 
 
 def child_env(job_dir, worker_folder, environ=None) -> dict[str, str]:
-    """The whole environment of a child: PATH, HOME and LANG from the parent, its own TMPDIR,
+    """The whole environment of a child: OS paths/locale from the parent, its own temp directory,
     LOOPCUT_WORKER=1 and LOOPCUT_ENV_FILE. Nothing named like a key, token or secret."""
     environ = os.environ if environ is None else environ
-    env = {name: environ[name] for name in KEEP_ENV if environ.get(name)}
-    env.update(TMPDIR=str(Path(worker_folder) / "tmp"), LOOPCUT_WORKER="1",
+    env = {name.upper(): value for name, value in environ.items() if name.upper() in KEEP_ENV and value}
+    temporary = str(Path(worker_folder) / "tmp")
+    env.update(TMPDIR=temporary, TMP=temporary, TEMP=temporary, LOOPCUT_WORKER="1",
                LOOPCUT_ENV_FILE=str(env_file(job_dir)))
     return {name: value for name, value in env.items() if not is_secret(name)}

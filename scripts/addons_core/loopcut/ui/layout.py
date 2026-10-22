@@ -10,7 +10,7 @@ import math
 import re
 from pathlib import Path
 
-from .. import config, spending, state
+from .. import allowance, config, spending, state
 from . import textedit
 from . import theme as T
 from .markdown import REFERENCE_LIMIT, split_markdown
@@ -174,6 +174,24 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
         text_height += f.px(4) if item["text"] else 0
         text_height += _image_chips(f, f"item{n}.image", x + pad, y + pad + text_height, width - 2 * pad,
                                     item["images"], removable=False)
+    if item.get("queued"):
+        helpers = sum(row.get("status") in state.WAVE_RUNNING
+                      for card in f.session["items"] if card.get("kind") == "wave"
+                      for row in card.get("rows", [])) if f.session.get("busy") else 0
+        sending = item.get("sending")
+        helper = "helper" if helpers == 1 else "helpers"
+        note = (f"Stopping {helper}; queued for the main agent" if sending else
+                f"Queued for the main agent; {helper} can read this before another request" if helpers else
+                "Queued for the main agent")
+        text_height += f.px(6) + f.paragraph(f"item{n}.delivery", x + pad, y + pad + text_height + f.px(6),
+                                            width - 2 * pad, note, small, T.TEXT_MUTED)
+        if helpers and not sending:
+            text_height += f.px(6)
+            action_height = f.paragraph(f"item{n}.send_now.label", x + pad, y + pad + text_height,
+                                        width - 2 * pad, f"Stop {helper} and send now", small, T.ACCENT)
+            f.hit(f"item{n}.send_now", x + pad, y + pad + text_height, width - 2 * pad, action_height,
+                  ("send_queued_now", n))
+            text_height += action_height
     if item.get("checkpoint"):
         text_height += _checkpoint_row(f, n, item, x + pad, y + pad + text_height, width - 2 * pad)
     height = text_height + 2 * pad
@@ -344,7 +362,14 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         for k, line in enumerate(item.get("ask_lines") or ()):
             cursor += f.paragraph(f"item{n}.tool.ask{k}", inner_x, cursor, inner_w, line, small,
                                   T.TEXT_MUTED if k == 0 and item.get("worker") else T.TEXT)
-    if expanded and item["code"]:
+    delegate = item["name"] == "delegate"
+    if expanded and delegate and item["code"]:
+        cursor += f.px(6)
+        f.button(f"item{n}.tool.details", inner_x, cursor,
+                 "Hide details" if item.get("details_expanded") else "Details", T.BUTTON_GHOST, T.TEXT_MUTED,
+                 ("toggle_details", n))
+        cursor += f.px(24)
+    if expanded and item["code"] and (not delegate or item.get("details_expanded")):
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
                                T.CODE_PREVIEW_LINES if awaiting else None)
@@ -534,7 +559,7 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 _LIMIT_TITLES = {"session_limit": "Session allowance used", "week_limit": "Weekly allowance used",
                  "model_not_in_plan": "Pro is not in your plan", "free_daily_limit": "Free Fast is used up for today"}
-HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit"}  # Loopcut's allowance, not the user's plan.
+HOSTED_LIMITS = state.HOSTED_LIMITS
 
 
 def _button_row(f: Frame, x, y, width, buttons) -> int:
@@ -586,9 +611,29 @@ def _item_offer(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
+def _limit_buttons(f: Frame, n: int | str | None, item: dict, id: str) -> list:
+    status, upgrade = item.get("status", ""), item.get("upgrade")
+    if not config.billing_open():
+        status = ""
+    buttons = []
+    if status == "" and upgrade and config.billing_open():
+        buttons.append((id + ".upgrade", upgrade.get("label") or "Upgrade", T.BUTTON, T.BUTTON_TEXT,
+                        ("limit_upgrade", n)))
+    if item["reason"] in HOSTED_LIMITS and status == "":
+        buttons.append((id + ".chatgpt", "Switch to ChatGPT plan", T.BUTTON_GHOST, T.TEXT, ("limit_chatgpt", n))
+                       if f.ui.get("chatgpt_plan") else
+                       (id + ".chatgpt", "Sign in with ChatGPT", T.BUTTON_GHOST, T.TEXT, ("sign_in", "chatgpt")))
+        buttons.append((id + ".key", "Use my own API key", T.BUTTON_GHOST, T.TEXT, ("own_key", None)))
+    if item["reason"] == "model_not_in_plan":
+        buttons.append((id + ".fast", "Use Fast instead", T.BUTTON_GHOST, T.TEXT, ("limit_fast", n)))
+    if n is not None and state.can_resume(f.session):
+        buttons.append((id + ".retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
+    return buttons
+
+
 def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     """Out of allowance: what ran out, what the next plan offers, and the button that gets it.
-    The buttons show on the newest card only; older ones are history."""
+    The buttons show on the newest unresolved limit; older ones are history."""
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
@@ -600,34 +645,32 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
         title, body, color = "Upgraded", item["text"], T.OK
     elif status == "waiting":
         title, color = "Waiting for your upgrade", T.WARN
-        body = "Finish in the browser. Loopcut picks this conversation up by itself once the plan is active."
+        body = "Finish in the browser. Loopcut refreshes your plan and available models when it is active."
     else:
         title, color = _LIMIT_TITLES.get(item["reason"], "Allowance used"), T.WARN
         if not config.billing_open() and item["reason"] == "model_not_in_plan":
             title = "Model unavailable"
         body = item["text"] + (f"\n{upgrade['note']}" if upgrade and upgrade.get("note") else "")
+        if item.get("resets_at"):
+            reset = state.reset_label(item["resets_at"], now=f.ui.get("now"))
+            body = body.replace(item["resets_at"], reset)
+            if reset not in body:
+                body += f"\nResets {reset}."
         if item["reason"] in HOSTED_LIMITS:  # M7: a ChatGPT plan can carry on where Loopcut's allowance stopped.
             if f.ui.get("chatgpt_plan"):
                 body += "\nYour ChatGPT plan can carry on now."
             elif item["reason"] != "free_daily_limit":  # The server's free_daily_limit text already says it.
                 body += "\nHave ChatGPT Plus or Pro? It can run Loopcut now."
+        balance = f.ui.get("credit_balance")
+        if item["reason"] in HOSTED_LIMITS and isinstance(balance, (int, float)) and balance > 0:
+            body += "\nYour credits pay for cloud tools and do not add chat time."
     f.text(f"item{n}.limit.title", inner_x, cursor, title, size, color)
     cursor += f.line_height(size) + f.px(4)
     cursor += f.paragraph(f"item{n}.limit.text", inner_x, cursor, inner_w, body, small, T.TEXT)
-    newest = n == len(f.session["items"]) - 1
+    newest = n == state.latest_limit(f.session["items"])
     if newest and status != "done" and not f.session.get("busy"):
         cursor += f.px(8)
-        buttons = []
-        if status == "" and upgrade:
-            buttons.append((f"item{n}.limit.upgrade", upgrade.get("label") or "Upgrade", T.BUTTON, T.BUTTON_TEXT,
-                            ("limit_upgrade", n)))
-        if item["reason"] in HOSTED_LIMITS and status == "":
-            buttons.append((f"item{n}.limit.chatgpt", "Switch to ChatGPT plan", T.BUTTON_GHOST, T.TEXT, ("limit_chatgpt", n))
-                           if f.ui.get("chatgpt_plan") else
-                           (f"item{n}.limit.chatgpt", "Sign in with ChatGPT", T.BUTTON_GHOST, T.TEXT, ("sign_in", "chatgpt")))
-        if item["reason"] == "model_not_in_plan":
-            buttons.append((f"item{n}.limit.fast", "Use Fast instead", T.BUTTON_GHOST, T.TEXT, ("limit_fast", n)))
-        buttons.append((f"item{n}.limit.retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("resume", n)))
+        buttons = _limit_buttons(f, n, item, f"item{n}.limit")
         cursor += _button_row(f, inner_x, cursor, inner_w, buttons)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.limit.card", "x": x, "y": y, "w": width, "h": height,
@@ -709,12 +752,18 @@ def _worker_status(row: dict) -> str:
     return "merged" if status == "done" else f"{status} · merged"
 
 
-def _worker_detail(row: dict) -> str:
-    """The row's second line: role, steps taken, checks passed (also for older saved rows with a cap)."""
+def _worker_detail(row: dict, now: float = 0) -> str:
+    """Elapsed time, role, steps and checks. A saved duration stays frozen."""
     steps = row.get("steps") or 0
     parts = [row.get("role", "")]
     if steps or row.get("status") not in ("queued", "starting"):
-        parts.append(f"{steps} steps")
+        parts.append(f"{steps} step{'s' if steps != 1 else ''}")
+    elapsed = row.get("elapsed")
+    if elapsed is None and row.get("started_at") is not None and row.get("status") in state.WAVE_RUNNING:
+        elapsed = max(0, now - row["started_at"])
+    if elapsed is not None and elapsed >= 1:
+        minutes, seconds = divmod(round(elapsed), 60)
+        parts.insert(0, f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s")
     if row.get("checks"):
         parts.append(f"checks {row['checks']}")
     return " · ".join(p for p in parts if p)
@@ -752,9 +801,13 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
             f.hit(f"{id}.cancel", right - f.px(4), cursor - f.px(2), label_width + f.px(8), small_height + f.px(4),
                   ("worker_cancel", (item["wave"], row["id"])), "Stop this worker; the others carry on")
             right -= f.px(10)
-        f.text(f"{id}.detail", name_x, cursor, _ellipsize(f, _worker_detail(row), small, right - name_x), small,
+        f.text(f"{id}.detail", name_x, cursor,
+               _ellipsize(f, _worker_detail(row, f.ui.get("now", 0)), small, right - name_x), small,
                T.TEXT_MUTED)
         cursor += small_height
+        if row.get("summary"):
+            cursor += f.paragraph(f"{id}.summary", name_x, cursor, inner_x + inner_w - name_x,
+                                  row["summary"], small, T.TEXT_MUTED)
         if row.get("note"):
             cursor += f.paragraph(f"{id}.note", name_x, cursor, inner_x + inner_w - name_x, row["note"], small,
                                   T.TEXT_FAINT)
@@ -1098,6 +1151,25 @@ def _chip_rows(f: Frame, id: str, x: int, y: int, width: int, session: dict) -> 
 
 def _input_notice(f: Frame, y: int) -> int:
     """Transient feedback above the controls; the host's regular poll redraws it at expiry."""
+    notice = f.ui.get("allowance_notice")
+    item = notice.get("item") if notice else None
+    if item and item.get("reason") in allowance.LIMIT_WINDOWS \
+            and allowance.refused_window(f.ui.get("account"), notice, f.ui.get("now")) is None:
+        item = None
+    if item and not f.session.get("busy"):
+        pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+        width = f.width - 2 * pad
+        reset = state.reset_label(item.get("resets_at", ""), now=f.ui.get("now"))
+        line = f"Chat allowance used. Resets {reset}." if reset else "Chat allowance used."
+        balance = f.ui.get("credit_balance")
+        if isinstance(balance, (int, float)) and balance > 0:
+            line += " Your credits pay for cloud tools and do not add chat time."
+        height = f.paragraph("input.limit.text", pad, y, width, line, small, T.WARN) + f.px(6)
+        n = next((n for n, row in enumerate(f.session.get("items", [])) if row is item), None)
+        if n is None and notice.get("conversation") == f.session.get("id"):
+            n = f.session["id"]
+        return height + _button_row(f, pad, y + height, width,
+                                   _limit_buttons(f, n, item, "input.limit")) + f.px(6)
     notice = f.ui.get("action_notice")
     if not notice or f.ui.get("now", 0.0) >= notice["until"]:
         return 0
@@ -1110,7 +1182,7 @@ def input_height(f: Frame, session: dict) -> int:
     pad, card_pad = f.px(T.PAD), f.px(T.CARD_PAD)
     inner_w = f.width - 2 * pad - 2 * card_pad
     size, _, visible = _input_lines(f, session, inner_w)
-    measuring = Frame(f.width, f.height, f.scale, f.measure, ui=f.ui)  # Measure wrapped chips and notice.
+    measuring = Frame(f.width, f.height, f.scale, f.measure, session=session, ui=f.ui)
     chips = _chip_rows(measuring, "measure", 0, 0, inner_w, session)
     chips += f.px(6) if chips else 0
     return (visible * f.line_height(size) + 2 * card_pad + f.px(26) + 2 * pad
@@ -1338,7 +1410,8 @@ def _context_row(f: Frame, x: int, y: int, width: int) -> None:
     f.text("input.context.label", left + f.px(21), text_y, label, small, T.TEXT_MUTED)
 
 
-def usage_lines(usage: dict, budget: int, account: dict | None) -> list[str]:
+def usage_lines(usage: dict, budget: int, account: dict | None, notice: dict | None = None,
+                now: float | None = None) -> list[str]:
     """The numbers behind the two rings, for their tooltip: the latest request against the
     budget it is compacted at, the conversation's total, and the account's windows."""
     context, total_in, total_out = usage.get("context", 0), usage.get("input", 0), usage.get("output", 0)
@@ -1346,23 +1419,27 @@ def usage_lines(usage: dict, budget: int, account: dict | None) -> list[str]:
     lines = [f"Context: {_k(context)} of {_k(budget)} tokens{share} before compaction"]
     if total_in or total_out:
         lines.append(f"This conversation: {_k(total_in)} in, {_k(total_out)} out")
+    refused = allowance.refused_windows(account, notice, now)
     for key, label in (("session", "Session"), ("week", "Week")):
-        used = ((account or {}).get(key) or {}).get("used")
-        if isinstance(used, (int, float)):
+        used = 1.0 if key in refused else allowance.used((account or {}).get(key))
+        if used is not None:
             lines.append(f"{label}: {round(used * 100)}% used, {round(max(0.0, 1 - used) * 100)}% left")
     return lines
 
 
-def ring_shares(usage: dict, budget: int, account: dict | None) -> list[tuple[str, float, tuple]]:
+def ring_shares(usage: dict, budget: int, account: dict | None, notice: dict | None = None,
+                now: float | None = None) -> list[tuple[str, float, tuple]]:
     """(id, fill, color) per ring, left to right: context used, then what is left of the session
-    window when the account meters one."""
+    window when the account meters one. A weekly refusal focuses the allowance ring on that window."""
     context = usage.get("context", 0)
     share = min(1.0, context / budget) if budget else 0.0
     rings = [("context", share, T.ERROR if share >= 1 else T.WARN if share >= 0.8 else T.ACCENT)]
-    used = ((account or {}).get("session") or {}).get("used")
-    if isinstance(used, (int, float)):
+    refused = allowance.refused_windows(account, notice, now)
+    window = allowance.refused_window(account, notice, now) or next(iter(sorted(refused)), "session")
+    used = 1.0 if refused else allowance.used((account or {}).get(window))
+    if used is not None:
         left = max(0.0, min(1.0, 1 - used))
-        rings.append(("session", left, T.ERROR if left < 0.1 else T.WARN if left < 0.3 else T.OK))
+        rings.append((window, left, T.ERROR if left < 0.1 else T.WARN if left < 0.3 else T.OK))
     return rings
 
 
@@ -1378,7 +1455,7 @@ def usage_note(account: dict | None) -> tuple[str, float]:
     glance, else ("", share)."""
     best = ("", 0.0)
     for key in ("week", "session"):
-        used = ((account or {}).get(key) or {}).get("used")
+        used = allowance.used((account or {}).get(key))
         if isinstance(used, (int, float)) and used > best[1]:
             best = (f"{round(used * 100)}% of {key} used", float(used))
     return best if best[1] >= SHOW_USAGE_FROM else ("", best[1])
@@ -1489,13 +1566,14 @@ def _rings(f: Frame, session: dict, right: int, y: int, height: int) -> None:
     compacted at, and what is left of the session's allowance. The tooltip has the numbers."""
     diameter, thickness, gap = f.px(14), f.px(3), f.px(6)
     usage, budget, account = session.get("usage") or {}, int(f.ui.get("context_budget") or 0), f.ui.get("account")
-    rings = ring_shares(usage, budget, account)
+    notice, now = f.ui.get("allowance_notice"), f.ui.get("now")
+    rings = ring_shares(usage, budget, account, notice, now)
     total = len(rings) * diameter + (len(rings) - 1) * gap
     left, top = right - total, y + (height - diameter) // 2
     for n, (id, share, color) in enumerate(rings):
         f.ring(f"input.ring.{id}", left + n * (diameter + gap), top, diameter, share, thickness, color)
     f.hit("input.rings", left - f.px(4), y, total + f.px(8), height, ("noop", None),
-          tip="\n".join(usage_lines(usage, budget, account)))
+          tip="\n".join(usage_lines(usage, budget, account, notice, now)))
 
 
 def _input(f: Frame, session: dict, top: int, model: str) -> None:

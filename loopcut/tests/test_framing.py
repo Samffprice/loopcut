@@ -10,6 +10,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -37,6 +38,65 @@ def cloud(seed: int, count: int = 300) -> list:
 def box(center=(0.0, 0.0, 0.0), size=(2.0, 2.0, 2.0)) -> list:
     return [tuple(c + s / 2 * sign for c, s, sign in zip(center, size, signs))
             for signs in ((x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1))]
+
+
+class ParentGeometryTest(unittest.TestCase):
+    def test_camera_parent_uses_only_visible_descendants_and_instances(self):
+        class Object:
+            def __init__(self, name, kind="MESH", visible=True, children=()):
+                self.name, self.type, self.children_recursive = name, kind, children
+                self.original = self
+                self.visible_get = lambda **kwargs: visible
+
+        leaf = Object("Visible")
+        hidden = Object("Hidden", visible=False)
+        instance_owner = Object("Instance", "EMPTY")
+        nested = Object("Nested", "EMPTY", children=[leaf, hidden, instance_owner])
+        parent = Object("Parent", "EMPTY", children=[nested, leaf, hidden, instance_owner])
+        instanced = Object("Instanced geometry", visible=False)  # Its visible instancer owns visibility.
+        instances = [types.SimpleNamespace(object=o, is_instance=False, matrix_world=None)
+                     for o in (parent, nested, leaf, hidden)]
+        instances.append(types.SimpleNamespace(object=instanced, is_instance=True, parent=instance_owner,
+                                               matrix_world=None))
+        depsgraph = types.SimpleNamespace(object_instances=instances, view_layer=object())
+        numpy = types.SimpleNamespace(vstack=lambda arrays: [p for a in arrays for p in a])
+        with mock.patch.dict(sys.modules, {"numpy": numpy}), \
+                mock.patch.object(camera, "_local_points", side_effect=lambda obj, budget: [obj.name]), \
+                mock.patch.object(camera, "_world", side_effect=lambda points, matrix: points):
+            rows, notes = camera._geometry([parent], depsgraph)
+        self.assertEqual(rows, {"Parent": ["Visible", "Instanced geometry"]})
+        self.assertEqual(notes, [])
+
+    def test_viewport_bounds_use_transformed_descendants_not_parent_origin(self):
+        class Vector(tuple):
+            def __add__(self, other):
+                return Vector(a + b for a, b in zip(self, other))
+
+            def __sub__(self, other):
+                return Vector(a - b for a, b in zip(self, other))
+
+            def __truediv__(self, value):
+                return Vector(a / value for a in self)
+
+            @property
+            def length(self):
+                return math.sqrt(sum(a * a for a in self))
+
+        class Transform:
+            def __matmul__(self, point):
+                return point + Vector((20, -5, 10))
+
+        child = types.SimpleNamespace(name="Child", type="MESH", bound_box=box(), matrix_world=Transform(),
+                                      visible_get=lambda: True)
+        hidden = types.SimpleNamespace(name="Hidden", type="MESH", bound_box=box(size=(200, 200, 200)),
+                                       visible_get=lambda: False)
+        for kind in ("EMPTY", "LIGHT", "ARMATURE", "MESH"):
+            parent = types.SimpleNamespace(name="Parent", type=kind, bound_box=[(-1, -1, -1)] * 8,
+                                           children_recursive=[child, hidden])
+            with self.subTest(kind=kind), mock.patch.dict(sys.modules, {"mathutils": types.SimpleNamespace(Vector=Vector)}):
+                center, radius = tools._bounding_sphere([parent, child])
+            self.assertEqual(center, (20, -5, 10))
+            self.assertAlmostEqual(radius, math.sqrt(3))
 
 
 class FrameTest(unittest.TestCase):

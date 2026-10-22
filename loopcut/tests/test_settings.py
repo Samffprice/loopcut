@@ -142,6 +142,68 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "doesn't support IDProperties"):
                 access()
 
+    def test_both_model_pickers_keep_current_model_when_plan_locks_the_choice(self):
+        account = self.settings.account
+        state = importlib.import_module(NAME + ".state")
+        rows = [{"id": "fast", "display_name": "Fast", "available": True, "default": True},
+                {"id": "pro", "display_name": "Pro", "available": False,
+                 "unlock_plan": {"id": "pro", "name": "Pro"}},
+                {"id": "max", "display_name": "Opus", "available": False,
+                 "unlock_plan": {"id": "max", "name": "Max"}}]
+        for billing in (False, True):
+            for pick in (self.settings.choose_model, self.settings.set_tier):
+                for model, plan in (("pro", "Pro"), ("max", "Max")):
+                    with self.subTest(billing=billing, picker=pick.__name__, model=model), \
+                            patch.object(self.settings, "preferences", return_value=self.prefs), \
+                            patch.object(self.settings.config, "billing_open", return_value=billing), \
+                            patch.dict(account._state, models=rows):
+                        self.prefs.provider, self.prefs.tier, self.prefs.model = "LOOPCUT", "fast", "fast"
+                        session = state.reset()
+                        pick(model)
+                        self.assertEqual((self.prefs.tier, self.prefs.model), ("fast", "fast"))
+                        notice = session["items"][-1]
+                        self.assertEqual(notice["text"], f"{account.model_label(model)} needs the {plan} plan.")
+                        self.assertEqual(notice["action_label"], f"Upgrade to {plan}" if billing else "")
+                        if billing:
+                            self.assertIn(f"reason=model_not_in_plan&plan={model}", notice["url"])
+                        else:
+                            self.assertEqual(notice["url"], "")
+
+    def test_available_hosted_model_and_own_provider_still_switch(self):
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.account, "models", return_value=[{"id": "pro", "available": True}]):
+            self.prefs.provider = "LOOPCUT"
+            self.settings.choose_model("pro")
+            self.assertEqual(self.prefs.tier, "pro")
+            self.prefs.provider = "OPENAI"
+            self.settings.choose_model("own-model")
+            self.assertEqual(self.prefs.model, "own-model")
+
+    def test_sign_out_clears_the_old_accounts_allowance_notice(self):
+        state = importlib.import_module(NAME + ".state")
+        with patch.dict(state.ui, allowance_notice={"item": {}}, warned_session_allowance=("free", "reset")):
+            self.settings.account._set_account(None)
+            self.assertNotIn("allowance_notice", state.ui)
+            self.assertNotIn("warned_session_allowance", state.ui)
+
+    def test_loopcut_model_changes_keep_notice_but_other_providers_clear_it(self):
+        state = importlib.import_module(NAME + ".state")
+        card = state.item_limit("Used up.", "session_limit", "free", "", None)
+        with patch.dict(state.ui, allowance_notice={"item": card}), \
+                patch.object(self.settings, "_changed"):
+            self.prefs.provider = "LOOPCUT"
+            self.prefs.tier = "pro"
+            self.settings._provider_changed(self.prefs, None)
+            self.assertIs(state.ui["allowance_notice"]["item"], card)
+            self.prefs.tier = "fast"
+            self.settings._provider_changed(self.prefs, None)
+            self.assertIs(state.ui["allowance_notice"]["item"], card)
+            for provider in ("CHATGPT", "OPENAI"):
+                state.ui["allowance_notice"] = {"item": card}
+                self.prefs.provider = provider
+                self.settings._provider_changed(self.prefs, None)
+                self.assertNotIn("allowance_notice", state.ui)
+
     def test_signed_out_defaults_and_toggles_use_saved_hidden_fields(self):
         for runtime in (None, self.runtime):
             with self.subTest(runtime=runtime), patch.object(self.cloud, "_runtime", runtime):

@@ -196,6 +196,9 @@ def config_changed() -> None:
 
 
 def _provider_changed(self, context) -> None:
+    if self.provider != "LOOPCUT":
+        from . import state
+        state.clear_allowance_notice(invalidate=True)
     _, _, base_url, model, _ = _BY_ID[self.provider]
     if self.provider == "LOOPCUT":
         self.base_url, self.model = base_url, self.tier
@@ -770,8 +773,7 @@ def choose_model(model_id: str) -> None:
     if prefs is None or not model_id:
         return
     if prefs.provider == "LOOPCUT":
-        if model_id in {m["id"] for m in account.models()}:
-            prefs.tier = model_id  # _tier_changed copies it to the model and reloads the config.
+        set_tier(model_id)
     else:
         prefs.model = model_id
 
@@ -810,6 +812,24 @@ def set_tier(tier: str) -> None:
     """Pick a model of the Loopcut service by alias, as the model menu would."""
     prefs = preferences()
     if prefs is not None and prefs.provider == "LOOPCUT":
+        model = next((m for m in account.models() if m["id"] == tier), None)
+        if model is None:
+            return
+        if not model["available"]:
+            from . import state
+            unlock = model.get("unlock_plan") or {}
+            plan = str(unlock.get("name") or unlock.get("id") or "Pro")
+            text = f"{model['label']} needs the {plan} plan."
+            billing = config.billing_open()
+            url = config.pricing_url("model_not_in_plan", str(unlock.get("id") or "pro")) if billing else ""
+            session = state.session()
+            notice = state.item_notice(text, f"Upgrade to {plan}" if billing else "", url=url)
+            if billing:
+                notice["plan_upgrade"] = (state.ui.get("account") or {}).get("plan", "free")
+            session["items"].append(notice)
+            session["scroll"] = 0.0
+            _changed()
+            return
         prefs.tier = tier  # _tier_changed copies it to the model and reloads the config.
 
 

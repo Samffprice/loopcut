@@ -116,8 +116,9 @@ class RuntimeReviewTest(RuntimeFixture):
 
     def test_cancel_while_waiting_for_consent_removes_preparation_files(self):
         from loopcut import llm
-        runtime = self.runtime(Reply(manifest(tool(cost={'credits_estimate': 100, 'quote_required': False}))))
-        runtime.refresh()
+        runtime = self.runtime(Reply(manifest(tool(cost={'credits_estimate': 100, 'quote_required': False}))),
+                               Reply({'quote_id': 'qt_1', 'credits': 100, 'expires_at': '2099-01-01T00:00:00Z'}))
+        runtime.refresh()  # The quote's reply: every paid call is priced before its consent card.
         with patch.object(cloud_jobs, 'resolve_files', return_value={}):
             prepared = cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'prop'})
         with cloud_account.approval_context(Mock(side_effect=llm.Cancelled())), self.assertRaises(llm.Cancelled):
@@ -135,6 +136,35 @@ class RuntimeReviewTest(RuntimeFixture):
                 self.assertRaises(cloud_http.CloudError) as caught:
             cloud_account.recheck(runtime, descriptor, snapshot)
         self.assertEqual(caught.exception.code, 'account_changed')
+
+
+class QuotingModule:
+    """cloud_jobs as authorize sees it: every paid call is priced first (cloud_account.quoted), and the server
+    answers with a quote. Whatever run a test assigns sees only the submissions; a quote_required tool's own
+    quote stays the test's."""
+    def __init__(self, run):
+        self.quotes = 0
+        self.run = run
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, Priced(self, value) if name == "run" else value)
+
+
+class Priced:
+    """A test's run behind the server's quote; its own attributes (a Mock's call_args_list) stay readable."""
+    def __init__(self, module, run):
+        self.module, self.submit = module, run
+
+    def __call__(self, descriptor, arguments, files, quote=False, **kwargs):
+        if quote and not arguments.get("quote_id") and not descriptor["cost"].get("quote_required"):
+            self.module.quotes += 1
+            raise cloud_http.CloudError("Quote", "quote_required", extra={
+                "quote_id": f"qt_{self.module.quotes}", "credits": descriptor["cost"]["credits_estimate"],
+                "expires_at": "later"})
+        return self.submit(descriptor, arguments, files, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.submit, name)
 
 
 class ConsentReviewTest(unittest.TestCase):
@@ -187,7 +217,7 @@ class RetryReviewTest(unittest.TestCase):
             if self.lose_reply:
                 raise cloud_http.CloudError('Lost acknowledgement', 'connection_failed')
             return job()
-        self.module = types.SimpleNamespace(run=run)
+        self.module = QuotingModule(run)
 
     def call(self, arguments=None):
         with cloud_account.approval_context(lambda details: True):

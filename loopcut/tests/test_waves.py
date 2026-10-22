@@ -251,6 +251,447 @@ class BudgetTest(unittest.TestCase):
         self.assertFalse(hasattr(budget, "max_steps"))
 
 
+class WorkerSteerTest(unittest.TestCase):
+    """Real worker hooks and loop, with requests replaced in process; no server or Blender."""
+
+    def setUp(self):
+        self.data = tempfile.TemporaryDirectory()
+        self.addCleanup(self.data.cleanup)
+        from prompt_index_fixture import index_patch
+        for patcher in (index_patch(),
+                        mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": self.data.name}),
+                        mock.patch.object(ownership, "expand_owns", return_value=set()),
+                        mock.patch.object(checkpoints, "ensure_for_wave", return_value="cp"),
+                        mock.patch.object(agent, "_redraw")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        cfg = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast", reasoning_effort="low",
+                            auto_run=True, auto_look=False, max_steps=0, context_budget=40_000)
+        self.session = state.reset()
+        self.turn = agent.Turn()
+        self.turn.roles = config.Roles(orchestrator=cfg, worker=cfg, orchestrate=True)
+        self.session.update(busy=True, turn=self.turn)
+        self.session["items"].append(state.item_user("make a small object"))
+        self.wave = self.prepare()
+        self.job = self.wave.job
+        self.addCleanup(lambda: [conversations.FOLDERS.pop(w.session["id"], None) for w in self.crew])
+        self.crew = []
+
+    def prepare(self):
+        plan = orchestrator.normalise_wave({"workers": [
+            {"id": name, "deliverable": name.upper(), "role": "modeling", "prefix": name.upper(),
+             "requirements": [{"quote": "small", "do": "small"}], "checks": []} for name in ("a", "b")]})
+        return waves.prepare(self.session, self.turn, plan, message_index=0,
+                             save_spawn=lambda folder: types.SimpleNamespace(wave=str(folder), tokens={}),
+                             scene_context=lambda text: "scene")
+
+    def worker(self, index=0, wave=None):
+        worker = waves.Worker(wave or self.wave, (wave or self.wave).plan["workers"][index], index)
+        worker.started = worker.wave.job.budget.clock()
+        worker.wave.first_reply.set()
+        self.crew.append(worker)
+        return worker
+
+    def take_step(self, worker, step):
+        worker.before_request(step)
+        agent._fold_notes(worker.session, worker.turn)
+
+    def steers(self, session):
+        return [m["content"] for m in session["messages"] if m.get(context.STEER)]
+
+    def worker_steer(self, text):
+        return f"<steer>{workers.STEER_INSTRUCTION}\n\n{text}</steer>"
+
+    def test_running_and_queued_workers_each_read_corrections_once_and_parent_keeps_them(self):
+        first, queued = self.worker(0), self.worker(1)
+        self.take_step(first, 1)
+        for text in ("make it smaller", "also red"):
+            self.assertTrue(agent.send(text))
+        for worker in (first, queued):
+            self.take_step(worker, 2)
+            self.take_step(worker, 3)
+            self.assertEqual(self.steers(worker.session),
+                             [self.worker_steer("make it smaller"), self.worker_steer("also red")])
+        self.assertEqual(len(self.turn.notes), 2, "worker delivery does not consume the orchestrator's notes")
+        self.assertTrue(all(item.get("queued") for _, item in self.turn.notes))
+        agent._fold_notes(self.session, self.turn)
+        self.assertEqual(self.steers(self.session), ["<steer>make it smaller</steer>", "<steer>also red</steer>"])
+        self.assertFalse(any(i.get("queued") for i in self.session["items"]))
+
+    def test_a_note_arriving_during_the_first_reply_wait_reaches_that_request(self):
+        worker = self.worker(1)
+        self.wave.first_reply = mock.Mock()
+        self.wave.first_reply.is_set.return_value = False
+        self.wave.first_reply.wait.side_effect = lambda timeout: agent.send("smaller")
+        self.take_step(worker, 1)
+        self.assertEqual(self.steers(worker.session), [self.worker_steer("smaller")])
+
+    def test_cancel_as_first_reply_wait_ends_does_not_consume_notes_or_request(self):
+        worker = self.worker(1)
+        agent.send("smaller")
+        self.wave.first_reply = mock.Mock()
+        self.wave.first_reply.is_set.return_value = False
+
+        def released(timeout):
+            worker.turn.cancel.set()
+            return True  # The first worker's failed startup releases the wait concurrently with Stop.
+
+        self.wave.first_reply.wait.side_effect = released
+        with mock.patch.object(agent, "_request", return_value=llm.Completion(text="done")) as requested:
+            agent.run_loop(worker.session, worker.turn, worker.spec)
+        requested.assert_not_called()
+        self.assertEqual(worker.turn.outcome, "cancelled")
+        self.assertEqual((worker.steps, worker.steer_index, self.job.budget.steps), (0, 0, 0))
+        self.assertEqual(self.steers(worker.session), [])
+        self.assertEqual([text for text, _ in self.turn.notes], ["smaller"])
+
+    def test_retry_keeps_its_cursor_and_reads_new_notes(self):
+        worker = self.worker()
+        agent.send("smaller")
+        self.take_step(worker, 1)
+        cancel = worker.turn.cancel
+        worker.turn = worker._new_turn(cancel)
+        agent.send("red")
+        self.take_step(worker, 1)
+        self.assertIs(worker.turn.cancel, cancel)
+        self.assertEqual(self.steers(worker.session), [self.worker_steer("smaller"), self.worker_steer("red")])
+
+    def test_new_wave_has_earlier_notes_in_its_opening_and_only_receives_later_steers(self):
+        agent.send("smaller")
+        later = self.prepare()
+        worker = self.worker(wave=later)
+        self.assertIn("smaller", later.openings[worker.id])
+        self.take_step(worker, 1)
+        self.assertEqual(self.steers(worker.session), [])
+        agent.send("red")
+        self.take_step(worker, 2)
+        self.assertEqual(self.steers(worker.session), [self.worker_steer("red")])
+
+    def test_loop_folds_a_workers_note_before_requesting(self):
+        worker = self.worker()
+        agent.send("smaller")
+
+        def request(session, turn, cfg, spec):
+            self.assertEqual(self.steers(session), [self.worker_steer("smaller")])
+            self.assertFalse(turn.notes)
+            return llm.Completion(text="done")
+
+        with mock.patch.object(agent, "_request", side_effect=request) as requested:
+            agent.run_loop(worker.session, worker.turn, worker.spec)
+        self.assertEqual(worker.turn.outcome, "completed")
+        requested.assert_called_once()
+        self.assertEqual(len(self.turn.notes), 1)
+
+    def test_ordinary_worker_requests_have_no_correction_instruction(self):
+        worker = self.worker()
+
+        def request(session, *args):
+            self.assertEqual(self.steers(session), [])
+            self.assertNotIn(workers.STEER_INSTRUCTION, json.dumps(session["messages"]))
+            return llm.Completion(text="done")
+
+        with mock.patch.object(agent, "_request", side_effect=request) as requested:
+            agent.run_loop(worker.session, worker.turn, worker.spec)
+        requested.assert_called_once()
+
+    def run_worker(self, worker, request):
+        registry = Registry()
+        self.wave.make_runtime = lambda wave, worker: FakeRuntime(registry, worker)
+        with mock.patch.object(agent, "_request", side_effect=request):
+            worker._work()
+        return registry
+
+    def stop_workers(self):
+        waves.stop(self.job)
+        scheduler = self.job.scheduler
+        if scheduler is not None:
+            scheduler.join(2)
+            self.assertFalse(scheduler.is_alive())
+
+    def test_blocking_startup_keeps_steering_available_and_notes_precede_first_requests(self):
+        registry = Registry()
+        entered = [threading.Event(), threading.Event()]
+        release = threading.Event()
+
+        def runtime(wave, worker):
+            child = FakeRuntime(registry, worker)
+
+            def start():
+                FakeRuntime.start(child)
+                entered[worker.index].set()
+                if not release.wait(3):
+                    raise AssertionError("test did not release startup")
+            child.start = start
+            return child
+
+        def request(session, *args):
+            self.assertEqual(self.steers(session), [self.worker_steer("smaller")])
+            return llm.Completion(tool_calls=[llm.ToolCall("r1", "report_back", '{"summary":"Built it."}')])
+
+        self.wave.make_runtime = runtime
+        sent = []
+        sender = threading.Thread(target=lambda: sent.append(agent.send("smaller")), daemon=True)
+        with mock.patch.object(agent, "_request", side_effect=request) as requested:
+            try:
+                waves.start(self.wave, self.turn.cancel.is_set, lambda fn: fn())
+                self.crew += self.wave.crew
+                self.assertTrue(all(event.wait(2) for event in entered), "both children prewarm concurrently")
+                requested.assert_not_called()
+                sender.start()
+                sender.join(1)
+                self.assertFalse(sender.is_alive(), "startup must not hold job.lock against steering")
+                self.assertEqual(sent, [True])
+                requested.assert_not_called()
+                release.set()
+                for worker in self.crew:
+                    worker.thread.join(2)
+                    self.assertFalse(worker.thread.is_alive())
+                    self.assertEqual(worker.status, "done")
+                    self.assertEqual(worker.steer_index, 1)
+                self.assertEqual(requested.call_count, 2)
+                self.assertEqual([text for text, _ in self.turn.notes], ["smaller"])
+            finally:
+                release.set()
+                if sender.ident is not None:
+                    sender.join(2)
+                self.stop_workers()
+
+    def test_send_now_during_startup_waits_for_cleanup_before_resending(self):
+        registry = Registry()
+        entered, cleaning, release = threading.Event(), threading.Event(), threading.Event()
+
+        def runtime(wave, worker):
+            child = FakeRuntime(registry, worker)
+
+            def start():
+                FakeRuntime.start(child)
+                entered.set()
+                if not worker.turn.cancel.wait(3):
+                    raise AssertionError("test did not cancel startup")
+                cleaning.set()
+                if not release.wait(3):
+                    raise AssertionError("test did not release startup cleanup")
+                raise llm.Cancelled()
+            child.start = start
+            return child
+
+        self.wave.make_runtime = runtime
+        self.turn.config = self.turn.roles.orchestrator
+        spec = agent.LoopSpec(role="orchestrator", system=lambda session: "", schemas=lambda: [],
+                              save=lambda session: None, asks=False, checkpoints=False, changes_card=False,
+                              scene_changed=lambda result: False, on_end=waves.end_turn)
+        parent = threading.Thread(target=agent.run_loop,
+                                  args=(self.session, self.turn, spec,
+                                        lambda *args: waves.run_wave(self.wave, self.turn.cancel.is_set, lambda fn: fn())),
+                                  daemon=True)
+        with mock.patch.object(agent, "_request", return_value=llm.Completion(
+                tool_calls=[llm.ToolCall("d1", "delegate", "{}")])) as requested, \
+                mock.patch.object(agent, "_resend_on_main") as resent, \
+                mock.patch.object(agent, "_restore_input_on_main") as restored:
+            parent.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.crew += self.wave.crew
+                self.assertTrue(agent.send("smaller"))
+                self.assertTrue(agent.send_queued_now())
+                self.assertTrue(cleaning.wait(2))
+                parent.join(0.2)
+                self.assertTrue(parent.is_alive(), "send now must wait for startup to unwind")
+                resent.assert_not_called()
+                release.set()
+                parent.join(2)
+                self.assertFalse(parent.is_alive())
+                self.assertEqual(self.turn.outcome, "cancelled")
+                requested.assert_called_once()  # Only the orchestrator's delegate; no worker model spend.
+                resent.assert_called_once_with("smaller")
+                restored.assert_not_called()
+                self.assertTrue(all(w.finished is not None and w.status == "stopped" for w in self.crew))
+                self.assertFalse(self.session.get("workers_unavailable"))
+            finally:
+                self.turn.cancel.set()
+                release.set()
+                parent.join(2)
+                self.stop_workers()
+
+    def test_failed_boot_keeps_healthy_worker_steerable_and_wait_only_until_collected(self):
+        from loopcut.worker_host import WorkerUnavailable
+        registry = Registry()
+        entered, release = threading.Event(), threading.Event()
+
+        def runtime(wave, worker):
+            child = FakeRuntime(registry, worker)
+
+            def start():
+                FakeRuntime.start(child)
+                if worker.index == 0:
+                    if not entered.wait(2):
+                        raise AssertionError("healthy sibling did not start")
+                    raise WorkerUnavailable("cannot connect")
+                entered.set()
+                if not release.wait(3):
+                    raise AssertionError("test did not release healthy startup")
+            child.start = start
+            return child
+
+        def request(session, *args):
+            self.assertIs(session, healthy.session)
+            self.assertEqual(self.steers(session), [self.worker_steer("smaller")])
+            return llm.Completion(tool_calls=[llm.ToolCall("r1", "report_back", '{"summary":"Built it."}')])
+
+        spec = types.SimpleNamespace(schemas=lambda: orchestrator.SCHEMAS)
+        self.wave.make_runtime = runtime
+        with mock.patch.object(agent, "_request", side_effect=request) as requested:
+            try:
+                waves.start(self.wave, self.turn.cancel.is_set, lambda fn: fn())
+                self.crew += self.wave.crew
+                failed, healthy = self.crew
+                self.assertTrue(entered.wait(2))
+                failed.thread.join(2)
+                self.assertFalse(failed.thread.is_alive())
+                self.assertEqual(failed.status, "failed")
+                self.assertEqual(failed.retries, 0)
+                self.assertTrue(self.session["workers_unavailable"])
+                failed.reported = True  # The first delegate result has already reported this failure.
+                self.assertIn(orchestrator.WAIT_SCHEMA, agent._session_schemas(self.session, spec))
+                self.assertIn("Still running: b", waves.unavailable_note(self.session))
+                requested.assert_not_called()
+                self.assertTrue(agent.send("smaller"))
+                release.set()
+                healthy.thread.join(2)
+                self.assertFalse(healthy.thread.is_alive())
+                self.assertEqual(healthy.status, "done")
+                requested.assert_called_once()
+                self.assertEqual(failed.steer_index, 0)
+                self.assertEqual(healthy.steer_index, 1)
+                self.assertEqual([text for text, _ in self.turn.notes], ["smaller"])
+                self.assertIn(orchestrator.WAIT_SCHEMA, agent._session_schemas(self.session, spec))
+                self.assertIn("Ready to collect: b", waves.unavailable_note(self.session))
+
+                def report(job, batch, *args):
+                    self.assertIs(job, self.job)
+                    self.assertEqual(batch, [healthy])
+                    healthy.reported = True
+                    return tools.ToolResult("Healthy result merged.")
+
+                waiting = orchestrator.delegate(wait=True)
+                with mock.patch.object(waves, "report", side_effect=report):
+                    self.assertEqual(waiting.then(lambda: False, lambda fn: fn()).text, "Healthy result merged.")
+                self.assertNotIn("delegate", {s["function"]["name"] for s in agent._session_schemas(self.session, spec)})
+            finally:
+                release.set()
+                self.stop_workers()
+
+    def test_worker_finishing_its_outstanding_reply_does_not_consume_a_late_correction(self):
+        worker = self.worker()
+
+        def request(session, turn, cfg, spec):
+            self.assertEqual(worker.steps, 1)
+            self.assertTrue(agent.send("Make A smaller"))
+            self.assertEqual(self.steers(session), [])
+            return llm.Completion(tool_calls=[llm.ToolCall("r1", "report_back", '{"summary":"A built."}')])
+
+        with mock.patch.object(agent, "_resend_on_main") as resent, \
+                mock.patch.object(agent, "_restore_input_on_main") as restored:
+            self.run_worker(worker, request)
+        self.assertEqual(worker.steps, 1, "the final reply needs no further request")
+        self.assertEqual(worker.status, "done")
+        self.assertIsNotNone(worker.finished)
+        self.assertEqual(worker.steer_index, 0)
+        self.assertEqual(self.steers(worker.session), [])
+        self.assertEqual(self.job.steers, ["Make A smaller"])
+        self.assertEqual([text for text, _ in self.turn.notes], ["Make A smaller"])
+        self.assertTrue(self.turn.notes[0][1]["queued"])
+        resent.assert_not_called()
+        restored.assert_not_called()
+
+    def test_targeted_correction_keeps_both_deliverables_scoped_and_reports_the_unrelated_request(self):
+        first, other = self.worker(0), self.worker(1)
+        self.assertTrue(agent.send("Make A smaller"))
+
+        def request(session, turn, cfg, spec):
+            # A scripted model exercises the delivery contract and tool/report paths, not language understanding.
+            note, = self.steers(session)
+            self.assertIn("Reconsider requirements that conflict", note)
+            self.assertIn("Change only what clearly applies to your deliverable", note)
+            self.assertIn("Report unclear or unrelated requests to the orchestrator", note)
+            self.assertIn("Your ownership and merge restrictions still apply", note)
+            self.assertIn("Make A smaller", note)
+            if session is first.session:
+                self.assertIn("deliverable: A", session["messages"][0]["content"])
+                if first.steps == 1:
+                    return llm.Completion(tool_calls=[llm.ToolCall("c1", "run_python",
+                                          '{"code":"resize own object", "summary":"Make A smaller"}')])
+                report = {"summary": "A made smaller."}
+            else:
+                self.assertIn("deliverable: B", session["messages"][0]["content"])
+                report = {"summary": "B unchanged; the correction names A.", "question": "Please route this to A."}
+            return llm.Completion(tool_calls=[llm.ToolCall("r1", "report_back", json.dumps(report))])
+
+        built = self.run_worker(first, request)
+        unchanged = self.run_worker(other, request)
+        self.assertEqual(built.scene, {"A_Part": "a"})
+        self.assertEqual(unchanged.scene, {})
+        self.assertEqual((first.status, other.status), ("done", "question"))
+        self.assertEqual(first.row["summary"], "A made smaller.")
+        self.assertIn("B unchanged", other.row["summary"])
+        self.assertEqual(other.report["question"], "Please route this to A.")
+        self.assertEqual(len(self.steers(first.session)), 1)
+        self.assertEqual(len(self.steers(other.session)), 1)
+        self.assertEqual(len(self.turn.notes), 1, "the parent still reviews the correction and both reports")
+
+    def test_cancelled_worker_never_restores_its_copy_of_a_note_into_the_users_input(self):
+        worker = self.worker()
+        agent.send("smaller")
+        worker.before_request(1)
+        worker.turn.cancel.set()
+        with mock.patch.object(agent, "_restore_input_on_main") as restored, \
+                mock.patch.object(agent, "_resend_on_main") as resent:
+            agent.run_loop(worker.session, worker.turn, worker.spec)
+        self.assertEqual(worker.turn.outcome, "cancelled")
+        restored.assert_not_called()
+        resent.assert_not_called()
+        self.assertEqual(len(self.turn.notes), 1, "the orchestrator still owns delivery")
+
+    def test_steps_wait_for_a_reply_and_latest_action_uses_the_tool_summary(self):
+        worker = self.worker()
+        worker.before_request(1)
+        self.assertEqual(worker.row["steps"], 0)
+        worker.on_usage({})
+        self.assertEqual(worker.row["steps"], 1)
+        worker.ready.set()
+        worker.runtime = mock.Mock()
+        worker.runtime.run_tool.return_value = tools.ToolResult("changed")
+        worker.run_tool("run_python", json.dumps({"code": "pass", "summary": "Adjust the shape"}))
+        self.assertEqual(worker.row["summary"], "Adjust the shape")
+        worker.before_request(2)
+        self.assertEqual(worker.row["steps"], 1, "the next pending request has not progressed yet")
+
+    def test_stop_prevents_delivery_and_elapsed_time_is_kept_when_the_worker_ends(self):
+        worker = self.worker()
+        clock_time = [50]
+        runtime = mock.Mock()
+        runtime.kill.side_effect = lambda: clock_time.__setitem__(0, 75)
+        worker.wave.make_runtime = mock.Mock(return_value=runtime)
+        worker.started = 10
+        with mock.patch.object(worker, "_end"), mock.patch.object(agent, "run_loop"), \
+                mock.patch.object(self.job.budget, "clock", side_effect=lambda: clock_time[0]):
+            worker.report = {"summary": "Finished the shape."}
+            worker._work()
+        self.assertEqual(worker.row["elapsed"], 65, "the saved duration includes child cleanup")
+        self.assertEqual(worker.row["summary"], "Finished the shape.")
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        from loopcut.ui import layout
+        for now in (999, 9999):
+            self.assertEqual(layout._worker_detail(worker.row, now), "1m 05s · modeling · 0 steps")
+            self.assertEqual(layout._worker_detail(loaded["items"][1]["rows"][0], now),
+                             "1m 05s · modeling · 0 steps")
+        self.assertEqual(loaded["items"][1]["rows"][0]["summary"], "Finished the shape.")
+        waves.stop(self.job)
+        waves.steer(self.job, "smaller")
+        self.assertEqual(self.job.steers, [])
+
+
 class WaveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -411,12 +852,24 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(worker["usage"], {"input": 2000, "cached": 800, "output": 100, "requests": 2})
         self.assertAlmostEqual(worker["usd"], (1200 * 0.15 + 800 * 0.03 + 100 * 0.5) / 1e6)
         self.assertEqual(worker["peak_rss_mb"], 300)
+        for row in wave.item["rows"]:
+            row["elapsed"] = 65.6  # A fixed saved duration; the fake requests' runtime varies between runs.
         from loopcut.ui import layout  # The panel draws the cards the wave made, as they are.
         display = layout.build(self.session, 420, 2000, 1.0, lambda font, size, text: len(text) * size * 0.6, "fast",
                                None, {"selection": [], "context_budget": 24_000, "account": None})
         drawn = {p["id"]: p.get("text") for p in display["prims"]}
         self.assertEqual((drawn["item1.wave.row0.status"], drawn["item1.wave.row1.detail"]),
-                         ("merged", "modeling · 2 steps · checks 1/1"), "a merged worker's row says so")
+                         ("merged", "1m 06s · modeling · 2 steps · checks 1/1"), "a merged worker's row says so")
+        self.assertEqual(drawn["item1.wave.row1.summary.l0"], "Table built.")
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        for session in (self.session, loaded):
+            redrawn = layout.build(session, 420, 2000, 1.0, lambda font, size, text: len(text) * size * 0.6,
+                                    "fast", None, {"now": time.time() + 9999})
+            text = {p["id"]: p.get("text") for p in redrawn["prims"]}
+            self.assertEqual(text["item1.wave.row0.status"], "merged")
+            self.assertEqual(text["item1.wave.row1.detail"], "1m 06s · modeling · 2 steps · checks 1/1")
+            self.assertEqual(text["item1.wave.row1.summary.l0"], "Table built.")
         self.assertEqual(drawn["item2.merge.l2.l0"], "LIGHT:A_Test /a (kept aside)")
         self.assertIn("item2.merge.accept", {h["id"] for h in display["hits"]})
 
@@ -1247,7 +1700,7 @@ class WaveTest(unittest.TestCase):
         wave = self.wave(["a"])
         result = self.run_wave(wave)
         self.assertEqual(self.rows(wave), {"a": "partial"}, "its checks pass, its report says done: still partial")
-        self.assertIn("[a] A · modeling · partial · 1 steps · checks 1/1 · deliverable missing: no A in its copy "
+        self.assertIn("[a] A · modeling · partial · 1 step · checks 1/1 · deliverable missing: no A in its copy "
                       "at report time", result.text)
         self.assertIn("flags (its words vs measured): deliverable missing: no object named A in its copy", result.text)
         logged = self.logged()["a"]

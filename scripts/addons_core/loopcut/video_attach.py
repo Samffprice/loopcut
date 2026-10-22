@@ -99,7 +99,7 @@ def start(session: dict, path: Path, start_seconds: float, end_seconds: float | 
     env = {k: v for k, v in os.environ.items() if not k.startswith("LOOPCUT_")}
     with (folder / "worker.log").open("ab") as log:
         process = subprocess.Popen(worker_command(folder), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                   start_new_session=True, env=env)
+                                   start_new_session=os.name != "nt", env=env)
     session["video_reserved"] = session.get("video_reserved", 0) + spec["max_sheets"]
     _running[clip_id] = {"process": process, "session": session, "folder": folder, "name": path.name,
                          "reserved": spec["max_sheets"], "started": time.monotonic()}

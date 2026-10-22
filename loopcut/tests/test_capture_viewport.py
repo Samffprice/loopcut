@@ -49,7 +49,8 @@ class CaptureTest(unittest.TestCase):
         self.scene = types.SimpleNamespace(
             render=types.SimpleNamespace(engine="BLENDER_WORKBENCH", resolution_x=1920, resolution_y=1080),
             camera=mock.Mock(name="Camera"),
-            objects=[types.SimpleNamespace(name="Cube", type="MESH", visible_get=lambda: True)],
+            objects=[types.SimpleNamespace(name="Cube", type="MESH", visible_get=lambda: True,
+                                           bound_box=[(-1, -1, -1), (1, 1, 1)])],
             view_settings=types.SimpleNamespace(view_transform="AgX"))
         self.scene.camera.name = "Camera"
         self.shading = Shading(self.scene)
@@ -65,7 +66,7 @@ class CaptureTest(unittest.TestCase):
             context=types.SimpleNamespace(scene=self.scene, evaluated_depsgraph_get=lambda: None))))
         self.enterContext(mock.patch.object(tools, "_editor_context", return_value=contextlib.nullcontext()))
         self.enterContext(mock.patch.object(tools, "_view3d_override", return_value=override))
-        self.enterContext(mock.patch.object(tools, "_framed_view", return_value=(None, None, mock.Mock())))
+        self.framed = self.enterContext(mock.patch.object(tools, "_framed_view", return_value=(None, None, mock.Mock())))
         self.labels = self.enterContext(mock.patch.object(tools, "_labels", return_value=[("Cube", 10.0, 20.0)]))
         self.enterContext(mock.patch.object(tools, "_nearest_first", return_value=""))
         self.enterContext(mock.patch.object(tools.scratch, "folder", return_value=self.folder))
@@ -106,6 +107,41 @@ class CaptureTest(unittest.TestCase):
         for engine in ("BLENDER_EEVEE", "CYCLES", "CUSTOM_ENGINE"):
             with self.subTest(engine=engine):
                 self.capture(engine, engine)
+
+    def test_parent_focus_frames_visible_geometry_at_every_sheet_angle(self):
+        cube = self.scene.objects[0]
+        hidden = types.SimpleNamespace(name="Hidden", type="MESH", visible_get=lambda: False,
+                                       bound_box=[(-100, -100, -100), (100, 100, 100)])
+        nested = types.SimpleNamespace(name="Nested", type="EMPTY", visible_get=lambda: True,
+                                       children_recursive=[cube, hidden])
+        parent = types.SimpleNamespace(name="Group", type="EMPTY", visible_get=lambda: True,
+                                       children_recursive=[nested, cube, hidden])
+        self.scene.objects.extend([parent, nested, hidden])
+        tools.bpy.data = types.SimpleNamespace(objects={o.name: o for o in self.scene.objects})
+        for angle in ("front", "sheet"):
+            with self.subTest(angle=angle):
+                self.framed.reset_mock()
+                self.look(focus=[parent.name, cube.name], angle=angle)
+                # A sheet also computes the three-quarter eye for the nearest-first list.
+                self.assertEqual(self.framed.call_count, 5 if angle == "sheet" else 1)
+                for call in self.framed.call_args_list:
+                    self.assertEqual(call.args[1], [cube])
+
+    def test_geometry_free_mesh_and_hidden_only_parent(self):
+        cube = self.scene.objects[0]
+        parent = types.SimpleNamespace(name="Group", type="MESH", bound_box=[(-1, -1, -1)] * 8,
+                                       children_recursive=[cube])
+        tools.bpy.data = types.SimpleNamespace(objects={parent.name: parent})
+        self.look(focus=[parent.name])
+        self.assertEqual(self.framed.call_args.args[1], [cube])
+        cube.visible_get = lambda: False
+        with self.assertRaisesRegex(tools.ToolError, "Nothing visible to frame"):
+            self.look(focus=[parent.name])
+
+    def test_geometry_target_keeps_its_own_bounds(self):
+        cube = self.scene.objects[0]
+        cube.children_recursive = [types.SimpleNamespace(name="Distant", type="MESH")]
+        self.assertEqual(tools._framing_targets([cube]), [cube])
 
     def test_draw_exception_restores_engine_shading_overlays_and_lighting(self):
         for engine, shading in (("BLENDER_WORKBENCH", "SOLID"), ("BLENDER_WORKBENCH", "RENDERED"),

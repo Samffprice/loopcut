@@ -6,6 +6,7 @@ server-refusal retry goes through cloud_account.submit and cloud_jobs.run agains
 
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -460,7 +461,7 @@ class ServerRefusalTest(unittest.TestCase):
         self.assertEqual(seen["ask"], spending.DAILY)
         self.assertEqual(seen["ask_link"], "https://loopcut.org/account")
         self.assertIn("Today's cloud spending limit of 100 credits is reached.", seen["ask_lines"])
-        self.assertIn("Balance 500 → 494 credits", seen["ask_lines"])
+        self.assertIn("Balance 500 → 480 credits", seen["ask_lines"])  # The quote's 20, not the 6 estimated.
         self.assertEqual(len(self.posts), 2)
         self.assertNotIn("x-loopcut-confirm", self.posts[0][0])
         self.assertEqual(self.posts[1][0]["x-loopcut-confirm"], TOKEN)
@@ -749,6 +750,94 @@ class SettingsTest(unittest.TestCase):
             with patch.object(config, "_preference_values", return_value={"LOOPCUT_CHAT_BUDGET_CREDITS": "0"}), \
                     patch.object(config, "_find_env_file", return_value=None), self.assertRaises(config.ConfigError):
                 config.spending()
+
+
+# The server's price for each per-unit tool (loopcut-web src/lib/pricing/price-card.ts, 2026-10-21), and the
+# estimate its descriptor carries: the price of the tool's default arguments.
+SERVER_PRICE = {
+    "motion_from_text": (10, lambda a: 2 * max(1, math.ceil(a["duration_s"] - 1e-9))),  # 2/s, 5 s default.
+    "image_to_3d": (80, lambda a: 25 if a.get("quality") == "draft" else 80),
+    "image_generate": (6, lambda a: 20 if a.get("quality") == "high" else 6),
+    "sfx": (4, lambda a: 4 + math.ceil(max(0, a["duration_seconds"] - 6) / 2 - 1e-9)),
+}
+
+
+class QuotedPriceTest(unittest.TestCase):
+    """Every paid call's card shows the server's price for its own arguments, not the descriptor's estimate for
+    the defaults (0.2.6 QA: "About 25 credits" on a 3-second motion charged 15), and the job is charged that quote."""
+
+    def setUp(self):
+        self.posts, self.quoted = [], []
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.runtime = types.SimpleNamespace(lock=threading.RLock(), cache_dir=Path(temp.name), quotes={},
+                                             quote_requests={}, handle_error=lambda error: None, manifest={})
+        self.client = cloud_http.Client(base_url="https://service.test", api_key="lc_test", transport=self.server,
+                                        client_headers={"x-loopcut-contract": "0.1", "x-loopcut-client": "test"})
+        for target in (patch.object(agent, "_redraw"), patch.object(cloud_jobs, "_redraw"),
+                       patch.object(conversations, "save"), patch.object(cloud_jobs, "_registry", {})):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def server(self, request, *, timeout):
+        if request.full_url.endswith("/blobs/check"):
+            return Reply({"missing": []})
+        body = json.loads(request.data)
+        price = SERVER_PRICE[body["tool"]][1](body["input"])
+        if request.full_url.endswith("/v1/quotes"):
+            self.quoted.append(body)
+            return Reply({"quote_id": f"qt_{len(self.quoted)}", "credits": price, "expires_at": "2099-01-01T00:00:00Z"})
+        self.posts.append(body)
+        job_id = f"job_ok{len(self.posts)}"
+        return Reply({"id": job_id, "tool": body["tool"], "status": "succeeded", "progress": {"pct": 100, "message": "Done"},
+                      "credits": {"reserved": price, "charged": price, "refunded": 0}, "outputs": [], "error": None,
+                      "provenance": {"job_id": job_id, "tool": body["tool"], "vendor": "test", "model": "m",
+                                     "kind": "gen", "created_at": "2026-10-21T00:00:00Z"}})
+
+    def card_for(self, name, arguments, estimate=None):
+        estimate = SERVER_PRICE[name][0] if estimate is None else estimate
+        descriptor = {"name": name, "version": 1, "backend": "managed", "kind": "gen", "latency": "seconds",
+                      "cost": {"credits_estimate": estimate, "quote_required": False}, "file_inputs": [],
+                      "approval": {"confirm_over_credits": 100}, "title": name}
+        card = state.item_tool("loopcut_cloud__" + name, name, "")
+        consent = agent._Consent(state.new_session(), agent.Turn(), card)
+        with cloud_account.approval_context(consent):
+            approved = cloud_account.authorize(cloud_jobs, descriptor, arguments, {}, project=PROJECT,
+                                               cancel=threading.Event(), runtime=self.runtime, client=self.client)
+            job = cloud_account.submit(cloud_jobs, descriptor, approved, {}, project=PROJECT, on_progress=None,
+                                       cancel=threading.Event(), runtime=self.runtime, client=self.client)
+        return card, job
+
+    def test_each_per_unit_tool_shows_and_charges_the_price_of_its_own_arguments(self):
+        from loopcut.nudges import dollars
+        cases = [("motion_from_text", {"prompt": "jump", "duration_s": 3}),   # 6, not the 5 s default's 10.
+                 ("motion_from_text", {"prompt": "walk", "duration_s": 9.5}),  # 20: rounded up to whole seconds.
+                 ("image_to_3d", {"prompt": "a lamp", "quality": "draft"}),    # 25, not the final's 80.
+                 ("image_generate", {"prompt": "a lamp", "quality": "high"}),  # 20, not standard's 6.
+                 ("sfx", {"prompt": "rain", "duration_seconds": 11})]          # 7, not one take's 4.
+        for name, arguments in cases:
+            with self.subTest(name=name, arguments=arguments):
+                price = SERVER_PRICE[name][1](arguments)
+                self.assertNotEqual(price, SERVER_PRICE[name][0])  # Non-default arguments: the estimate is wrong.
+                card, job = self.card_for(name, dict(arguments))
+                self.assertEqual(card["cost"], f"{price:g} credits ({dollars(price)}), quoted")
+                self.assertEqual(self.posts[-1]["quote_id"], f"qt_{len(self.quoted)}")  # The job is charged it.
+                self.assertEqual(job["credits"]["charged"], price)
+
+    def test_a_free_tool_is_not_quoted(self):
+        SERVER_PRICE["asset_search"] = (0, lambda a: 0)
+        self.addCleanup(SERVER_PRICE.pop, "asset_search")
+        card, _ = self.card_for("asset_search", {"query": "chair"})
+        self.assertEqual(self.quoted, [])
+        self.assertNotIn("quote_id", self.posts[-1])
+        self.assertEqual(card["cost"], "Free")
+
+    def test_the_quick_check_before_a_call_still_reads_the_estimate(self):
+        descriptor = {"backend": "managed", "cost": {"credits_estimate": 80, "quote_required": False},
+                      "approval": {"confirm_over_credits": 50}}
+        self.assertEqual(cloud_account.approval_details(descriptor)["text"], "About 80 credits ($0.80)")
+        self.assertTrue(cloud_account.quoted(descriptor))
+        self.assertFalse(cloud_account.quoted({"cost": {"credits_estimate": 0, "quote_required": False}}))
 
 
 if __name__ == "__main__":

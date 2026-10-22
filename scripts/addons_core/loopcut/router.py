@@ -302,8 +302,8 @@ def _count(session: dict, usage: dict) -> None:
 
 
 def ask(cfg, message: dict, session: dict, is_cancelled, stream=None) -> tuple[Decision | None, dict]:
-    """One call to the router model: (its decision or None, the usage it reported). Raises only
-    llm.Cancelled; any other failure is no decision."""
+    """One call to the router model: (its decision or None, the usage it reported).
+    Cancellation and hosted allowance refusals end the turn; other failures mean no decision."""
     from . import config, cloud
     if not config.on_service(cfg.base_url):
         return None, {}
@@ -321,6 +321,10 @@ def ask(cfg, message: dict, session: dict, is_cancelled, stream=None) -> tuple[D
     except llm.Cancelled:
         raise
     except Exception as ex:  # A router that fails is no router, never a failed turn.
+        if isinstance(ex, llm.LLMError) and ex.status == 402:
+            from . import state
+            if ex.code in state.HOSTED_LIMITS:
+                raise  # The account's refusal ends the turn; another model request cannot add allowance.
         print(f"Loopcut: no routing for this turn: {ex!r}")
         return None, {}
     return parse(completion.text), completion.usage or {}

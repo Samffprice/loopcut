@@ -4,6 +4,7 @@ Retry-After is honoured and capped, not obeyed verbatim. No Blender needed.
     python3 -m unittest discover -s loopcut/tests
 """
 
+import io
 import json
 import os
 import struct
@@ -111,6 +112,55 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class ErrorHeadersTest(unittest.TestCase):
+    def test_reservation_headers_are_totals_and_survive_a_successful_stream(self):
+        from email.message import Message
+        response = io.BytesIO(text_reply("Done."))
+        response.headers = Message()
+        for name, value in {"X-Loopcut-Plan": "free", "X-Loopcut-Session-Used": "0.62",
+                            "X-Loopcut-Session-Used-With-Reservations": "0.82",
+                            "X-Loopcut-Week-Used": "0.31",
+                            "X-Loopcut-Week-Used-With-Reservations": "0.43"}.items():
+            response.headers[name] = value
+        reply = llm._read(response, lambda _: None, lambda: False)
+        self.assertEqual(reply.account["session"], {"used": 0.62, "used_with_reservations": 0.82, "resets_at": None})
+        self.assertEqual(reply.account["week"], {"used": 0.31, "used_with_reservations": 0.43, "resets_at": None})
+
+    def test_missing_or_invalid_reservation_headers_preserve_settled_usage(self):
+        for invalid in (None, "", "bad", "nan", "inf", "-inf", "-0.1", True, [], {}, 10 ** 400):
+            with self.subTest(invalid=str(invalid)):
+                headers = {"x-loopcut-plan": "free", "x-loopcut-session-used": "0.82",
+                           "x-loopcut-week-used": None, "x-loopcut-session-used-with-reservations": invalid}
+                info = llm.account_from_headers(headers)
+                self.assertEqual(info["session"], {"used": 0.82, "resets_at": None})
+                self.assertIsNone(info["week"]["used"])
+        self.assertIsNone(llm.account_from_headers({"x-loopcut-session-used-with-reservations": "0.9"}))
+        for value, expected in (("0", 0.0), (" 0.91 ", 0.91), ("1.2", 1.0)):
+            info = llm.account_from_headers({"x-loopcut-plan": "free", "x-loopcut-session-used-with-reservations": value})
+            self.assertEqual(info["session"]["used_with_reservations"], expected)
+
+    def test_refusal_keeps_plan_and_window_headers(self):
+        from email.message import Message
+        from urllib.error import HTTPError
+        from urllib.request import Request
+        headers = Message()
+        headers["x-loopcut-plan"] = "free"
+        headers["x-loopcut-session-used"] = "0.82"
+        headers["x-loopcut-session-used-with-reservations"] = "0.98"
+        headers["x-loopcut-session-resets-at"] = "2099-10-21T18:00:00Z"
+        body = io.BytesIO(json.dumps({"error": {"code": "session_limit", "message": "Used up."}}).encode())
+        refusal = HTTPError("https://loopcut.org/v1/chat/completions", 402, "Used up", headers, body)
+        with mock.patch.object(llm.urllib.request, "urlopen", side_effect=refusal) as request:
+            with self.assertRaises(llm.LLMError) as caught:
+                llm._open(lambda: Request(refusal.url), "https://loopcut.org/v1", 1, lambda: False)
+        error = caught.exception
+        self.assertEqual((error.status, error.code), (402, "session_limit"))
+        self.assertEqual(error.account["plan"], "free")
+        self.assertEqual(error.account["session"], {"used": 0.82, "used_with_reservations": 0.98,
+                                                    "resets_at": "2099-10-21T18:00:00Z"})
+        request.assert_called_once()
 
 
 class LLMTest(unittest.TestCase):

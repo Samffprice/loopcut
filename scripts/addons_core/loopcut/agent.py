@@ -5,9 +5,10 @@ import json
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
+from copy import deepcopy
 from typing import Any, Callable
 
-from . import checkpoints, config, context, conversations, image_budget, llm, repeats, spending, state, videoref
+from . import allowance, checkpoints, config, context, conversations, image_budget, llm, repeats, spending, state, videoref
 from .ui.markdown import finish_reply
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
@@ -98,7 +99,7 @@ _POLL_SECONDS = 0.1
 MAX_IDLE_CAPTURES = 3
 SOFT_LOOKS = 8
 DEFAULT_ANGLE = "three_quarter"
-LOW_ALLOWANCE = 0.8  # Share of the week's allowance used at which the conversation gets a heads-up, once.
+LOW_ALLOWANCE = 0.8  # Warn with about 20% left in either allowance window.
 CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene"}
 # An explicit step limit (cfg.max_steps > 0) is announced this many steps before it; at it, the model is asked
 # once more, for text only, to say where the work stands (_wrap_up).
@@ -162,6 +163,8 @@ class Turn:
         self.scene_before: dict | None = None
         self.scene_after: dict | None = None
         self.notes: list = []       # (text, chat item) sent while the turn runs; folded in at the next step.
+        self.notes_lock = threading.Lock()  # Appending, folding, claiming and retiring notes share this lock.
+        self.send_notes_on_stop = False  # The queued note's explicit Stop helpers and send now action.
         self.ledger = repeats.Ledger()  # Failures and reads the model repeats; see repeats.py.
         self.outcome = "running"  # completed, cancelled, step_limit, no_progress, budget or error; retained by evals.
         self.stop_reason = ""    # The budget or guard that stopped it; preserved through its wrap-up.
@@ -202,6 +205,11 @@ class Turn:
         self.telemetry: dict = {}
         self.first_item = 0
         self.error_code = ""
+        self.allowance_generation = state.ui.get("allowance_generation", 0)
+        self.hosted_requests = 0
+        self.allowance_notices: list = []  # (items, notice) emitted this turn, removed if admission later refuses.
+        self.submission = None  # A new send can be returned to the input if its first request is refused.
+        self.returned_submission = False
         # Its conversation log (session_logs.py): what ran it, or {} when the conversation is not uploaded.
         self.conversation_log: dict = {}
 
@@ -413,24 +421,29 @@ def _resend_on_main(text: str) -> None:
     mainthread.run_on_main(lambda: send(text))
 
 
-def _restore_input_on_main(text: str) -> None:
+def _restore_input_on_main(text: str, session: dict | None = None) -> None:
     from . import mainthread
     from .ui import textedit
 
     def restore():
-        session = state.session()
-        if not session["input"]:
-            textedit.set_text(session, text)
+        target = session if session is not None else state.session()
+        if session is not None:
+            textedit.set_text(target, "\n".join(t for t in (target["input"], text) if t))
+        elif not target["input"]:
+            textedit.set_text(target, text)
     mainthread.run_on_main(restore)
 
 
 def _fold_notes(session: dict, turn: Turn) -> None:
     """What the user sent while the turn ran goes in before the next request, marked so the
     model continues rather than starts over. The chat item drops its 'queued' tag."""
-    while turn.notes:
-        text, item = turn.notes.pop(0)
-        item.pop("queued", None)
-        session["messages"].append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
+    with turn.notes_lock:
+        if turn.send_notes_on_stop:
+            return  # The cancelled turn hands these to the next turn after its helpers have stopped.
+        while turn.notes:
+            text, item = turn.notes.pop(0)
+            item.pop("queued", None)
+            session["messages"].append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
 
 
 def _project_roots() -> tuple:
@@ -493,21 +506,108 @@ def _update_account(info: dict) -> None:
     account.update_usage(info)
 
 
-def _warn_low_allowance(session: dict, items: list, info: dict) -> None:
-    """Warn once before the week's allowance runs out; with billing closed there is no purchase action."""
-    used = (info.get("week") or {}).get("used")
-    if session.get("warned_low") or not isinstance(used, (int, float)) or used < LOW_ALLOWANCE:
+def _hosted_reply(turn: Turn, cfg: config.Config, info: dict | None = None, *, success: bool = False,
+                  session: dict | None = None) -> None:
+    if not config.on_service(cfg.base_url):
+        return
+    if success:
+        turn.hosted_requests += 1
+    from . import mainthread
+
+    def apply():
+        if turn.allowance_generation != state.ui.get("allowance_generation", 0):
+            return  # A signed-out account or a provider we left cannot repopulate the display/meter.
+        if info:
+            _update_account(info)
+        if success:
+            state.clear_allowance_notice()
+            if info and session is not None:
+                _warn_low_allowance(session, session["items"], info, turn=turn)
+    mainthread.run_on_main(apply)
+
+
+def _hosted_refusal(session: dict, turn: Turn, item: dict) -> None:
+    """Return a refused new send to its own draft; retain one account notice, never a send gate."""
+    def apply():
+        previous = state.ui.get("allowance_notice") or {}
+        windows = dict(previous.get("windows") or {})
+        previous_item = previous.get("item") or {}
+        previous_window = allowance.LIMIT_WINDOWS.get(previous_item.get("reason"))
+        if previous_window:
+            windows[previous_window] = dict(previous_item)
+        owner = turn.chat[1] if turn.chat else turn
+        for items, notice in owner.allowance_notices:
+            items[:] = [row for row in items if row is not notice]
+        owner.allowance_notices.clear()
+        snapshot = turn.submission if not turn.hosted_requests else None
+        if snapshot:
+            extra = [i["text"] for i in session["items"][len(snapshot["items"]) + 1:] if i.get("kind") == "user"]
+            session["items"][:] = snapshot["items"]
+            session["messages"][:] = snapshot["messages"]
+            for key in ("references", "scene_seen", "scene_turn_start", "pending_checkpoint", "turn_number"):
+                session[key] = snapshot[key]
+            from .ui import textedit
+            draft = "\n".join(t for t in (snapshot["text"], *extra, session["input"]) if t)
+            textedit.set_text(session, draft)
+            refs = {a["ref"] for a in snapshot["attachments"]}
+            session["attachments"] = snapshot["attachments"] + [a for a in session["attachments"] if a["ref"] not in refs]
+            turn.notes.clear()
+            turn.returned_submission = True
+        latest = state.latest_limit(session["items"])
+        if not turn.hosted_requests and latest is not None:
+            existing = session["items"][latest]
+            existing.clear()
+            existing.update(item)
+            item_to_show = existing
+        else:
+            item_to_show = item
+            if not snapshot:
+                session["items"].append(item)
+        if turn.allowance_generation == state.ui.get("allowance_generation", 0):
+            info = state.ui.get("account") or {}
+            window = allowance.LIMIT_WINDOWS.get(item["reason"])
+            reported = info.get(window) or {}
+            if not item_to_show.get("resets_at") and isinstance(reported, dict):
+                item_to_show["resets_at"] = reported.get("resets_at") or ""
+            if not item_to_show.get("plan"):
+                item_to_show["plan"] = info.get("plan") or ""
+            if window:
+                windows[window] = dict(item_to_show)
+            state.ui["allowance_notice"] = {"item": item_to_show, "conversation": session["id"], "windows": windows}
+    _on_main(apply)
+
+
+def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | None = None) -> None:
+    """The session warning follows its reset, including across conversations; the weekly one is per chat."""
+    def warn(item):
+        items.append(item)
+        if turn is not None:
+            owner = turn.chat[1] if turn.chat else turn
+            owner.allowance_notices.append((items, item))
+
+    window = info.get("session") or {}
+    used = allowance.used(window)
+    reset = window.get("resets_at") if isinstance(window, dict) else None
+    if isinstance(used, (int, float)) and LOW_ALLOWANCE <= used < 1:
+        key = reset or info.get("plan") or "unknown"
+        if state.ui.get("warned_session_allowance") != key:
+            state.ui["warned_session_allowance"] = key
+            left = max(0, round((1 - used) * 100))
+            when = f" Resets {state.reset_label(reset)}." if reset else ""
+            warn(state.item_notice(f"About {left}% of this session's chat allowance is left.{when}"))
+    used = allowance.used(info.get("week"))
+    if session.get("warned_low") or used is None or not LOW_ALLOWANCE <= used < 1:
         return
     session["warned_low"] = True
     left, plan = max(0, round((1 - used) * 100)), str(info.get("plan") or "")
     if not config.billing_open():
-        items.append(state.item_notice(f"About {left}% of this week's allowance is left."))
+        warn(state.item_notice(f"About {left}% of this week's allowance is left."))
     elif plan == "free":
-        items.append(state.item_notice(
+        warn(state.item_notice(
             f"About {left}% of this week's free allowance is left. Upgrading now keeps this conversation "
             f"going without a stop.", "See plans", url=config.pricing_url("low_allowance")))
     else:
-        items.append(state.item_notice(f"About {left}% of this week's allowance is left on the {plan.capitalize()} plan.",
+        warn(state.item_notice(f"About {left}% of this week's allowance is left on the {plan.capitalize()} plan.",
                                        "Account", url=config.account_url()))
 
 
@@ -516,8 +616,11 @@ def _limit_item(ex: llm.LLMError) -> dict:
     the next plan offers; any other provider's 402 shows its message with no button."""
     details = ex.details
     upgrade = details.get("upgrade") if isinstance(details.get("upgrade"), dict) else None
-    return state.item_limit(str(details.get("message") or ex), ex.code or "limit", str(details.get("plan") or ""),
-                            str(details.get("resets_at") or ""), upgrade)
+    info = ex.account or {}
+    window = info.get({"session_limit": "session", "week_limit": "week"}.get(ex.code, "")) or {}
+    return state.item_limit(str(details.get("message") or ex), ex.code or "limit",
+                            str(details.get("plan") or info.get("plan") or ""),
+                            str(details.get("resets_at") or window.get("resets_at") or ""), upgrade)
 
 
 def _alike_on_main(a, b) -> bool:
@@ -871,7 +974,8 @@ def _correlation_headers(session: dict, role: str) -> dict:
     return llm.correlation_headers(session["id"], role)
 
 
-def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single") -> list[str]:
+def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single",
+                    turn: Turn | None = None) -> list[str]:
     """Describe the images the user just attached, so the description outlives the turn and any
     summary, and the model works from a checklist rather than a glance. Returns their names. A clip's
     contact sheets are left out: they are frames to time an action by, not an image to reproduce, and the
@@ -893,6 +997,8 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
         tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
         max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
         headers=_correlation_headers(session, "reference"), on_retry=lambda: None)  # Nothing shown mid-stream to undo.
+    if turn is not None:
+        _hosted_reply(turn, cfg, completion.account, success=True, session=session)
     card = completion.text.strip()
     if card:
         message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
@@ -992,6 +1098,17 @@ def _orchestrator_schemas() -> list[dict]:
     return [s for s in _tool_schemas() if s["function"]["name"] not in uv_tools.SINGLE_ONLY] + orchestrator.SCHEMAS
 
 
+def _session_schemas(session: dict, spec: LoopSpec) -> list[dict]:
+    schemas = spec.schemas()
+    if session.get("workers_unavailable"):
+        from . import orchestrator, waves
+        job = getattr(session.get("turn"), "job", None)
+        collecting = job is not None and waves.pending(job)
+        schemas = [orchestrator.WAIT_SCHEMA if s["function"]["name"] == "delegate" else s
+                   for s in schemas if collecting or s["function"]["name"] != "delegate"]
+    return schemas
+
+
 def _acceptance_run(checks: list, spawn=None) -> list:
     from . import acceptance
     return acceptance.run(checks, spawn)
@@ -1005,7 +1122,11 @@ def _route(session: dict, turn: Turn) -> None:
     from . import router
     roles = getattr(turn, "roles", None)
     divert = router.to_workspace if getattr(turn, "may_divert", False) else None
-    router.start_turn(session, turn, roles.router if roles else None, turn.cancel.is_set, divert=divert)
+    def stream(**kwargs):
+        completion = llm.stream_chat(**kwargs)
+        _hosted_reply(turn, roles.router, completion.account, success=True, session=session)
+        return completion
+    router.start_turn(session, turn, roles.router if roles else None, turn.cancel.is_set, stream=stream, divert=divert)
     if getattr(turn, "diverted", False):
         session["mode"] = "workspace"
         turn.spec = WORKSPACE_SPEC
@@ -1030,7 +1151,8 @@ def _orchestrator_edit_note(session: dict, name: str, result) -> str:
 def _orchestrator_final(session: dict, turn: Turn, completion) -> str | None:
     """A level-3 turn that delegated nothing is nudged once; then the finish gate."""
     from . import router
-    return router.nudge(turn, completion) or _finish_gate(session, turn, completion)
+    nudge = None if session.get("workers_unavailable") else router.nudge(turn, completion)
+    return nudge or _finish_gate(session, turn, completion)
 
 
 def _orchestrator_end(session: dict, turn: Turn) -> None:
@@ -1238,7 +1360,10 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
     if hosted == "single" and index is None:
         hosted = None  # Older servers and unavailable manifests use the open prompt and its budget.
     system = _system_tail(session) if hosted in ("single", "orchestrator") else spec.system(session)
-    schemas = spec.schemas()
+    if session.get("workers_unavailable"):
+        from . import waves
+        system += "\n\n" + waves.unavailable_note(session)
+    schemas = _session_schemas(session, spec)
     fixed = context.fixed_tokens(system, schemas, prompt_id=hosted, index=index)
     prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed, skill_index=index)
     if compacted:
@@ -1266,16 +1391,22 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                                           full_refs=full_refs)]
 
     def call(messages: list[dict], effort: str) -> llm.Completion:
-        return llm.stream_chat(
-            base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
-            messages=messages, tools=schemas, reasoning_effort=effort,
-            on_text=on_text, is_cancelled=turn.cancel.is_set,
-            max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-            headers=_correlation_headers(session, spec.role), on_retry=on_retry,
-            prompt_id=hosted,
-        )
+        try:
+            return llm.stream_chat(
+                base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+                messages=messages, tools=schemas, reasoning_effort=effort,
+                on_text=on_text, is_cancelled=turn.cancel.is_set,
+                max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
+                headers=_correlation_headers(session, spec.role), on_retry=on_retry,
+                prompt_id=hosted,
+            )
+        except llm.LLMError as ex:
+            if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
+                _drop_empty(items, reply)
+            raise
 
     def record(completion: llm.Completion) -> None:
+        _hosted_reply(turn, cfg, completion.account, success=True, session=session)
         if completion.usage:
             for key in ("input", "cached", "output"):
                 session["usage"][key] += completion.usage.get(key, 0)
@@ -1288,9 +1419,6 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
         bucket["requests"] += 1
         if spec.on_usage:
             spec.on_usage(completion.usage or {})
-        if completion.account:
-            _update_account(completion.account)
-            _warn_low_allowance(session, items, completion.account)
 
     def cap_reason(completion: llm.Completion) -> str:
         return "the wall-clock limit" if completion.timed_out else f"the {cfg.max_output_tokens}-token output cap"
@@ -1414,10 +1542,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         last = messages[-1] if messages else {}
         if spec.reference_card and last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
             try:
-                names = _reference_card(session, cfg, last, turn.cancel.is_set, spec.role)
+                names = _reference_card(session, cfg, last, turn.cancel.is_set, spec.role, turn)
                 if names:
                     items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
             except llm.LLMError as ex:
+                if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
+                    raise
                 print(f"Loopcut: could not describe the attached images: {ex}")
         if spec.on_turn_start:
             spec.on_turn_start(session, turn)
@@ -1432,13 +1562,13 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             step += 1
             if turn.cancel.is_set():
                 raise llm.Cancelled()
+            if spec.before_request:
+                spec.before_request(step)
             if turn.notes:
                 turn.ledger.scene_changed()  # What the user says mid-turn may come with edits of their own.
                 if no_progress:
                     no_progress.reset()
             _fold_notes(session, turn)
-            if spec.before_request:
-                spec.before_request(step)
             completion = _request(session, turn, cfg, spec)
             messages.append(completion.as_message())
             if not completion.tool_calls:
@@ -1635,12 +1765,21 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
     except (config.ConfigError, llm.LLMError) as ex:
         turn.outcome = "error"
         turn.error_code = _error_code(ex)
+        if getattr(ex, "account", None):
+            _hosted_reply(turn, cfg, ex.account)
         from . import nudges
         stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
         if stopped is not None:
             items.append(stopped)  # The ChatGPT plan stopped: offer Loopcut's models for the same chat (M2).
         elif getattr(ex, "status", None) == 402:
-            items.append(_limit_item(ex))
+            item = _limit_item(ex)
+            if config.on_service(cfg.base_url) and item["reason"] in state.HOSTED_LIMITS:
+                _hosted_refusal(session, turn, item)
+            else:
+                items.append(item)
+            if config.on_service(cfg.base_url) and not ex.account:
+                from . import account
+                account.refresh_account()  # Older gateways may omit usage headers on a refusal.
         else:
             items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") in (llm.CONNECTION_LOST,
                                                                                      llm.EMPTY_REPLY)))
@@ -1662,15 +1801,15 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 import traceback
                 traceback.print_exc()
                 items.append(state.item_error(f"Internal error while ending the turn: {ex!r}"))
-        if spec.role != "worker":
+        if spec.role != "worker" and not turn.returned_submission:
             _record_level(session, turn)
-        changed = _changes_item(session, turn) if spec.changes_card else None
+        changed = _changes_item(session, turn) if spec.changes_card and not turn.returned_submission else None
         if changed:
             items.append(changed)
         if spec.role != "worker" and turn.outcome != "error" and not turn.cancel.is_set():
             from . import nudges
             nudges.flush(session)  # A waiting trial or low-credit card, after the reply, never during it.
-        if turn.scene_after is not None:
+        if turn.scene_after is not None and not turn.returned_submission:
             session["scene_seen"] = turn.scene_after  # What the next message's context diffs against.
         for item in items:
             if item.get("streaming"):
@@ -1678,13 +1817,15 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 finish_reply(item, turn.roots[0] if turn.roots else None)
             if item.get("status") in ("awaiting", "running"):
                 item["status"] = "rejected"
-        session["turn_outcome"] = turn.outcome
-        session["busy"] = False
-        session["turn"] = None
         # Notes that arrived after the last fold: sent as the next message, or, after a stop, put
-        # back in the input box for the user to decide.
-        late = [(text, item) for text, item in turn.notes]
-        turn.notes.clear()
+        # back in the input box for the user to decide. Retire under the append lock so a sender
+        # that already captured this turn either joins this drain or retries against the session.
+        with turn.notes_lock:
+            session["turn_outcome"] = turn.outcome
+            session["busy"] = False
+            session["turn"] = None
+            late = list(turn.notes)
+            turn.notes.clear()
         for _, item in late:
             if item in items:
                 items.remove(item)
@@ -1692,25 +1833,40 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             spec.save(session)
         except OSError as ex:
             items.append(state.item_error(f"Could not save this conversation: {ex}"))
-        if late:
+        if late and spec.role != "worker":  # Workers' copies of a note never send or restore into the user's chat.
             joined = "\n".join(text for text, _ in late)
-            (_restore_input_on_main if turn.cancel.is_set() else _resend_on_main)(joined)
+            if turn.error_code in state.HOSTED_LIMITS:
+                _restore_input_on_main(joined, session)  # Refused for allowance: the user decides.
+            else:
+                restore = turn.cancel.is_set() and not turn.send_notes_on_stop
+                (_restore_input_on_main if restore else _resend_on_main)(joined)
         _redraw()
 
 
 def send(text: str) -> bool:
     session = state.session()
+    draft = text
     text = text.strip()
     attachments = list(session["attachments"])
-    if session["busy"]:
+    while session["busy"]:
         # Mid-turn: the note is queued and folded in at the agent's next step; see _fold_notes.
         turn = session.get("turn")
-        if not text or turn is None:
+        if not text:
             return False
-        item = state.item_user(text)
-        item["queued"] = True
-        session["items"].append(item)
-        turn.notes.append((text, item))
+        if turn is None:
+            continue  # Teardown retired it after the busy check; retry normal sending.
+        with turn.notes_lock:
+            if session.get("turn") is not turn:
+                continue
+            item = state.item_user(text)
+            item["queued"] = True
+            if turn.send_notes_on_stop:
+                item["sending"] = True
+            session["items"].append(item)
+            turn.notes.append((text, item))
+        if turn.job is not None:
+            from . import waves
+            waves.steer(turn.job, text)
         return True
     if not (text or attachments):
         return False
@@ -1725,6 +1881,10 @@ def send(text: str) -> bool:
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
         return False
+    if turn.config is not None and config.on_service(turn.config.base_url):
+        turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),
+                           "messages": deepcopy(session["messages"]), "references": list(session["references"]),
+                           **{k: session.get(k) for k in ("scene_seen", "scene_turn_start", "pending_checkpoint", "turn_number")}}
     turn.roots = _project_roots()
     card, prompt = session.pop("try_it", None) or ("", "")
     if card and prompt.strip() == text:  # Edited first, it is the user's own request.
@@ -1773,8 +1933,7 @@ def resume() -> bool:
     after any error the user wants retried. Nothing is added to the conversation; the request
     is simply made again. False when a turn is running or the last one finished."""
     session = state.session()
-    messages = session["messages"]
-    if session["busy"] or not messages or messages[-1].get("role") == "assistant":
+    if not state.can_resume(session):
         return False
     turn = Turn()
     try:
@@ -1812,7 +1971,27 @@ def decide(approved: bool, always: bool = False, index: int | None = None) -> bo
     return True
 
 
+def send_queued_now() -> bool:
+    """Stop helpers through the usual turn cancellation, then send every waiting note once.
+    Cleanup and any in-flight main-thread tool finish before the next turn starts."""
+    session = state.session()
+    turn = session["turn"]
+    if turn is None or turn.job is None:
+        return False
+    with turn.notes_lock:
+        if session.get("turn") is not turn or not turn.notes or turn.cancel.is_set():
+            return False
+        turn.send_notes_on_stop = True
+        for _, item in turn.notes:
+            item["sending"] = True
+        turn.cancel.set()
+    _redraw()
+    return True
+
+
 def stop() -> None:
     turn = state.session()["turn"]
     if turn is not None:
-        turn.cancel.set()
+        with turn.notes_lock:
+            turn.send_notes_on_stop = False
+            turn.cancel.set()
