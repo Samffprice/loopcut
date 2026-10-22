@@ -17,7 +17,7 @@ import checkout  # noqa: E402
 checkout.use()
 import loopcut  # noqa: E402
 from loopcut import checkpoints, state, tools  # noqa: E402
-from loopcut.ui import host  # noqa: E402
+from loopcut.ui import host, textedit  # noqa: E402
 
 PROJECT_DIR = Path(sys.argv[sys.argv.index("--") + 1])
 PROJECT = PROJECT_DIR / "kitchen.blend"
@@ -194,6 +194,98 @@ def verify_undone():
         assert now != SEEN["first_restored_file"] and now.name.startswith("kitchen.restored-"), now
         assert SEEN["first_restored_file"].is_file(), "an earlier restored file must not be overwritten"
     assert sha(PROJECT) == SEEN["project_sha"]
+
+
+@step
+def click_edit_on_turn_3():
+    # Edit is a restore that hands the message back to the box. An in-place restore loads the snapshot's
+    # windows, so the one the click came from is gone; 0.2.6 focused the box through it and crashed.
+    index = next(n for n, i in enumerate(state.session()["items"]) if i["kind"] == "user" and i["text"] == "add C")
+    SEEN["turn3_index"] = index
+    click(f"item{index}.checkpoint.edit")
+
+
+@step
+def confirm_edit():
+    session = state.session()
+    assert session["confirm_restore"] == SEEN["turn3_index"] and session["confirm_edit"], "Edit must ask first"
+    assert meshes() == {"Cube", "A", "Manual", "B", "C"}, "nothing may change before confirming"
+    click(f"item{SEEN['turn3_index']}.checkpoint.confirm")
+
+
+@step
+def verify_edit_and_type():
+    session = state.session()
+    errors = [i["text"] for i in session["items"] if i["kind"] == "error"]
+    assert not errors, errors
+    assert meshes() == {"Cube", "A", "Manual", "B"}, meshes()
+    assert session["input"] == "add C" and session["focused"], (session["input"], session["focused"])
+    window, _ = panel()
+    window.event_simulate(type="X", value="PRESS", unicode="x")  # The box has the keys: typing edits the message.
+    window.event_simulate(type="X", value="RELEASE")
+
+
+@step
+def undo_the_edit():
+    session = state.session()
+    assert session["input"] == "add Cx", session["input"]
+    click(f"item{len(session['items']) - 1}.notice.action")
+
+
+@step
+def verify_edit_undone():
+    session = state.session()
+    errors = [i["text"] for i in session["items"] if i["kind"] == "error"]
+    assert not errors, errors
+    assert meshes() == {"Cube", "A", "Manual", "B", "C"}, meshes()
+    kinds = [i["kind"] for i in session["items"]]
+    assert kinds == ["user", "assistant"] * 3 + ["notice", "notice"], kinds
+    assert len(session["messages"]) == 6 and session["input"] == "", session["input"]
+
+
+@step
+def merge_a_wave():
+    """What waves.py leaves: a "wave" checkpoint taken before the delegate call, the merge's change to the
+    scene, and the merge card offering Restore before merge."""
+    session = state.session()
+    session["messages"].append({"role": "user", "content": "add W with workers"})
+    session["items"].append(state.item_user("add W with workers"))
+    cut = (len(session["messages"]), len(session["items"]))
+    wave = checkpoints.ensure_for_wave(session, "Before wave 1", *cut)
+    session["messages"].append({"role": "assistant", "content": "Delegating W."})
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(8, 3, 0))
+    bpy.context.active_object.name = "W"
+    session["items"].append(state.item_merge("w1", "Merged wave 1.", ["+ W"], wave, []))
+    textedit.set_text(session, "draft")
+    SEEN["wave_cut"] = cut
+    host.tag_redraw_all()
+
+
+@step
+def click_restore_before_merge():
+    click(f"item{len(state.session()['items']) - 1}.merge.restore")
+
+
+@step
+def verify_merge_restored():
+    session = state.session()
+    errors = [i["text"] for i in session["items"] if i["kind"] == "error"]
+    assert not errors, errors
+    assert meshes() == {"Cube", "A", "Manual", "B", "C"}, meshes()
+    messages, items = SEEN["wave_cut"]
+    assert len(session["messages"]) == messages and len(session["items"]) == items + 1, session["items"]
+    assert session["items"][-1]["kind"] == "notice" and session["input"] == "draft", "a wave restore keeps the input"
+    click(f"item{len(session['items']) - 1}.notice.action")
+
+
+@step
+def verify_merge_undone():
+    session = state.session()
+    errors = [i["text"] for i in session["items"] if i["kind"] == "error"]
+    assert not errors, errors
+    assert meshes() == {"Cube", "A", "Manual", "B", "C", "W"}, meshes()
+    assert [i["kind"] for i in session["items"]][-3:] == ["user", "merge", "notice"], session["items"]
+    textedit.set_text(session, "")
 
 
 @step

@@ -833,8 +833,8 @@ class OnboardingTest(unittest.TestCase):
 
     # --- 0.2.6: a required, modal and resumable setup ---------------------------------------------------------
 
-    def draw_step(self, first_run=False, wm=None):
-        splash = Splash()
+    def draw_step(self, first_run=False, wm=None, styled=False):
+        splash = StyledSplash() if styled else Splash()
         context = types.SimpleNamespace(region_popup=None, window_manager=wm or types.SimpleNamespace(splash_modal=False))
         drawn = self.onboarding.draw_splash(splash, context, first_run=first_run)
         return splash, drawn, context.window_manager
@@ -1276,7 +1276,7 @@ class OnboardingTest(unittest.TestCase):
             self.onboarding._state["credits_asked"] -= self.onboarding.CREDITS_PATIENCE + 1
             self.assertFalse(self.onboarding._credits_pending())
 
-    def try_screen(self, descriptors, signed_in=True, billing=True, connected=True):
+    def try_screen(self, descriptors, signed_in=True, billing=True, connected=True, styled=False):
         self.onboarding._state["step"] = "done"
         with patch.object(self.account, "signed_in", return_value=signed_in), \
                 patch.object(self.onboarding, "_connected", return_value=connected), \
@@ -1285,15 +1285,16 @@ class OnboardingTest(unittest.TestCase):
                 patch.object(self.onboarding, "_thumbnail", return_value=7), \
                 patch.object(self.onboarding.settings, "route_label", return_value="your ChatGPT plan"), \
                 patch.object(self.onboarding.config, "billing_open", return_value=billing):
-            splash, drawn, _ = self.draw_step()
+            splash, drawn, _ = self.draw_step(styled=styled)
         self.assertTrue(drawn)
         return splash, " ".join(r[1] for r in splash.records if r[0] == "label")
 
     LIVE = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
             {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
 
-    def test_first_project_cards_show_credits_and_dollars_and_both_paid_ones_fit_the_trial(self):
-        splash, labels = self.try_screen(self.LIVE)
+    def test_first_project_cards_show_their_price_struck_for_0_credits_and_both_paid_ones_fit_the_trial(self):
+        with patch.object(self.onboarding, "_strikes", return_value=True):
+            splash, labels = self.try_screen(self.LIVE, styled=True)
         parts = [r for r in splash.operators() if r[1] == "loopcut.onboarding_try"]
         texts = [r[2] for r in parts]
         # Each card: a picture, its title, line and price, and its Start; then Skip.
@@ -1301,8 +1302,14 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(texts, ["Start", "Start", "Start", "Skip for now"])
         for title in ("Make it move", "Photo to 3D model", "Model a treasure chest"):
             self.assertIn(title, labels)
-        for price in ("6 credits · $0.06", "80 credits · $0.80", "Free"):  # 3 of 5 s of motion.
-            self.assertIn(price, labels)
+        styled = [r for r in splash.records if r[0] == "label" and len(r) > 2]
+        for price in ("6 credits", "80 credits"):  # 3 of 5 s of motion; on the house (try_samples).
+            struck = [r for r in styled if r[1] == price]
+            self.assertEqual(len(struck), 1, price)
+            self.assertEqual(struck[0][2], tuple(self.onboarding.DANGER))
+            self.assertIs(struck[0][3].get("strike"), True)
+        self.assertEqual([r[1] for r in styled].count("0 credits"), 2)
+        self.assertIn("Free", labels)  # The modelling card runs on the model alone.
         self.assertTrue(all(r[4].enabled for r in parts))
         self.assertEqual(splash.records.count(("icon", 7)), 3)  # Every card has its picture, the same size.
         self.assertIn("● ● ● ●", labels)
@@ -1314,6 +1321,18 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(texts[-1], "Skip for now")
         for paragraph in ("Cmd+L", "jumps to the chat", "ChatGPT runs the conversation"):
             self.assertNotIn(paragraph, labels)
+
+    def test_a_build_without_strike_still_draws_the_prices_without_the_keyword(self):
+        with patch.object(self.onboarding, "_strikes", return_value=False):
+            splash, labels = self.try_screen(self.LIVE, styled=True)
+        price = next(r for r in splash.records if r[0] == "label" and r[1] == "80 credits")
+        self.assertNotIn("strike", price[3])  # An unknown keyword would break the modal screen's drawing.
+        self.assertIn("0 credits", labels)
+
+    def test_a_card_on_the_users_own_key_shows_no_struck_price(self):
+        splash, labels = self.try_screen([{**self.LIVE[1], "backend": "byok"}])
+        self.assertIn("Your own key", labels)
+        self.assertNotIn("80 credits", labels)
 
     def test_cards_follow_what_the_account_can_run_and_the_pro_strip_follows_sales(self):
         splash, labels = self.try_screen(self.LIVE[1:], billing=False)
@@ -1355,6 +1374,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertIs(start.call_args.args[0], window)
         self.assertIn("attached photo", start.call_args.args[1])
         self.assertEqual(start.call_args.args[2], (str(self.onboarding.SAMPLE_PHOTO),))
+        self.assertEqual(start.call_args.kwargs, {"try_it": "photo_3d"})  # Its cloud call is on the house.
         self.assertTrue(self.onboarding.SAMPLE_PHOTO.is_file())
 
     def test_finishing_without_an_account_brings_the_setup_back_next_start(self):

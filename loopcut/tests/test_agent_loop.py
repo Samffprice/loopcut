@@ -236,6 +236,19 @@ class AgentLoopTest(unittest.TestCase):
         # The line is read on the main thread at the start of each turn, not stored with the conversation.
         self.assertNotIn("addons_line", conversations._PERSISTED)
 
+    def test_a_setup_card_request_sent_unedited_marks_its_turn_and_an_edited_one_does_not(self):
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        for sent, marked in (("Turn the photo into a model.", "photo_3d"), ("Turn the photo into a blue model.", "")):
+            SCRIPT.replies.append(text_reply("Done."))
+            self.session["try_it"] = ("photo_3d", "Turn the photo into a model.")  # ui.host.start_request
+            self.assertTrue(agent.send(sent))
+            turn = self.session["turn"]
+            turn.thread.join(5)
+            self.assertEqual(turn.try_it, marked)  # Edited, it is the user's own request: an ordinary paid call.
+            self.assertNotIn("try_it", self.session)  # Once: the next request is never free.
+
     def awaiting(self):
         self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "the approval card")
 

@@ -11,7 +11,8 @@ along -Y (as glTF imports it), Unreal (UE5 names, A-pose, turned and moved, one 
 controls (IK to FK switch), a Character Creator-like rig (name heuristic) and a generated Rigify rig.
 SOMA's generated skeleton has no bone longer than a leg bone (its jaw and eyes end in the head). Then a walk;
 controls that drive no deforming bone are refused with the bake undone, and a travel bone that does not carry
-constraint-placed thighs stays put.
+constraint-placed thighs stays put. A motion without fingers gives every rig a relaxed hand, measured on its
+deforming bones; a finger the current action keys is kept.
 --render writes 8 frames per rig, seen from the front of the body, for a contact sheet (ffmpeg tile);
 --ybot also renders the motion on a Mixamo character from a local GLB (never committed: Adobe's licence).
 """
@@ -351,13 +352,38 @@ def compare(name, ob, names, ref, frames, yaw, k, ground_t, *, travel=True, limi
     return lowest
 
 
+def build_rig(kind, P):
+    """One of the rigs, built on SOMA's rest points P: (armature object, its yaw)."""
+    yaw = 0.0
+    if kind == "mixamo":
+        ob = make_armature("Hero", mixamo_rows(P), rolls=True)
+    elif kind == "mixamo_lying":
+        ob = make_armature("Y Bot rig", mixamo_rows(P, lying=True), rolls=True)
+    elif kind == "unreal":
+        yaw = math.radians(90)
+        ob = make_armature("SK_Mannequin", unreal_rows(P), location=Vector((1.0, 2.0, 0.0)), yaw=yaw)
+        ob.pose.bones["lowerarm_l"].rotation_mode = "XYZ"
+    elif kind == "auto_rig_pro":
+        ob = make_armature("rig", arp_rows(P))
+        for s in "lr":
+            ob.pose.bones[f"c_hand_ik.{s}"]["ik_fk_switch"] = 0.0
+            ob.pose.bones[f"c_foot_ik.{s}"]["ik_fk_switch"] = 0.0
+    elif kind == "generic":
+        ob = make_armature("CC_Base_Body_Rig", cc_rows(P))
+    elif kind == "rigify":
+        ob = rigify_rig()
+    else:
+        raise ValueError(kind)
+    return ob, yaw
+
+
 def run_rig(kind, bvh_text, meta, bvh, args):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     scene.render.fps = args.fps
     P = soma_points(bvh)
     ref = None
-    yaw, k, location = 0.0, 1.0, Vector((0, 0, 0))
+    k = 1.0
     title = "kathak dance"
     if kind == "soma":
         line = mr.apply(bvh_text, meta, target=None, title=title)
@@ -378,28 +404,11 @@ def run_rig(kind, bvh_text, meta, bvh, args):
     ref.hide_render = True
     bpy.data.objects["Motion body"].hide_render = True
     scene.cursor.location = (0, 0, 0)
+    ob, yaw = build_rig(kind, P)
     if kind == "mixamo":
-        ob = make_armature("Hero", mixamo_rows(P), rolls=True)
         old = bpy.data.actions.new("Idle")
         ob.animation_data_create().action = old
         ob.pose.bones["mixamorig:Hips"].keyframe_insert("location", frame=1)
-    elif kind == "mixamo_lying":
-        ob = make_armature("Y Bot rig", mixamo_rows(P, lying=True), rolls=True)
-    elif kind == "unreal":
-        yaw, location = math.radians(90), Vector((1.0, 2.0, 0.0))
-        ob = make_armature("SK_Mannequin", unreal_rows(P), location=location, yaw=yaw)
-        ob.pose.bones["lowerarm_l"].rotation_mode = "XYZ"
-    elif kind == "auto_rig_pro":
-        ob = make_armature("rig", arp_rows(P))
-        for s in "lr":
-            ob.pose.bones[f"c_hand_ik.{s}"]["ik_fk_switch"] = 0.0
-            ob.pose.bones[f"c_foot_ik.{s}"]["ik_fk_switch"] = 0.0
-    elif kind == "generic":
-        ob = make_armature("CC_Base_Body_Rig", cc_rows(P))
-    elif kind == "rigify":
-        ob = rigify_rig()
-    else:
-        raise ValueError(kind)
     bpy.context.view_layer.update()
     rig = mr.rig_of(ob)
     check(rig is not None and rig.kind == kind.replace("_lying", ""), f"{kind}: detected as {rig.kind if rig else None}")
@@ -417,6 +426,7 @@ def run_rig(kind, bvh_text, meta, bvh, args):
     print("   ", line, f"[{time.perf_counter() - began:.1f} s]", flush=True)
     action = ob.animation_data.action
     check(action is not None and action.name == "Motion: kathak dance", f"{kind}: action named from the request")
+    check(mr.RELAXED_KEY not in action and "relaxed" not in line, f"{kind}: fingers the motion animates are not relaxed")
     names = dict(rig.bones)
     if kind == "rigify":
         names.update(RIGIFY_DEF)
@@ -477,9 +487,129 @@ def walk_checks(args):
             check(span > 0.6, f"walk in world: the pelvis travels {span:.2f} m")
             check((scene.frame_start, scene.frame_end) == (1, 48) and "resampled from 30" in line,
                   f"walk at 24 fps: 60 frames at 30 fps become frames 1-48 ({scene.frame_start}-{scene.frame_end})")
-            check("fingers not animated" in line, "walk: fingers left alone when the model does not animate them")
+            check("fingers set to a relaxed pose; the model doesn't animate fingers" in line,
+                  "walk: the result says the fingers were set to a relaxed pose")
             fingers = [c for c in _curves(ob.animation_data.action) if "HandIndex" in c.data_path]
-            check(not fingers, "walk: no finger curves for a body-only motion")
+            check(fingers and all([p.co[0] for p in c.keyframe_points] == [1.0, 48.0]
+                                  and len({p.co[1] for p in c.keyframe_points}) == 1 for c in fingers),
+                  "walk: the relaxed hand is one value keyed on the action's first and last frame")
+
+
+def _hand(ob, rig, side):
+    """The deforming hand and finger chains a rig's mapped bones move (Rigify: its DEF bones)."""
+    def deform(name):
+        if rig.kind != "rigify":
+            return name
+        return "DEF-hand." + name[-1] if name.startswith("hand_fk.") else "DEF-" + name
+    chains = {}
+    for f in ("thumb",) + mr.FINGERS:
+        names = [deform(rig.bones[f"{f}{i}_{side}"]) for i in (1, 2, 3) if f"{f}{i}_{side}" in rig.bones]
+        if names and all(n in ob.data.bones for n in names):
+            chains[f] = names
+    return deform(rig.bones[f"hand_{side}"]), chains
+
+
+def hand_bends(ob, rig, side, frame=None):
+    """finger -> bend in degrees at each joint of its deforming chain, toward the palm positive, at frame (None:
+    the rest), in the hand's own frame. The palm faces (fingers' direction) x (index to pinky) on a right hand,
+    mirrored on a left one; each finger bends about its first bone x that palm normal, read from the rest."""
+    hand, chains = _hand(ob, rig, side)
+    bones = ob.data.bones
+    if frame is not None:
+        bpy.context.scene.frame_set(frame)
+    pbs = ob.pose.bones
+    knuckles = [bones[chains[f][0]].head_local for f in mr.FINGERS if f in chains]
+    wrist = bones[hand].head_local
+    along = (sum(knuckles, Vector()) / len(knuckles) - wrist).normalized()
+    across = knuckles[-1] - knuckles[0]
+    across = (across - along * across.dot(along)).normalized()
+    normal = along.cross(across) if side == "r" else across.cross(along)
+    undo = (bones[hand].matrix_local.to_3x3() @ pbs[hand].matrix.to_3x3().normalized().inverted()
+            if frame is not None else Matrix.Identity(3))
+
+    def head_tail(n):
+        return (pbs[n].head, pbs[n].tail) if frame is not None else (bones[n].head_local, bones[n].tail_local)
+    out = {"normal": normal}
+    for f, names in chains.items():
+        dirs = [(undo @ (head_tail(n)[1] - head_tail(n)[0])).normalized() for n in names]
+        start = head_tail(hand)[0] if frame is not None else wrist
+        ref = (undo @ (head_tail(names[0])[0] - start)).normalized()
+        rest_first = (bones[names[0]].tail_local - bones[names[0]].head_local).normalized()
+        if f == "thumb":
+            out[f] = dirs
+            continue
+        hinge = rest_first.cross(normal).normalized()
+        out[f] = [mr._bend(tuple(a), tuple(b), tuple(hinge)) for a, b in zip([ref] + dirs, dirs)]
+    return out
+
+
+def relaxed_checks(args):
+    """A motion without fingers (Kimodo's): every rig's mapped finger chains get a relaxed hand, measured on Blender's
+    evaluation of the deforming bones in the hand's own frame: each joint bends toward the palm and none backwards,
+    every finger curls more than at rest (Rigify's metarig fingers are already bent, so they gain least), the pinky
+    more than the index, and all stay well short of a fist, the same on both hands and on every frame. Keys a finger already has are left alone; applying again relaxes the hand again."""
+    text = (FIXTURES / "kimodo_walk_60.bvh").read_text()
+    meta = {"fps": 30, "fingers_animated": False, "units": "cm"}
+    P = soma_points(mr.parse_bvh(text))
+    for kind in ("soma", "mixamo", "mixamo_lying", "unreal", "auto_rig_pro", "generic", "rigify"):
+        try:
+            bpy.ops.wm.read_factory_settings(use_empty=True)
+            scene = bpy.context.scene
+            if kind == "soma":
+                line = mr.apply(text, meta, target=None, title="walk")
+                ob = bpy.data.objects["Motion skeleton"]
+            else:
+                ob = build_rig(kind, P)[0]
+                bpy.context.view_layer.update()
+                line = mr.apply(text, meta, target=ob, title="walk")
+            rig = mr.rig_of(ob)
+            rest = {s: hand_bends(ob, rig, s) for s in "lr"}
+            if kind == "mixamo":
+                check(all(rest[s]["normal"].dot(Vector((0, 0, -1))) > 0.95 for s in "lr"),
+                      "relaxed: the palm normal read from a T-pose hand's rest points down, as SOMA's T-pose has it")
+            frames = (scene.frame_start, (scene.frame_start + scene.frame_end) // 2, scene.frame_end)
+            seen = {(s, f): hand_bends(ob, rig, s, f) for s in "lr" for f in frames}
+            fingers = [f for f in mr.FINGERS if f in rest["l"]]
+            totals = {(s, f): sum(seen[s, frames[0]][f]) for s in "lr" for f in fingers}
+            lowest = min(b for (s, _f), bends in seen.items() for f in fingers for b in bends[f])
+            drift = max(abs(a - b) for s in "lr" for f in fingers for t in frames
+                        for a, b in zip(seen[s, t][f], seen[s, frames[0]][f]))
+            mirror = max(abs(totals["l", f] - totals["r", f]) for f in fingers)
+            gained = min(totals[s, f] - sum(rest[s][f]) for s in "lr" for f in fingers)
+            thumb = "thumb" not in rest["l"] or all(
+                sum(d.dot(rest[s]["normal"]) for d in seen[s, frames[0]]["thumb"])
+                > sum(d.dot(rest[s]["normal"]) for d in rest[s]["thumb"]) for s in "lr")
+            check("fingers set to a relaxed pose; the model doesn't animate fingers" in line
+                  and lowest > -1.0 and 20.0 <= min(totals.values()) and max(totals.values()) <= 110.0 and gained > 10.0
+                  and totals["l", fingers[-1]] >= totals["l", fingers[0]] and drift < 0.5 and mirror < 2.0 and thumb,
+                  f"relaxed {kind}: deforming fingers curl toward the palm "
+                  f"({fingers[0]} {totals['l', fingers[0]]:.0f}°, "
+                  f"{fingers[-1]} {totals['l', fingers[-1]]:.0f}° in all, +{gained:.0f}° at least, lowest joint "
+                  f"{lowest:+.1f}°), the thumb in, both hands within {mirror:.1f}°, every frame within {drift:.2f}°")
+        except Exception:
+            traceback.print_exc()
+            check(False, f"relaxed {kind}: ran without an error")
+
+    # Keys of the user's own: a posed index knuckle keyed in the current action stays as it is.
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    ob = build_rig("mixamo", P)[0]
+    ob.animation_data_create().action = bpy.data.actions.new("Grip")
+    pb = ob.pose.bones["mixamorig:LeftHandIndex1"]
+    pb.rotation_quaternion = (0.9, 0.0, 0.0, 0.43)
+    pb.keyframe_insert("rotation_quaternion", frame=1)
+    line = mr.apply(text, meta, target=ob, title="walk")
+    paths = {c.data_path for c in _curves(ob.animation_data.action)}
+    check('pose.bones["mixamorig:LeftHandIndex1"].rotation_quaternion' not in paths
+          and 'pose.bones["mixamorig:LeftHandIndex2"].rotation_quaternion' in paths
+          and "keys already on 1 finger bone were left as they are" in line,
+          "relaxed: a finger the current action keys is left as it is, and the result says so")
+    first = ob.animation_data.action
+    line = mr.apply(text, meta, target=ob, title="walk again")
+    paths = {c.data_path for c in _curves(ob.animation_data.action)}
+    check(ob.animation_data.action is not first
+          and 'pose.bones["mixamorig:RightHandPinky3"].rotation_quaternion' in paths
+          and "relaxed pose" in line and "left as they are" not in line,
+          "relaxed: applying again over a relaxed hand relaxes it again (its own keys are not the user's)")
 
 
 def drive_checks(args):
@@ -618,6 +748,11 @@ def main():
         except Exception:
             traceback.print_exc()
             check(False, "drive checks ran without an error")
+        try:
+            relaxed_checks(args)
+        except Exception:
+            traceback.print_exc()
+            check(False, "relaxed hand checks ran without an error")
     if args.ybot:
         try:
             ybot(args.ybot, text, meta, args.render)

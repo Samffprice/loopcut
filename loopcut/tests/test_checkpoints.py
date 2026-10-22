@@ -139,5 +139,96 @@ class CheckpointLayoutTest(unittest.TestCase):
         self.assertIn(("restore", "22" * 16), [h["action"] for h in self.build(session)["hits"]])
 
 
+class FreedWindow(Exception):
+    """In Blender a segfault: temp_override reads a freed window's screen before checking it exists."""
+
+
+class Window:
+    def __init__(self, panel: bool):
+        self.freed = False
+        self.screen = types.SimpleNamespace(areas=[types.SimpleNamespace(type="VIEW_3D")] +
+                                            ([types.SimpleNamespace(type="LOOPCUT")] if panel else []))
+
+
+class FileReadBlender:
+    """Windows and the bits of bpy that host._restore_later touches. read_file() is what an in-place
+    restore does to the UI: the snapshot's windows replace these, which are freed."""
+
+    def __init__(self, panels: list[bool], clicked: int):
+        self.windows = [Window(p) for p in panels]
+        self.window, self.timers, self.focused_in = self.windows[clicked], [], []
+        blender = self
+        context = type("Context", (), {
+            "window": property(lambda _: blender.window),
+            "window_manager": property(lambda _: types.SimpleNamespace(windows=list(blender.windows))),
+            "temp_override": lambda _, window: blender.temp_override(window)})()
+        self.bpy = types.SimpleNamespace(
+            context=context, ops=types.SimpleNamespace(loopcut=types.SimpleNamespace(focus=self.focus)),
+            app=types.SimpleNamespace(timers=types.SimpleNamespace(
+                register=lambda fn, first_interval=0: self.timers.append(fn))))
+
+    def read_file(self, panels: list[bool]):
+        for window in self.windows:
+            window.freed = True
+        self.windows, self.window = [Window(p) for p in panels], None  # A file read leaves no context window.
+
+    def temp_override(self, window):
+        import contextlib
+        if window.freed:
+            raise FreedWindow
+        self.window = window
+        return contextlib.nullcontext()
+
+    def focus(self):
+        self.focused_in.append(self.window)
+        return {"FINISHED"}
+
+
+class EditAfterRestoreTest(unittest.TestCase):
+    """Edit on a past message restores the scene, then gives the box the keys (0.2.6 crashed here)."""
+
+    def run_restore(self, before: list[bool], clicked: int, after: list[bool], edit=True, fails=False):
+        import ast
+        blender = FileReadBlender(before, clicked)
+        session = state.new_session()
+
+        def restore(_session, checkpoint_id):
+            if fails:
+                raise cp.CheckpointError("That checkpoint has expired.")
+            blender.read_file(after)
+        namespace = {"bpy": blender.bpy, "state": types.SimpleNamespace(session=lambda: session, item_error=state.item_error),
+                     "checkpoints": types.SimpleNamespace(restore=restore, CheckpointError=cp.CheckpointError),
+                     "tag_redraw_all": lambda: None, "_runtime": {}, "NATIVE": True, "HOST_UI_TYPE": "LOOPCUT"}
+        source = Path(__file__).resolve().parents[2] / "scripts" / "addons_core" / "loopcut" / "ui" / "host.py"
+        names = {"is_host", "find_panel", "_restore_later", "_window_after_load"}
+        nodes = [node for node in ast.parse(source.read_text()).body if getattr(node, "name", None) in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+        namespace["_restore_later"]("ab" * 16, edit=edit)
+        self.assertEqual(blender.focused_in, [], "nothing happens before the click is handled")
+        while blender.timers:
+            blender.timers.pop(0)()
+        return blender, session
+
+    def test_edit_focuses_the_box_through_a_window_from_after_the_file_read(self):
+        blender, _ = self.run_restore([False, True], 1, [False, True])
+        self.assertEqual(blender.focused_in, [blender.windows[1]])
+        self.assertFalse(blender.focused_in[0].freed)
+
+    def test_the_clicked_windows_place_wins_while_it_shows_the_panel(self):
+        blender, _ = self.run_restore([True, True], 1, [True, True])
+        self.assertEqual(blender.focused_in, [blender.windows[1]])
+
+    def test_a_window_that_shows_the_panel_beats_one_that_lost_it(self):
+        blender, _ = self.run_restore([False, True], 1, [True, False])
+        self.assertEqual(blender.focused_in, [blender.windows[0]])
+
+    def test_restore_and_a_refused_edit_leave_the_keys_alone(self):
+        blender, _ = self.run_restore([True], 0, [True], edit=False)
+        self.assertEqual(blender.focused_in, [])
+        blender, session = self.run_restore([True], 0, [True], fails=True)
+        self.assertEqual(blender.focused_in, [])
+        self.assertEqual(session["items"][-1]["kind"], "error")
+
+
 if __name__ == "__main__":
     unittest.main()

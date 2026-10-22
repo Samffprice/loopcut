@@ -14,9 +14,12 @@ so the first frame faces where the character faces now. The pelvis (midpoint of 
 source pelvis, scaled by the ratio of leg lengths, from where the character stands. Local rotations are
 written parent first: basis = chain^-1 @ desired. After the bake, Blender's evaluation is checked: when no limb's
 deforming bones follow the motion (mapped controls that drive nothing), the bake is undone and refused.
+When the motion does not animate fingers (fingers_animated false), the mapped finger bones get a relaxed hand,
+each chain curled toward the palm about a hinge read from its own rest geometry, instead of the rig's rest
+(flat on T-pose rigs); finger bones that something already keys are left as they are.
 
-The parsing, bone maps and rig detection need no Blender (unit tested without it); retarget() and apply()
-run in Blender.
+The parsing, bone maps, rig detection and the relaxed hand need no Blender (unit tested without it); retarget()
+and apply() run in Blender.
 """
 
 import math
@@ -621,6 +624,115 @@ def sample_times(frames, source_fps, scene_fps):
     return [min(frames - 1.0, i * source_fps / scene_fps) for i in range(count)]
 
 
+# ---------------------------------------------------------------------------------------- relaxed hands
+
+# A motion that does not animate fingers (Kimodo's: motion.json fingers_animated false) would leave the rig's own
+# rest on them, flat and straight on T-pose rigs. Those hands get a relaxed pose instead. Bend in degrees at each
+# joint from the knuckle out, toward the palm: most at the middle joint, more toward the pinky. A joint the rig
+# already bends that far at rest is not bent further. The thumb turns a little toward the palm and the fingers.
+RELAXED = {"index": (12.0, 22.0, 12.0), "middle": (15.0, 26.0, 14.0), "ring": (18.0, 30.0, 16.0),
+           "pinky": (22.0, 34.0, 18.0)}
+RELAXED_THUMB = (6.0, 10.0, 12.0)  # Added at each thumb joint.
+RELAXED_TAIL = math.cos(math.radians(75.0))  # A tail turned further from its chain is not read as a direction.
+RELAXED_KEY = "loopcut_relaxed_hands"  # On an action: the bones it keys with a relaxed hand (a JSON list).
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    length = math.sqrt(_dot(a, a))
+    return (a[0] / length, a[1] / length, a[2] / length) if length > 1e-9 else None
+
+
+def _bend(u, v, axis):
+    """Degrees from direction u to direction v about axis, seen in the plane across the axis."""
+    u = _sub(u, tuple(axis[i] * _dot(u, axis) for i in range(3)))
+    v = _sub(v, tuple(axis[i] * _dot(v, axis) for i in range(3)))
+    return math.degrees(math.atan2(_dot(axis, _cross(u, v)), _dot(u, v)))
+
+
+def _turn(matrix, axis, degrees):
+    """The pose basis (w, x, y, z) that turns a bone with rest rotation matrix (rows) about axis (armature space)."""
+    local = _unit(tuple(sum(matrix[i][j] * axis[i] for i in range(3)) for j in range(3)))
+    half = math.radians(degrees) / 2
+    return (math.cos(half),) + tuple(math.sin(half) * c for c in local)
+
+
+def relaxed_hand(side, rest):
+    """A relaxed pose for one hand, side "l" or "r", from its rest geometry; no Blender needed.
+    rest: canonical -> (head, tail, rotation rows) in armature space for the mapped hand, finger and thumb bones.
+    Returns canonical -> pose basis rotation (w, x, y, z), only for the bones it turns.
+
+    The palm faces (fingers' direction) x (index to pinky) on a right hand, the mirror on a left one, whatever the
+    rest pose. Each finger bends about one hinge, its first bone's direction x the palm normal, so the whole chain
+    curls in its own plane toward the palm in every rig's own bone axes (rolls, Mixamo's, Unreal's, Rigify's)."""
+    def at(part):
+        return rest.get(f"{part}_{side}")
+
+    hand = at("hand")
+    knuckles = [at(f"{f}1")[0] for f in FINGERS if at(f"{f}1")]
+    if hand is None or not knuckles:
+        return {}
+    wrist = hand[0]
+    along = _unit(_sub(tuple(sum(k[i] for k in knuckles) / len(knuckles) for i in range(3)), wrist))
+    if len(knuckles) > 1:
+        across = _sub(knuckles[-1], knuckles[0])
+    elif at("thumb1"):  # One finger: the thumb is on the index side.
+        across = _sub(knuckles[0], at("thumb1")[0])
+    else:
+        return {}
+    if along is None:
+        return {}
+    across = _unit(_sub(across, tuple(along[i] * _dot(across, along) for i in range(3))))
+    if across is None:
+        return {}
+    normal = _cross(along, across) if side == "r" else _cross(across, along)
+    out = {}
+    for f in FINGERS:
+        chain = []
+        for i in (1, 2, 3):
+            if at(f"{f}{i}") is None:
+                break
+            chain.append((f"{f}{i}_{side}", at(f"{f}{i}")))
+        if not chain:
+            continue
+        base = at(f"{f}0")
+        dirs = [_unit(_sub(chain[0][1][0], base[0] if base else wrist)) or along]
+        for n, (_c, (head, tail, _m)) in enumerate(chain):
+            d = _unit(_sub(chain[n + 1][1][0] if n + 1 < len(chain) else tail, head))
+            dirs.append(d if d is not None and _dot(d, dirs[-1]) > RELAXED_TAIL else dirs[-1])
+        hinge = _unit(_cross(dirs[1], normal)) or _unit(_cross(along, normal))
+        for n, (c, (_h, _t, matrix)) in enumerate(chain):
+            want = RELAXED[f][n]
+            add = min(max(0.0, want - _bend(dirs[n], dirs[n + 1], hinge)), want + 30.0)
+            if add > 0.1:
+                out[c] = _turn(matrix, hinge, add)
+    thumb = []
+    for i in (1, 2, 3):
+        if at(f"thumb{i}") is None:
+            break
+        thumb.append((f"thumb{i}_{side}", at(f"thumb{i}")))
+    if thumb:
+        head, tail, _m = thumb[0][1]
+        d = _unit(_sub(thumb[-1][1][0], head) if len(thumb) > 1 else _sub(tail, head))
+        toward = _unit(tuple(normal[i] + across[i] for i in range(3)))
+        hinge = _unit(_cross(d, toward)) if d is not None else None
+        if hinge is not None:
+            for n, (c, (_h, _t, matrix)) in enumerate(thumb):
+                out[c] = _turn(matrix, hinge, RELAXED_THUMB[n])
+    return out
+
+
 # ------------------------------------------------------------------------------- Blender: source
 
 class Source:
@@ -721,9 +833,12 @@ def _leg_length(points, side_names):
 
 
 def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=True, name="Motion: motion"):
-    """Bake the motion onto armature object ob (rig from detect()). Returns a report dict."""
+    """Bake the motion onto armature object ob (rig from detect()). Returns a report dict.
+    fingers=False (a motion that does not animate them): the mapped finger bones get a relaxed hand, held over the
+    action's frames, except bones that what plays on ob now already keys (those are left as they are)."""
+    import json
     import bpy
-    from mathutils import Matrix, Vector
+    from mathutils import Matrix, Quaternion, Vector
     bones, data = ob.data.bones, ob.data
     warnings = []
     pairs = {}  # target bone -> (SOMA joint, canonical or None)
@@ -735,6 +850,15 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         if joint in source.rest and bone in bones:
             pairs.setdefault(bone, (joint, None))
     root = rig.root if rig.root in bones else rig.bones["hips"]
+    relaxed, kept = {}, []
+    if not fingers:
+        keyed = _keyed_bones(ob)  # Before the new action stashes the current one.
+        hands = {c: b for c, b in rig.bones.items() if b in bones and part_of(c) in FINGER_PARTS | {"hand"}}
+        kept = sorted(b for c, b in hands.items() if b in keyed and part_of(c) != "hand")
+        rest = {c: (tuple(bones[b].head_local), tuple(bones[b].tail_local),
+                    [tuple(row) for row in bones[b].matrix_local.to_3x3()]) for c, b in hands.items()}
+        for s in "lr":
+            relaxed.update({hands[c]: q for c, q in relaxed_hand(s, rest).items() if hands[c] not in keyed})
 
     bpy.context.view_layer.update()
     mw = ob.matrix_world.copy()
@@ -801,7 +925,8 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         b = bones[n]
         rel[n] = b.parent.matrix_local.inverted() @ b.matrix_local if b.parent else b.matrix_local.copy()
     # What a refused bake puts back: the pose, the switches and the animation data.
-    saved = {n: (ob.pose.bones[n].rotation_mode, ob.pose.bones[n].matrix_basis.copy()) for n in needed}
+    saved = {n: (ob.pose.bones[n].rotation_mode, ob.pose.bones[n].matrix_basis.copy())
+             for n in needed | set(relaxed)}
     saved_switches = [(b, p, ob.pose.bones[b][p]) for b, p, _v in rig.switches
                       if b in ob.pose.bones and p in ob.pose.bones[b].keys()]
     ad = ob.animation_data
@@ -811,6 +936,9 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         pb.matrix_basis = Matrix.Identity(4)
         if pb.rotation_mode == "AXIS_ANGLE":
             pb.rotation_mode = "QUATERNION"
+    for n in relaxed:
+        if ob.pose.bones[n].rotation_mode == "AXIS_ANGLE":
+            ob.pose.bones[n].rotation_mode = "QUATERNION"
     for n in pairs:
         pb = ob.pose.bones[n]
         if any(c.type == "IK" and c.influence > 0 and not c.mute for c in pb.constraints):
@@ -889,7 +1017,16 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         path = "rotation_quaternion" if mode == "QUATERNION" else "rotation_euler"
         series += [(f'pose.bones["{_escape(n)}"].{path}', i, n, [v[i] for v in values]) for i in range(len(values[0]))]
     series += [(f'pose.bones["{_escape(root)}"].location', i, root, [v[i] for v in locations]) for i in range(3)]
+    ends = frames[:1] + frames[1:][-1:]  # A relaxed hand: one value, keyed at the first and last frame.
+    for n, q in relaxed.items():
+        mode = ob.pose.bones[n].rotation_mode
+        (value,) = _rotation_values([Quaternion(q).to_matrix()], mode)
+        path = "rotation_quaternion" if mode == "QUATERNION" else "rotation_euler"
+        series += [(f'pose.bones["{_escape(n)}"].{path}', i, n, [value[i]] * len(ends), ends)
+                   for i in range(len(value))]
     _write(ob, action, frames, series)
+    if relaxed:
+        action[RELAXED_KEY] = json.dumps(sorted(relaxed))
     ob.pose.bones[root].location = locations[0]
     missed, judged = _unreached(ob, rig, scene, frames, poses, k)
     if missed and len(missed) == judged:
@@ -899,7 +1036,8 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         warnings.append(f"the {' and '.join(missed)} did not follow the motion: their mapped bones do not move "
                         "the deforming bones (a limb left in IK mode?)")
     return {"action": action, "frames": (frames[0], frames[-1]), "count": len(frames), "fps": fps_scene,
-            "mapped": len(pairs), "stashed": stashed, "warnings": warnings, "scale": k, "evaluated": evaluate}
+            "mapped": len(pairs), "stashed": stashed, "warnings": warnings, "scale": k, "evaluated": evaluate,
+            "relaxed": len(relaxed), "kept": len(kept)}
 
 
 def _rotation_values(mats, mode):
@@ -1014,6 +1152,44 @@ def _escape(name):
     return name.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_POSE_BONE = re.compile(r'^pose\.bones\["((?:[^"\\]|\\.)*)"\]')
+
+
+def _curves_of(action):
+    if hasattr(action, "layers"):
+        return [c for layer in action.layers for strip in layer.strips for bag in strip.channelbags
+                for c in bag.fcurves]
+    return list(action.fcurves)  # Before slotted actions.
+
+
+def _keyed_bones(ob):
+    """Bones that what plays on ob now keys: its action and the actions of its unmuted NLA strips. A relaxed hand
+    this module keyed (listed under RELAXED_KEY) that nobody has changed since (flat, two keys at most) is not."""
+    import json
+    ad = ob.animation_data
+    if ad is None:
+        return set()
+    actions = [ad.action] if ad.action is not None else []
+    actions += [s.action for t in ad.nla_tracks if not t.mute for s in t.strips if s.action is not None and not s.mute]
+    keyed = set()
+    for action in actions:
+        try:
+            ours = set(json.loads(action.get(RELAXED_KEY) or "[]"))
+        except (TypeError, ValueError):
+            ours = set()
+        curves = {}
+        for curve in _curves_of(action):
+            match = _POSE_BONE.match(curve.data_path)
+            if match:
+                curves.setdefault(re.sub(r"\\(.)", r"\1", match.group(1)), []).append(curve)
+        for bone, found in curves.items():
+            if bone in ours and all(len(c.keyframe_points) <= 2
+                                    and len({round(p.co[1], 6) for p in c.keyframe_points}) <= 1 for c in found):
+                continue
+            keyed.add(bone)
+    return keyed
+
+
 def _new_action(ob, name):
     """A fresh active action; the previous one goes to a muted "[Action Stash]" NLA track, as Blender does."""
     import bpy
@@ -1041,7 +1217,8 @@ def _new_action(ob, name):
 
 
 def _write(ob, action, frames, series):
-    """Write whole curves at once: keyframe_insert per bone per frame is slow on long clips."""
+    """Write whole curves at once: keyframe_insert per bone per frame is slow on long clips.
+    series: (data path, index, group, values[, their frames when not frames])."""
     ad = ob.animation_data
     if hasattr(action, "layers"):
         from bpy_extras import anim_utils
@@ -1050,7 +1227,7 @@ def _write(ob, action, frames, series):
     else:  # Before slotted actions.
         curves, groups = action.fcurves, action.groups
     made = {}
-    for path, index, group, values in series:
+    for path, index, group, values, *keys in series:
         curve = curves.new(path, index=index)
         if group not in made:
             made[group] = groups.get(group) or groups.new(group)
@@ -1058,7 +1235,7 @@ def _write(ob, action, frames, series):
         points = curve.keyframe_points
         points.add(len(values))
         flat = []
-        for frame, value in zip(frames, values):
+        for frame, value in zip(keys[0] if keys else frames, values):
             flat += (float(frame), float(value))
         points.foreach_set("co", flat)
         for point in points:
@@ -1331,8 +1508,13 @@ def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_
         notes.append(f"its previous action '{report['stashed']}' is kept in a muted NLA track")
     if empty:
         notes.append(f"scene frame range set to {first}–{last}")
-    if fingers is False:
-        notes.append("fingers not animated by this model")
+    n = report["kept"]
+    kept = f"keys already on {n} finger bone{'s' if n != 1 else ''} were left as they are" if n else ""
+    if report["relaxed"]:
+        notes.append("fingers set to a relaxed pose; the model doesn't animate fingers"
+                     + (f" ({kept})" if kept else ""))
+    elif fingers is False:
+        notes.append("fingers not animated by this model" + (f"; {kept}" if kept else ""))
     notes += meta.get("warnings", [])[:5]
     notes += report["warnings"][:5]
     line = (f"Motion '{report['action'].name}' {where}: frames {first}–{last} at {rate} ({seconds:.1f} s), "

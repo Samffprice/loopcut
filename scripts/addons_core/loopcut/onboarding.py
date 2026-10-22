@@ -463,14 +463,26 @@ def _styled(layout) -> bool:
     return hasattr(layout, "label_styled")
 
 
+def _strikes() -> bool:
+    """Whether this build's label_styled can strike its text (the fork from 0.2.8). Asked, never assumed: an
+    unknown keyword would break the modal setup's drawing."""
+    try:
+        return "strike" in bpy.types.UILayout.bl_rna.functions["label_styled"].parameters
+    except (AttributeError, KeyError, TypeError):
+        return False
+
+
 def _text(column, text: str, color=FOREGROUND, scale: float = 1.0, bold: bool = False, center: bool = False,
-          tight: bool = False, code: bool = False) -> None:
+          tight: bool = False, code: bool = False, strike: bool = False) -> None:
     """Text in a palette color (the fork's UILayout.label_styled); a plain label elsewhere. Lines split on "\\n";
-    tight leaves only the text's own height, for a caption set close under its label; code sets hyphens tight."""
+    tight leaves only the text's own height, for a caption set close under its label; code sets hyphens tight;
+    strike draws a line through it where the build can."""
     if _styled(column):
         row = column.row()
         row.alignment = "CENTER" if center else "LEFT"
-        row.label_styled(text=text, scale=scale, bold=bold, color=color, tight=tight, center=center, code=code)
+        extra = {"strike": True} if strike and _strikes() else {}
+        row.label_styled(text=text, scale=scale, bold=bold, color=color, tight=tight, center=center, code=code,
+                         **extra)
         return
     for line in text.split("\n"):
         row = column.row()
@@ -1343,15 +1355,16 @@ def _draw_privacy(layout) -> None:
 # The Try it screen's first projects. tool: the cloud tool a card runs, priced by its manifest estimate; a
 # per-second tool's estimate covers its default length (MOTION_DEFAULT_SECONDS), so "seconds" scales it. With
 # the default 80-credit model and 3 seconds of motion (6), both paid cards fit in 100 trial credits.
+# free: the card's cloud call is on the house (try_samples): its price shows struck through, next to 0 credits.
 # thumbnail: in media/, square, in the sample photo's studio look: our renders of the clay mannequin text to motion
 # puts on an empty scene, mid-jump with a pale ghost of its crouch, and of Poly Haven's CC0 "Treasure Chest", and the
 # photo.
 MOTION_DEFAULT_SECONDS = 5  # motion_from_text bills per second and defaults to 5 (its manifest description).
 CARDS = (
-    {"id": "motion", "title": "Make it move", "tool": "motion_from_text", "seconds": 3,
+    {"id": "motion", "title": "Make it move", "tool": "motion_from_text", "seconds": 3, "free": True,
      "thumbnail": "card_motion.jpg", "line": "A figure jumps for joy, with text to motion.",
      "prompt": "Remove the default cube, then use text to motion to make a figure jump for joy, 3 seconds long."},
-    {"id": "photo_3d", "title": "Photo to 3D model", "tool": "image_to_3d", "photo": True,
+    {"id": "photo_3d", "title": "Photo to 3D model", "tool": "image_to_3d", "photo": True, "free": True,
      "thumbnail": "alarm-clock.jpg", "line": "Turns this photo into a textured 3D model.",
      "prompt": "Turn the attached photo into a textured 3D model and put it in the scene in place of the default "
                "cube."},
@@ -1479,7 +1492,16 @@ def _draw_try(layout, context) -> None:
         price = foot.column()
         price.separator(factor=TITLE_OFFSET)  # The price's middle on the button's middle.
         locked = card["tool"] is not None and not signed_in
-        _text(price, "Needs a Loopcut account" if locked else _price(credits_needed), MUTED if locked else FOREGROUND)
+        if locked:
+            _text(price, "Needs a Loopcut account", MUTED)
+        elif card.get("free") and credits_needed:  # On the house: what it would cost, struck, then 0.
+            line = price.row(align=True)
+            line.alignment = "LEFT"  # Side by side, not spread across the price's column.
+            _text(line, f"{credits_needed:g} credits", DANGER, strike=True)
+            line.separator(factor=0.5)
+            _text(line, "0 credits")
+        else:
+            _text(price, _price(credits_needed))
         start = foot.column()
         start.enabled = runnable and connected
         start.scale_y = OPTION_SCALE
@@ -1831,7 +1853,8 @@ def _close_and_start(card: dict | None):
             bpy.ops.loopcut.focus()
             return None
     from .ui import host
-    host.start_request(window, card["prompt"], (str(SAMPLE_PHOTO),) if card.get("photo") else ())
+    host.start_request(window, card["prompt"], (str(SAMPLE_PHOTO),) if card.get("photo") else (),
+                       try_it=card["id"] if card.get("free") else "")
     return None
 
 

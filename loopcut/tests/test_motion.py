@@ -4,6 +4,7 @@ and the apply_motion handler, without Blender. Retargeting itself runs in Blende
 
 import hashlib
 import json
+import math
 import shutil
 import sys
 import tempfile
@@ -360,6 +361,171 @@ class BakeChecksTest(unittest.TestCase):
         self.assertNotIn("CloudRig", other)
 
 
+def _rotation(axis, degrees):
+    """Rows of the rotation about a unit axis (Rodrigues)."""
+    (x, y, z), c, s = axis, math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    return [[c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+            [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+            [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)]]
+
+
+def _apply(m, v):
+    return tuple(sum(m[i][j] * v[j] for j in range(3)) for i in range(3))
+
+
+def _mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _bone_matrix(direction, roll):
+    """Rest rotation rows: Y along the bone, X and Z turned by roll degrees about it."""
+    d = mr._unit(direction)
+    x = mr._unit(mr._cross(d, (0.0, 0.0, 1.0))) or (1.0, 0.0, 0.0)
+    x = _apply(_rotation(d, roll), x)
+    z = mr._cross(x, d)
+    return [[x[i], d[i], z[i]] for i in range(3)]
+
+
+def hand_rest(side, turn=None, rolls=False, curl=0.0):
+    """A T-pose hand, palm down, as rest geometry: canonical -> (head, tail, rotation rows). The character faces -Y,
+    so the index is on the -Y side of either hand. curl: rest bend at every finger joint, toward the palm (-Z)."""
+    sx = 1.0 if side == "l" else -1.0
+    turn = turn or _rotation((0.0, 0.0, 1.0), 0.0)
+    bones = {}
+
+    def add(part, head, direction, length, n):
+        d = mr._unit(direction)
+        tail = tuple(head[i] + d[i] * length for i in range(3))
+        bones[f"{part}_{side}"] = (_apply(turn, head), _apply(turn, tail),
+                                   _mul(turn, _bone_matrix(d, (n * 47) % 180 - 90 if rolls else 0.0)))
+        return tail
+
+    wrist = (sx * 0.6, 0.0, 1.4)
+    add("hand", wrist, (sx, 0.0, 0.0), 0.08, 0)
+    hinge = (0.0, sx, 0.0)  # Turns the fingers (+X on the left, -X on the right) toward -Z.
+    for n, (f, y) in enumerate(zip(mr.FINGERS, (-0.03, -0.01, 0.01, 0.03))):
+        head, d = (wrist[0] + sx * 0.09, y, 1.4), (sx, 0.0, 0.0)
+        for i, length in zip((1, 2, 3), (0.04, 0.025, 0.02)):
+            d = _apply(_rotation(hinge, curl), d)
+            head = add(f"{f}{i}", head, d, length, n * 3 + i)
+    head = (wrist[0] + sx * 0.02, -0.03, 1.39)
+    for i, length in zip((1, 2, 3), (0.035, 0.03, 0.025)):
+        head = add(f"thumb{i}", head, (sx * 0.7, -0.7, -0.2), length, 20 + i)
+    return bones
+
+
+def posed(rest, pose, chain):
+    """Armature-space directions of chain's bones after the pose: each bone turns by its own rest @ basis @ rest^T,
+    carried by the bones before it."""
+    out, carried = [], _rotation((0.0, 0.0, 1.0), 0.0)
+    for c in chain:
+        head, tail, m = rest[c]
+        if c in pose:
+            w, *v = pose[c]
+            angle = math.degrees(2 * math.acos(max(-1.0, min(1.0, w))))
+            axis = mr._unit(_apply(m, v))
+            carried = _mul(carried, _rotation(axis, angle)) if axis else carried
+        out.append(_apply(carried, mr._unit(mr._sub(tail, head))))
+    return out
+
+
+class RelaxedHandTest(unittest.TestCase):
+    """The relaxed hand for motions without fingers; harness/motion_check.py checks it on real rigs in Blender."""
+
+    def chain(self, side, finger):
+        return [f"{finger}{i}_{side}" for i in (1, 2, 3)]
+
+    def test_both_hands_curl_toward_the_palm_more_toward_the_pinky(self):
+        for side in "lr":
+            rest = hand_rest(side)
+            pose = mr.relaxed_hand(side, rest)
+            totals = []
+            for f in mr.FINGERS:
+                with self.subTest(side=side, finger=f):
+                    dirs = posed(rest, pose, self.chain(side, f))
+                    hinge = (0.0, 1.0, 0.0) if side == "l" else (0.0, -1.0, 0.0)
+                    arm = (1.0 if side == "l" else -1.0, 0.0, 0.0)
+                    bends = [mr._bend(a, b, hinge) for a, b in zip([arm] + dirs, dirs)]
+                    self.assertEqual([round(b, 3) for b in bends], list(mr.RELAXED[f]))
+                    self.assertTrue(all(d[2] < 0 for d in dirs))  # Every bone points below the palm: toward it.
+                    self.assertTrue(all(abs(d[1]) < 1e-9 for d in dirs))  # In the finger's own plane.
+                    totals.append(sum(bends))
+            self.assertEqual(totals, sorted(totals))
+
+    def test_same_turn_whatever_the_bone_rolls_and_the_rest_orientation(self):
+        a_pose = _mul(_rotation((0.0, 1.0, 0.0), 40.0), _rotation((1.0, 0.0, 0.0), -70.0))  # Down and palm turned.
+        for side in "lr":
+            plain = hand_rest(side)
+            pose = mr.relaxed_hand(side, plain)
+            for turn in (None, a_pose):
+                rest = hand_rest(side, turn=turn, rolls=True)
+                other = mr.relaxed_hand(side, rest)
+                self.assertEqual(set(other), set(pose))
+                for f in mr.FINGERS + ("thumb",):
+                    with self.subTest(side=side, finger=f, turned=turn is not None):
+                        same = turn or _rotation((0, 0, 1), 0.0)
+                        want = [_apply(same, d) for d in posed(plain, pose, self.chain(side, f))]
+                        got = posed(rest, other, self.chain(side, f))
+                        for a, b in zip(want, got):
+                            self.assertLess(max(abs(a[i] - b[i]) for i in range(3)), 1e-9)
+
+    def test_rest_bends_count_and_nothing_bends_backwards(self):
+        curled = mr.relaxed_hand("r", hand_rest("r", curl=40.0))
+        self.assertFalse(any(c.startswith(mr.FINGERS) for c in curled))  # Already relaxed past the pose: untouched.
+        back = hand_rest("r", curl=-15.0)
+        pose = mr.relaxed_hand("r", back)
+        dirs = posed(back, pose, self.chain("r", "middle"))
+        bends = [mr._bend(a, b, (0.0, -1.0, 0.0)) for a, b in zip([(-1.0, 0.0, 0.0)] + dirs, dirs)]
+        self.assertEqual([round(b, 3) for b in bends], list(mr.RELAXED["middle"]))  # Straightened, then curled.
+
+    def test_thumb_turns_a_little_toward_the_palm_and_the_fingers(self):
+        for side in "lr":
+            rest = hand_rest(side)
+            pose = mr.relaxed_hand(side, rest)
+            chain = [f"thumb{i}_{side}" for i in (1, 2, 3)]
+            before = [mr._unit(mr._sub(rest[c][1], rest[c][0])) for c in chain]
+            after = posed(rest, pose, chain)
+            with self.subTest(side=side):
+                self.assertTrue(all(a[2] < b[2] and a[1] > b[1] for a, b in zip(after, before)))  # Down and back.
+                turned = math.degrees(math.acos(max(-1.0, min(1.0, mr._dot(after[-1], before[-1])))))
+                self.assertAlmostEqual(turned, sum(mr.RELAXED_THUMB), places=6)
+
+    def test_only_mapped_bones_and_nothing_without_a_hand_or_fingers(self):
+        rest = hand_rest("l")
+        partial = {c: v for c, v in rest.items() if not c.startswith(("ring", "pinky", "index3"))}
+        self.assertEqual(set(mr.relaxed_hand("l", partial)), {"index1_l", "index2_l", "middle1_l", "middle2_l",
+                                                              "middle3_l", "thumb1_l", "thumb2_l", "thumb3_l"})
+        self.assertEqual(mr.relaxed_hand("l", {c: v for c, v in rest.items() if c != "hand_l"}), {})
+        self.assertEqual(mr.relaxed_hand("l", {c: v for c, v in rest.items() if c.startswith(("hand", "thumb"))}), {})
+        self.assertEqual(mr.relaxed_hand("r", rest), {})
+
+    def test_keys_of_their_own_are_kept_and_an_unchanged_relaxed_hand_is_not(self):
+        def curve(path, *values):
+            points = [types.SimpleNamespace(co=(float(n + 1), v)) for n, v in enumerate(values)]
+            return types.SimpleNamespace(data_path=path, keyframe_points=points)
+
+        class Action(dict):
+            def __init__(self, curves, relaxed=None):
+                super().__init__({mr.RELAXED_KEY: json.dumps(relaxed)} if relaxed else {})
+                bag = types.SimpleNamespace(fcurves=curves)
+                self.layers = [types.SimpleNamespace(strips=[types.SimpleNamespace(channelbags=[bag])])]
+
+        q = 'pose.bones["{}"].rotation_quaternion'
+        active = Action([curve(q.format("index1"), 0.9, 0.9), curve(q.format("index2"), 0.9, 0.9, 0.9),
+                         curve(q.format("middle1"), 0.9, 0.8), curve(q.format("ring1"), 0.9, 0.9),
+                         curve('pose.bones["hips"].location', 0.0, 1.0)],
+                        relaxed=["index1", "index2", "middle1"])
+        layer = Action([curve('pose.bones["thumb \\"1\\""].rotation_euler', 0.1)])
+        muted = Action([curve(q.format("pinky1"), 0.1)])
+        track = lambda action, mute=False: types.SimpleNamespace(  # noqa: E731
+            mute=mute, strips=[types.SimpleNamespace(action=action, mute=False)])
+        ad = types.SimpleNamespace(action=active, nla_tracks=[track(layer), track(muted, mute=True)])
+        keyed = mr._keyed_bones(types.SimpleNamespace(animation_data=ad))
+        # index1 is this module's untouched relaxed hand; index2 got a key and middle1 a new value since.
+        self.assertEqual(keyed, {"index2", "middle1", "ring1", "hips", 'thumb "1"'})
+        self.assertEqual(mr._keyed_bones(types.SimpleNamespace(animation_data=None)), set())
+
+
 class ApplyArgsTest(unittest.TestCase):
     def test_descriptor_takes_closed_apply_args_only(self):
         self.assertTrue(cloud._descriptor(descriptor()))
@@ -547,7 +713,19 @@ class ApplyMotionTest(unittest.TestCase):
         self.assertIs(options["target"], hero)
         self.assertEqual(options["title"], "walk forward and wave")
         self.assertIs(options["in_place"], False)
-        self.assertEqual(summary, "Applied motion: Motion 'Motion: walk' on 'Hero'. Job job_test; provenance recorded.")
+        self.assertEqual(summary, "Applied motion: Motion 'Motion: walk' on 'Hero'. Job job_test; provenance recorded.\n"
+                         + cloud_jobs.MOTION_CHECK["motion_from_text"])
+
+    def test_the_model_is_told_to_report_what_the_motion_does_and_never_fake_it(self):
+        text = cloud_jobs.MOTION_CHECK["motion_from_text"]
+        for said in ("actually does, not what was asked", "simpler prompt", "charged again", "Never keyframe the root"):
+            self.assertIn(said, text)
+        result = self.motion_job(apply_args={"target_armature": "Hero"})
+        result.update(tool="motion_from_video")
+        result["provenance"]["tool"] = "motion_from_video"
+        summary, _ = self.apply(result, {"Hero": FakeArmature("Hero")})
+        self.assertTrue(summary.endswith("\n" + cloud_jobs.MOTION_CHECK["motion_from_video"]))
+        self.assertNotIn("simpler prompt", summary)  # A capture is not re-prompted.
 
     def test_in_place_apply_arg_reaches_the_retarget(self):
         hero = FakeArmature("Hero")

@@ -1230,6 +1230,20 @@ def _read_output(output, limit):
     return path.read_text(encoding="utf-8")
 
 
+# Said after every applied motion (owner 2026-10-21): a spinning jump kick came back as a kick, and the agent faked
+# the jump and spin with root keyframes over it, then reported what was asked instead of what the motion did.
+MOTION_CHECK = {
+    "motion_from_text": (
+        "Before you report, look at its key frames and say what this motion actually does, not what was asked. If it "
+        "misses the request, call motion_from_text again with a simpler prompt (one plain physical action; it is "
+        "charged again) or tell the user what it made. Never keyframe the root, hips or whole body over it to fake "
+        "missing motion. A small local touch-up (say, a hand pose or holding the last pose) is fine if you say so."),
+    "motion_from_video": (
+        "Before you report, look at its key frames and say what was captured and where tracking failed. Never "
+        "keyframe the root, hips or whole body over it to fake missing motion."),
+}
+
+
 def _apply_motion(job):
     """Retarget motion.bvh onto the call's target_armature (resolved when it was called), or onto a new SOMA
     skeleton with a simple body; motion.json adds the frame rate check, fingers and warnings."""
@@ -1281,6 +1295,8 @@ def apply_result(descriptor: dict, job: dict) -> str:
     try:
         names = handlers[handler](job)
         reports = _reports(job) if handler not in ("none", "apply_motion") else []
+        if handler == "apply_motion" and job.get("tool") in MOTION_CHECK:
+            reports = [MOTION_CHECK[job["tool"]]]
         if descriptor.get("name") == "asset_search" and handler == "attach_report":
             _remember_assets(job)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as ex:

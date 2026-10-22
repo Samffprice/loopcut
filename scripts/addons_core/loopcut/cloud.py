@@ -1336,6 +1336,11 @@ def execute(name, arguments):
         prepare = getattr(module, "prepare_inputs", None)
         if callable(prepare):  # Measured inputs (a video's length) and the apply handler's resolved target.
             arguments = prepare(descriptor, arguments, files)
+        from . import try_samples
+        sample = try_samples.match(getattr(state.session().get("turn"), "try_it", ""), tool_name(name), files)
+        if sample is not None:  # A setup Try it card: its shipped result, not a job (try_samples).
+            _discard_preparation(out_dir)
+            return _sample_call(name, descriptor, module, arguments, sample, origin_scene)
         # Exports are ours. Unresolved local paths require their own gate before hashing or upload,
         # including tools invoked outside agent.run_loop and workers that cannot ask the user.
         from . import files as local_files
@@ -1433,7 +1438,28 @@ def execute(name, arguments):
     return tools.ToolResult("Preparing cloud job…", then=finish)
 
 
-NOT_SUBMITTED = {"canceled", "approval_required", "declined", "quote_changed", "submission_pending", "pending_limit",
+def _sample_call(name, descriptor, module, arguments, sample, origin_scene):
+    """A setup Try it card's call (try_samples): the run's progress on its card at production's pace, then the
+    shipped outputs applied as a job's are. Nothing is quoted, held, uploaded or charged; the card says Free."""
+    from . import tools, try_samples
+    client_only = set(apply_args(descriptor))
+    inputs = {k: v for k, v in arguments.items() if k not in client_only}
+    applies = {k: v for k, v in arguments.items() if k in client_only}
+
+    def finish(is_cancelled, on_main):
+        cancel = _Cancel(is_cancelled)
+        consent = getattr(cloud_account._approval, "callback", None)  # agent._Consent: the call's card(s).
+        for card in getattr(consent, "shown", ()):
+            card["cost"] = "Free"
+        if not try_samples.play(try_samples.timeline(sample["tool"], arguments), lambda p: _progress(name, p),
+                                cancel.is_set):
+            return tools.ToolResult("Cloud call canceled; no output applied.", ok=False)
+        job = try_samples.job(sample, descriptor.get("kind", "gen"), inputs, applies)
+        return on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene))
+    return tools.ToolResult("Preparing cloud job…", then=finish)
+
+
+NOT_SUBMITTED ={"canceled", "approval_required", "declined", "quote_changed", "submission_pending", "pending_limit",
                  "invalid_input", "account_changed", "tool_changed"}
 
 

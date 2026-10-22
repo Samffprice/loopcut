@@ -183,6 +183,7 @@ class Turn:
         self.may_divert = False
         self.diverted = False
         self.codex = None  # config.CodexApp when Codex's own loop runs the turn (CODEX_SPEC, codex_app.py).
+        self.try_it = ""  # The setup card that sent this turn's request unedited: its cloud call is on the house.
         # Credits (spending.py, C47): paid calls this turn, workers' included, and the burst guard's limit;
         # the user's spending settings, read on the main thread by _configure.
         self.paid_calls = 0
@@ -1725,6 +1726,9 @@ def send(text: str) -> bool:
         session["items"].append(state.item_error(str(ex)))
         return False
     turn.roots = _project_roots()
+    card, prompt = session.pop("try_it", None) or ("", "")
+    if card and prompt.strip() == text:  # Edited first, it is the user's own request.
+        turn.try_it = card
     session["turn_number"] = session.get("turn_number", 0) + 1
     user_item = state.item_user(text, [a["name"] for a in attachments])
     checkpoints.begin_turn(session, user_item)

@@ -688,7 +688,8 @@ static void rna_uiItemL_styled(Layout *layout,
                                const float color[3],
                                const bool tight,
                                const bool center,
-                               const bool code)
+                               const bool code,
+                               const bool strike)
 {
   if (text[0] == '\0') {
     return;
@@ -730,6 +731,16 @@ static void rna_uiItemL_styled(Layout *layout,
     const int baseline = height - top - text_height + descender - int(i) * line_height;
     const int x = center ? (width - widths[i]) / 2 : 1;
     styled_line(fontid, lines[i], code ? &ink : nullptr, true, x, baseline);
+    if (strike) {
+      /* A line through the middle of the lowercase letters, as heavy as the text's own strokes. */
+      const int thickness = std::max(1, int(text_height / 14.0f + 0.5f));
+      const int y_low = baseline + int(BLF_height(fontid, "x", 1) * 0.5f + 0.5f) - thickness / 2;
+      for (int y = std::max(0, y_low); y < std::min(height, y_low + thickness); y++) {
+        for (int px = std::max(0, x); px < std::min(width, x + widths[i]); px++) {
+          coverage[y * width + px] = 255;
+        }
+      }
+    }
   }
   BLF_buffer(fontid, nullptr, nullptr, 0, 0, 0, nullptr);
   ui::fontstyle_set(&style->widget); /* The UI's own size and weight again. */
@@ -2019,6 +2030,8 @@ void RNA_api_ui_layout(StructRNA *srna)
   RNA_def_boolean(func, "tight", false, "Tight", "Only the text's own height, for a caption");
   RNA_def_boolean(func, "center", false, "Center", "Center each line");
   RNA_def_boolean(func, "code", false, "Code", "Set hyphens as tight as the letters (a code)");
+  RNA_def_boolean(
+      func, "strike", false, "Strike", "A line through the text (a price that is not charged)");
 
   func = RNA_def_function(srna, "operator_link", "rna_uiItemO_link");
   RNA_def_function_ui_description(

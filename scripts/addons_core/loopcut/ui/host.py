@@ -116,7 +116,10 @@ def _restore_later(checkpoint_id: str, edit: bool = False) -> None:
     """Loading a file from inside a running operator frees that operator under its own feet,
     so the restore runs from a timer, after the click has been fully handled. After an Edit the
     message is back in the box: the box takes the keys, as after a dropped photo."""
-    window = bpy.context.window
+    # The clicked window's place in the list, not the window: an in-place restore loads the snapshot's
+    # windows and frees these, and temp_override reads a freed window before checking it (0.2.6 crashed).
+    windows = list(bpy.context.window_manager.windows)
+    place = next((n for n, w in enumerate(windows) if w == bpy.context.window), 0)
 
     def run():
         session = state.session()
@@ -129,14 +132,23 @@ def _restore_later(checkpoint_id: str, edit: bool = False) -> None:
         session["confirm_restore"] = None
         _runtime.pop("checkpoint_stamp", None)
         tag_redraw_all()
-        if edit and restored and window is not None:
+        window = _window_after_load(place) if edit and restored else None
+        if window is not None:
             try:
                 with bpy.context.temp_override(window=window):
                     bpy.ops.loopcut.focus()
-            except (RuntimeError, ReferenceError):
-                pass  # The window closed meanwhile: the message is in the box all the same.
+            except RuntimeError:
+                pass  # The message is in the box all the same.
     state.session()["focused"] = False
     bpy.app.timers.register(run, first_interval=0.01)
+
+
+def _window_after_load(place: int):
+    """The window to go on in after a file read replaced every window, screen and area: the one at the
+    clicked window's place in the list, unless it lost the panel and another window shows it."""
+    windows = list(bpy.context.window_manager.windows)
+    order = windows[place:place + 1] + windows
+    return next((w for w in order if find_panel(w)), order[0] if order else None)
 
 
 def draw_area() -> None:
@@ -309,9 +321,10 @@ def _submit(session: dict) -> None:
     state.ui["mentions"] = []
 
 
-def start_request(window, text: str, images: tuple = ()) -> None:
+def start_request(window, text: str, images: tuple = (), try_it: str = "") -> None:
     """Open the panel and send a starter request with its images (onboarding's first projects). Like a
-    starter prompt, it waits in the input while no model is connected."""
+    starter prompt, it waits in the input while no model is connected. try_it: the setup card it came from, whose
+    cloud call agent.send makes free if the text goes out unedited (try_samples)."""
     def send(area):
         from .. import attachments
         session = state.session()
@@ -319,6 +332,10 @@ def start_request(window, text: str, images: tuple = ()) -> None:
             return
         for problem in attachments.add(session, list(images)):
             print(f"Loopcut: {problem}")
+        if try_it:
+            session["try_it"] = (try_it, text)
+        else:
+            session.pop("try_it", None)
         textedit.set_text(session, text)
         session["focused"] = True
         _close_popups()
