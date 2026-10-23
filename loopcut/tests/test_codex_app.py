@@ -30,6 +30,13 @@ ENV = {"LOOPCUT_API_KEY": "", "LOOPCUT_BASE_URL": "", "LOOPCUT_MODEL": "", "LOOP
 
 
 class CodexAppTest(unittest.TestCase):
+    def test_windows_script_guidance_has_a_background_file_tool(self):
+        self.assertIn("On Windows, write Python to a .py file", codex_app.developer_instructions())
+        self.assertIn("run_blender", codex_app.DYNAMIC)
+        offered = {tool["name"]: tool for tool in codex_app.dynamic_tools()}
+        self.assertEqual(offered["run_blender"]["inputSchema"]["required"], ["script"])
+        self.assertEqual(agent._approval("run_blender", '{"script":"build.py", "blend":""}', ()), "gate")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -126,7 +133,7 @@ class CodexAppTest(unittest.TestCase):
                          (str(self.ws), "never", "danger-full-access", "gpt-6.1-sol"))
         self.assertTrue(thread["developerInstructions"].startswith(codex_app.PROMPT))
         self.assertEqual([t["name"] for t in thread["dynamicTools"]], list(codex_app.DYNAMIC),
-                         "apply_build, snapshot_scene and the live tools, never the cheaper agent's others")
+                         "Blender tools including the file runner, with Codex's own shell and file tools")
         api = next(t for t in thread['dynamicTools'] if t['name'] == 'inspect_api')
         http_api = next(t['function'] for t in agent._workspace_schemas()
                         if t['function']['name'] == 'inspect_api')

@@ -158,6 +158,10 @@ def draw_area() -> None:
         return
     from .. import cloud, cloud_account
     cloud.panel_seen()
+    if not _runtime.get("first_panel_seen"):
+        from .. import telemetry
+        telemetry.first_use("panel_opened")
+        _runtime["first_panel_seen"] = True
     prefs = settings.preferences()
     session = state.session()
     draw.retain_images(_image_paths(session))
@@ -1115,6 +1119,10 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             textedit.insert(session, event.unicode)
         else:
             return True  # Not ours, and nothing changed.
+        if session["input"].strip() and not session.get("first_prompt_typed"):
+            from .. import telemetry
+            telemetry.first_use("prompt_typed")
+            session["first_prompt_typed"] = True
         _update_mentions(session)
         return True
 

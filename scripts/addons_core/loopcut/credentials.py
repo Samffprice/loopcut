@@ -107,6 +107,27 @@ def store(base_url: str, key: str) -> None:
         _write(data, target=target)
 
 
+def pending_device(service_url: str) -> dict | None:
+    """A pending device code is a secret too: keep it in the private credentials file, never a .blend."""
+    record = _read().get("pending_device")
+    return dict(record) if isinstance(record, dict) and record.get("service_url") == service_url else None
+
+
+def store_pending_device(service_url: str, record: dict | None, *, cancelled=None) -> bool:
+    with _transaction() as target:
+        # Serialize cancellation with saving: a slow start reply cannot resurrect a cancelled code.
+        if cancelled is not None and cancelled.is_set():
+            return False
+        data = _read(target=target, strict=True)
+        if record is None:
+            if isinstance(data.get("pending_device"), dict) and data["pending_device"].get("service_url") == service_url:
+                data.pop("pending_device")
+        else:
+            data["pending_device"] = {**record, "service_url": service_url}
+        _write(data, target=target)
+        return True
+
+
 def _write(data: dict, *, target=None, filename=FILE_NAME) -> None:
     target = target or folder()
     target.mkdir(parents=True, exist_ok=True)

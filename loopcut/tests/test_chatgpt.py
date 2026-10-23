@@ -26,7 +26,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
-from loopcut import chatgpt_auth, chatgpt_responses, config, llm  # noqa: E402
+from loopcut import chatgpt_auth, chatgpt_ready, chatgpt_responses, config, llm  # noqa: E402
 
 
 # --- A test RSA key (2048 bits, deterministic) and JWT signing -----------------------------------
@@ -876,6 +876,127 @@ class StreamTest(Base):
         FakeResponses.script = [(200, broken), (200, reply("ok"))]
         completion, _ = self.stream()
         self.assertEqual(completion.text, "ok")
+
+    def test_empty_stream_exhaustion_keeps_an_exception_cause(self):
+        FakeResponses.script = [(200, b"")] * (len(llm.RETRY_DELAYS) + 1)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(caught.exception.code, llm.CONNECTION_LOST)
+        self.assertIsInstance(caught.exception.__cause__, EOFError)
+        self.assertIn("before response.completed", str(caught.exception))
+
+    def test_partial_stream_raises_connection_error_instead_of_type_error(self):
+        partial = sse({"type": "response.output_text.delta", "output_index": 0, "delta": "hello"})
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                FakeResponses.requests = []
+                FakeResponses.script = [(200, partial)] * 2
+                restarted = []
+                with self.assertRaises(llm.LLMError) as caught:
+                    self.stream(**({"on_retry": lambda: restarted.append(True)} if retry else {}))
+                self.assertEqual(caught.exception.code, llm.CONNECTION_LOST)
+                self.assertIsInstance(caught.exception.__cause__, EOFError)
+                self.assertIn("while it was replying", str(caught.exception))
+                self.assertEqual(len(FakeResponses.requests), 2 if retry else 1)
+                self.assertEqual(len(restarted), int(retry))
+
+    def test_disconnect_preserves_the_original_exception(self):
+        disconnected = ConnectionResetError("connection reset")
+        def interrupted(response, *args):
+            response.close()
+            self.interrupted(disconnected)
+        with mock.patch.object(chatgpt_responses, "_read", side_effect=interrupted):
+            with self.assertRaises(llm.LLMError) as caught:
+                self.stream()
+        self.assertIs(caught.exception.__cause__, disconnected)
+
+    @staticmethod
+    def interrupted(cause):
+        raise chatgpt_responses._Interrupted(False) from cause
+
+    def test_unsupported_default_retries_once_and_remembers_the_account(self):
+        refusal = error_body("invalid_request_error", "The 'gpt-6.1-sol' model is not supported when using Codex "
+                             "with a ChatGPT account.")
+        FakeResponses.script = [(400, refusal), (200, reply("done")), (200, reply("again"))]
+        with mock.patch.object(chatgpt_auth, "list_models", return_value=[{"slug": "gpt-6-sol"}]) as catalog, \
+                mock.patch.object(chatgpt_ready, "model_used") as used:
+            self.assertEqual(self.stream()[0].text, "done")
+            self.assertEqual(self.stream()[0].text, "again")
+        self.assertEqual([r["body"]["model"] for r in FakeResponses.requests],
+                         ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-sol"])
+        catalog.assert_called_once()
+        used.assert_called_with(chatgpt_ready.account_key(), "gpt-6.1-sol", "gpt-6-sol")
+        self.assertTrue(chatgpt_ready.verified(chatgpt_ready.account_key(), "gpt-6-sol"))
+        self.assertFalse(chatgpt_ready.verified(("different", "issuer", "subject"), "gpt-6-sol"))
+
+    def test_unsupported_fallback_never_walks_the_catalog(self):
+        FakeResponses.script = [(400, error_body("unsupported_model"))] * 3
+        with mock.patch.object(chatgpt_auth, "list_models", return_value=[{"slug": "gpt-6-sol"},
+                                                                        {"slug": "gpt-5.4"}]), \
+                self.assertRaises(llm.LLMError):
+            self.stream()
+        self.assertEqual(len(FakeResponses.requests), 2)
+        self.assertFalse(chatgpt_ready.verified(chatgpt_ready.account_key(), "gpt-6-sol"))
+
+    def test_a_known_accepted_model_is_used_without_listing(self):
+        chatgpt_ready.remember(chatgpt_ready.account_key(), "gpt-6-sol", True)
+        FakeResponses.script = [(400, error_body("unsupported_model")), (200, reply("done"))]
+        with mock.patch.object(chatgpt_auth, "list_models") as catalog:
+            self.stream()
+        catalog.assert_not_called()
+        self.assertEqual(FakeResponses.requests[-1]["body"]["model"], "gpt-6-sol")
+
+    def test_readiness_is_small_and_tool_free(self):
+        FakeResponses.script = [(200, reply("OK"))]
+        result = chatgpt_ready.check("gpt-6.1-sol")
+        self.assertEqual(result["code"], "ready")
+        self.assertEqual(FakeResponses.requests[0]["body"], {
+            "model": "gpt-6.1-sol", "input": [{"role": "user", "content": "Reply OK."}],
+            "store": False, "stream": True})
+
+    def test_readiness_falls_back_once_and_remembers_it(self):
+        FakeResponses.script = [(400, error_body("unsupported_model")), (200, reply("OK"))]
+        with mock.patch.object(chatgpt_auth, "list_models", return_value=[{"slug": "gpt-6-sol"}]):
+            result = chatgpt_ready.check("gpt-6.1-sol")
+        self.assertEqual((result["code"], result["model"]), ("ready", "gpt-6-sol"))
+        self.assertIn("so Loopcut used gpt-6-sol", result["note"])
+
+    def test_an_explicit_recheck_can_restore_a_newly_available_model(self):
+        account = chatgpt_ready.account_key()
+        chatgpt_ready.remember(account, "gpt-6-sol", True, requested="gpt-6.1-sol")
+        FakeResponses.script = [(200, reply("OK"))]
+        result = chatgpt_ready.check("gpt-6.1-sol", fresh=True)
+        self.assertEqual((result["code"], result["model"]), ("ready", "gpt-6.1-sol"))
+        self.assertEqual(chatgpt_ready.effective_model(account, "gpt-6.1-sol"), "gpt-6.1-sol")
+
+    def test_readiness_specific_refusals_do_not_retry(self):
+        for code in ("invalid_grant", "subscription_sharing_user_not_eligible",
+                     "unsupported_country_region_territory"):
+            with self.subTest(code=code):
+                FakeResponses.requests = []
+                FakeResponses.script = [(403, error_body(code))]
+                result = chatgpt_ready.check("gpt-6.1-sol")
+                self.assertEqual(result["code"], code)
+                self.assertEqual(len(FakeResponses.requests), 1)
+                self.assertIn("Loopcut Fast", chatgpt_ready.message(code))
+
+    def test_readiness_offline_and_incomplete_are_never_cached_as_ready(self):
+        with mock.patch.object(chatgpt_responses, "_post", side_effect=urllib.error.URLError("offline")) as post, \
+                mock.patch.object(llm, "_wait") as wait:
+            self.assertEqual(chatgpt_ready.check("gpt-6.1-sol")["code"], "offline")
+            post.assert_called_once()
+            wait.assert_not_called()
+        FakeResponses.script = [(200, reply("partial", status="incomplete"))]
+        self.assertEqual(chatgpt_ready.check("gpt-6.1-sol")["code"], "check_incomplete")
+        self.assertFalse(chatgpt_ready.verified(chatgpt_ready.account_key(), "gpt-6.1-sol"))
+
+    def test_readiness_does_not_mark_an_account_that_changed(self):
+        account = chatgpt_ready.account_key()
+        FakeResponses.script = [(200, reply("OK"))]
+        with mock.patch.object(chatgpt_ready, "account_key", side_effect=[account, account, account, ("new", "", "")]):
+            result = chatgpt_ready.check("gpt-6.1-sol")
+        self.assertEqual(result["code"], "cancelled")
+        self.assertFalse(chatgpt_ready.verified(account, "gpt-6.1-sol"))
 
     def test_incomplete_is_a_capped_reply(self):
         FakeResponses.script = [(200, reply("partial", status="incomplete"))]

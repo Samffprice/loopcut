@@ -9,13 +9,17 @@ Network calls happen on a worker thread. Anything that touches bpy goes through 
 """
 
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from http.client import HTTPException
+from urllib.parse import urlsplit
 
 import bpy
 import bpy.utils.previews
@@ -106,8 +110,8 @@ def _send(request) -> dict:
         except (ValueError, KeyError, TypeError):
             message = f"HTTP {ex.code}"
         raise AccountError(message, f"http_{ex.code}") from ex
-    except (urllib.error.URLError, TimeoutError, ValueError) as ex:
-        raise AccountError(f"Could not reach {SERVICE_URL}: {ex}", "unreachable") from ex
+    except (OSError, HTTPException, ValueError) as ex:
+        raise AccountError("Could not reach Loopcut. Check your connection", "unreachable") from ex
     if not isinstance(payload, dict):
         raise AccountError("Unexpected reply from the Loopcut service", "bad_reply")
     return payload
@@ -150,40 +154,107 @@ def _device_name() -> str:
     return f"Blender on {platform.node() or platform.system()}"[:80]
 
 
-def _run_sign_in() -> None:
+def _device_flow(reply: dict, fresh: bool = False) -> dict:
+    """Validate fresh and saved replies alike; a saved secret must only go back to this service.
+    A fresh code lasts 15 minutes by this computer's clock (the server's): its absolute expires_at
+    would reject every code on a computer whose clock is off. A saved code keeps that local deadline."""
+    device_code, user_code = reply.get("device_code"), reply.get("user_code")
+    url = reply.get("verification_url")
     try:
-        started = _post("/api/device/start", {"device_name": _device_name()})
-        device_code, user_code = started.get("device_code"), started.get("user_code")
-        url = str(started.get("verification_url") or "").strip()
-        if not url.startswith("https://"):
-            raise AccountError(f"The sign-in reply had a bad page address: {url!r}", "bad_reply")
-        interval = float(started.get("interval") or 3)
-        if not (device_code and user_code and url):
-            raise AccountError("The sign-in reply was incomplete", "bad_reply")
-        _state.update(status="waiting", user_code=user_code, url=url, error="")
-        _redraw()
-        if _cancel.is_set():
+        expiry = time.time() + 15 * 60 if fresh else float(reply["expires_local"])
+        interval = float(reply.get("interval", 3))
+        address, service = urlsplit(url), urlsplit(SERVICE_URL)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise AccountError("The sign-in reply was incomplete", "bad_reply") from None
+    if not (isinstance(device_code, str) and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", device_code)
+            and isinstance(user_code, str) and re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}", user_code)
+            and isinstance(url, str) and address.scheme == "https" and address.netloc == service.netloc
+            and address.path == "/link" and math.isfinite(interval) and 1 <= interval <= 30
+            and time.time() < expiry <= time.time() + 15 * 60 + 30):
+        raise AccountError("The sign-in code expired or was incomplete; try again", "bad_reply")
+    return {"device_code": device_code, "user_code": user_code, "verification_url": url,
+            "expires_local": expiry, "interval": interval}
+
+
+def _clear_pending_device() -> None:
+    try:
+        credentials.store_pending_device(SERVICE_URL, None)
+    except OSError:
+        # A disk failure must not trap Cancel or hide a key that was successfully stored.
+        print("Loopcut: could not clear the saved sign-in code")
+
+
+def _sign_in_cancelled(cancel) -> bool:
+    if cancel is not _cancel:
+        return True
+    if cancel.is_set():
+        _state.update(status="idle", user_code="", url="", error="")
+        return True
+    return False
+
+
+def _run_sign_in(resume_only: bool = False, cancel=None) -> None:
+    cancel = cancel if cancel is not None else _cancel
+    try:
+        if _sign_in_cancelled(cancel):
+            return
+        saved = credentials.pending_device(SERVICE_URL)
+        try:
+            started = _device_flow(saved) if saved else None
+        except AccountError:
+            _clear_pending_device()
+            started = None
+        if not started:
+            if resume_only:
+                _state.update(status="idle")
+                return
+            started = _device_flow(_post("/api/device/start", {"device_name": _device_name()}), fresh=True)
+        device_code, user_code, url = started["device_code"], started["user_code"], started["verification_url"]
+        interval = started["interval"]
+        expiry = started["expires_local"]
+        if _sign_in_cancelled(cancel):
+            return
+        if credentials.store_pending_device(SERVICE_URL, started, cancelled=cancel) is False:
             _state.update(status="idle", user_code="", url="")
             return
-        open_browser(url)
-        deadline = time.monotonic() + 15 * 60
-        while time.monotonic() < deadline:
-            if _cancel.wait(interval):
-                _state.update(status="idle", user_code="", url="")
-                _redraw()
+        _state.update(status="waiting", user_code=user_code, url=url, error="")
+        _redraw()
+        if _sign_in_cancelled(cancel):
+            return
+        if not resume_only:
+            open_browser(url)
+        deadline = time.monotonic() + max(0, expiry - time.time())
+        retry_interval = interval
+        while time.time() < expiry and time.monotonic() < deadline:
+            if cancel.wait(min(retry_interval, max(0, expiry - time.time()))):
+                _sign_in_cancelled(cancel)
                 return
-            polled = _post("/api/device/poll", {"device_code": device_code, **_platform()})
-            if _cancel.is_set():
-                _state.update(status="idle", user_code="", url="")
+            if time.time() >= expiry:
+                break
+            try:
+                polled = _post("/api/device/poll", {"device_code": device_code, **_platform()})
+            except AccountError as ex:
+                if _sign_in_cancelled(cancel):
+                    return
+                if ex.code == "unreachable" or ex.code == "http_429" or ex.code.startswith("http_5"):
+                    retry_interval = min(30, retry_interval * 2)
+                    _state.update(error="Connection interrupted. Retrying while this code is valid.")
+                    _redraw()
+                    continue
+                raise
+            retry_interval = interval
+            if _sign_in_cancelled(cancel):
                 return
+            _state.update(error="")
             outcome = polled.get("status")
             if outcome == "pending":
                 continue
             if outcome == "approved" and polled.get("api_key"):
                 key = str(polled["api_key"])
-                generation = mainthread.run_on_main(lambda: None if _cancel.is_set() else _store_key(key)).result()
-                if _cancel.is_set():
+                generation = mainthread.run_on_main(lambda: None if _sign_in_cancelled(cancel) else _store_key(key)).result()
+                if _sign_in_cancelled(cancel):
                     return
+                _clear_pending_device()
                 _state.update(status="idle", user_code="", url="", error="")
                 _setup_event(True)
                 _refresh_account(key, generation=generation)
@@ -192,10 +263,15 @@ def _run_sign_in() -> None:
                                "denied" if outcome == "denied" else "expired")
         raise AccountError("The sign-in code expired; try again", "expired")
     except AccountError as ex:
+        if _sign_in_cancelled(cancel):
+            return
+        _clear_pending_device()
         print(f"Loopcut: sign-in failed: {ex}")
         _setup_event(False, ex.code)
         _state.update(status="error", error=str(ex) + ". Try Sign in to Loopcut again, or use another route.", user_code="", url="")
     except Exception as ex:  # Worker thread: show it rather than lose it.
+        if _sign_in_cancelled(cancel):
+            return
         import traceback
         traceback.print_exc()
         _setup_event(False, "internal")
@@ -402,16 +478,18 @@ def stop_watching() -> None:
 
 
 def sign_in() -> bool:
+    global _cancel
     if _state["status"] in ("starting", "waiting"):
         return False
-    _cancel.clear()
+    _cancel = threading.Event()
     _state.update(status="starting", error="")
-    threading.Thread(target=_run_sign_in, name="loopcut-sign-in", daemon=True).start()
+    threading.Thread(target=_run_sign_in, args=(False, _cancel), name="loopcut-sign-in", daemon=True).start()
     return True
 
 
 def cancel_sign_in() -> None:
     _cancel.set()
+    _clear_pending_device()
 
 
 def sign_out() -> None:
@@ -553,6 +631,8 @@ def draw(column) -> None:
         row.operator("loopcut.open_sign_in_page", text="Open the page again")
         row.operator("loopcut.copy_sign_in_link", text="Copy Link")
         row.operator("loopcut.cancel_sign_in", text="Cancel")
+        if state["error"]:
+            column.label(text=state["error"], icon="INFO")
         return
     if state["status"] == "starting":
         column.label(text="Contacting Loopcut…")
@@ -587,6 +667,7 @@ _CLASSES = (LOOPCUT_OT_sign_in, LOOPCUT_OT_open_sign_in_page, LOOPCUT_OT_copy_si
 
 
 def register() -> None:
+    global _cancel
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
     try:
@@ -595,11 +676,16 @@ def register() -> None:
         print(f"Loopcut: could not load the mark icon: {ex}")
     if signed_in():
         refresh_account()
+    elif not bpy.app.background:
+        # File/network work stays on the worker; do not reopen a browser just for restarting Blender.
+        _cancel = threading.Event()
+        _state.update(status="starting", error="")
+        threading.Thread(target=_run_sign_in, args=(True, _cancel), name="loopcut-sign-in", daemon=True).start()
 
 
 def unregister() -> None:
     global _previews
-    cancel_sign_in()
+    _cancel.set()  # Preserve the private pending code for the next interactive start.
     on_signed_in.clear()
     if _previews is not None:
         bpy.utils.previews.remove(_previews)

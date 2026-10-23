@@ -8,8 +8,8 @@
 # Only valid when the native code has not changed since the base tag: the updater swaps the whole app,
 # so the app must be exactly what release_mac.sh would build. The script refuses when anything changed
 # between the base tag and HEAD outside scripts/ (Python the build only copies), the bundled extensions,
-# loopcut/, repository text files and packaging-only files (CPack hygiene hook, archive script, the
-# Windows workflow), apart from the install exclusions in source/creator/CMakeLists.txt
+# loopcut/, repository text files and packaging-only files (CPack hygiene hook, archive script, CI
+# workflows), apart from the install exclusions in source/creator/CMakeLists.txt
 # (which this script applies itself: no __pycache__ or *.pyc ships). It first proves the mapping: the
 # base app's scripts/ and extensions/ must equal the base tag's git tree under the install rules' exclusions
 # (build products such as addons_core/cycles may only be extra). It then applies the base..HEAD change to
@@ -39,7 +39,7 @@ cd "$repo"
 git rev-parse -q --verify "$base_tag^{commit}" >/dev/null || { echo "no tag $base_tag" >&2; exit 1; }
 # release/loopcut/wix-*: the Windows installer's images (and the script that draws them), not in the Mac app.
 native="$(git diff --name-only "$base_tag" HEAD | grep -Ev \
-  '^(scripts/|release/extensions/|loopcut/|README\.md$|LICENSE$|\.gitignore$|\.gitattributes$|source/creator/CMakeLists\.txt$|\.github/workflows/release\.yml$|build_files/cmake/(packaging|loopcut_release_hygiene)\.cmake$|build_files/package_spec/build_archive\.py$|release/loopcut/(wix-banner\.bmp|wix-dialog\.png|make_assets\.py)$)' || true)"
+  '^(scripts/|release/extensions/|loopcut/|README\.md$|LICENSE$|\.gitignore$|\.gitattributes$|source/creator/CMakeLists\.txt$|\.github/workflows/[^/]+\.yml$|build_files/cmake/(packaging|loopcut_release_hygiene)\.cmake$|build_files/package_spec/build_archive\.py$|release/loopcut/(wix-banner\.bmp|wix-dialog\.png|make_assets\.py)$)' || true)"
 # LOOPCUT_REPACKAGE_WITHOUT: native changes the owner chose to ship without, as space-separated paths (0.2.2: the
 # ICON_LOOPCUT editor icon; the add-on's Python never names it). Each path must be listed; anything else still refuses.
 without=""; needs_build=""

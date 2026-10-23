@@ -146,6 +146,36 @@ class LedgerTest(unittest.TestCase):
         key = repeats.call_key("get_object_info", '{"names": ["Scatter"]}')
         self.assertEqual(self.ledger.record(2, key, "KeyError: 'Scatter'", ok=False), "")
 
+    def test_identical_shell_failure_points_to_files_on_the_second_attempt_ignoring_summary(self):
+        command = 'python3 -c "from pathlib import Path; print(Path.cwd())"'
+        for step in (1, 2, 3):
+            key = repeats.call_key("shell", json.dumps({"command": command, "summary": f"Attempt {step}"}))
+            text = (f'exit 1 in {step / 10:.1f} s\n  File "<string>", line 1\n    "from\n    ^\n'
+                    'SyntaxError: unterminated string literal (detected at line 1)')
+            note = self.ledger.record(step, key, text, ok=False)
+            if step == 1:
+                self.assertEqual(note, "")
+            else:
+                self.assertIn(f"same shell command has failed the same way {step} times this turn", note)
+                self.assertIn("write_file", note)
+                self.assertIn("python3 file.py", note)
+                self.assertNotIn("inspect_api", note)
+
+    def test_different_shell_errors_do_not_count_as_identical_failures(self):
+        key = repeats.call_key("shell", '{"command":"python script.py"}')
+        for step, error in enumerate(("ValueError: bad value", "TypeError: bad type"), 1):
+            self.assertEqual(self.ledger.record(step, key, f"exit 1 in 0.1 s\n{error}", ok=False), "")
+        second = self.ledger.record(3, key, "exit 1 in 0.2 s\nValueError: bad value", ok=False)
+        self.assertIn("same way 2 times this turn", second)
+        fresh = repeats.Ledger()
+        self.assertEqual(fresh.record(1, key, "exit 1 in 0.1 s\nValueError: bad value", ok=False), "")
+
+    def test_refused_inline_shell_repeats_get_the_same_working_path(self):
+        key = repeats.call_key("shell", '{"command":"python -c x"}')
+        error = "Not run: inline Python in Windows shell commands can change the code. Write a .py file."
+        self.assertEqual(self.ledger.record(1, key, error, ok=False), "")
+        self.assertIn("write_file", self.ledger.record(2, key, error, ok=False))
+
     def test_failing_runs_in_a_row_are_nudged_whatever_the_errors(self):
         errors = ["NameError: name 'x' is not defined", "KeyError: 'Scatter'",
                   "TypeError: bpy_struct: item.attr = val: enum \"X\" not found", "ValueError: bad value"]

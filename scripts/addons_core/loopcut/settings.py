@@ -188,6 +188,8 @@ def _set_project_no_generation(self, value):
 def _changed(self=None, context=None) -> None:
     from .ui import host
     host.config_changed()
+    from . import chatgpt_ui
+    chatgpt_ui.request_readiness()
 
 
 def config_changed() -> None:

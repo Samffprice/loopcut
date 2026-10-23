@@ -94,7 +94,8 @@ class SettingsTest(unittest.TestCase):
         fake.props = types.SimpleNamespace(**{name: Property for name in
             ("StringProperty", "EnumProperty", "BoolProperty", "IntProperty")})
         fake.context = types.SimpleNamespace(scene={}, preferences=types.SimpleNamespace(addons={}))
-        fake.app = types.SimpleNamespace(driver_namespace={})
+        # Background: register() schedules no readiness check (that needs bpy.app.timers).
+        fake.app = types.SimpleNamespace(driver_namespace={}, background=True)
         fake.utils = types.ModuleType("bpy.utils")
         fake.utils.previews = types.ModuleType("bpy.utils.previews")
         fake.utils.register_class = register

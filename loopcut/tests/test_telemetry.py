@@ -290,6 +290,58 @@ class SendingTest(fixtures.RuntimeFixture):
         self.assertEqual(self.queued(), [])
         self.assertFalse((self.config_dir / "install.json").exists(), "no install id made for nothing")
 
+    def test_first_use_milestones_are_persistent_private_and_contract_valid(self):
+        schema, folder = _schema()
+        for action in ("panel_opened", "prompt_typed", "prompt_sent", "result_error", "result_ok"):
+            telemetry.first_use(action)
+            telemetry.first_use(action)
+        queued = self.queued()
+        self.assertEqual([body["props"]["error_code"] for body, _, _ in queued],
+                         ["first_panel_opened", "first_prompt_typed", "first_prompt_sent", "first_result_error"])
+        for body, _, _ in queued:
+            self.assertEqual(body["event"], "setup_step")
+            self.assertEqual(set(body["props"]), {"step", "choice", "ok", "error_code"})
+            if schema:
+                validate(body, schema, schema, folder)
+        saved = json.loads((self.config_dir / "first-use.json").read_text())
+        self.assertEqual(saved, {"panel_opened": True, "prompt_typed": True, "prompt_sent": True, "result": True})
+        telemetry._seen_steps.clear()  # A later launch still does not send milestones again.
+        telemetry.first_use("prompt_sent")
+        self.assertEqual(self.queued(), [])
+
+    def test_first_use_storage_handles_spaces_and_non_ascii_paths(self):
+        folder = self.config_dir / "Sam Price" / "模型"
+        with patch.object(credentials, "folder", return_value=folder):
+            telemetry.first_use("prompt_sent")
+        self.assertTrue((folder / "first-use.json").is_file())
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_first_use_opt_out_writes_no_flags_and_sends_nothing(self):
+        self.prefs.share_usage_stats = False
+        for action in telemetry._FIRST_ACTIONS:
+            telemetry.first_use(action)
+        self.assertFalse((self.config_dir / "first-use.json").exists())
+        self.assertEqual(self.queued(), [])
+
+    def test_first_use_ignores_existing_users_and_unrelated_results(self):
+        self.prefs.first_message_sent = True
+        for action in telemetry._FIRST_ACTIONS:
+            telemetry.first_use(action)
+        self.assertEqual(self.queued(), [])
+        self.assertFalse((self.config_dir / "first-use.json").exists())
+
+    def test_first_result_uses_the_actual_turn_outcome(self):
+        telemetry.first_use("prompt_sent")
+        self.queued()
+        self.prefs.first_message_sent = True
+        turn = types.SimpleNamespace(outcome="cancelled", error_code="", started=time.monotonic(), first_item=0,
+                                     telemetry={"provider": "chatgpt", "model": "gpt-6.1-sol"})
+        telemetry.turn_end(turn, [])
+        bodies = [body for body, _, _ in self.queued()]
+        self.assertEqual([b["event"] for b in bodies], ["turn", "setup_step"])
+        self.assertEqual(bodies[1]["props"]["error_code"], "first_result_cancelled")
+        self.assertFalse(bodies[1]["props"]["ok"])
+
     def test_caps(self):
         telemetry.app_start()
         telemetry.app_start()

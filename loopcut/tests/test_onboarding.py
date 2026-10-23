@@ -18,6 +18,7 @@ import sys
 import types
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -132,12 +133,18 @@ class OnboardingTest(unittest.TestCase):
         self.addCleanup(p.stop)
         self.account._state.update(status="idle", error="", url="", user_code="")
         self.account._cancel.clear()
+        for name, value in (("pending_device", None), ("store_pending_device", None)):
+            p = patch.object(self.account.credentials, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
         for name, value in (("_thumbnail", 0), ("_row_mark", {"icon": "LOOPCUT"})):  # No previews outside Blender.
             p = patch.object(self.onboarding, name, return_value=value)
             p.start()
             self.addCleanup(p.stop)
         self.chatgpt_ui._state.update(status="idle", error="", url="")
         self.chatgpt_ui._cancel.clear()
+        self.chatgpt_ui._checked.clear()
+        self.chatgpt_ui._ready.update(status="idle", code="", account=(), model="", selected="", note="")
         self.state.ui.clear()
         self.host._runtime.clear()
         self.prefs = types.SimpleNamespace(provider="LOOPCUT", first_message_sent=False, share_conversations=True,
@@ -236,7 +243,13 @@ class OnboardingTest(unittest.TestCase):
             model = Splash()
             self.onboarding._draw_connect(model, self.context)
             self.assertIn(('label', 'person@example.test'), model.records)  # The ChatGPT option, signed in.
-            self.press_step(model, 'Continue')
+            self.assertTrue(any(r[0] == "operator" and r[2] == "Use ChatGPT" for r in model.records))
+            with patch.object(self.chatgpt_ui, "request_readiness"):
+                self.chatgpt_ui.LOOPCUT_OT_chatgpt_check().execute(self.context)
+            with patch.object(self.chatgpt_ui, "can_continue", return_value=True):
+                model = Splash()
+                self.onboarding._draw_connect(model, self.context)
+                self.press_step(model, "Continue")
             self.assertEqual(self.prefs.provider, 'CHATGPT')
             self.assertEqual(self.onboarding._state['step'], 'privacy')
 
@@ -248,6 +261,7 @@ class OnboardingTest(unittest.TestCase):
                                               io.BytesIO(b'service unavailable'))):
             with self.subTest(failure=failure):
                 self.onboarding._state['step'] = 'account'
+                self.account._cancel.clear()
                 with patch.object(self.account.urllib.request, 'urlopen', side_effect=failure), \
                         patch.object(self.account, 'open_browser') as browser, \
                         redirect_stdout(io.StringIO()) as log, redirect_stderr(log):
@@ -278,7 +292,7 @@ class OnboardingTest(unittest.TestCase):
                 self.assertNotIn("Couldn't reach Loopcut", str(model.records))
 
     def test_account_poll_failure_is_quiet_and_skip_suppresses_a_late_key(self):
-        reply = {'device_code': 'fixture', 'user_code': 'TEST', 'verification_url': 'https://sign-in.test'}
+        reply = {'device_code': 'd' * 43, 'user_code': 'TEST-CODE', 'verification_url': self.account.SERVICE_URL + '/link?code=TEST-CODE', 'expires_at': datetime.fromtimestamp(time.time() + 900, timezone.utc).isoformat()}
         self.onboarding._state['step'] = 'account'
         with patch.object(self.account, '_post', side_effect=[reply, self.account.AccountError('Sign-in was denied')]), \
                 patch.object(self.account._cancel, 'wait', return_value=False), \
@@ -317,12 +331,116 @@ class OnboardingTest(unittest.TestCase):
         body = json.loads(request.data)
         self.assertIn(body['os'], ('mac', 'windows', 'linux'))
         self.assertIn(body['arch'], ('arm64', 'x86_64', 'other'))
-        reply = {'device_code': 'fixture', 'user_code': 'TEST', 'verification_url': 'https://sign-in.test'}
+        reply = {'device_code': 'd' * 43, 'user_code': 'TEST-CODE', 'verification_url': self.account.SERVICE_URL + '/link?code=TEST-CODE', 'expires_at': datetime.fromtimestamp(time.time() + 900, timezone.utc).isoformat()}
         with patch.object(self.account, '_post', side_effect=[reply, {'status': 'denied'}]) as post, \
                 patch.object(self.account._cancel, 'wait', return_value=False), patch.object(self.account, 'open_browser'):
             self.account._cancel.clear()
             self.account._run_sign_in()
         self.assertEqual(set(post.call_args_list[1].args[1]), {'device_code', 'os', 'arch'})
+
+    def device_reply(self, seconds=900):
+        return {"device_code": "d" * 43, "user_code": "TEST-CODE",
+                "verification_url": self.account.SERVICE_URL + "/link?code=TEST-CODE",
+                "expires_at": datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat(),
+                "expires_local": time.time() + seconds, "interval": 3}
+
+    def test_a_fresh_code_uses_a_local_deadline_when_this_clock_is_off(self):
+        """Server time says the code expired an hour ago by this clock; it is still polled and the key stored."""
+        reply = {**self.device_reply(-3600)}
+        del reply["expires_local"]
+        self.account._cancel.clear()
+        with patch.object(self.account, "_post", side_effect=[reply, {"status": "approved", "api_key": "fixture-key"}]) as post, \
+                patch.object(self.account._cancel, "wait", return_value=False), patch.object(self.account, "open_browser"), \
+                patch.object(self.account, "_store_key") as store, patch.object(self.account, "_refresh_account"), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=lambda callback: (callback(), Mock())[1]), \
+                redirect_stdout(io.StringIO()):
+            self.account._run_sign_in()
+        self.assertEqual(post.call_args_list[1].args[0], "/api/device/poll")
+        store.assert_called_once_with("fixture-key")
+
+    def test_account_transient_poll_errors_retry_the_same_code_then_store_the_key(self):
+        for code in ("unreachable", "http_500", "http_503", "http_429"):
+            self.account._cancel.clear()
+            with self.subTest(code=code), \
+                    patch.object(self.account, "_post", side_effect=[self.device_reply(),
+                        self.account.AccountError("temporary", code), {"status": "pending"},
+                        {"status": "approved", "api_key": "fixture-key"}]) as post, \
+                    patch.object(self.account._cancel, "wait", return_value=False), \
+                    patch.object(self.account, "open_browser"), patch.object(self.account, "_store_key", return_value=3) as store, \
+                    patch.object(self.account, "_refresh_account"), \
+                    patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: types.SimpleNamespace(result=fn)):
+                self.account._run_sign_in()
+                store.assert_called_once_with("fixture-key")
+                self.assertEqual([call.args[0] for call in post.call_args_list],
+                                 ["/api/device/start"] + ["/api/device/poll"] * 3)
+                self.assertEqual(self.account.status()["error"], "")
+                self.assertEqual(self.account.status()["status"], "idle")
+
+    def test_an_old_cancelled_worker_cannot_change_a_new_attempt(self):
+        old = self.account._cancel
+        def replaced_attempt(*args):
+            old.set()
+            self.account._cancel = threading.Event()
+            self.account._state.update(status="waiting", user_code="NEW1-CODE", error="")
+            return self.device_reply()
+        with patch.object(self.account, "_post", side_effect=replaced_attempt), \
+                patch.object(self.account, "open_browser") as browser:
+            self.account._run_sign_in(cancel=old)
+        browser.assert_not_called()
+        self.assertEqual(self.account.status()["user_code"], "NEW1-CODE")
+        self.account.credentials.store_pending_device.assert_not_called()
+
+    def test_cancel_still_works_when_saved_code_cleanup_fails(self):
+        self.account.credentials.store_pending_device.side_effect = OSError("read-only")
+        with redirect_stdout(io.StringIO()):
+            self.account.cancel_sign_in()
+        self.assertTrue(self.account._cancel.is_set())
+
+    def test_restart_resumes_an_approved_code_without_a_new_code_or_browser(self):
+        reply = self.device_reply(180)
+        self.account.credentials.pending_device.return_value = reply
+        with patch.object(self.account, "_post", return_value={"status": "approved", "api_key": "fixture-key"}) as post, \
+                patch.object(self.account._cancel, "wait", return_value=False), \
+                patch.object(self.account, "open_browser") as browser, \
+                patch.object(self.account, "_store_key", return_value=3) as store, \
+                patch.object(self.account, "_refresh_account"), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: types.SimpleNamespace(result=fn)):
+            self.account._run_sign_in(resume_only=True)
+        browser.assert_not_called()
+        store.assert_called_once_with("fixture-key")
+        self.assertEqual(post.call_args.args[0], "/api/device/poll")
+        self.account.credentials.store_pending_device.assert_called_with(self.account.SERVICE_URL, None)
+
+    def test_restart_discards_expired_or_foreign_saved_codes_without_creating_one(self):
+        for reply in (self.device_reply(-1), {**self.device_reply(), "verification_url": "https://other.test/link"},
+                      {**self.device_reply(), "interval": float("nan")}, {"device_code": "bad"}):
+            self.account.credentials.pending_device.return_value = reply
+            with self.subTest(reply=reply), patch.object(self.account, "_post") as post:
+                self.account._run_sign_in(resume_only=True)
+                post.assert_not_called()
+                self.assertEqual(self.account.status()["status"], "idle")
+
+    def test_poll_transport_failure_is_bounded_by_the_code_lifetime(self):
+        """Retries back off and stop when the code's 15 minutes (by this clock) are up."""
+        start = time.time()
+        clock = [start]
+        def wait(seconds):
+            clock[0] += seconds
+            return False
+        def post(path, body):
+            if path == "/api/device/start":
+                return self.device_reply(10)
+            raise self.account.AccountError("offline", "unreachable")
+        with patch.object(self.account.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(self.account._cancel, "wait", side_effect=wait), \
+                patch.object(self.account, "_post", side_effect=post) as posted, \
+                patch.object(self.account, "open_browser"):
+            self.account._run_sign_in()
+        self.assertEqual(self.account.status()["status"], "error")
+        self.assertIn("expired", self.account.status()["error"])
+        polls = [call for call in posted.call_args_list if call.args[0] == "/api/device/poll"]
+        self.assertTrue(5 < len(polls) < 60)
+        self.assertGreaterEqual(clock[0] - start, 15 * 60 - 1)
 
     def test_account_waiting_allows_cancel_and_only_a_slow_sign_in_offers_to_go_on(self):
         for status in ('waiting', 'starting'):
@@ -432,12 +550,137 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(self.onboarding._state["step"], "account")  # Stays for the credits and Continue.
         self.fake.ops.wm.save_userpref.assert_called_once()
 
-    def test_chatgpt_sign_in_selects_provider_saves_and_advances(self):
-        self.chatgpt_ui._finished({"signed_in": True, "plan_usage": True}, "")
+    def test_chatgpt_sign_in_selects_provider_saves_and_checks_before_advancing(self):
+        with patch.object(self.chatgpt_ui, "request_readiness") as check:
+            self.chatgpt_ui._finished({"signed_in": True, "plan_usage": True}, "")
+        check.assert_called_once_with(force=True)
         self.assertEqual(self.prefs.provider, "CHATGPT")
-        self.assertEqual(self.onboarding._state["step"], "privacy")
-        self.assertEqual(json.loads(self.progress.read_text())["step"], "privacy")
+        self.assertEqual(self.onboarding._state["step"], "connect")
         self.fake.ops.wm.save_userpref.assert_called_once()
+
+    def test_readiness_refusals_show_recovery_and_keep_a_working_way_out(self):
+        self.prefs.provider = "CHATGPT"
+        for code, enabled in (("ready", True), ("offline", True), ("unsupported_model", False),
+                              ("unsupported_country_region_territory", False), ("invalid_grant", False)):
+            with self.subTest(code=code), self.chatgpt_plan(), \
+                    patch.object(self.account, "signed_in", return_value=True), \
+                    patch.object(self.chatgpt_ui, "readiness", return_value={"status": "done", "code": code, "note": ""}), \
+                    patch.object(self.chatgpt_ui, "request_readiness"):
+                splash = Splash()
+                self.onboarding._draw_sign_in(splash, self.context)
+                operators = [r for r in splash.records if r[0] == "operator"]
+                proceed = next(r for r in operators if r[2] == "Continue")
+                self.assertEqual(proceed[4].enabled, enabled)
+                self.assertTrue(any(r[2] == "Use Loopcut" and r[4].enabled for r in operators))
+                self.assertTrue(any(r[0] == "prop" and r[1] == "model" for r in splash.records))
+                if code != "ready":
+                    self.assertTrue(any(r[1] == "loopcut.chatgpt_check" for r in operators))
+
+    def test_readiness_runs_in_a_worker_and_discards_stale_results(self):
+        ready = self.chatgpt_ui
+        self.prefs.provider, self.prefs.model = "CHATGPT", "gpt-6.1-sol"
+        identity = ("client", "issuer", "subject")
+        with patch.object(ready.chatgpt_ready, "account_key", return_value=identity), self.chatgpt_plan(), \
+                patch.object(ready.chatgpt_ready, "verified", return_value=False), \
+                patch.object(ready.chatgpt_ready, "check") as check, patch.object(ready.threading, "Thread") as worker:
+            ready._start_readiness()
+            check.assert_not_called()  # Not on Blender's main thread.
+            worker.assert_called_once()
+            worker.return_value.start.assert_called_once()
+            self.assertEqual(ready.readiness()["status"], "checking")
+            self.prefs.model = "gpt-6-sol"
+            ready._readiness_finished({"code": "ready", "model": "gpt-6.1-sol", "account": identity},
+                                      "gpt-6.1-sol", threading.Event())
+            self.assertEqual(ready.readiness()["status"], "idle")
+            self.assertEqual(self.prefs.model, "gpt-6-sol")
+
+    def test_offline_mode_skips_readiness_without_a_worker(self):
+        ready = self.chatgpt_ui
+        self.prefs.provider = "CHATGPT"
+        with patch.object(ready.chatgpt_ready, "account_key", return_value=("client", "issuer", "subject")), \
+                self.chatgpt_plan(), patch.object(self.fake.app, "online_access", False, create=True), \
+                patch.object(ready.threading, "Thread") as worker:
+            ready._start_readiness()
+            worker.assert_not_called()
+            self.assertEqual(ready.readiness()["code"], "offline")
+            self.assertTrue(ready.can_continue())
+
+    def test_only_a_definite_refusal_or_a_short_check_holds_setup_back(self):
+        ready = self.chatgpt_ui
+        self.prefs.provider, self.prefs.model = "CHATGPT", "gpt-6.1-sol"
+        identity = ("client", "issuer", "subject")
+        with patch.object(ready.chatgpt_ready, "account_key", return_value=identity), self.chatgpt_plan(), \
+                patch.object(ready.time, "monotonic", return_value=100.0):
+            for code, allowed in (("ready", True), ("check_failed", True), ("http_503", True), ("check_incomplete", True),
+                                  ("invalid_grant", False), ("unsupported_country_region_territory", False),
+                                  ("unsupported_model", False), ("chatgpt_not_signed_in", False)):
+                with self.subTest(code=code):
+                    ready._ready.update(status="done", code=code, model="gpt-6.1-sol", account=identity,
+                                        selected="gpt-6.1-sol", note="")
+                    self.assertEqual(ready.can_continue(), allowed)
+            for started, allowed in ((95.0, False), (100.0 - ready.CHECK_WAIT, True)):
+                with self.subTest(started=started):
+                    ready._ready.update(status="checking", code="", model="gpt-6.1-sol", account=identity,
+                                        selected="gpt-6.1-sol", note="", started=started)
+                    self.assertEqual(ready.can_continue(), allowed)
+
+    def test_switching_models_back_restarts_a_cancelled_readiness_check(self):
+        ready = self.chatgpt_ui
+        self.prefs.provider, self.prefs.model = "CHATGPT", "gpt-6.1-sol"
+        identity = ("client", "issuer", "subject")
+        with patch.object(ready.chatgpt_ready, "account_key", return_value=identity), self.chatgpt_plan(), \
+                patch.object(ready.chatgpt_ready, "verified", return_value=False), \
+                patch.object(ready.threading, "Thread") as worker:
+            ready._start_readiness()
+            old_cancel = ready._ready_cancel
+            self.prefs.model = "gpt-6-sol"
+            ready._start_readiness()
+            self.prefs.model = "gpt-6.1-sol"
+            ready._start_readiness()
+            self.assertEqual(worker.call_count, 3)
+            ready._readiness_finished({"account": identity, "model": "gpt-6.1-sol", "code": "cancelled"},
+                                      "gpt-6.1-sol", old_cancel)
+            ready._start_readiness()
+            self.assertEqual(worker.call_count, 3, "an old worker must not cancel the current check")
+
+    def test_continue_preserves_the_verified_chatgpt_model(self):
+        class Preferences:
+            provider_writes = 0
+            model = "gpt-6-sol"
+
+            @property
+            def provider(self):
+                return "CHATGPT"
+
+            @provider.setter
+            def provider(self, value):
+                self.provider_writes += 1
+                self.model = "gpt-6.1-sol"
+
+        prefs = Preferences()
+        op = self.onboarding.LOOPCUT_OT_onboarding_step()
+        op.provider, op.step, op.save = "CHATGPT", "privacy", False
+        with patch.object(self.settings, "preferences", return_value=prefs):
+            op.execute(self.context)
+        self.assertEqual(prefs.provider_writes, 0)
+        self.assertEqual(prefs.model, "gpt-6-sol")
+
+    def test_typing_records_one_content_free_event(self):
+        session = self.state.reset()
+        op = self.host.LOOPCUT_OT_interact()
+        event = types.SimpleNamespace(type="A", unicode="a", shift=False, oskey=False, ctrl=False, alt=False)
+        telemetry = importlib.import_module(NAME + ".telemetry")
+        with patch.object(telemetry, "first_use") as record, patch.object(self.host, "_update_mentions"):
+            op._key(self.context, session, event)
+            op._key(self.context, session, event)
+        record.assert_called_once_with("prompt_typed")
+        self.assertEqual(session["input"], "aa")
+
+    def test_unfinished_setup_reports_the_previous_step_on_resume(self):
+        self.onboarding.save_progress("connect")
+        with patch.object(self.onboarding, "_report") as report:
+            self.onboarding._start_step(False)
+        self.assertIn(unittest.mock.call("welcome", None, False, "abandoned_connect"), report.call_args_list)
 
     # "For the LLM we always prefer their account, unless they select the Loopcut models" (owner, 2026-10-16).
     def chatgpt_plan(self, signed_in=True, plan_usage=True):
@@ -677,7 +920,7 @@ class OnboardingTest(unittest.TestCase):
 
     def test_cancel_during_device_start_does_not_open_a_browser(self):
         self.account._cancel.set()
-        reply = {"device_code": "fixture", "user_code": "TEST", "verification_url": "https://sign-in.test"}
+        reply = self.device_reply()
         with patch.object(self.account, "_post", return_value=reply), patch.object(self.account, "open_browser") as browser:
             self.account._run_sign_in()
         browser.assert_not_called()
@@ -1573,7 +1816,8 @@ class OnboardingTest(unittest.TestCase):
 
     def test_a_card_ends_the_setup_closes_the_splash_and_sends_its_request_with_the_photo(self):
         report, later = self.finish_with("photo_3d")
-        report.assert_called_once_with("done", "loopcut", True, "card_photo_3d")
+        self.assertEqual(report.call_args_list, [unittest.mock.call("done", "loopcut", True, "card_photo_3d"),
+                                                unittest.mock.call("done", "loopcut", True, "setup_finished")])
         self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": "done", "done": True})
         self.assertIsNone(self.onboarding._state["step"])
         window = object()
@@ -1593,7 +1837,8 @@ class OnboardingTest(unittest.TestCase):
 
     def test_finishing_without_an_account_brings_the_setup_back_next_start(self):
         report, _ = self.finish_with("", signed_in=False)
-        report.assert_called_once_with("done", "loopcut", True, "no_card")
+        self.assertEqual(report.call_args_list, [unittest.mock.call("done", "loopcut", True, "no_card"),
+                                                unittest.mock.call("done", "loopcut", False, "abandoned_done")])
         self.assertEqual(json.loads(self.progress.read_text()), {"version": 1, "step": "account", "done": False})
         self.fresh_session()
         with patch.object(self.onboarding, "_connected", return_value=True):
@@ -1606,7 +1851,8 @@ class OnboardingTest(unittest.TestCase):
         with patch.object(self.onboarding, "_report") as report:
             self.draw_step()
             self.draw_step()
-        report.assert_called_once_with("loopcut_account", None, code="shown")
+        self.assertEqual(report.call_args_list, [unittest.mock.call("welcome", None, code="at_account"),
+                                                unittest.mock.call("loopcut_account", None, code="shown")])
 
     # --- P0: the setup never traps, whatever is missing or failing --------------------------------------------
 

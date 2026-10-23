@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import types
@@ -37,6 +38,43 @@ def jpeg_header(path: Path, width: int, height: int) -> None:
     app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9
     sof = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
     path.write_bytes(b"\xff\xd8" + app0 + sof + b"\xff\xd9")
+
+
+def windows_args(command: str) -> list[str]:
+    """MS C-runtime argv rules for arguments (not argv[0]), also used by Python on Windows.
+
+    https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
+    Backslashes escape quotes for a native process, NOT for cmd.exe. Tests remove cmd's outer
+    /c quotes first, then parse the native child's command line here. No shell expansion is simulated.
+    """
+    args, index = [], 0
+    while index < len(command):
+        if command[index] in " \t":
+            index += 1
+            continue
+        value, quoted = "", False
+        while index < len(command) and (quoted or command[index] not in " \t"):
+            slashes = 0
+            while index < len(command) and command[index] == "\\":
+                slashes += 1
+                index += 1
+            if index < len(command) and command[index] == '"':
+                value += "\\" * (slashes // 2)
+                if slashes % 2:
+                    value += '"'
+                elif quoted and index + 1 < len(command) and command[index + 1] == '"':
+                    value += '"'
+                    index += 1
+                else:
+                    quoted = not quoted
+            else:
+                value += "\\" * slashes
+                if index == len(command) or (not quoted and command[index] in " \t"):
+                    break
+                value += command[index]
+            index += 1
+        args.append(value)
+    return args
 
 
 class Folder(unittest.TestCase):
@@ -282,6 +320,107 @@ class ShellTest(Folder):
                 workspace.shell(**kwargs)
 
 
+class WindowsShellTest(unittest.TestCase):
+    # The three launch-review failures, with project filenames replaced by synthetic fixtures.
+    COMMANDS = (
+        'python -c "from PIL import Image; print(\'Pillow ready\')"',
+        'python3 -c "from pathlib import Path; print(Path(\'build helpers.py\').read_text(encoding=\'utf8\'));'
+        'print(Path(\'hair and display.py\').read_text(encoding=\'utf8\'))"',
+        'python3 -c "import os,sys,platform,importlib.util; print(\'OS:\',platform.platform()); '
+        'print(\'HOME:\',os.path.expanduser(\'~\')); print(\'USERPROFILE:\',os.environ.get(\'USERPROFILE\')); '
+        'print(\'Python:\',sys.executable); print(\'GIS modules:\',{m:bool(importlib.util.find_spec(m)) '
+        'for m in [\'rasterio\',\'osgeo\',\'fiona\',\'shapefile\',\'pyproj\',\'tifffile\',\'numpy\']})"',
+    )
+
+    def test_old_list_serialization_reproduces_the_quoted_token_and_fixed_wrapper_preserves_code(self):
+        for command in self.COMMANDS:
+            with self.subTest(command=command):
+                old = subprocess.list2cmdline(["cmd", "/c", command])
+                # cmd strips its outer quotes, but does not consume the backslashes before inner quotes.
+                old_child = old.partition(" /c ")[2][1:-1]
+                broken = windows_args(old_child)[2]
+                self.assertIn(broken, ('"from', '"import'))
+                with self.assertRaises(SyntaxError):
+                    compile(broken, "<string>", "exec")
+                with mock.patch.object(workspace.os, "name", "nt"):
+                    fixed = workspace._shell_command(command)
+                child = fixed.partition(" /d /s /c ")[2][1:-1]
+                self.assertEqual(child, command)
+                args = windows_args(child)
+                self.assertEqual(len(args), 3)
+                compile(args[2], "<string>", "exec")
+
+    def test_windows_inline_forms_are_refused_before_starting_any_process(self):
+        code = '''print('quotes "inside"; %PATH% ^ & $HOME `whoami` 日本語')'''
+        commands = [*self.COMMANDS,
+                    f"py -3.13 -c '{code}'", f'python3 -Ic "{code}"',
+                    f'python -X utf8 -W ignore -c "{code}"',
+                    f'"C:\\Program Files\\Loopcut 日本語\\python.exe" -c "{code}"',
+                    f"& 'C:\\Program Files\\Loopcut 日本語\\python.exe' -c '{code}'",
+                    f'blender -b source.blend --python-expr "{code}"',
+                    'cmd /c python -c "print(1)"',
+                    'cmd /c "python -c \\"print(1)\\""',
+                    '''powershell -NoProfile -Command "python -c 'print(1)'"''',
+                    '''pwsh -Command 'python -c "print(1)"' ''',
+                    'echo before && python -c "print(1)"',
+                    'echo before\r\npython -c "print(1)"']
+        with mock.patch.object(workspace.os, "name", "nt"), \
+                mock.patch.object(workspace, "_workspace") as prepare, \
+                mock.patch.object(workspace, "run_process") as run:
+            for command in commands:
+                with self.subTest(command=command):
+                    result = workspace.shell(command)
+                    self.assertFalse(result.ok)
+                    self.assertIsNone(result.then)
+                    self.assertEqual(len(result.text.splitlines()), 1)
+                    self.assertIn("python3 file.py", result.text)
+            prepare.assert_not_called()
+            run.assert_not_called()
+
+    def test_file_commands_and_other_shell_commands_are_not_inline_python(self):
+        for command in ('python "build helpers.py" -c value', 'py -3 -m pip --version',
+                        'python -W ignore::DeprecationWarning script.py', 'python -X dev script.py',
+                        'blender -b source.blend --python "build helpers.py"',
+                        'echo "python -c example"', 'git -c core.autocrlf=true status'):
+            with self.subTest(command=command):
+                self.assertFalse(workspace._inline_python(command))
+
+    def test_cmd_payload_is_unchanged_for_paths_quotes_and_shell_metacharacters(self):
+        command = ('"C:\\Program Files\\日本語\\tool.exe" "a b" %TEMP% ^& '
+                   '&& powershell -NoProfile -Command "Write-Output $HOME; Write-Output `\"hello`\""')
+        with mock.patch.object(workspace.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}):
+            wrapped = workspace._shell_command(command)
+        self.assertEqual(wrapped, f'C:\\Windows\\System32\\cmd.exe /d /s /c "{command}"')
+
+    def test_windows_native_argv_roundtrip(self):
+        args = [r'C:\Program Files\Loopcut 日本語\blender.exe', '--python',
+                r'C:\Users\日本語\workspace folder\build.py', '--',
+                'quotes "inside"', '%TEMP%', '^&', '$HOME', '`whoami`', 'trailing slash \\', '']
+        self.assertEqual(windows_args(subprocess.list2cmdline(args)), args)
+
+    def test_native_parser_matches_the_documented_windows_examples(self):
+        # Examples from Microsoft's argv documentation, independent of list2cmdline.
+        for command, expected in ((r'"a b c" d e', ['a b c', 'd', 'e']),
+                                  (r'"ab\"c" "\\" d', ['ab"c', '\\', 'd']),
+                                  (r'a\\\b d"e f"g h', [r'a\\\b', 'de fg', 'h']),
+                                  (r'a"b"" c d', ['ab" c d'])):
+            with self.subTest(command=command):
+                self.assertEqual(windows_args(command), expected)
+
+    @unittest.skipUnless(os.name == "nt", "requires a real Windows cmd.exe")
+    def test_real_cmd_preserves_a_quoted_native_executable(self):
+        with tempfile.TemporaryDirectory(prefix="Loopcut 日本語 ") as tmp:
+            script = Path(tmp) / "build helpers.py"
+            script.write_text('import sys; print(sys.argv[1])', encoding="utf-8")
+            # No .cmd shim: exercise cmd's outer quotes and the native executable's argv.
+            command = subprocess.list2cmdline([sys.executable, str(script), "日本語 space"])
+            result = subprocess.run(workspace._shell_command(command), capture_output=True,
+                                    env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.decode("utf-8").strip(), "日本語 space")
+
+
 class ShellSummaryTest(Folder):
     def test_describe_uses_normalized_summary(self):
         command = "echo first\necho second\n"
@@ -338,6 +477,30 @@ class ShellSummaryTest(Folder):
 
 
 class RunBlenderTest(Folder):
+    def test_file_route_preserves_code_and_native_arguments_without_a_shell(self):
+        script = self.ws / "日本語 build helpers.py"
+        literal = 'quotes "inside" %TEMP% ^ & $HOME `whoami` 日本語'
+        code = f'print({literal!r})\r\n'
+        files.write_file(script.name, code)
+        self.assertEqual(script.read_bytes(), code.encode("utf-8"))
+        # Execute the generated file with real Python to check its text independently of Blender.
+        output = subprocess.check_output([sys.executable, str(script)], cwd=self.ws,
+                                         env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        self.assertEqual(output.decode("utf-8").strip(), literal)
+
+        def run(command, cwd, env, timeout, log, cancelled, label=""):
+            self.assertIsInstance(command, list)
+            self.assertEqual(windows_args(subprocess.list2cmdline(command)), command)
+            self.assertIn(str(script), command)
+            self.assertEqual(command[-5:], [str(script), "--", literal, "space 日本語", '"quoted"'])
+            log.write_text("completed", encoding="utf-8")
+            return 0, 0.1, ""
+
+        with mock.patch.object(workspace, "run_process", side_effect=run) as process:
+            result = self.then(workspace.run_blender(script.name, blend="", args=[literal, "space 日本語", '"quoted"']))
+        self.assertTrue(result.ok, result.text)
+        process.assert_called_once()
+
     def test_validation(self):
         (self.ws / "build.py").write_text("print('hi')")
         (self.ws / "notes.txt").write_text("x")
@@ -854,9 +1017,9 @@ Note for {name}.
         with mock.patch.object(cloud, 'skill_options', return_value=options), \
                 mock.patch.object(codex_app, 'dynamic_tools', return_value=dynamic):
             notes = self.notes(codex=True)
-        for name in ('python', 'shell', 'uv', 'image'):
+        # run_blender is one of Codex's dynamic tools since the Windows file runner (0.2.10), so its note comes too.
+        for name in ('python', 'shell', 'uv', 'image', 'blender'):
             self.assertIn(f'Note for {name}.', notes)
-        self.assertNotIn('Note for blender.', notes)
 
     def test_single_notes_select_fetched_index_entries(self):
         from prompt_index_fixture import built_index

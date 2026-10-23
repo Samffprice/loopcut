@@ -54,6 +54,11 @@ def error_line(text: str) -> str:
     _, marker, trace = output.rpartition("Traceback (most recent call last):")
     if marker:  # The exception is the unindented lines after the frames; its message may span several.
         return " ".join(line.strip() for line in trace.splitlines() if line.strip() and not line[0].isspace())
+    if re.match(r"exit \d+ in ", output):
+        # shell's timing is not the error; SyntaxError has no Traceback header.
+        lines = output.splitlines()[1:]
+        return next((line.strip() for line in lines if re.match(r"\w*(?:Error|Exception):", line)),
+                    next((line.strip() for line in lines if line.strip()), ""))
     stopped = output.find("Stopped: the code ran for more than")
     if stopped >= 0:
         return output[stopped:].split(",", 1)[0]
@@ -133,6 +138,7 @@ class Ledger:
         self._lock = threading.Lock()
         self._revision = 0  # Bumped by anything that may have changed the scene.
         self._failures: dict[tuple, list[str]] = {}  # (tool, normalised error) -> "step N gist" per try.
+        self._shell_failures: dict[tuple, int] = {}  # Same command and error, ignoring its display summary.
         self._reads: dict[tuple, dict] = {}  # Call key -> revision, digest, steps and where of its latest result.
         self._failing_runs = 0
         self._polls = 0  # Status calls without wait that found a render job running.
@@ -172,11 +178,23 @@ class Ledger:
         with self._lock:
             repeated = False
             if not ok:
-                tries = self._failures.setdefault((key[0], normalised(error_line(text))), [])
+                error = normalised(error_line(text))
+                tries = self._failures.setdefault((key[0], error), [])
                 earlier = _listed(tries)
                 tries.append(f"step {step} {gist(key)}")
                 repeated = len(tries) >= 3
-                if repeated:
+                shell_count = 0
+                if key[0] == "shell":
+                    command = _arguments(key).get("command")
+                    if isinstance(command, str):
+                        shell_key = (command, error)
+                        shell_count = self._shell_failures.get(shell_key, 0) + 1
+                        self._shell_failures[shell_key] = shell_count
+                if shell_count >= 2:
+                    notes.append(f"(This same shell command has failed the same way {shell_count} times this turn. "
+                                 "Do not repeat it unchanged. For Python, write a .py file with write_file and run python3 file.py; "
+                                 'for bpy use run_blender(script="script.py", blend="") or run_python for the live scene.)')
+                elif repeated:
                     notes.append(f"(This error has now come up {len(tries)} times. Already tried: {earlier}. "
                                  f"This approach is not working: read the error above and check the names in it "
                                  f"with inspect_api or get_object_info, then try a different approach, or stop "

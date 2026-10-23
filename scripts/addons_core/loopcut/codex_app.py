@@ -7,7 +7,7 @@ model inside Loopcut, even once the workspace had an environment-only prompt (ev
 against 20261001-*). What was left was the loop: Loopcut's driver had Codex role-play the model behind Loopcut
 and answer each step in JSON, so it never used its own shell, apply_patch, view_image or context handling.
 Here Codex drives: its prompt, shell, file edits, image viewing and compaction are its own, and Loopcut adds
-only what Codex lacks, the live scene (DYNAMIC). The turn, its cards, approvals, checkpoints and the end of
+only what Codex lacks: the live scene and a shell-free Blender script runner (DYNAMIC). The turn, its cards, approvals, checkpoints and the end of
 turn bookkeeping stay agent.run_loop's (CODEX_SPEC hands it the turn through LoopSpec.drive).
 
 One app-server per turn, started on the agent thread in a session of its own, so that a Stop takes the
@@ -58,8 +58,8 @@ POLL = 0.1
 SHOWN = 4000                  # Characters of a command's output or a patch on its card.
 SENT = "loopcut_codex"        # On a turn's message once Codex has it: a resumed turn sends RESUME instead.
 RESUME = "Go on from where you stopped."
-# The live-scene tools Codex lacks; its own shell, file edits and image viewer do the rest.
-DYNAMIC = ("apply_build", "snapshot_scene", "run_python", "get_scene_info", "inspect_api", "capture_viewport",
+# Blender tools Codex lacks, including a shell-free script runner; its own file edits and image viewer do the rest.
+DYNAMIC = ("apply_build", "snapshot_scene", "run_blender", "run_python", "get_scene_info", "inspect_api", "capture_viewport",
            "search_assets", "import_asset")
 # What the user's own ~/.codex/config.toml would add to a Loopcut thread: MCP servers (switched off by name,
 # _mcp_servers), plugins, apps, memories, hooks, a notify program, web search, AGENTS.md files and personal
@@ -81,6 +81,9 @@ conversation's first message found it; keep it as it is), the images the user at
 file you make. The <workspace> note on a message lists it. In your shell, blender is this Blender, to run headless \
 (blender -b source.blend --python script.py), and python3 is Blender's Python, with numpy. A headless run has no \
 window: save with bpy. In it // is the workspace; in the live scene it is the .blend's folder.
+On Windows, write Python to a .py file and run that file instead of using python -c, py -c or Blender's \
+--python-expr: shell quoting and expansion can change inline code. Run plain Python as python3 file.py; for bpy \
+use run_python in the live scene or run_blender(script="script.py", blend="") in an empty background scene.
 
 The user's live scene is reached through Loopcut's tools:
 - apply_build brings a result .blend into the live scene in one undo step: what the build created comes in, what \

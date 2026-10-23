@@ -654,7 +654,8 @@ bpy.types = types.SimpleNamespace(Operator=type("Operator", (), {}), Menu=type("
 bpy.props = types.SimpleNamespace(**{name: (lambda **kw: kw) for name in
                                     ("StringProperty", "EnumProperty", "BoolProperty", "IntProperty")})
 bpy.context = types.SimpleNamespace(preferences=types.SimpleNamespace(addons={}))
-bpy.app = types.SimpleNamespace(driver_namespace={})
+bpy.app = types.SimpleNamespace(driver_namespace={}, background=True, timers=types.SimpleNamespace(
+    is_registered=lambda function: False, register=lambda *args, **kwargs: None, unregister=lambda function: None))
 utils = types.ModuleType("bpy.utils")
 previews = types.ModuleType("bpy.utils.previews")
 utils.previews = previews

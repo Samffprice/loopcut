@@ -102,9 +102,10 @@ Environment:
 relative paths in the file tools mean. It holds source.blend (the live scene as this conversation's first request \
 found it; keep it as it is), the images the user attached, at full size, and every file you make. The <workspace> \
 note on a request lists it. snapshot_scene saves the live scene as source.blend again.
-- In the shell, blender is this Blender, to run headless (blender -b source.blend --python script.py), and python3 \
-is Blender's Python, with numpy. run_blender does the same and lists the files the run wrote. Those runs have no \
-window: save with bpy. In them // is the workspace; in the live scene it is the .blend's folder.
+- In shell, blender is this Blender and python3 its Python, with numpy. run_blender runs headless \
+(blender -b source.blend --python script.py) and lists files written. No window: save with bpy. There // is the \
+workspace; in the live scene it is the .blend's folder.
+- Windows shell: cmd.exe. For Python, write_file a .py and run python3 file.py.
 - view_image shows you any image: your renders, crops, the references.
 - The user's live Blender: run_python runs bpy code in it, get_scene_info reads it, capture_viewport shows it, and \
 after a step that changed it you get a capture. inspect_api describes its live API and turns on a bundled add-on \
@@ -136,8 +137,8 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     {"type": "function", "function": {
         "name": "shell",
         "description": (
-            "Run a shell command in your workspace folder. Returns the exit code and the output, its middle cut "
-            "past 8,000 characters (the whole of it then saved under logs/). No input; set a timeout for long jobs."),
+            "Run a workspace command; returns exit code and output (over 8,000 chars clipped, full log in "
+            "logs/). No input. Windows: cmd.exe; inline Python refused: write_file a .py, then python3 file.py."),
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
             "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
@@ -492,14 +493,14 @@ def _kill(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def run_process(command: list, cwd: Path, env: dict, timeout: float, log: Path, is_cancelled,
+def run_process(command: list | str, cwd: Path, env: dict, timeout: float, log: Path, is_cancelled,
                 label: str = "") -> tuple:
     """Run to the end, the time limit or a Stop; stdout and stderr into log. Returns (exit code or None,
     seconds, "timeout" | ""). A Stop kills it and raises llm.Cancelled."""
     from . import llm
     log.parent.mkdir(parents=True, exist_ok=True)
     id = uuid.uuid4().hex
-    label = (label.strip() or Path(command[0]).name).splitlines()[0][:80]
+    label = (label.strip() or ("cmd.exe" if isinstance(command, str) else Path(command[0]).name)).splitlines()[0][:80]
     started = time.monotonic()
     stopped = ""
     with log.open("wb") as out:
@@ -528,13 +529,59 @@ def run_process(command: list, cwd: Path, env: dict, timeout: float, log: Path, 
     return None if stopped else process.returncode, time.monotonic() - started, stopped
 
 
-def _shell_command(command: str) -> list:
+def _shell_command(command: str) -> list | str:
     if os.name == "nt":
-        return ["cmd", "/c", command]
+        # Popen serializes a list with MS C-runtime rules (\" becomes \\\"), which cmd does not use.
+        # /s removes only our outer quotes; the command's own quotes reach cmd unchanged. /d skips AutoRun.
+        shell = subprocess.list2cmdline([os.environ.get("COMSPEC") or "cmd.exe"])
+        return f'{shell} /d /s /c "{command}"'
     for shell in ("/bin/bash", "/bin/sh"):
         if os.path.exists(shell):
             return [shell, "-c", command]
     return ["sh", "-c", command]
+
+
+# Detection only, not a shell parser or sandbox: never decode or rewrite generated Python as shell text.
+_SHELL_WORD = re.compile(r'''"[^"\r\n]*"|'[^'\r\n]*'|[^\s&|;()]+|[&|;()\r\n]''')
+_PYTHON_NAME = re.compile(r"(?:python(?:w|[23](?:\.\d+)*)?|py)(?:\.(?:exe|cmd|bat))?", re.I)
+
+
+def _inline_python(command: str, depth: int = 0) -> bool:
+    import ntpath
+    words = _SHELL_WORD.findall(command)
+    for index, word in enumerate(words):
+        name = ntpath.basename(word.strip("\"'"))
+        if name.lower() in ("cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe") and depth < 4:
+            for offset, arg in enumerate(words[index + 1:], index + 1):
+                if arg.lower() in ("/c", "-command", "-c") and offset + 1 < len(words):
+                    if _inline_python(words[offset + 1].strip("\"'"), depth + 1):
+                        return True
+                    break
+        python = bool(_PYTHON_NAME.fullmatch(name))
+        blender = name.lower() in ("blender", "blender.exe", "blender.cmd")
+        if not python and not blender:
+            continue
+        takes_value = False
+        for arg in words[index + 1:]:
+            arg = arg.strip("\"'")
+            if arg in ("&", "|", ";", "(", ")", "\r", "\n"):
+                break
+            if takes_value:
+                takes_value = False
+                continue
+            if python:
+                if re.match(r"-[bBdEhiIOPqRsSuvVx]*c", arg):
+                    return True
+                if not arg.startswith("-") or arg in ("-m", "--"):
+                    break  # A file/module's arguments are not interpreter options.
+                takes_value = arg in ("-W", "-X", "--check-hash-based-pycs")
+            elif arg == "--python-expr" or arg.startswith("--python-expr="):
+                return True
+    return False
+
+
+INLINE_PYTHON_HELP = ("Write the code to a .py file with write_file, then run python3 file.py here; for bpy use "
+                      'run_blender(script="script.py", blend="") or run_python for the live scene.')
 
 
 def _exit_text(code, seconds: float, stopped: str, timeout: float) -> str:
@@ -800,9 +847,12 @@ def _path(raw: str, must_exist: bool = True) -> Path:
 
 
 def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolResult:
-    if not str(command or "").strip():
+    if not isinstance(command, str) or not command.strip():
         raise ToolError("command must not be empty")
     seconds = _timeout(timeout, SHELL_TIMEOUT)
+    if os.name == "nt" and _inline_python(command):
+        return ToolResult("Not run: inline Python in Windows shell commands can change the code. "
+                          + INLINE_PYTHON_HELP, ok=False)
     _, ws = _workspace()
     env = shell_env(ws)
 

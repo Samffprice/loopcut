@@ -23,6 +23,7 @@ is dropped quietly (a server before 014 answers 422). A 404 (the server's app_te
 the same setup step once per process, at most MAX_EVENTS events in any WINDOW seconds, and a bounded queue.
 """
 
+import json
 import os
 import platform
 import queue
@@ -317,6 +318,43 @@ def setup_step(step: str, choice: str | None, ok: bool = True, code=None) -> Non
     record("setup_step", lambda: setup_step_props(step, choice, ok, code))
 
 
+# First-use milestones use the existing closed setup_step contract. Persist only event flags, never content.
+_FIRST_ACTIONS = ("panel_opened", "prompt_typed", "prompt_sent", "result_ok", "result_error",
+                  "result_cancelled", "result_empty")
+
+
+def first_use(action: str) -> None:
+    if action not in _FIRST_ACTIONS:
+        raise ValueError("Unknown first-use action")
+
+    def props():
+        from . import credentials
+        prefs = _preferences()
+        path = credentials.folder() / "first-use.json"
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        saved = saved if isinstance(saved, dict) else {}
+        result = action.startswith("result_")
+        key = "result" if result else action
+        if saved.get(key) or (not result and getattr(prefs, "first_message_sent", False)):
+            return None
+        if result and not saved.get("prompt_sent"):
+            return None
+        saved[key] = True
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(saved), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as ex:
+            print(f"Loopcut: first-use event flag not saved: {type(ex).__name__}")
+        return setup_step_props("done", None, action not in ("result_error", "result_cancelled", "result_empty"),
+                                "first_" + action)
+    record("setup_step", props)
+
+
 def provider_of(source: str) -> str:
     """cloud.model_source() as the event's provider: a model server on this computer is the user's own."""
     return source if source in ("chatgpt", "loopcut") else "own_key"
@@ -355,6 +393,7 @@ def turn_end(turn, items: list) -> None:
     tools = sum(1 for item in items[first:] if item.get("kind") == "tool")
     duration = (time.monotonic() - started) * 1000
     record("turn", turn_props(start["provider"], start["model"], result, duration, tools, code))
+    first_use("result_" + result)
 
 
 def register() -> None:

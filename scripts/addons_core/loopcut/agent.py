@@ -1875,11 +1875,14 @@ def send(text: str) -> bool:
     if waiting:
         session["items"].append(state.item_notice(f"Still preparing {', '.join(waiting)}; send once it is ready."))
         return False
+    from . import telemetry
+    telemetry.first_use("prompt_sent")
     turn = Turn()
     try:
         _configure(turn, session)
     except config.ConfigError as ex:
         session["items"].append(state.item_error(str(ex)))
+        telemetry.first_use("result_error")
         return False
     if turn.config is not None and config.on_service(turn.config.base_url):
         turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),

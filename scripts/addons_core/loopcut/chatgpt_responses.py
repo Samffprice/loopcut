@@ -51,7 +51,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 
-from . import chatgpt_auth, cloud, context, image_budget, llm
+from . import chatgpt_auth, chatgpt_ready, cloud, context, image_budget, llm
 
 NAMESPACE = "loopcut"
 NAMESPACE_DESCRIPTION = ("Loopcut's tools. They act on the user's open Blender scene and, when one is set up, "
@@ -429,6 +429,10 @@ def _error_from(status: int | None, body: bytes, headers) -> llm.LLMError:
 
 def _error(status: int | None, code: str, detail: str, error: dict, request_id: str) -> llm.LLMError:
     friendly = _MESSAGES.get(code)
+    if chatgpt_ready.unsupported(llm.LLMError(detail, status, code)):
+        code, friendly = "unsupported_model", chatgpt_ready.message("unsupported_model")
+    elif code in ("invalid_grant", "unsupported_country_region_territory", "country_not_supported"):
+        friendly = chatgpt_ready.message(code)
     if not friendly:
         if status == 401:
             friendly = f"ChatGPT did not accept the sign-in (HTTP 401{', ' + code if code else ''}): {detail}"
@@ -494,13 +498,16 @@ def _post(body: dict, token: str, timeout: float, turn_state: str = "", session:
 
 
 def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcript: _Transcript,
-          turn_state: Callable[[], str] = lambda: "", session: str = "", on_drop: Callable[[], bool] = lambda: False):
+          turn_state: Callable[[], str] = lambda: "", session: str = "", on_drop: Callable[[], bool] = lambda: False,
+          probe: bool = False):
     """Open the stream: the token (refreshed when near expiry, and once more after a 401), retries
     for 429/5xx that are not usage limits, and one retry per optional feature a 400 refuses (the body
     is built again by build(), which leaves out every feature refused so far, and after a dropped
     connection sends smaller images: on_drop is image_budget.Sized.tighten)."""
     attempt, refreshed, refused = 0, False, set()
     while True:
+        if is_cancelled():
+            raise llm.Cancelled()
         body = build()
         try:
             token = chatgpt_auth.access_token()
@@ -508,7 +515,7 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
             raise llm.LLMError(str(ex), ex.status or 401, ex.code or "chatgpt_not_signed_in") from None
         transcript.request(body)
         try:
-            return _post(body, token, read_timeout(), turn_state(), session)
+            return _post(body, token, 15.0 if probe else read_timeout(), turn_state(), session)
         except urllib.error.HTTPError as ex:
             headers = ex.headers
             try:
@@ -518,6 +525,8 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
                 raw = b""  # The answer's body broke off; its status still decides.
             error = _error_from(ex.code, raw, headers)
             transcript.response({"status": ex.code, "error": error.details, "headers": _headers(headers)})
+            if probe:
+                raise error from None
             if ex.code == 401 and not refreshed and error.code not in _NO_RETRY:
                 refreshed = True
                 try:
@@ -543,6 +552,8 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
             print(f"Loopcut: retrying the ChatGPT request after HTTP {ex.code} ({attempt + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")
         except (urllib.error.URLError, OSError, http.client.HTTPException) as ex:
+            if probe:
+                raise
             # A dropped connection: refused, reset, a broken pipe while the body went up, or a TLS alert such
             # as bad_record_mac read in place of the status line (ssl.SSLError, which urlopen does not wrap).
             # api.openai.com cut large uploads (2.5-5 MB) that way about one time in four on 2026-10-16.
@@ -760,7 +771,7 @@ def _log_response(transcript, meta, started, first_byte, events, items, order, f
     })
 
 
-def stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_effort: str,
+def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_effort: str,
            on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
            call_max_seconds: float | None = None, headers: dict | None = None,
            on_retry: Callable[[], None] | None = None) -> llm.Completion:
@@ -789,7 +800,7 @@ def stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_eff
         try:
             return _read(response, on_text, is_cancelled, deadline, transcript, meta)
         except _Interrupted as ex:
-            cause = ex.__cause__ or "the stream ended before response.completed"
+            cause = ex.__cause__ or EOFError("the stream ended before response.completed")
             if ex.streamed:
                 if retried_partial or on_retry is None:
                     raise llm.connection_lost("ChatGPT", cause, while_replying=True) from cause
@@ -804,3 +815,31 @@ def stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_eff
                   f"waiting {delay:g}s)")
             before_content += 1
             llm._wait(delay, is_cancelled)
+
+
+def stream(*, model: str, **kwargs) -> llm.Completion:
+    """Retry an explicitly unsupported model once, within the same ChatGPT account."""
+    account = chatgpt_ready.account_key()
+    actual = chatgpt_ready.effective_model(account, model)
+    try:
+        completion = _stream(model=actual, **kwargs)
+    except llm.LLMError as ex:
+        if not chatgpt_ready.unsupported(ex):
+            raise
+        chatgpt_ready.remember(account, actual, False)
+        # A remembered fallback is already the one alternative for this request.
+        alternative = chatgpt_ready.fallback(account, actual) if actual == model else None
+        if not alternative:
+            raise
+        actual = alternative
+        try:
+            completion = _stream(model=actual, **kwargs)
+        except llm.LLMError as fallback_error:
+            if chatgpt_ready.unsupported(fallback_error):
+                chatgpt_ready.remember(account, actual, False)
+            raise
+    if not completion.timed_out and completion.finish_reason != "length":
+        chatgpt_ready.remember(account, actual, True, requested=model)
+        if actual != model:
+            chatgpt_ready.model_used(account, model, actual)
+    return completion

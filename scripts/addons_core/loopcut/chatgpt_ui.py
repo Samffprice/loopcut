@@ -9,10 +9,11 @@ settings, and the first sign-in shows "You're using your ChatGPT plan" once.
 """
 
 import threading
+import time
 
 import bpy
 
-from . import chatgpt_auth, mainthread
+from . import chatgpt_auth, chatgpt_ready, mainthread
 
 _state = {"status": "idle", "error": "", "url": ""}   # status: idle | waiting | error
 _cancel = threading.Event()
@@ -24,7 +25,7 @@ def _redraw() -> None:
 
 def _finished(result: dict | None, error: str) -> None:
     """Main thread, after a sign-in attempt: signed in, the ChatGPT plan becomes the provider and onboarding
-    moves on to privacy."""
+    stays on model setup for the readiness result."""
     from . import onboarding, settings
     if _cancel.is_set():
         result, error = None, ""
@@ -34,7 +35,7 @@ def _finished(result: dict | None, error: str) -> None:
         prefs.provider = "CHATGPT"  # settings._provider_changed sets its URL and model.
     settings.config_changed()
     if result and result.get("signed_in"):
-        onboarding._on_signed_in()
+        request_readiness(force=True)
         try:
             bpy.ops.wm.save_userpref()
         except RuntimeError as ex:
@@ -67,6 +68,156 @@ def _run_sign_in(new_account: bool) -> None:
         telemetry.setup_step("chatgpt", "chatgpt", bool(result and result.get("signed_in")) and not error,
                              None if result and not error else code or "not_signed_in")
     mainthread.run_on_main(lambda: _finished(result, error))
+
+
+_ready = {"status": "idle", "code": "", "model": "", "account": (), "selected": "", "note": ""}
+_checked = set()
+_ready_cancel = threading.Event()
+_force_ready = False
+
+
+def request_readiness(force: bool = False) -> None:
+    """Main thread: debounce model edits; all network work stays on the worker."""
+    global _force_ready
+    if force:
+        _force_ready = True
+        _checked.clear()
+    if not bpy.app.background and not bpy.app.timers.is_registered(_start_readiness):
+        bpy.app.timers.register(_start_readiness, first_interval=0.5)
+
+
+def _start_readiness():
+    global _ready_cancel, _force_ready
+    from . import settings
+    prefs = settings.preferences()
+    if prefs is None or prefs.provider != "CHATGPT" or not chatgpt_auth.plan_signed_in():
+        _ready_cancel.set()
+        _checked.clear()
+        return None
+    account, selected = chatgpt_ready.account_key(), prefs.model
+    key = (account, selected)
+    if key in _checked and not _ready_cancel.is_set():
+        return None
+    _checked.clear()
+    _checked.add(key)
+    _ready_cancel.set()
+    cancel = threading.Event()
+    _ready_cancel = cancel
+    force, _force_ready = _force_ready, False
+    if not getattr(bpy.app, "online_access", True):
+        from . import telemetry
+        _ready.update(status="done", code="offline", model=selected, account=account, selected=selected, note="")
+        telemetry.setup_step("chatgpt", "chatgpt", False, "readiness_offline")
+        _redraw()
+        return None
+    actual = chatgpt_ready.effective_model(account, selected)
+    if not force and chatgpt_ready.verified(account, actual):
+        note = _ready["note"] if _ready["account"] == account and _ready["model"] == actual else ""
+        _ready.update(status="done", code="ready", model=actual, account=account, selected=selected, note=note)
+        if actual != selected:
+            model_used(account, selected, actual)
+        return None
+    _ready.update(status="checking", code="", model=selected, account=account, selected=selected, note="",
+                  started=time.monotonic())
+    _redraw()
+
+    def run():
+        try:
+            result = chatgpt_ready.check(selected, cancel.is_set, fresh=force)
+        except Exception:  # Always retire the UI's in-flight state, even for an unexpected worker failure.
+            import traceback
+            traceback.print_exc()
+            result = {"code": "check_failed", "model": selected, "account": account}
+        mainthread.run_on_main(lambda: _readiness_finished(result, selected, cancel))
+    threading.Thread(target=run, name="loopcut-chatgpt-ready", daemon=True).start()
+    return None
+
+
+def _readiness_finished(result: dict, selected: str, cancel) -> None:
+    from . import settings, telemetry
+    prefs = settings.preferences()
+    if cancel.is_set() or result["account"] != chatgpt_ready.account_key() or prefs is None \
+            or prefs.provider != "CHATGPT" or prefs.model != selected:
+        if cancel is _ready_cancel:
+            _checked.discard((result["account"], selected))
+        return
+    code = result["code"]
+    _ready.update(result, status="done", selected=selected)
+    telemetry.setup_step("chatgpt", "chatgpt", code == "ready", "readiness_" + code)
+    if code == "ready" and result["model"] != selected:
+        model_used(result["account"], selected, result["model"])
+    _redraw()
+
+
+def readiness() -> dict:
+    from . import settings
+    prefs = settings.preferences()
+    if prefs is None or prefs.provider != "CHATGPT" or _ready["account"] != chatgpt_ready.account_key() \
+            or prefs.model not in (_ready["selected"], _ready["model"]):
+        return {"status": "idle", "code": "", "note": ""}
+    return dict(_ready)
+
+
+def draw_readiness(column) -> None:
+    ready = readiness()
+    if ready["status"] == "checking":
+        column.label(text="Checking ChatGPT…", icon="TIME")
+    elif ready["code"]:
+        from . import settings
+        for line in settings.wrap(ready.get("note") or chatgpt_ready.message(ready["code"]), 70):
+            column.label(text=line, icon="INFO" if ready["code"] == "ready" else "ERROR")
+        if ready["code"] != "ready":
+            column.operator("loopcut.chatgpt_check", text="Check again")
+            if ready["code"] not in ("offline", "network", "unsupported_model"):
+                column.operator("loopcut.chatgpt_sign_in", text="Sign in again")
+
+
+# Only an answer that this plan can't work here holds setup back. A slow check or a passing error (5xx,
+# timeouts) lets the user carry on; their first turn retries and says what went wrong.
+REFUSALS = frozenset(("invalid_grant", "subscription_sharing_user_not_eligible", "no_plan_scope",
+                      "unsupported_country_region_territory", "country_not_supported", "chatgpt_not_signed_in",
+                      "subscription_sharing_invalid_user", "invalid_refresh_token", "unsupported_model"))
+CHECK_WAIT = 20.0
+
+
+def can_continue() -> bool:
+    ready = readiness()
+    if ready["status"] == "checking":
+        return time.monotonic() - ready.get("started", 0.0) >= CHECK_WAIT
+    return ready["code"] not in REFUSALS
+
+
+def model_used(account: tuple, requested: str, actual: str) -> None:
+    def apply():
+        from . import settings, state
+        prefs = settings.preferences()
+        if account != chatgpt_ready.account_key() or prefs is None or prefs.provider != "CHATGPT" \
+                or prefs.model != requested:
+            return
+        prefs.model = actual
+        _ready.update(status="done", code="ready", model=actual, account=account, selected=requested,
+                      note=chatgpt_ready.notice(requested, actual))
+        state.session()["items"].append(state.item_notice(_ready["note"]))
+        try:
+            bpy.ops.wm.save_userpref()
+        except RuntimeError as ex:
+            print(f"Loopcut: could not save the ChatGPT model: {ex}")
+        _redraw()
+    mainthread.run_on_main(apply)
+
+
+class LOOPCUT_OT_chatgpt_check(bpy.types.Operator):
+    bl_idname = "loopcut.chatgpt_check"
+    bl_label = "Check ChatGPT"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        from . import settings
+        prefs = settings.preferences()
+        if prefs is not None and prefs.provider != "CHATGPT":
+            prefs.provider = "CHATGPT"
+        request_readiness(force=True)
+        return {"FINISHED"}
 
 
 def sign_in(new_account: bool = False) -> bool:
@@ -233,6 +384,7 @@ def draw(column, prefs=None) -> None:
             column.operator("loopcut.chatgpt_sign_in", text="Use another ChatGPT account").new_account = True
     if prefs is not None and info.get("signed_in"):
         from . import settings
+        draw_readiness(column)
         row = column.row(align=True)
         row.prop(prefs, "model")
         row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
@@ -240,16 +392,21 @@ def draw(column, prefs=None) -> None:
             row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
 
 
-_CLASSES = (LOOPCUT_OT_chatgpt_sign_in, LOOPCUT_OT_chatgpt_cancel, LOOPCUT_OT_chatgpt_copy_link,
+_CLASSES = (LOOPCUT_OT_chatgpt_check, LOOPCUT_OT_chatgpt_sign_in, LOOPCUT_OT_chatgpt_cancel, LOOPCUT_OT_chatgpt_copy_link,
             LOOPCUT_OT_chatgpt_sign_out, LOOPCUT_OT_chatgpt_manage_usage, LOOPCUT_OT_chatgpt_welcome)
 
 
 def register() -> None:
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
+    request_readiness()
 
 
 def unregister() -> None:
     _cancel.set()
+    _ready_cancel.set()
+    _checked.clear()
+    if bpy.app.timers.is_registered(_start_readiness):
+        bpy.app.timers.unregister(_start_readiness)
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)

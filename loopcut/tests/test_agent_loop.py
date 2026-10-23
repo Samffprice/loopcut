@@ -2588,6 +2588,19 @@ class LimitStateTest(unittest.TestCase):
         self.refuse(launch.call_args.args[1])
         self.assertEqual(sum(i["kind"] == "limit" for i in self.session["items"]), 1)
 
+    def test_send_records_the_first_attempt_and_an_early_setup_failure(self):
+        from loopcut import telemetry
+        with mock.patch.object(telemetry, "first_use") as record, \
+                mock.patch.object(agent, "_configure", side_effect=config.ConfigError("Model not connected")):
+            self.assertFalse(agent.send("make a cabinet"))
+        self.assertEqual(record.call_args_list, [mock.call("prompt_sent"), mock.call("result_error")])
+
+    def test_send_records_no_prompt_content_in_telemetry(self):
+        from loopcut import telemetry
+        with mock.patch.object(telemetry, "first_use") as record:
+            self.send("a private prompt")
+        record.assert_called_once_with("prompt_sent")
+
     def test_display_never_blocks_send_with_unknown_reset_or_any_model_or_provider(self):
         for reset in ("", "bad date", "2099-10-21T18:00:00Z"):
             for route, model in ((self.cfg.base_url, "fast"), (self.cfg.base_url, "pro"),

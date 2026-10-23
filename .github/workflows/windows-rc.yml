@@ -1,0 +1,38 @@
+# The 0.2.10 fixes on real Windows: cmd.exe quoting for the workspace shell (its real-cmd test is skipped
+# elsewhere), device sign-in resume, ChatGPT readiness, telemetry and onboarding. Runs on pushes to release candidates.
+name: Windows release checks
+
+on:
+  push:
+    branches: ['rc/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          sparse-checkout: |
+            scripts/addons_core/loopcut
+            loopcut/tests
+            loopcut/harness
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"  # The Python inside Blender 5.2.
+      - name: Workspace shell on cmd.exe (inline Python refusal, quoting round trips, real cmd)
+        run: python loopcut/tests/test_workspace.py WindowsShellTest ShellTest ShellSummaryTest ProcessTest PureTest -v
+      - name: Sign-in, ChatGPT readiness, telemetry, onboarding, repeats
+        if: always()
+        run: |
+          $failed = @()
+          foreach ($t in "test_device_credentials", "test_onboarding", "test_chatgpt", "test_telemetry", "test_repeats", "test_settings") {
+            if (Test-Path "loopcut/tests/$t.py") { python "loopcut/tests/$t.py"; if ($LASTEXITCODE -ne 0) { $failed += $t } }
+          }
+          if ($failed) { throw "failed: $($failed -join ', ')" }

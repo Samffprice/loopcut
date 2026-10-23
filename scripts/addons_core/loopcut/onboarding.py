@@ -56,7 +56,7 @@ NUMBERED = ("account", "how", "connect", "privacy", "done")  # "Step n of 5"; Bl
 OPERATORS = ("import_blender_settings", "onboarding_step", "onboarding_own_key", "onboarding_no_account",
              "onboarding_claim", "onboarding_try", "sign_in", "cancel_sign_in", "open_sign_in_page",
              "copy_sign_in_link", "chatgpt_sign_in", "chatgpt_cancel", "chatgpt_copy_link", "fetch_models",
-             "onboarding_change_model")
+             "onboarding_change_model", "chatgpt_check")
 STARTING_PATIENCE = 15  # Seconds of "Loopcut is starting…" before it says to restart.
 _registered = False  # Between register() and unregister(): the watchdog never opens a setup outside it.
 MEDIA = Path(__file__).parent / "media"
@@ -192,6 +192,8 @@ def _start_step(first_run: bool) -> str | None:
         _state["existing"] = starting or bool(progress and progress["existing"])
         step = _resume_step("account" if starting or progress is None else progress["step"])
     save_progress(step, existing=True if _state["existing"] else None)
+    if progress and not progress["done"]:
+        _report("welcome", None, False, "abandoned_" + progress["step"])
     if _state["existing"]:  # Told apart from new installs in the funnel.
         _report("welcome", None, code="existing_resumed" if progress and not progress["done"] else "existing")
     else:
@@ -279,7 +281,8 @@ def _signature() -> tuple:
              bool(_state["starting_since"]) and now - _state["starting_since"] >= STARTING_PATIENCE,
              None if credits is None else repr(sorted(credits.items())))
     if step == "connect":
-        shown += (_on_chatgpt_plan(),)
+        ready = chatgpt_ui.readiness()
+        shown += (_on_chatgpt_plan(), ready["status"], ready["code"], ready.get("note", ""))
     elif step == "how":
         shown += (_account_plan(), _unit_prices(_descriptors()))
     elif step == "done":
@@ -338,6 +341,7 @@ def draw_splash(layout, context, first_run: bool) -> bool:
         return drawn
     except Exception:
         traceback.print_exc()
+        _report("welcome", None, False, "abandoned_" + (_state["step"] or "unknown"))
         _state.update(step=None, finished=True)  # This session only: the saved step comes back next start.
         if bpy.app.timers.is_registered(_watch):
             bpy.app.timers.unregister(_watch)
@@ -364,6 +368,7 @@ def _draw_splash(layout, context, first_run: bool) -> bool:
     _set_banner(context, step in (None, "import", "setup"))  # The image on the first screens only.
     if step is None:
         return False  # Done, or preferences existed and nothing is missing: the normal splash.
+    _report_once("welcome", None, "at_" + step)
     region = getattr(context, "region_popup", None)  # Set when the splash is built, not on every refresh.
     if region is not None:
         _state["region"] = region
@@ -1237,8 +1242,16 @@ def _draw_sign_in(layout, context) -> None:
         _link(another, "loopcut.chatgpt_sign_in", "Another account").new_account = True
     elif _on_chatgpt_plan():
         right = _option(column, "ChatGPT", chatgpt_ui.account_line(), _icon("done"), "Recommended")
-        props = right.operator("loopcut.onboarding_step", text="Continue", depress=True)
-        props.step, props.save, props.provider = "privacy", True, "CHATGPT"
+        if settings.preferences().provider != "CHATGPT":
+            right.operator("loopcut.chatgpt_check", text="Use ChatGPT", depress=True)
+        else:
+            chatgpt_ui.request_readiness()
+            chatgpt_ui.draw_readiness(right)
+            right.prop(settings.preferences(), "model")
+            proceed = right.row()
+            proceed.enabled = chatgpt_ui.can_continue()
+            props = proceed.operator("loopcut.onboarding_step", text="Continue", depress=True)
+            props.step, props.save, props.provider = "privacy", True, "CHATGPT"
     else:
         _report_once("chatgpt", None, "shown")
         right = _option(column, "ChatGPT", CONNECT_LINE if config.billing_open() else CONNECT_LINE_NO_SALES,
@@ -1293,7 +1306,13 @@ def _draw_connected(layout) -> None:
         title.label(text="Connected")
     if detail:
         _text(_icon_row(box), detail, MUTED, tight=True)
-    props = _primary(column, "loopcut.onboarding_step", "Continue")
+    if prefs.provider == "CHATGPT":
+        from . import chatgpt_ui
+        chatgpt_ui.request_readiness()
+        chatgpt_ui.draw_readiness(box)
+        box.prop(prefs, "model")
+    props = _primary(column, "loopcut.onboarding_step", "Continue",
+                     enabled=prefs.provider != "CHATGPT" or chatgpt_ui.can_continue())
     props.step, props.save = "privacy", False
     left, right = _footer(column)
     _back(left, "how" if account.signed_in() else "account")
@@ -1301,12 +1320,13 @@ def _draw_connected(layout) -> None:
 
 
 def _on_signed_in() -> None:
-    """A Loopcut account stays on its step to show its credits; a connected ChatGPT plan opens privacy."""
+    """A Loopcut account stays on its step to show its credits; a ChatGPT connection stays for its readiness result."""
     if _state["step"] == "account":
         _state.update(no_account=False, credits_asked=0.0)
         _ask_for_credits()
     elif _state["step"] == "connect" and getattr(settings.preferences(), "provider", None) == "CHATGPT":
-        _go("privacy")
+        from . import chatgpt_ui
+        chatgpt_ui.request_readiness()  # Stay on model setup so the result is visible before the first prompt.
 
 
 def _privacy_url() -> str:
@@ -1744,7 +1764,7 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
             from . import chatgpt_ui
             chatgpt_ui.cancel_sign_in()
         prefs = settings.preferences()
-        if self.provider != "CURRENT" and prefs is not None:
+        if self.provider != "CURRENT" and prefs is not None and prefs.provider != self.provider:
             prefs.provider = self.provider
         _report_move(_state["step"], self.step, self.provider)
         if _state["step"] == "privacy" and self.step == "done":
@@ -1828,6 +1848,7 @@ class LOOPCUT_OT_onboarding_try(bpy.types.Operator):
 def _finish() -> None:
     """The setup ends for this session: done with an account and a model, else it comes back next start."""
     done = account.signed_in() and _connected()
+    _report("done", _choice(), done, "setup_finished" if done else "abandoned_" + (_state["step"] or "account"))
     save_progress("done" if done else "account", done=done)
     _state.update(step=None, finished=True, region=None)
     if bpy.app.timers.is_registered(_watch):
