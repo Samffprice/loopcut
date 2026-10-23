@@ -4,6 +4,7 @@ checks make the subjects, and how exposure numbers read. The renders themselves,
 labels, timings and that a look leaves no trace, are loopcut/harness/worker_host_check.py."""
 
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -83,6 +84,174 @@ class PlanTest(unittest.TestCase):
     def test_a_camera_workers_sheet_is_its_cameras(self):
         self.assertEqual(W.plan("camera", "sheet", True, False), ("role", "grid", ("cameras",)))
         self.assertEqual(W.plan("camera", "camera", True, True), ("role", "single", ("camera",)))
+
+
+class DeliverablePreviewTest(unittest.TestCase):
+    """Drive the capture reused by the wave card, replacing render I/O but keeping target/bounds math."""
+
+    def obj(self, name, uid, offset=(0, 0, 0), size=(0.4, 0.3, 0.2), kind="MESH", **props):
+        class Transform:
+            def __matmul__(self, point):
+                return tuple(a + b for a, b in zip(point, offset))
+
+        obj = mock.Mock()
+        obj.name, obj.session_uid, obj.id_type, obj.type = name, uid, "OBJECT", kind
+        obj.children_recursive, obj.material_slots = [], []
+        obj.hide_render = False
+        obj.get.side_effect = lambda key, default=None: props.get(key, default)
+        obj.visible_get.return_value = True
+        obj.evaluated_get.return_value = obj
+        obj.matrix_world = Transform()
+        obj.bound_box = [(x * size[0], y * size[1], z * size[2])
+                         for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)]
+        return obj
+
+    def test_ownership_selects_new_owned_and_deliverable_children_only(self):
+        from loopcut import ownership
+        root = self.obj("Machine", 1, kind="EMPTY")
+        child = self.obj("Body", 2)
+        root.children_recursive = [child]
+        created = self.obj("New key", 3)
+        owned = self.obj("Existing key", 4, lc_spawn_name="Existing key")
+        floor = self.obj("Floor", 5, size=(200, 200, 0), lc_spawn_name="Floor")
+        temp = self.obj("lc_temp", 6, lc_temp=True)
+        scene = types.SimpleNamespace(objects=[root, child, created, owned, floor, temp])
+        blender = types.SimpleNamespace(data=types.SimpleNamespace(objects={"Machine": root}))
+        with mock.patch.object(W, "bpy", blender), mock.patch.object(ownership, "created_ids", return_value=[created, temp]), \
+                mock.patch.dict(W._role, deliverable="Machine", owned={"OBJECT:Existing key"}):
+            own = W.own_objects(scene)
+            self.assertEqual(own, [root, child, created, owned])
+            self.assertEqual(W._default_targets(scene, "modeling", own), [child, created, owned])
+
+    def capture(self, folder, objects, own, angle=None):
+        scene = types.SimpleNamespace(objects=objects, camera=object())
+        cameras = []
+
+        def new_camera(name, data):
+            camera = types.SimpleNamespace(name=name, data=data)
+            cameras.append(camera)
+            return camera
+
+        scene.collection = types.SimpleNamespace(objects=types.SimpleNamespace(link=lambda camera: None))
+        blender = types.SimpleNamespace(
+            context=types.SimpleNamespace(scene=scene, evaluated_depsgraph_get=lambda: "graph",
+                                          view_layer=types.SimpleNamespace(update=lambda: None)),
+            data=types.SimpleNamespace(cameras=types.SimpleNamespace(new=lambda name: types.SimpleNamespace()),
+                                       objects=types.SimpleNamespace(new=new_camera)))
+        restore = mock.MagicMock()
+        restore.__enter__.return_value = restore
+        restore.keep.side_effect = lambda obj: obj
+        with mock.patch.object(W, "bpy", blender), \
+                mock.patch.dict(sys.modules, mathutils=types.SimpleNamespace(Vector=tuple)), \
+                mock.patch.dict(W._role, role="modeling", folder=Path(folder), width=1024, count=1, cameras=[]), \
+                mock.patch.object(W, "own_objects", return_value=own), \
+                mock.patch.object(W, "repair_meshes", return_value=[]), \
+                mock.patch.object(W, "_Restore", return_value=restore), \
+                mock.patch.object(W, "_output", return_value=False), \
+                mock.patch.object(W, "_shade", return_value=(None, "clay")), \
+                mock.patch.object(W, "_provenance", return_value="clay"), \
+                mock.patch.object(W, "_hidden_by", return_value=(0, [])), \
+                mock.patch.object(W, "_text", return_value="Image attached: deliverable"), \
+                mock.patch.object(W, "_left_out", return_value=""), \
+                mock.patch.object(W, "_compose") as compose, mock.patch.object(W, "_render") as render:
+            try:
+                shot = W._look_in(angle, None, None, None, None, False, 1, "", False, (), (), False, None, None)
+            except W.ToolError:
+                render.assert_not_called()
+                compose.assert_not_called()
+                raise
+        return shot, cameras, compose.call_args.args[1], render
+
+    def test_preview_fits_evaluated_owned_bounds_without_floor_camera_or_empty_mesh(self):
+        body = self.obj("Machine", 1, offset=(8, -3, 0.1))
+        empty = self.obj("Unbuilt part", 2, offset=(-100, 100, 0), size=(0, 0, 0))
+        floor = self.obj("Private scene floor", 3, size=(200, 200, 0))
+        neighbour = self.obj("Other deliverable", 4, offset=(200, 0, 0))
+        # Original bounds differ: the evaluated (modified) geometry must determine the view.
+        evaluated = self.obj("Evaluated machine", 5, offset=(8, -3, 0.1), size=(0.5, 0.4, 0.2))
+        body.evaluated_get.return_value = evaluated
+        with tempfile.TemporaryDirectory() as folder:
+            shot, cameras, tiles, render = self.capture(folder, [body, empty, floor, neighbour], [body, empty])
+        self.assertIsNotNone(shot.image_path)
+        self.assertEqual(render.call_count, 3)
+        self.assertEqual([t.view for t in tiles], list(W.DETAIL_ANGLES))
+        for camera, tile in zip(cameras, tiles):
+            basis = W.framing.euler_basis(W.VIEWS[tile.view])
+            frame = W.framing.frame(tile.rect[2:], lens=camera.data.lens, sensor_width=camera.data.sensor_width)
+            projected = [W.framing.project(evaluated.matrix_world @ p, camera.location, basis, frame)
+                         for p in evaluated.bound_box]
+            spans = [max(p[i] for p in projected) - min(p[i] for p in projected) for i in (0, 1)]
+            self.assertAlmostEqual(max(spans), 1 - 2 * W.MARGIN)
+            self.assertTrue(all(W.MARGIN - 1e-8 <= p[i] <= 1 - W.MARGIN + 1e-8
+                                for p in projected for i in (0, 1)))
+
+    def test_nothing_built_does_not_render_the_private_scene_or_saved_camera(self):
+        floor = self.obj("Private scene floor", 1, size=(200, 200, 0))
+        root = self.obj("Machine", 2, kind="EMPTY")
+        empty = self.obj("Unbuilt mesh", 3, size=(0, 0, 0))
+        with tempfile.TemporaryDirectory() as folder:
+            for own in ([], [root], [empty]):
+                with self.subTest(own=own), self.assertRaises(W.ToolError):
+                    self.capture(folder, [floor, *own], own)
+            for angle in ("final", "camera"):
+                for own in ([], [empty]):
+                    with self.subTest(angle=angle, own=own), self.assertRaises(W.ToolError):
+                        self.capture(folder, [floor, *own], own, angle)
+
+    def test_invalid_world_bounds_skip_before_fitting_or_rendering(self):
+        class Scale:
+            def __init__(self, factor):
+                self.factor = factor
+
+            def __matmul__(self, point):
+                return tuple(v * self.factor for v in point)
+
+        for size, factor in ((1e200, 1e200), (1, float("nan")), (1, 1e30), (1, 0)):
+            with self.subTest(size=size, factor=factor), tempfile.TemporaryDirectory() as folder:
+                body = self.obj("Machine", 1, size=(size,) * 3)
+                body.matrix_world = Scale(factor)
+                with mock.patch.object(W.framing, "fit", wraps=W.framing.fit) as fit:
+                    with self.assertRaisesRegex(W.ToolError, "world bounds|Nothing visible"):
+                        self.capture(folder, [body], [body])
+                    fit.assert_not_called()
+
+    def test_small_geometry_is_inside_camera_clip_planes(self):
+        for size in (1e-4, 1e-5, 1.0):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as folder:
+                body = self.obj("Tiny part", 1, size=(size,) * 3)
+                _, cameras, tiles, _ = self.capture(folder, [body], [body])
+                for camera, tile in zip(cameras, tiles):
+                    basis = W.framing.euler_basis(W.VIEWS[tile.view])
+                    frame = W.framing.frame(tile.rect[2:], lens=camera.data.lens,
+                                            sensor_width=camera.data.sensor_width)
+                    coverage = W.framing.coverage(body.bound_box, camera.location, basis, frame,
+                                                  clip=(camera.data.clip_start, camera.data.clip_end))
+                    self.assertEqual(coverage["clips"], [], tile.view)
+                    self.assertEqual(coverage["inside"], 1.0)
+                    self.assertGreaterEqual(camera.data.clip_start, 1e-6)
+
+    def test_geometry_below_supported_clip_scale_is_clearly_skipped(self):
+        body = self.obj("Microscopic part", 1, size=(1e-8,) * 3)
+        with tempfile.TemporaryDirectory() as folder, self.assertRaisesRegex(W.ToolError, "too small"):
+            self.capture(folder, [body], [body])
+
+    def test_materials_prefer_owned_objects_to_unrelated_material_users(self):
+        own, other = self.obj("My part", 1), self.obj("Other part", 2)
+        other.material_slots = [types.SimpleNamespace(material=object())]
+        scene = types.SimpleNamespace(objects=[own, other])
+        with mock.patch.object(W, "_mine", return_value=True):
+            self.assertEqual(W._default_targets(scene, "materials", [own]), [own])
+            # Material-only ownership can still frame the objects wearing that material.
+            self.assertEqual(W._default_targets(scene, "materials", []), [other])
+
+    def test_scene_subjects_ignore_empty_mesh_bounds(self):
+        empty = self.obj("Empty mesh", 1, size=(0, 0, 0))
+        built = self.obj("Built mesh", 2)
+        scene = types.SimpleNamespace(objects=[empty, built])
+        blender = types.SimpleNamespace(context=types.SimpleNamespace(evaluated_depsgraph_get=lambda: "graph"))
+        with mock.patch.object(W, "bpy", blender), mock.patch.dict(W._role, subjects=[]), \
+                mock.patch.dict(sys.modules, mathutils=types.SimpleNamespace(Vector=tuple)):
+            self.assertEqual(W._subjects(scene), [built])
 
 
 class ShadingTest(unittest.TestCase):

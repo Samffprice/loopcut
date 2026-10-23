@@ -719,15 +719,13 @@ def _do_action(session: dict, action) -> None:
 
 
 def _accept_quarantine(session: dict, item: dict) -> None:
-    """Bring a wave's held-back datablocks into the scene. Clicks arrive on the main thread, which
-    is where merge.accept_quarantine must run."""
-    from .. import merge
+    """Resolve held datablocks and their worker receipts on the main thread."""
+    from .. import merge, waves
     try:
-        text = merge.accept_quarantine(item["wave"])
+        text = waves.accept_quarantine(session, item["wave"])
     except (merge.MergeError, RuntimeError) as ex:
         session["items"].append(state.item_error(f"Could not accept the held-back items: {ex}"))
         return
-    item["resolved"] = "accepted"
     session["items"].append(state.item_notice(text))
     conversations.save(session)
 

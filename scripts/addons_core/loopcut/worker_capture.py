@@ -32,7 +32,9 @@ shading, view transform, size. Angle crops (_review) renders through the camera 
 and crops each object at one common scale, with its size on screen, cut edges and brightness.
 Without a focus, a look frames what the worker is judging (its own objects, the brief's subjects),
 never a whole set whose floor would shrink the product to a dot. Named angles use a temporary
-camera placed with framing.fit. Everything temporary (cameras, the studio world and key light,
+camera placed with framing.fit. Modeling/material looks supply the wave card's preview too: until
+there is geometry to frame they return no image, and empty meshes never enlarge the fitted bounds.
+Everything temporary (cameras, the studio world and key light,
 albedo's material copies) is tagged lc_temp and removed afterwards; every scene, render, object and
 material setting a look changes, and the frame, is put back, so a look changes nothing a later
 tool, check or the result can see (the originals of a material are never edited). With
@@ -57,6 +59,8 @@ TEMP = "lc_temp"          # ownership.TEMP: excluded from tokens and results.
 WIDTH = 1024              # A look's long side, px: enough to judge a bevel or a hinge, still a few seconds.
 ASPECT = 0.75             # Named angles are 4:3; through a camera the shape follows its render size.
 MARGIN = 0.08
+MIN_CLIP = 1e-6           # Camera RNA's minimum clipping distance (rna_camera.cc).
+MAX_WORLD_BOUND = 1e12    # Leave headroom for camera fitting and float32 render matrix products.
 LABEL_LIMIT = tools.LABEL_LIMIT
 LABELLED_TILE = 480       # Names are drawn on tiles at least this wide; smaller ones would be covered.
 ANGLES = ("three_quarter", "front", "side", "back", "top", "camera", "sheet", "final", "crops")
@@ -509,8 +513,13 @@ def _look_in(angle, focus, frames, long_side, folder, labels, step, tag, studio,
     own = own_objects(scene)
     repaired = repair_meshes(own)
     shown = _focus_objects(focus)
-    visible = {o.session_uid for o in _visible(scene)}
-    mine_only = own_focus(role, angle, focus) and any(o.session_uid in visible for o in own)
+    mine_only = own_focus(role, angle, focus)
+    targets = shown or _default_targets(scene, role, own)
+    if not targets and role in OWN_FOCUS:
+        # These captures also supply the wave card's preview (Worker.after_step). Before the
+        # helper builds anything, do not substitute the private scene or its saved camera.
+        raise ToolError("Nothing built yet: no visible helper-owned geometry to frame.")
+    bounds = _corners(targets) if role in OWN_FOCUS else None
     camera = chosen or _camera_for(scene, focus, own)
     own_camera = any(o.type == "CAMERA" for o in own)
     # A camera asked for is looked through whatever the focus: the focus is then what is measured.
@@ -518,7 +527,6 @@ def _look_in(angle, focus, frames, long_side, folder, labels, step, tag, studio,
                                 own_camera or chosen is not None)
     if views:
         kind, planned = "grid", views
-    targets = shown or _default_targets(scene, role, own)
     tiles = _tiles(scene, planned, camera, frames, own)
     count = len(tiles)
     tiles, dropped = _panels(tiles, [shading_for(role, setup, s) for s in shadings or (None,)])
@@ -550,7 +558,7 @@ def _look_in(angle, focus, frames, long_side, folder, labels, step, tag, studio,
                 scene.frame_set(tile.frame)
             size = tile.rect[2:]
             if tile.view != "camera":
-                tile.camera = _fit_camera(scene, tile.view, fixed or _corners(targets), size, restore)
+                tile.camera = _fit_camera(scene, tile.view, fixed or bounds or _corners(targets), size, restore)
             if views or len(shadings) > 1:
                 tile.place = _place(tile, targets)
             if tile.view != "camera" and targets and not isolate:
@@ -1075,22 +1083,27 @@ def _subjects(scene) -> list:
     visible = _visible(scene)
     boxes = {}
     for obj in visible:
-        points = _corners([obj])
+        try:
+            points = _corners([obj])
+        except ToolError:  # An empty mesh has no subject bounds yet.
+            continue
         boxes[obj.name] = (tuple(min(p[i] for p in points) for i in range(3)), tuple(max(p[i] for p in points) for i in range(3)))
     dropped = backdrops(boxes)
-    return [o for o in visible if o.name not in dropped]
+    return [o for o in visible if o.name in boxes and o.name not in dropped]
 
 
 def _default_targets(scene, role, own) -> list:
+    """Frame the deliverable, never surrounding scene geometry when it has not been built yet."""
     visible = _visible(scene)
     ids = {o.session_uid for o in visible}
     own = [o for o in own if o.session_uid in ids]
-    if role == "materials":
-        wearing = [o for o in visible if any(s.material is not None and _mine(s.material) for s in o.material_slots)]
-        if wearing:
-            return wearing
     if role in ("modeling", "materials", "animation") and own:
         return own
+    if role == "materials":
+        wearing = [o for o in visible if any(s.material is not None and _mine(s.material) for s in o.material_slots)]
+        return wearing
+    if role in ("modeling", "animation"):
+        return []
     return _subjects(scene) or own or visible
 
 
@@ -1452,12 +1465,16 @@ def _fit_camera(scene, view: str, points, size, restore: _Restore):
         fitted = framing.fit(points, basis, frame, MARGIN)
     except ValueError as ex:
         raise ToolError(f"Nothing to frame: {ex}.") from ex
+    depths = [framing.dot(tuple(c - p for c, p in zip(fitted.location, point)), basis[2]) for point in points]
+    if not all(math.isfinite(v) for v in (*fitted.location, *depths)):
+        raise ToolError("Nothing to frame: unusable world bounds.")
+    near, far = min(depths), max(depths)
+    if near <= 2 * MIN_CLIP:
+        raise ToolError("Nothing to frame: geometry is too small for the preview camera's clipping range.")
     camera.location = fitted.location
     camera.rotation_mode = "XYZ"
     camera.rotation_euler = [math.radians(a) for a in degrees]
-    extent = max(max(p[i] for p in points) - min(p[i] for p in points) for i in range(3))
-    reach = max(math.dist(fitted.location, p) for p in points)
-    data.clip_start, data.clip_end = max(0.001, extent * 1e-3), max(100.0, reach * 2.0)
+    data.clip_start, data.clip_end = max(MIN_CLIP, near * 0.5), far * 2.0
     bpy.context.view_layer.update()   # Its matrix_world, for what reads it before the render does.
     return camera
 
@@ -1506,12 +1523,24 @@ def _hidden_by(scene, camera, targets) -> tuple:
 
 
 def _corners(objects) -> list:
+    """Evaluated world bounds only: empty meshes have a collapsed sentinel box, not geometry.
+    Including that box (often far from a small deliverable) pulls the fitted camera back."""
     from mathutils import Vector
     graph = bpy.context.evaluated_depsgraph_get()
     points = []
     for obj in objects:
         evaluated = obj.evaluated_get(graph)
-        points += [tuple(evaluated.matrix_world @ Vector(corner)) for corner in evaluated.bound_box]
+        corners = [tuple(corner) for corner in evaluated.bound_box]
+        if not corners or not all(math.isfinite(v) for corner in corners for v in corner):
+            continue
+        if not any(max(c[i] for c in corners) > min(c[i] for c in corners) for i in range(3)):
+            continue
+        world = [tuple(evaluated.matrix_world @ Vector(corner)) for corner in corners]
+        if not all(math.isfinite(v) and abs(v) <= MAX_WORLD_BOUND for corner in world for v in corner):
+            raise ToolError(f"Nothing to frame: {obj.name} has non-finite or too large world bounds.")
+        if not any(max(c[i] for c in world) > min(c[i] for c in world) for i in range(3)):
+            continue
+        points += world
     if not points:
         raise ToolError("Nothing visible to frame.")
     return points

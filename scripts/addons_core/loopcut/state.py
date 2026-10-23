@@ -210,9 +210,59 @@ def wave_row(worker: str, deliverable: str, role: str) -> dict:
     """One worker in a wave card. status: queued | starting | working | checking | merging | done |
     partial | failed | cancelled (its own Cancel) | stopped (Stop, the budget before it started, its
     time, or a reload while it ran) | question. checks: "4/5" once run. merged: its result is in the
-    scene (each worker merges as it finishes, not with its whole wave)."""
+    scene (each worker merges as it finishes, not with its whole wave). merged_changes records the
+    merge's live names; quarantined, conflicts and merge_error retain incomplete deliveries.
+    merge_unchanged confirms no changes reached the scene, including a successful rollback."""
     return {"id": worker, "deliverable": deliverable, "role": role, "status": "queued", "steps": 0,
             "checks": "", "note": "", "merged": False}
+
+
+def worker_complete(row: dict) -> bool:
+    """Finishing in its copy counts only when delivery has no outstanding problems."""
+    return bool(row.get("status") == "done" and row.get("merged")
+                and not any(row.get(key) for key in ("merge_error", "quarantined", "conflicts")))
+
+
+def worker_outcome(row: dict) -> str:
+    """Delivery, independently of checks or the worker's own summary; also works on saved rows."""
+    status = row.get("status", "")
+    missing = []
+    if row.get("quarantined"):
+        missing.append("held back (quarantined, waiting for the user's accept): " + "; ".join(row["quarantined"]))
+    if row.get("conflicts"):
+        missing.append("conflicted" + ("" if row.get("merged") else " (nothing merged)")
+                       + ": " + "; ".join(row["conflicts"]))
+    if row.get("merged"):
+        if row.get("merge_error"):
+            missing.append(row["merge_error"])
+        if missing:
+            return ("partly merged: " + "; ".join(row.get("merged_changes") or ["details unavailable"])
+                    + "; missing: " + "; ".join(missing))
+        return "completed and merged" if status == "done" else f"{status} and merged"
+    if row.get("unavailable"):
+        return "unavailable (nothing merged)"
+    if row.get("merge_error"):
+        failure = ("failed (nothing merged)" if row.get("merge_unchanged") else
+                   "merge failed; what reached the scene is unconfirmed")
+        missing.append(f"{failure}: {row['merge_error']}")
+    if missing:
+        return "; ".join(missing)
+    if row.get("cancelled_before_merge") or status in ("stopped", "cancelled"):
+        note = str(row.get("note") or "").lower()
+        if status == "cancelled" or "by the user" in note or "cancelled" in note:
+            stopped = "stopped by the user"
+        elif "out of time" in note or "s ran out" in note or "timed out" in note:
+            stopped = "timed out"
+        elif "budget" in note or ("$" in note and "used" in note):
+            stopped = "stopped by the budget"
+        else:
+            stopped = "stopped"
+        return f"{stopped} before finishing (nothing merged)"
+    if status == "failed":
+        return "failed (nothing merged)"
+    if status in ("done", "partial", "question"):
+        return f"{status} in its copy (nothing merged)"
+    return ""
 
 
 def item_wave(wave: str, number: int, rows: list[dict]) -> dict:

@@ -44,7 +44,7 @@ class ToolResult:
     guard_notes: list | None = None  # cost_guard.take: modifiers it switched off, shown in the panel too.
     file_image: bool = False  # The image is a file preview, not a look at the open scene.
     receipt: str = ""  # A paid cloud call that finished: what it used ("Used 6 credits ($0.06)"), for its card.
-    plan_refused: bool = False  # Local helper-plan validation; raw text still goes to the model and Details.
+    plan_refused: bool = False  # Helper arguments/plan validation; raw text still goes to the model and Details.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -1254,11 +1254,11 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         if not isinstance(arguments, dict):
             raise ValueError("arguments must be a JSON object")
     except ValueError as ex:
-        return ToolResult(f"Invalid tool arguments: {ex}", ok=False)
+        return ToolResult(f"Invalid tool arguments: {ex}", ok=False, plan_refused=name == "delegate")
     try:
         inspect.signature(fn).bind(**arguments)
     except TypeError as ex:
-        return ToolResult(f"Bad arguments for {name}: {ex}", ok=False)
+        return ToolResult(f"Bad arguments for {name}: {ex}", ok=False, plan_refused=name == "delegate")
     try:
         return fn(**arguments)
     except TypeError as ex:

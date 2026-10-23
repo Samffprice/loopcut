@@ -121,7 +121,7 @@ SCHEMAS = [
     *glb.SCHEMAS,
 ]
 
-LATE = ("[Loopcut] You replied while workers were still running; Loopcut waited for them and merged them. Review "
+LATE = ("[Loopcut] You replied while workers were still running; Loopcut collected their outcomes. Review "
         "their results as after any delegate, then reply again:\n{report}")
 BOUNCE = ("[Loopcut] These checks fail on the live scene:\n{lines}\nSend a fix to a worker's object back to that "
           "worker (delegate, continues), fix your own work yourself, or say plainly that they are not done. A check the user has since overridden, or one that is wrong, you retire "
@@ -1412,13 +1412,13 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
     session = state.session()
     turn = session.get("turn")
     roles = getattr(turn, "roles", None)
-    if roles is None or not roles.orchestrate:
-        return tools.ToolResult("Workers are off in this conversation; do the work yourself.", ok=False)
     job = getattr(turn, "job", None)
     if waits("delegate", {"wave": wave, "wait": wait}) and not dry_run:
-        if job is None or not waves.pending(job):
-            return tools.ToolResult("Nothing to wait for: every worker has reported.")
+        if job is None or job.stopped or not waves.pending(job):
+            return waves.wait_result(session, job)
         return tools.ToolResult("Waiting for the workers.", then=functools.partial(waves.collect, job))
+    if roles is None or not roles.orchestrate:
+        return tools.ToolResult("Workers are off in this conversation; do the work yourself.", ok=False)
     if session.get("workers_unavailable"):
         return tools.ToolResult(waves.unavailable_note(session), ok=False)
     if not isinstance(wave, dict):
@@ -1475,16 +1475,12 @@ def accept_quarantine(wave: str, names: list | None = None):
     """Main thread. What a wave's workers made outside their role, into the scene (merge.py)."""
     from . import tools
     try:
-        from . import merge
-        text = merge.accept_quarantine(str(wave), names if isinstance(names, list) else None)
+        from . import waves
+        text = waves.accept_quarantine(state.session(), str(wave), names if isinstance(names, list) else None)
     except ImportError:
         return tools.ToolResult("Quarantine is not available in this build.", ok=False)
     except Exception as ex:
         return tools.ToolResult(f"Could not accept the quarantine of {wave}: {ex}", ok=False)
-    if not names:  # All of it: the merge card's buttons are done.
-        for item in state.session()["items"]:
-            if item.get("kind") == "merge" and item.get("wave") == str(wave):
-                item["resolved"] = "accepted"
     return tools.ToolResult(str(text))
 
 
@@ -1694,8 +1690,10 @@ def describe(name: str, arguments: dict):
     if waits(name, arguments):
         return "Wait for the helpers' next results", ""
     wave = arguments.get("wave") if isinstance(arguments.get("wave"), dict) else {}
-    workers = [w for w in wave.get("workers") or [] if isinstance(w, dict)]
-    what = ", ".join(str(w.get("deliverable") or w.get("id") or "?") for w in workers) or "nothing"
+    workers = wave.get("workers")
+    if not isinstance(workers, list) or not workers or not all(isinstance(w, dict) for w in workers):
+        return "Helper plan is empty or invalid", json.dumps(arguments, indent=2)
+    what = ", ".join(str(w.get("deliverable") or w.get("id") or "?") for w in workers)
     code = json.dumps(wave, indent=2)
     if only_reads(name, arguments):
         return f"Check a helper plan: {what}", code
@@ -1839,6 +1837,9 @@ def _append_to_reply(session: dict, completion, block: str) -> None:
         reply["streaming"] = False
         items.append(reply)
     reply["text"] = f"{reply['text'].rstrip()}\n\n{block}" if reply["text"].strip() else block
+    # Only the runtime sets this field. Text from the model (including an identical line)
+    # stays ordinary prose; old conversations without provenance do too.
+    reply["verification"] = block
     last = messages[-1] if messages else {}
     if last.get("role") == "assistant" and not last.get("tool_calls") and completion is not None:
         last["content"] = f"{(last.get('content') or '').rstrip()}\n\n{block}".lstrip()
@@ -1860,10 +1861,11 @@ def _late_workers(session: dict, turn, job):
     if turn.outcome in ("step_limit", "no_progress"):
         reason = "at the step limit" if turn.outcome == "step_limit" else "when the no-progress guard stopped the turn"
         session["items"].append(state.item_notice(
-            f"Workers still running {reason} were waited for and merged; the agent did not review them."))
+            f"Workers still running {reason} were waited for; see each worker's outcome in its wave card. "
+            "The agent did not review them."))
         return None
-    session["items"].append(state.item_notice("Workers were still running at the reply: Loopcut waited and merged "
-                                              "them, and the agent reviews them."))
+    session["items"].append(state.item_notice("Workers were still running at the reply: Loopcut collected their "
+                                              "outcomes, and the agent reviews them."))
     job.log["late_bounces"] = job.log.get("late_bounces", 0) + 1  # Not a check bounce: counted apart.
     job.write()
     late.text = LATE.format(report=late.text)

@@ -52,7 +52,11 @@ _POINTERS = (("camera", "camera"), ("lighting", "world"))  # (aspect, scene poin
 
 
 class MergeError(Exception):
-    """The wave was not merged. The message says why and whether the scene is back as it was."""
+    """A failed merge; scene_unchanged confirms rollback or failure before any edits."""
+
+    def __init__(self, message: str, *, scene_unchanged: bool = False):
+        super().__init__(message)
+        self.scene_unchanged = scene_unchanged
 
 
 @dataclass
@@ -1114,14 +1118,14 @@ def merge_wave(spawn: Spawn, results: list[dict], checkpoint: Callable[[], str],
     unless keep_spawn: more of the wave's workers merge later), whether or not the merge succeeded.
     results[i] = {"brief": normalised brief (id, prefix, role, aspects), "manifest": the child's
     manifest (ownership.write_result), "shared"?: the wave's shared part (its notes may name a
-    collection, _asked)}. Raises MergeError, with the scene undone back to before the merge."""
+    collection, _asked)}. Raises MergeError, recording whether the scene is unchanged."""
     t0 = time.time()
     report = MergeReport()
     try:
         try:
             report.checkpoint = checkpoint() or ""
         except Exception as ex:  # noqa: BLE001 - anything: without a checkpoint nothing is merged.
-            raise MergeError(f"Not merged: no checkpoint could be saved first ({ex}).") from ex
+            raise MergeError(f"Not merged: no checkpoint could be saved first ({ex}).", scene_unchanged=True) from ex
         number = _number(spawn)
         pushed = _undo("push", f"Loopcut: before merge wave {number}")
         if not pushed:
@@ -1139,7 +1143,7 @@ def merge_wave(spawn: Spawn, results: list[dict], checkpoint: Callable[[], str],
             rolled = pushed and _undo("push", "Loopcut: failed merge") and _undo("undo")
             where = ("the scene is back as it was before the merge" if rolled else
                      f"the scene may be partly merged: restore checkpoint {report.checkpoint}")
-            raise MergeError(f"Not merged: {type(ex).__name__}: {ex}; {where}.") from ex
+            raise MergeError(f"Merge failed: {type(ex).__name__}: {ex}; {where}.", scene_unchanged=rolled) from ex
         spawn.moved = moved
         _undo("push", f"Loopcut: merge wave {number}")
     finally:
@@ -1154,10 +1158,11 @@ def _accepted_home(ob):
     return _home(str(ob.get(HOME) or ""))
 
 
-def accept_quarantine(wave: str, names: list[str] | None = None) -> str:
+def accept_quarantine(wave: str, names: list[str] | None = None, *, resolved: list | None = None) -> str:
     """Main thread: move a wave's quarantined objects (or only those named) from LC_Quarantine
     into the collection the rest of their worker's work went to, and clear the tags. Returns a
-    sentence for a notice."""
+    sentence for a notice. If supplied, resolved receives the datablocks actually accepted, with
+    their worker attribution, only after the operation succeeds."""
     import bpy
     tagged = [idb for idb in ownership.all_ids() if str(idb.get(QUARANTINE, "")).rsplit("/", 1)[0] == wave]
     if names:
@@ -1168,6 +1173,8 @@ def accept_quarantine(wave: str, names: list[str] | None = None) -> str:
         return f"Nothing from wave {wave} is in quarantine" + (f" named {', '.join(names)}." if names else ".")
     quarantine = bpy.data.collections.get(QUARANTINE_COLLECTION)
     accepted = []
+    entries = [{"worker": str(idb.get(QUARANTINE)).rsplit("/", 1)[-1],
+                "name": idb.name, "id_type": idb.id_type} for idb in tagged]
     for idb in tagged:
         if idb.id_type == "OBJECT":
             dest = _accepted_home(idb)
@@ -1184,4 +1191,6 @@ def accept_quarantine(wave: str, names: list[str] | None = None) -> str:
     if quarantine is not None and not quarantine.objects and not quarantine.children:
         bpy.data.collections.remove(quarantine)
     _undo("push", "Loopcut: accept quarantine")
+    if resolved is not None:
+        resolved.extend(entries)
     return f"Accepted from wave {wave}: {', '.join(accepted)}."

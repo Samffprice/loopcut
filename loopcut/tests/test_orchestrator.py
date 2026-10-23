@@ -1411,11 +1411,29 @@ class PromptTest(unittest.TestCase):
         turn.roles = types.SimpleNamespace(orchestrate=True)
         session["turn"] = turn
         result = orchestrator.delegate(wait=True)
-        self.assertEqual((result.text, result.ok, result.then), ("Nothing to wait for: every worker has reported.", True,
+        self.assertEqual((result.text, result.ok, result.then), ("Nothing to wait for: no worker results are available.", True,
                                                                  None))
         refused = orchestrator.delegate()
         self.assertFalse(refused.ok)
         self.assertIn("or wait true, with no wave, for the running workers' next results", refused.text)
+
+    def test_wait_reads_all_waves_of_the_latest_saved_job_without_claiming_completion(self):
+        session = state.reset()
+        self.addCleanup(state.reset)
+        # Legacy cards have no explicit job field. Keep earlier results in the same job,
+        # but do not pull unrelated helpers from an older job into the response.
+        for wave, status, merged in (("2-1-w1", "failed", False), ("3-1-w1", "done", True),
+                                     ("3-1-w2", "stopped", False)):
+            row = state.wave_row(wave, wave, "modeling")
+            row.update(status=status, merged=merged)
+            session["items"].append(state.item_wave(wave, 1, [row]))
+        result = orchestrator.delegate(wait=True)
+        self.assertNotIn("2-1-w1", result.text)
+        self.assertIn("3-1-w1", result.text)
+        self.assertIn("completed and merged", result.text)
+        self.assertIn("3-1-w2", result.text)
+        self.assertIn("stopped before finishing (nothing merged)", result.text)
+        self.assertNotIn("every worker has reported", result.text.lower())
 
     def test_the_brief_reads_as_fields_with_the_users_words(self):
         plan = orchestrator.normalise_wave(reference_wave())
@@ -1980,8 +1998,9 @@ class FinishGateTest(unittest.TestCase):
         self.assertIsNone(bounces[2], "at most two bounces")
         final = self.session["items"][-1]["text"]
         self.assertTrue(final.startswith("Done 2.\n\nVerified by Loopcut on this scene: 1 of 2 checks."), final)
+        self.assertEqual(self.session["items"][-1]["verification"], final.split("\n\n", 1)[1])
         self.assertIn('- not met: "an armchair on the rug" (contact Armchair rests_on Rug): 2 of 4 legs', final)
-        self.assertIn("Verified by Loopcut", self.session["messages"][-1]["content"], "the model sees it next turn too")
+        self.assertIn("Verified by Loopcut on this scene:", self.session["messages"][-1]["content"], "the model sees it next turn too")
         self.assertEqual(self.turn.job.finished[0], 2)
 
     def test_all_passing_ends_at_once_with_the_block(self):
@@ -2024,7 +2043,7 @@ class FinishGateTest(unittest.TestCase):
         self.turn.outcome = "step_limit"
         failing = lambda checks: [{"status": "fail", "detail": "no"} for _ in checks]
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, None, failing))
-        self.assertTrue(self.session["items"][-1]["text"].startswith("Verified by Loopcut on this scene: 0 of 2"))
+        self.assertTrue(self.session["items"][-1]["text"].startswith("Verified by Loopcut on this scene: 0 of 2 checks."))
 
     def test_after_no_progress_it_reports_failed_checks_without_bouncing(self):
         self.turn.outcome = "no_progress"
@@ -2032,7 +2051,7 @@ class FinishGateTest(unittest.TestCase):
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, self.reply("Blocked."), failing))
         self.assertEqual(self.turn.job.bounces, 0)
         self.assertEqual(self.turn.job.finished[0], 0)
-        self.assertIn("Verified by Loopcut on this scene: 0 of 2", self.session["items"][-1]["text"])
+        self.assertIn("Verified by Loopcut on this scene: 0 of 2 checks.", self.session["items"][-1]["text"])
 
     def test_after_no_progress_late_workers_are_drained_without_promising_a_review(self):
         from loopcut import waves

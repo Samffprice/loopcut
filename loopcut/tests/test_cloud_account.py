@@ -171,11 +171,12 @@ class LogicTest(unittest.TestCase):
         card.update(status="failed", expanded=True, cloud_error={"upgrade": "https://loopcut.org/pricing"})
         self.assertTrue(any(h["action"] == ("cloud_upgrade", 0) for h in display(session)["hits"]))
 
-    def test_credits_tooltip_and_panel_settings(self):
+    def test_credits_account_link_and_panel_settings(self):
         drawn = display(credits="1,840 credits · 2,000/month · resets 2026-11-01", service_settings=True,
                         project_override="on", service_policy={"no_generation": False, "private_mode": True})
         hit = next(h for h in drawn["hits"] if h["id"] == "input.credits")
-        self.assertIn("resets 2026-11-01", hit["tip"])
+        self.assertEqual(hit["action"], ("open_account", None))
+        self.assertEqual(hit["tip"], "", "account details must not float over the composer")
         self.assertEqual({h["action"][1] for h in drawn["hits"] if h["action"][0] == "project_generation"}, set(account.OVERRIDES))
         self.assertFalse(any(p["id"] == "input.credits" for p in display()["prims"]))
 

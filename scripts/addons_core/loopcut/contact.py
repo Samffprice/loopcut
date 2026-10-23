@@ -28,11 +28,14 @@ inside is against b's convex hull: what a bowl, a shelf or a glass holds.
 
 Nothing is ever moved: a failure gives the move that would fix it. Pairs checked with watch=true are
 measured again after every run_python (recheck), and a change of status joins its Scene changes.
+Every turn also retains its measurements for the final reply: only changed geometry is re-measured,
+and a pass invalidated by later edits can bounce the reply once (finish_gate).
 The top half is pure and tested in tests/test_contact.py; harness/contact_check.py runs the rest.
 """
 
 import difflib
 import math
+import re
 from array import array
 from bisect import bisect_left, bisect_right
 
@@ -287,14 +290,16 @@ def touches(pair: dict, measure: dict, tolerance: float) -> dict:
     a, b = pair["a"], pair["b"]
     if measure["depth"] > tolerance:
         moves = [(a, measure["out"])]
-        return {"status": "fail", "line": f"{_mm(measure['depth'])} into {b}" + _fix(moves), "fixes": moves}
+        return {"status": "fail", "failure_reason": "overlap",
+                "line": f"{_mm(measure['depth'])} into {b}" + _fix(moves), "fixes": moves}
     distance = 0.0 if measure["meet"] else measure["distance"]  # Surfaces that meet are 0 apart, whatever the vertices say.
     if distance <= tolerance:
         note = (f" ({_mm(measure['depth'])} into)" if measure["depth"] >= 5e-5
                 else f" (gap {_mm(distance)})" if distance >= 5e-5 else "")
         return {"status": "pass", "line": "in contact" + note, "fixes": []}
     moves = [(a, measure["toward"])]
-    return {"status": "fail", "line": f"gap {_mm(measure['distance'])}" + _fix(moves), "fixes": moves}
+    return {"status": "fail", "failure_reason": "too_far",
+            "line": f"gap {_mm(measure['distance'])}" + _fix(moves), "fixes": moves}
 
 
 def _away(direction, length: float) -> tuple:
@@ -311,14 +316,16 @@ def clear_of(pair: dict, measure: dict, tolerance: float, apart=(0.0, 0.0, 1.0))
     needed = max(pair["gap"], tolerance)
     if measure["depth"] > 1e-6:
         moves = [(a, _away(measure["out"], measure["depth"] + needed))]
-        return {"status": "fail", "line": f"{_mm(measure['depth'])} into {b}" + _fix(moves), "fixes": moves}
+        return {"status": "fail", "failure_reason": "overlap",
+                "line": f"{_mm(measure['depth'])} into {b}" + _fix(moves), "fixes": moves}
     distance = 0.0 if measure["meet"] else measure["distance"]
     if distance > tolerance and distance >= pair["gap"]:
         return {"status": "pass", "line": f"clear by {_mm(distance)}", "fixes": []}
     toward = measure["toward"] if distance > 0 and any(measure["toward"]) else tuple(-c for c in apart)
     moves = [(a, _away(tuple(-c for c in toward), needed - distance))]
     what = "touching" if distance <= tolerance else f"{_mm(distance)} apart, needs {_mm(needed)}"
-    return {"status": "fail", "line": what + _fix(moves), "fixes": moves}
+    return {"status": "fail", "failure_reason": "too_close",
+            "line": what + _fix(moves), "fixes": moves}
 
 
 def inside(pair: dict, measure: dict, tolerance: float) -> dict:
@@ -389,9 +396,9 @@ class Unavailable(Exception):
 class Shape:
     """One object's geometry in world space: its parts' evaluated meshes in one bmesh."""
 
-    def __init__(self, name: str, note: str, bm, co: array, starts: list, labels: list, fingerprint: int):
+    def __init__(self, name: str, note: str, bm, co: array, starts: list, labels: list):
         self.name, self.note, self.bm, self.co = name, note, bm, co
-        self.starts, self.labels, self.fingerprint = starts, labels, fingerprint
+        self.starts, self.labels = starts, labels
         self.count = len(co) // 3
         self._tree = self._piece = self._open = self._solids = self._box = None
         for elements in (bm.verts, bm.faces):  # from_mesh appends: indices must run on across parts.
@@ -524,10 +531,8 @@ def _parts(obj, depsgraph) -> tuple[list, str]:
     return children, f"{obj.name}: union of its {len(children)} child mesh{many}" if children else ""
 
 
-def _shape(name: str, depsgraph, faces=None) -> Shape:
-    """faces(evaluated, mesh) -> the polygon indices of that part to keep: a region of a joined mesh
-    (acceptance's a_part, b_part), built face by face; None keeps every face."""
-    import bmesh
+def _geometry(name: str, depsgraph) -> tuple[list, str]:
+    """Find the evaluated parts without constructing measurement geometry."""
     import bpy
     objects = bpy.context.scene.objects
     obj = objects.get(name)
@@ -538,7 +543,40 @@ def _shape(name: str, depsgraph, faces=None) -> Shape:
     if not parts:
         kind = obj.type.lower().replace("_", " ")
         raise Unavailable(f"{name} is {'an' if kind[0] in 'aeiou' else 'a'} {kind} with no mesh and no mesh children")
-    bm, co, starts, labels, prints, skipped = bmesh.new(), array("f"), [], [], [], []
+    return parts, note
+
+
+def _fingerprint(name: str, depsgraph) -> int:
+    """Read evaluated mesh data directly; only non-mesh geometry needs temporary conversion.
+
+    Local coordinates plus world matrices detect the same edits without transforming, validating
+    or copying meshes into BMeshes. Materials are deliberately absent from the fingerprint.
+    """
+    parts, _ = _geometry(name, depsgraph)
+    prints = []
+    for label, evaluated, matrix in parts:
+        convert = evaluated.type != "MESH"
+        try:
+            mesh = evaluated.to_mesh() if convert else evaluated.data
+        except RuntimeError:
+            prints.append((label, "unavailable"))
+            continue
+        try:
+            coords = array("f", bytes(12 * len(mesh.vertices)))
+            mesh.vertices.foreach_get("co", coords)
+            prints.append(hash(_mesh_fingerprint(label, matrix, mesh, coords)))
+        finally:
+            if convert:
+                evaluated.to_mesh_clear()
+    return hash(tuple(prints))
+
+
+def _shape(name: str, depsgraph, faces=None) -> Shape:
+    """faces(evaluated, mesh) -> the polygon indices of that part to keep: a region of a joined mesh
+    (acceptance's a_part, b_part), built face by face; None keeps every face."""
+    import bmesh
+    parts, note = _geometry(name, depsgraph)
+    bm, co, starts, labels, skipped = bmesh.new(), array("f"), [], [], []
     for label, evaluated, matrix in parts:
         try:
             mesh = evaluated.to_mesh()
@@ -569,7 +607,6 @@ def _shape(name: str, depsgraph, faces=None) -> Shape:
                 mesh.vertices.foreach_get("co", coords)
             starts.append(len(co) // 3)
             labels.append(label)
-            prints.append((label, coords.tobytes(), len(mesh.polygons), len(mesh.edges), len(keep or ())))
             co.extend(coords)
             if keep is None:
                 bm.from_mesh(mesh)
@@ -581,7 +618,18 @@ def _shape(name: str, depsgraph, faces=None) -> Shape:
     notes = [note] if note else []
     if skipped:
         notes.append("left out: " + "; ".join(skipped))
-    return Shape(name, "; ".join(notes), bm, co, starts, labels, hash(tuple(prints)))
+    return Shape(name, "; ".join(notes), bm, co, starts, labels)
+
+
+def _mesh_fingerprint(label, matrix, mesh, coords, keep=None) -> tuple:
+    """Evaluated transforms, coordinates and topology, including rewired faces of equal size."""
+    topology = []
+    for collection, field, width in ((mesh.loops, "vertex_index", 1),
+                                     (mesh.polygons, "loop_total", 1), (mesh.edges, "vertices", 2)):
+        values = array("i", [0]) * (len(collection) * width)
+        collection.foreach_get(field, values)
+        topology.append(values.tobytes())
+    return (label, tuple(tuple(row) for row in matrix), coords.tobytes(), *topology, tuple(keep or ()))
 
 
 def _region_into(bm, mesh, keep: list) -> array:
@@ -752,32 +800,40 @@ def _measure(pair: dict, a: Shape, b: Shape, tolerance: float) -> dict:
 
 
 class _Shapes(dict):
-    """Each object read once per call, and freed after."""
+    """Fingerprints cached separately from lazily constructed measurement shapes; freed after."""
 
     def __init__(self):
         import bpy
         super().__init__()
         self.depsgraph = bpy.context.evaluated_depsgraph_get()
+        self.prints = {}
 
-    def of(self, name: str):
-        """name's Shape, evaluated in a view layer that includes it (the active one first): one the
+    def _read(self, name: str, read):
+        """Read in a view layer that includes the object (the active one first): one the
         active layer excludes is otherwise read from its stale matrices; one every layer excludes is
         Unavailable, not a number."""
+        import bpy
+        from . import view_layers
+        obj = bpy.context.scene.objects.get(name)
+        layer = view_layers.home(obj) if obj is not None else None
+        try:
+            if obj is not None and layer is None:
+                raise Unavailable(view_layers.unavailable([name]))
+            if layer is None or layer == self.depsgraph.view_layer:
+                return read(name, self.depsgraph)
+            with view_layers.evaluating(layer):
+                return read(name, bpy.context.evaluated_depsgraph_get())
+        except Unavailable as ex:
+            return ex
+
+    def fingerprint(self, name: str):
+        if name not in self.prints:
+            self.prints[name] = self._read(name, _fingerprint)
+        return self.prints[name]
+
+    def of(self, name: str):
         if name not in self:
-            import bpy
-            from . import view_layers
-            obj = bpy.context.scene.objects.get(name)
-            layer = view_layers.home(obj) if obj is not None else None
-            try:
-                if obj is not None and layer is None:
-                    raise Unavailable(view_layers.unavailable([name]))
-                if layer is None or layer == self.depsgraph.view_layer:
-                    self[name] = _shape(name, self.depsgraph)
-                else:
-                    with view_layers.evaluating(layer):
-                        self[name] = _shape(name, bpy.context.evaluated_depsgraph_get())
-            except Unavailable as ex:
-                self[name] = ex
+            self[name] = self._read(name, _shape)
         return self[name]
 
     def free(self) -> None:
@@ -790,6 +846,13 @@ def _evaluate(pair: dict, shapes: _Shapes, tolerance: float, previous: dict | No
     """One pair's result; previous is returned as it was when neither object's geometry changed."""
     if pair["error"]:
         return unavailable(pair, pair["error"])
+    prints = [shapes.fingerprint(pair[key]) for key in ("a", "b")]
+    for value in prints:
+        if isinstance(value, Unavailable):
+            return unavailable(pair, str(value))
+    fingerprint = (*prints, tolerance)
+    if previous is not None and previous.get("fingerprint") == fingerprint:
+        return previous
     a, b = shapes.of(pair["a"]), shapes.of(pair["b"])
     for side in (a, b):
         if isinstance(side, Unavailable):
@@ -799,9 +862,6 @@ def _evaluate(pair: dict, shapes: _Shapes, tolerance: float, previous: dict | No
     shared = sorted(set(a.labels) & set(b.labels))
     if shared:
         return unavailable(pair, f"{shared[0]} is part of both {a.name} and {b.name}")
-    fingerprint = (a.fingerprint, b.fingerprint, tolerance)
-    if previous is not None and previous.get("fingerprint") == fingerprint:
-        return previous
     try:
         result = _measure(pair, a, b, tolerance)
     except (RuntimeError, ValueError) as ex:  # bmesh and the BVH trees on geometry they cannot take.
@@ -864,10 +924,129 @@ def check_contact(pairs: list, tolerance: float = DEFAULT_TOLERANCE, watch: bool
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not 0 <= tolerance <= 0.1:
         raise ToolError("tolerance is in m, from 0 to 0.1")
     results = evaluate(pairs, float(tolerance))
+    _remember(results, float(tolerance))
     text = report(results, float(tolerance))
     if watch:
         text += "\n" + _watch(results, float(tolerance))
     return ToolResult(text)
+
+
+def _remember(results: list, tolerance: float) -> None:
+    """Every live turn's checks, even without watch; a later explicit check replaces the old one."""
+    from . import state
+    turn = state.session().get("turn")
+    if turn is None:
+        return
+    if not hasattr(turn, "contact_checks"):  # A turn already running when the add-on was reloaded.
+        turn.contact_checks = []
+    for result in results:
+        if result.get("error"):
+            continue
+        pair = {key: result[key] for key in ("a", "relation", "b", "gap", "error")}
+        turn.contact_checks[:] = [entry for entry in turn.contact_checks if entry["pair"] != pair]
+        turn.contact_checks.append({"pair": pair, "tolerance": tolerance, "result": result})
+
+
+def _plain_name(name: str) -> str:
+    """Object names as words, including CamelCase and separated names."""
+    name = re.sub(r"([A-Z])([A-Z][a-z])", r"\1 \2", name)
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    return " ".join(re.sub(r"[_./-]+", " ", name).lower().split())
+
+
+def _plain_check(result: dict) -> str:
+    a, b = (_plain_name(result[key]) for key in ("a", "b"))
+    relation = result["relation"]
+    verb = {"touches": "touches", "rests_on": "rests on", "clear_of": "clears", "inside": "sits inside"}
+    if result["status"] == "unavailable":
+        return f"Could not check: whether {a} {verb[relation]} {b}."
+    if result["status"] == "fail":
+        failure = {"touches": "does not meet the required contact with",
+                   "rests_on": "does not have the required support from",
+                   "clear_of": "does not have the required clearance from",
+                   "inside": "does not sit fully inside"}
+        text = f"Failed: {a} {failure[relation]} {b}."
+        reason = result.get("failure_reason")
+        if reason == "overlap":
+            text += (f" It should be clear of {b} but overlaps it." if relation == "clear_of"
+                     else f" It extends too far into {b}.")
+        elif reason == "too_far":
+            text += f" It is too far from {b}."
+        elif reason == "too_close":
+            text += f" It is too close to {b}."
+        return text
+    return f"Passed: {a} {verb[relation]} {b}."
+
+
+def rechecked_line(result: dict) -> str:
+    """A plain panel notice; raw names, measurements and corrective moves stay in the details."""
+    return "Re-checked after later edits: " + _plain_check(result)
+
+
+def refresh(turn) -> tuple[list, list]:
+    """On the main thread at a final reply. Reuse unchanged measurements; never capture or render.
+
+    Fail open per pair (including missing objects), but never count an old pass as fresh on error.
+    Failures that replace passes are returned separately for the turn's one correction bounce.
+    """
+    entries = turn.contact_checks
+    results, regressed, shapes = [], [], None
+    if not entries:
+        return results, regressed
+    try:
+        shapes = _Shapes()
+        for entry in entries:
+            previous = entry["result"]
+            try:
+                result = _evaluate(entry["pair"], shapes, entry["tolerance"], previous)
+            except Exception as ex:
+                result = unavailable(entry["pair"], f"could not re-check: {ex}")
+            results.append(result)
+            if previous["status"] == "pass" and result["status"] == "fail":
+                regressed.append(result)
+            entry["result"] = result
+    except Exception as ex:
+        results = [unavailable(e["pair"], f"could not re-check: {ex}") for e in entries]
+        regressed = []
+    finally:
+        if shapes is not None:
+            try:
+                shapes.free()
+            except Exception:
+                pass
+    return results, regressed
+
+
+def finish_gate(session: dict, turn, completion, run_refresh):
+    """One bounce per turn for stale passes; every final attempt still gets fresh measurements."""
+    from . import orchestrator, state
+    if not getattr(turn, "contact_checks", None) or turn.cancel.is_set():
+        return None
+    try:
+        results, regressed = run_refresh()
+    except Exception as ex:  # Scheduling/evaluation errors must not prevent the reply.
+        results = [unavailable(e["pair"], f"could not re-check: {ex}") for e in turn.contact_checks]
+        regressed = []
+    if turn.cancel.is_set():
+        return None
+    for result in regressed:
+        session["items"].append(state.item_notice(rechecked_line(result)))
+    if regressed and not getattr(turn, "contact_bounced", False) and turn.outcome == "running":
+        turn.contact_bounced = True
+        return ("[Loopcut] Re-checked after later edits. Earlier passing checks no longer hold:\n"
+                + "\n".join(pair_line(r) for r in regressed)
+                + "\nUse these fresh measurements. Correct the placement and check it, or clearly state what "
+                  "still fails; do not claim it is connected or verified. This reminder runs once per turn.")
+    passed = sum(r["status"] == "pass" for r in results)
+    lines = [f"Verified by Loopcut on this scene: {passed} of {len(results)} checks."]
+    if results:
+        extra = len(results) - 3
+        more = f" Plus {extra} other check{'s' if extra != 1 else ''}." if extra > 0 else ""
+        lines.extend(_plain_check(r) for r in results[:3])
+        if more:
+            lines.append(more.strip())
+    orchestrator._append_to_reply(session, completion, "\n".join(lines))
+    return None
 
 
 DISPATCH = {"check_contact": check_contact}

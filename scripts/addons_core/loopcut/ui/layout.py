@@ -6,6 +6,7 @@ as text: an invisible or misplaced element shows up as a bad rect or a color equ
 background.
 """
 
+import json
 import math
 import re
 from pathlib import Path
@@ -238,7 +239,12 @@ def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
 
 def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
     size, cursor = f.px(T.FONT_SIZE), y
-    segments = split_markdown(item["text"])
+    text, verification = item["text"], item.get("verification")
+    if isinstance(verification, str) and verification and text.endswith(verification):
+        text = text[:-len(verification)].rstrip()
+    else:
+        verification = ""
+    segments = split_markdown(text)
     for k, (kind, body) in enumerate(segments):
         if k:
             cursor += f.px(6)
@@ -246,6 +252,12 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
             cursor += f.code_block(f"item{n}.code{k}", x, cursor, width, body)
         else:
             cursor += f.paragraph(f"item{n}.p{k}", x, cursor, width, body, size, T.TEXT)
+    if verification:
+        cursor += f.px(8)
+        f.rect(f"item{n}.verification.rule", x, cursor, width, f.px(1), T.CARD_BORDER)
+        cursor += f.px(6)
+        cursor += f.paragraph(f"item{n}.verification", x, cursor, width, verification,
+                              f.px(T.FONT_SIZE_SMALL), T.TEXT_MUTED)
     if not item.get("streaming"):
         cursor += _reference_rows(f, n, item.get("file_references", []), x, cursor, width)
     return cursor - y
@@ -818,16 +830,33 @@ def _worker_status(row: dict) -> str:
     """The row's status word; a worker whose result is in the scene says merged (the orchestrator has
     it while the others still run)."""
     status = row.get("status", "")
+    if row.get("unavailable"):
+        return "unavailable"
+    if any(row.get(key) for key in ("merge_error", "quarantined", "conflicts")):
+        if row.get("merged"):
+            return "partly merged"
+        if not row.get("merge_error"):
+            return "held back" if row.get("quarantined") else "conflicted"
+    if row.get("merge_error"):
+        return "failed"
+    if row.get("cancelled_before_merge") and not row.get("merged"):
+        return "stopped"
     if not row.get("merged"):
         return status
     return "merged" if status == "done" else f"{status} · merged"
+
+
+def _waiting_first_reply(row: dict) -> bool:
+    timing = row.get("timing") or {}
+    return (row.get("status") == "working" and not row.get("steps")
+            and timing.get("first_request") is not None and timing.get("first_reply") is None)
 
 
 def _worker_detail(row: dict, now: float = 0) -> str:
     """Elapsed time, role, steps and checks. A saved duration stays frozen."""
     steps = row.get("steps") or 0
     parts = [row.get("role", "")]
-    if steps or row.get("status") not in ("queued", "starting"):
+    if not _waiting_first_reply(row) and (steps or row.get("status") not in ("queued", "starting")):
         parts.append(f"{steps} step{'s' if steps != 1 else ''}")
     elapsed = row.get("elapsed")
     if elapsed is None and row.get("started_at") is not None and row.get("status") in state.WAVE_RUNNING:
@@ -852,6 +881,12 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
     for k, row in enumerate(item.get("rows", [])):
         cursor += f.px(6) if k else 0
         id, status = f"item{n}.wave.row{k}", row.get("status", "")
+        if row.get("merge_error"):
+            status = "failed"
+        elif row.get("quarantined") or row.get("conflicts"):
+            status = "partial"
+        elif row.get("cancelled_before_merge") and not row.get("merged"):
+            status = "stopped"
         glyph, color, cancellable = WORKER_STATUS.get(status, ("●", T.TEXT_FAINT, False))
         name_x = inner_x + f.px(18)
         status = _worker_status(row)
@@ -876,6 +911,16 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
                _ellipsize(f, _worker_detail(row, f.ui.get("now", 0)), small, right - name_x), small,
                T.TEXT_MUTED)
         cursor += small_height
+        if _waiting_first_reply(row):
+            cursor += f.paragraph(f"{id}.waiting", name_x, cursor, inner_x + inner_w - name_x,
+                                  "Waiting for the model's first reply…", small, T.TEXT_MUTED)
+        outcome = state.worker_outcome(row)
+        if outcome:
+            cursor += f.paragraph(f"{id}.outcome", name_x, cursor, inner_x + inner_w - name_x,
+                                  outcome, small, T.TEXT)
+        if row.get("merged_changes"):
+            cursor += f.paragraph(f"{id}.merged_changes", name_x, cursor, inner_x + inner_w - name_x,
+                                  "Merged: " + "; ".join(row["merged_changes"]), small, T.TEXT_MUTED)
         if row.get("summary"):
             cursor += f.paragraph(f"{id}.summary", name_x, cursor, inner_x + inner_w - name_x,
                                   row["summary"], small, T.TEXT_MUTED)
@@ -922,10 +967,11 @@ def _item_merge(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.line_height(small) + f.px(4)
 
     quarantined = item.get("quarantined", [])
-    if quarantined and item.get("resolved") == "accepted":
+    if item.get("accepted") or quarantined and item.get("resolved") == "accepted":
         cursor += f.px(4)
         cursor += f.paragraph(f"item{n}.merge.accepted", inner_x, cursor, inner_w,
-                              "Held-back items accepted into the scene.", small, T.TEXT_FAINT)
+                              ("Accepted into the scene: " + "; ".join(item["accepted"]) + "."
+                               if item.get("accepted") else "Held-back items accepted into the scene."), small, T.TEXT_FAINT)
     restorable = item.get("checkpoint") and f.checkpoints.get(item["checkpoint"], "ok") == "ok"
     accept = quarantined and not item.get("resolved")
     if (accept or restorable) and not f.session.get("busy"):
@@ -1066,19 +1112,78 @@ def _first_run(f: Frame, x, cursor, width) -> int:
     return cursor
 
 
+def _plan_names(item: dict) -> list:
+    """Fallback identity from saved arguments when the call did not supply worker ids."""
+    names = item.get("plan_names")
+    if isinstance(names, list) and all(isinstance(pair, list) and len(pair) == 2
+                                       and all(isinstance(s, str) for s in pair) for pair in names):
+        return names
+
+    def decoded(value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return None
+        return value
+
+    args = decoded(item.get("code"))
+    if not isinstance(args, dict):
+        return []
+    wave = decoded(args.get("wave"))
+    crew = decoded(wave.get("workers") if isinstance(wave, dict) else args.get("workers"))
+    if not isinstance(crew, list):
+        return []
+    from .. import orchestrator
+    names = [tuple(value.strip() if isinstance(value, str) else "" for value in
+                   (w.get("deliverable"), w.get("role"))) for w in crew if isinstance(w, dict)]
+    return [(name, orchestrator.normalise_role(role) if role else "") for name, role in names]
+
+
+def _plan_names_match(wanted: list, started: list) -> bool:
+    """Each named helper needs a distinct start matching every name it supplied."""
+    matched = {}
+
+    def assign(index, seen):
+        for n, candidate in enumerate(started):
+            if n in seen or not all(not name or name == value for name, value in zip(wanted[index], candidate)):
+                continue
+            seen.add(n)
+            if n not in matched or assign(matched[n], seen):
+                matched[n] = index
+                return True
+        return False
+
+    return all(assign(n, set()) for n in range(len(wanted)))
+
+
 def _plan_repairs(items: list, active_turn: str = "") -> dict:
     """Recovery is a view of the current transcript, so restore, undo and reload need no repair.
-    A deliverable can change during repair or belong to different helpers; match worker ids and roles."""
-    successful, repairs = {}, {}
+    A deliverable can change during repair or belong to different helpers; match worker ids and roles.
+    Without ids, retain any deliverable/role names. Without names either, only the very next
+    delegate call in that turn can recover the attempt, and only if it actually starts."""
+    successful, repairs, started, next_delegate = {}, {}, {}, {}
     for n in reversed(range(len(items))):
         item = items[n]
         if item.get("kind") != "tool" or item.get("name") != "delegate":
             continue
-        turn = item.get("plan_turn")
+        turn = item.get("plan_turn") or item.get("turn_id")
         if item.get("plan_repair"):
             repairs[n] = "adjusting" if active_turn and turn == active_turn else "needed"
         if not isinstance(turn, str) or not turn:
             continue
+        if item.get("plan_repair") and item.get("plan_unidentified"):
+            names = [pair for pair in _plan_names(item) if any(pair)]
+            if names:
+                recovered = any(_plan_names_match(names, crew) for crew in started.get(turn, []))
+            else:
+                retry = next_delegate.get(turn, {})
+                recovered = retry.get("plan_started") and not retry.get("plan_repair")
+            if recovered:
+                repairs[n] = "resolved"
+        next_delegate[turn] = item
+        if item.get("plan_started") and not item.get("plan_repair"):
+            started.setdefault(turn, []).append(_plan_names(item))
         crew = item.get("plan_workers")
         if not isinstance(crew, list) or not crew or any(
                 not isinstance(w, list) or len(w) != 2 or not all(isinstance(s, str) for s in w)
@@ -1299,32 +1404,38 @@ def _chip_rows(f: Frame, id: str, x: int, y: int, width: int, session: dict) -> 
 
 
 def _input_notice(f: Frame, y: int) -> int:
-    """Transient feedback above the controls; the host's regular poll redraws it at expiry."""
+    """Usage and transient feedback above the composer, with their own measured space."""
+    pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    width = f.width - 2 * pad
+    usage = ""
+    if f.ui.get("provider", "LOOPCUT") == "LOOPCUT":
+        usage, _ = usage_note(f.ui.get("account"), f.ui.get("allowance_notice"), f.ui.get("now"))
+    height = 0
+    if usage:
+        usage += " · AI use includes helpers, not time; credits buy cloud tools, not more chat."
+        height = f.paragraph("input.usage", pad, y, width, usage, small, T.TEXT_MUTED) + f.px(6)
+        y += height
     notice = f.ui.get("allowance_notice")
     item = notice.get("item") if notice else None
     if item and item.get("reason") in allowance.LIMIT_WINDOWS \
             and allowance.refused_window(f.ui.get("account"), notice, f.ui.get("now")) is None:
         item = None
     if item and not f.session.get("busy"):
-        pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
-        width = f.width - 2 * pad
         reset = state.reset_label(item.get("resets_at", ""), now=f.ui.get("now"))
         line = f"Chat allowance used. Resets {reset}." if reset else "Chat allowance used."
         balance = f.ui.get("credit_balance")
-        if isinstance(balance, (int, float)) and balance > 0:
+        if not usage and isinstance(balance, (int, float)) and balance > 0:
             line += " Your credits pay for cloud tools and do not add chat time."
-        height = f.paragraph("input.limit.text", pad, y, width, line, small, T.WARN) + f.px(6)
+        limit_height = f.paragraph("input.limit.text", pad, y, width, line, small, T.WARN) + f.px(6)
         n = next((n for n, row in enumerate(f.session.get("items", [])) if row is item), None)
         if n is None and notice.get("conversation") == f.session.get("id"):
             n = f.session["id"]
-        return height + _button_row(f, pad, y + height, width,
-                                   _limit_buttons(f, n, item, "input.limit")) + f.px(6)
+        return height + limit_height + _button_row(f, pad, y + limit_height, width,
+                                                  _limit_buttons(f, n, item, "input.limit")) + f.px(6)
     notice = f.ui.get("action_notice")
     if not notice or f.ui.get("now", 0.0) >= notice["until"]:
-        return 0
-    pad = f.px(T.PAD)
-    return f.paragraph("input.notice", pad, y, f.width - 2 * pad, notice["text"],
-                       f.px(T.FONT_SIZE_SMALL), T.OK) + f.px(6)
+        return height
+    return height + f.paragraph("input.notice", pad, y, width, notice["text"], small, T.OK) + f.px(6)
 
 
 def input_height(f: Frame, session: dict) -> int:
@@ -1348,17 +1459,13 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
         spending.valid_ledger(spend) and spend.get("credits")) else ""
     extras = [part for part in (chat, f.ui.get("today") or "") if part]
     lines = [f.ui["credits"]] if f.ui.get("credits") else []
-    if f.ui.get("provider", "LOOPCUT") == "LOOPCUT":
-        note, _ = usage_note(f.ui.get("account"), f.ui.get("allowance_notice"), f.ui.get("now"))
-        if note:
-            lines.extend(line.rstrip() for _, line in wrap(note, "ui", small, width, f.measure))
     if extras and f.measure("ui", small, " · ".join(extras)) <= width:
         return lines + [" · ".join(extras)]
     return lines + extras
 
 
 def _credit_height(f: Frame, lines: list[str]) -> int:
-    return f.px(22) + f.px(16) * (len(lines) - 1) if lines else 0
+    return f.line_height(f.px(T.FONT_SIZE_SMALL)) * len(lines) + f.px(6) if lines else 0
 
 
 _INTEREST_SIGN_IN = 'Sign in to hear when your picks launch.'
@@ -1600,20 +1707,20 @@ def _k(tokens: int) -> str:
     return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
 
 
-SHOW_USAGE_FROM = 0.7  # The footer names the fuller window once this much of it is used.
+SHOW_USAGE_FROM = 0.7  # The notice names the fuller window once this much of it is used.
 
 
 def usage_note(account: dict | None, notice: dict | None = None,
                now: float | None = None) -> tuple[str, float]:
-    """(text, share) for the footer: the fuller of the account's two windows once it is worth a
+    """(text, share) above the composer: the fuller of the account's two windows once it is worth a
     glance, else ("", share)."""
     best = ("", 0.0)
     refused = allowance.refused_windows(account, notice, now)
     for key in ("week", "session"):
         used = 1.0 if key in refused else allowance.used((account or {}).get(key), now)
         if isinstance(used, (int, float)) and used > best[1]:
-            window = "this 5-hour window" if key == "session" else "this week"
-            best = (f"Chat: {round(used * 100)}% of {window} used", float(used))
+            window = "5-hour window" if key == "session" else "week"
+            best = (f"Chat {round(used * 100)}% used ({window})", float(used))
     return best if best[1] >= SHOW_USAGE_FROM else ("", best[1])
 
 
@@ -1751,7 +1858,10 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     card_h = f.height - top - 2 * pad - cloud_height - notice_height
     f.rect("input.card", x, card_y, width, card_h, T.INPUT_BG, f.px(T.RADIUS), 1,
            T.ACCENT if focused else T.INPUT_BORDER)
-    f.hit("input.card", x, card_y, width, card_h, ("focus", None))
+    credit_lines = _credit_lines(f, inner_w)
+    # Only the context and typing rows focus the editor. Footer links have separate targets.
+    focus_h = card_h - card_pad - f.px(26) - _credit_height(f, credit_lines)
+    f.hit("input.card", x, card_y, width, focus_h, ("focus", None))
 
     text_y = card_y + card_pad
     _context_row(f, inner_x, text_y, inner_w)
@@ -1764,7 +1874,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     session["input_first"] = first
     shown = lines[first:first + visible]
     f.input = {"x": inner_x, "y": text_y, "size": size, "line_height": line_height, "lines": shown,
-               "width": inner_w}
+               "width": inner_w, "height": visible * line_height}
     anchor = session.get("anchor")
     if focused and anchor is not None and anchor != session["cursor"]:
         low, high = sorted((anchor, session["cursor"]))
@@ -1808,14 +1918,16 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))
     f.text("input.hint", hint_x, text_y, hint, small, T.TEXT_FAINT)
     _rings(f, session, hint_x - f.px(16), button_y, button_h)
-    credit_lines = _credit_lines(f, inner_w)
     if credit_lines:
         credit_y = button_y - _credit_height(f, credit_lines)
         for k, line in enumerate(credit_lines):
-            f.text("input.credits" + (str(k) if k else ""), inner_x, credit_y + f.px(16) * k,
+            f.text("input.credits" + (str(k) if k else ""), inner_x, credit_y + f.line_height(small) * k,
                    _ellipsize(f, line, small, inner_w), small, T.TEXT_MUTED)
-        f.hit("input.credits", inner_x, credit_y, inner_w, f.px(16) * (len(credit_lines) - 1) + f.px(20),
-              ("open_account", None), tip="\n".join(credit_lines))
+        # The balance alone opens the account; neither the spend rows nor blank space are links.
+        if f.ui.get("credits"):
+            balance = _ellipsize(f, credit_lines[0], small, inner_w)
+            f.hit("input.credits", inner_x, credit_y, round(f.measure("ui", small, balance)),
+                  f.line_height(small), ("open_account", None))
 
     if f.ui.get("picker") is not None:
         _picker(f, x, card_y, width)
@@ -1879,19 +1991,25 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
 
 
 def _tooltip(f: Frame) -> None:
-    """For the hovered hit that has a tip: a small card above it (below when there is no room)."""
+    """A bounded hover card that never covers the composer or its notices."""
     hover = f.ui.get("hover")
     hit = next((h for h in reversed(f.hits) if h["id"] == hover and h.get("tip")), None) if hover else None
     if hit is None:
         return
     small, pad_x, pad_y = f.px(T.FONT_SIZE_SMALL), f.px(8), f.px(5)
-    lines = hit["tip"].split("\n")
+    lines = [line.rstrip() for _, line in wrap(hit["tip"], "ui", small,
+                                              max(1, f.width - 2 * pad_x - f.px(8)), f.measure)]
     width = max(round(f.measure("ui", small, line)) for line in lines) + 2 * pad_x
     height = len(lines) * f.line_height(small) + 2 * pad_y
     x = max(f.px(4), min(f.width - width - f.px(4), hit["x"] + hit["w"] // 2 - width // 2))
     y = hit["y"] - height - f.px(6)
     if y < f.px(2):
         y = hit["y"] + hit["h"] + f.px(6)
+    zone = next((p for p in f.prims if p["id"] == "input.zone"), None)
+    if zone and y + height > zone["y"] and y < zone["y"] + zone["h"]:
+        y = zone["y"] - height - f.px(6)
+    if y < f.px(2) or y + height > f.height - f.px(2):
+        return  # A short panel must keep typing usable even when a tooltip cannot fit.
     f.rect("tooltip.bg", x, y, width, height, T.CARD, f.px(T.RADIUS_SMALL), 1, T.INPUT_BORDER)
     for n, line in enumerate(lines):
         f.text(f"tooltip.l{n}", x + pad_x, y + pad_y + n * f.line_height(small), line, small, T.TEXT)

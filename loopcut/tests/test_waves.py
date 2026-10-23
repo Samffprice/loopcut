@@ -4,6 +4,7 @@ concurrency, budgets, retries, cancel, reports and the JobLog. No Blender.
     python3 -m unittest discover -s loopcut/tests
 """
 
+import ast
 import base64
 import dataclasses
 import json
@@ -536,6 +537,432 @@ class WorkerSteerTest(unittest.TestCase):
             scheduler.join(2)
             self.assertFalse(scheduler.is_alive())
 
+    def outcome_runtime(self):
+        """Real scheduling/collection with in-process children and an attributable merge receipt."""
+        registry = Registry()
+        self.wave.make_runtime = lambda wave, worker: FakeRuntime(registry, worker)
+        self.wave.merge = mock.Mock(side_effect=lambda spawn, results, *args, **kwargs: {
+            "created": [{"worker": r["brief"]["id"], "name": r["brief"]["prefix"] + "_Part",
+                         "id_type": "OBJECT"} for r in results], "replaced": []})
+        self.wave.snapshot = lambda: {}
+        self.wave.run_checks = lambda checks, spawn: []
+        self.addCleanup(self.stop_workers)
+
+    def test_stop_mid_wave_then_wait_keeps_outcomes_across_turns_and_reload(self):
+        self.outcome_runtime()
+        entered = threading.Event()
+
+        def loop(session, turn, *args):
+            worker = next(w for w in self.wave.crew if w.session is session)
+            worker.steps = worker.row["steps"] = 6
+            if worker.id == "b":
+                session["messages"].append({"role": "assistant", "content": "I will add the new parts."})
+                entered.set()
+                if not turn.cancel.wait(3):
+                    raise AssertionError("test did not stop the helper")
+            else:
+                worker.report = workers.parse_report({"summary": "Built A."})
+
+        with mock.patch.object(agent, "run_loop", side_effect=loop), mock.patch.object(waves, "BATCH_SECONDS", 0):
+            waves.start(self.wave, self.turn.cancel.is_set, lambda fn: fn())
+            self.crew += self.wave.crew
+            self.assertTrue(entered.wait(2))
+            self.crew[0].thread.join(2)
+            first = waves.collect(self.job, lambda: False, lambda fn: fn())
+            self.assertIn("completed and merged", first.text)
+            self.assertIn("merged: + A_Part", first.text)
+            self.turn.cancel.set()
+            with self.assertRaises(llm.Cancelled):
+                waves.collect(self.job, self.turn.cancel.is_set, lambda fn: fn())
+        self.assertFalse(self.crew[1].row["merged"])
+        self.assertEqual(self.crew[1].row["steps"], 6)
+        self.assertEqual(self.crew[1].row["status"], "stopped")
+        self.wave.merge.assert_called_once()
+        logged = self.job.log["waves"][0]["workers"][1]
+        self.assertEqual((logged["delivery"], logged["merged"]),
+                         ("stopped by the user before finishing (nothing merged)", False))
+        same_job = waves.collect(self.job, lambda: False, lambda fn: fn())
+        # A new turn has no live Job. Save/reload must retain the very same receipts.
+        self.session["turn"] = agent.Turn()
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        for session in (self.session, loaded):
+            with mock.patch.object(state, "session", return_value=session):
+                for _ in range(2):
+                    result = orchestrator.delegate(wait=True)
+                    self.assertIsNone(result.then)
+                    self.assertEqual(result.text, same_job.text)
+                    self.assertIn("[a] A", result.text)
+                    self.assertIn("completed and merged", result.text)
+                    self.assertIn("merged: + A_Part", result.text)
+                    self.assertIn("[b] B", result.text)
+                    self.assertIn("stopped by the user before finishing (nothing merged)", result.text)
+                    self.assertNotIn("every worker has reported", result.text.lower())
+                    self.assertNotIn("I will add", result.text)
+        self.wave.merge.assert_called_once()
+
+    def test_row_cancel_after_finish_before_collection_never_merges_that_worker(self):
+        self.outcome_runtime()
+        with mock.patch.object(agent, "run_loop"):
+            waves.start(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+            for worker in self.crew:
+                self.assertTrue(worker.ready.wait(2))
+                worker.thread.join(2)
+                self.assertEqual(worker.status, "done")
+            self.assertTrue(waves.cancel_worker(self.wave.id, "b"))
+            result = waves.collect(self.job, lambda: False, lambda fn: fn())
+        self.assertIn("stopped by the user before finishing (nothing merged)", result.text)
+        self.assertNotIn("every worker has reported", result.text.lower())
+        self.assertNotIn("b finished", result.text)
+        self.assertEqual([r["brief"]["id"] for r in self.wave.merge.call_args.args[1]], ["a"])
+        self.assertFalse(waves.cancel_worker(self.wave.id, "a"))
+        self.assertIn("stopped by the user before finishing (nothing merged)", orchestrator.delegate(wait=True).text)
+
+    def test_normal_completion_and_repeated_wait_report_what_actually_merged(self):
+        self.outcome_runtime()
+        with mock.patch.object(agent, "run_loop"):
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        self.assertTrue(result.ok, result.text)
+        self.assertIn("Every worker has reported.", result.text)
+        self.assertEqual(result.text.count("outcome: completed and merged"), 2)
+        self.wave.merge.assert_called_once()
+        for worker in self.crew:
+            self.assertTrue(worker.row["merged"])
+            self.assertEqual(worker.row["merged_changes"], ["+ " + worker.id.upper() + "_Part"])
+        repeated = orchestrator.delegate(wait=True)
+        self.assertEqual(repeated.text.count("completed and merged"), 2)
+        self.assertIn("+ A_Part", repeated.text)
+        self.assertIn("+ B_Part", repeated.text)
+
+    def test_generic_merge_exception_does_not_confirm_rollback(self):
+        self.outcome_runtime()
+        self.wave.merge.side_effect = RuntimeError("merge rolled back")
+        with mock.patch.object(agent, "run_loop"):
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        self.assertFalse(result.ok)
+        for text in (result.text, orchestrator.delegate(wait=True).text):
+            self.assertIn("merge failed; what reached the scene is unconfirmed: merge rolled back", text)
+            self.assertNotIn("nothing merged", text)
+            self.assertNotIn("every worker has reported", text.lower())
+            self.assertNotIn("completed and merged", text)
+
+    def assert_delivery_receipt(self, result, expected, *, merged=False):
+        """The first receipt, later waits, saved rows and panel must tell the same story."""
+        from loopcut.ui import layout
+        self.assertFalse(result.ok)
+        self.assertEqual(self.crew[0].row["merged"], merged)
+        self.assertEqual(state.worker_outcome(self.crew[0].row), expected)
+        repeated = orchestrator.delegate(wait=True)
+        self.session["turn"] = agent.Turn()
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        receipts = [result, repeated, waves.wait_result(loaded)]
+        for receipt in receipts:
+            self.assertFalse(receipt.ok)
+            self.assertIn(expected, receipt.text)
+            self.assertNotIn("every worker has reported", receipt.text.lower())
+        self.assertIn(expected, self.job.log["waves"][0]["workers"][0]["delivery"])
+        for session in (self.session, loaded):
+            for width in (260, 420):
+                display = layout.build(session, width, 4000, 1.0,
+                                       lambda font, size, text: len(text) * size * 0.6, "fast", None, {})
+                outcome = " ".join(p["text"] for p in display["prims"]
+                                   if ".wave.row0.outcome.l" in p["id"])
+                self.assertEqual(outcome, expected)
+
+    def collect_merge_receipt(self, report):
+        self.outcome_runtime()
+        self.wave.merge.side_effect = None
+        self.wave.merge.return_value = report
+        with mock.patch.object(agent, "run_loop"):
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        return result
+
+    def test_quarantine_only_is_held_back_in_receipts_and_saved_cards(self):
+        result = self.collect_merge_receipt({
+            "quarantined": [{"worker": "a", "name": "A_Light", "id_type": "OBJECT"}],
+            "created": [{"worker": "b", "name": "B_Part", "id_type": "OBJECT"}]})
+        self.assert_delivery_receipt(result, "held back (quarantined, waiting for the user's accept): A_Light")
+        self.assertEqual(state.worker_outcome(self.crew[1].row), "completed and merged")
+
+    def held_results(self, *names):
+        entries = [{"worker": "a", "name": name, "id_type": "OBJECT"} for name in names]
+        self.collect_merge_receipt({"quarantined": entries,
+                                    "created": [{"worker": "b", "name": "B_Part", "id_type": "OBJECT"}]})
+        # Exercise the real acceptance selection and tag removal against small Blender stand-ins.
+        class HeldID(dict):
+            def __eq__(held, other):
+                return held is other
+
+            def __init__(held, name, kind="OBJECT"):
+                super().__init__({ownership.QUARANTINE: self.wave.id + "/a"})
+                held.name, held.id_type, held.type, held.data = name, kind, "LIGHT", None
+
+        ids = [HeldID(name) for name in names]
+        data = HeldID("A_LightData", "LIGHT")
+        ids[0].data = data
+        ids.append(data)
+        self.enterContext(mock.patch.object(ownership, "all_ids", side_effect=lambda: iter(ids)))
+        self.enterContext(mock.patch.dict(sys.modules, bpy=types.SimpleNamespace(
+            data=types.SimpleNamespace(collections={}))))
+        self.enterContext(mock.patch.object(merge, "_accepted_home", return_value=types.SimpleNamespace(
+            name="Collection", objects=mock.MagicMock())))
+        self.enterContext(mock.patch.object(merge, "_undo"))
+        return ids
+
+    def assert_resolved_receipt(self, expected, *, ok):
+        row = self.crew[0].row
+        self.assertEqual(state.worker_outcome(row), expected)
+        self.assertEqual(self.job.log["waves"][0]["workers"][0]["delivery"], expected)
+        on_disk = json.loads((self.job.folder / "job.json").read_text())
+        self.assertEqual(on_disk, self.job.log)
+        same_job = orchestrator.delegate(wait=True)
+        self.session["turn"] = agent.Turn()
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        for result in (same_job, orchestrator.delegate(wait=True), waves.wait_result(loaded)):
+            self.assertEqual(result.ok, ok, result.text)
+            self.assertIn(expected, result.text)
+        from loopcut.ui import layout
+        for session in (self.session, loaded):
+            display = layout.build(session, 420, 4000, 1.0,
+                                   lambda font, size, text: len(text) * size * 0.6, "fast", None, {})
+            index = next(n for n, item in enumerate(session["items"])
+                         if item.get("kind") == "wave" and item.get("wave") == self.wave.id)
+            outcome = " ".join(p["text"] for p in display["prims"]
+                               if p["id"].startswith(f"item{index}.wave.row0.outcome.l"))
+            self.assertEqual(outcome, expected)
+        return row
+
+    def resolve_from_panel(self):
+        # Import just the callback, as in test_host_area_guard, without Blender's drawing machinery.
+        source = Path(waves.__file__).parent / "ui" / "host.py"
+        nodes = [node for node in ast.parse(source.read_text()).body
+                 if isinstance(node, ast.FunctionDef) and node.name == "_accept_quarantine"]
+        scope = {"__package__": "loopcut.ui", "state": state, "conversations": conversations}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+        card = next(i for i in self.session["items"] if i["kind"] == "merge")
+        scope["_accept_quarantine"](self.session, card)
+        return card
+
+    def test_panel_accept_updates_worker_receipt(self):
+        self.held_results("A_Light")
+        card = self.resolve_from_panel()
+        self.assertEqual(card["resolved"], "accepted")
+        self.assert_resolved_receipt("completed and merged", ok=True)
+
+    def test_accept_quarantine_updates_worker_and_wait_after_reload(self):
+        ids = self.held_results("A_Light")
+        result = orchestrator.accept_quarantine(self.wave.id)
+        self.assertTrue(result.ok, result.text)
+        self.assertTrue(all(ownership.QUARANTINE not in idb for idb in ids))
+        row = self.assert_resolved_receipt("completed and merged", ok=True)
+        self.assertTrue(row["merged"])
+        self.assertFalse(row["merge_unchanged"])
+        self.assertEqual(row["quarantined"], [])
+        self.assertEqual(row["merged_changes"], ["+ A_Light"])
+        card = next(i for i in self.session["items"] if i["kind"] == "merge")
+        self.assertEqual(card["resolved"], "accepted")
+        self.assertEqual(card["quarantined"], [])
+
+    def test_selective_accept_keeps_other_names_held_then_finishes(self):
+        ids = self.held_results("A_Light", "A_Other")
+        result = orchestrator.accept_quarantine(self.wave.id, ["A_Light"])
+        self.assertTrue(result.ok, result.text)
+        self.assertNotIn(ownership.QUARANTINE, ids[0])
+        self.assertNotIn(ownership.QUARANTINE, ids[-1])  # The object's data goes with it.
+        self.assertIn(ownership.QUARANTINE, ids[1])
+        self.assert_resolved_receipt("partly merged: + A_Light; missing: held back "
+                                     "(quarantined, waiting for the user's accept): A_Other", ok=False)
+        card = next(i for i in self.session["items"] if i["kind"] == "merge")
+        self.assertEqual(card["quarantined"], ["A_Other"])
+        self.assertEqual(card["resolved"], "")
+        self.assertTrue(orchestrator.accept_quarantine(self.wave.id, ["A_Other"]).ok)
+        self.assert_resolved_receipt("completed and merged", ok=True)
+        self.assertEqual(self.crew[0].row["merged_changes"], ["+ A_Light", "+ A_Other"])
+        self.assertEqual(card["resolved"], "accepted")
+
+    def test_accept_after_turn_ends_persists_reconciled_job_log(self):
+        self.held_results("A_Light", "A_Other")
+        self.session["turn"] = agent.Turn()
+        self.assertIsNone(self.session["turn"].job)
+        path = self.job.folder / "job.json"
+        before = json.loads(path.read_text())
+        other_worker = before["waves"][0]["workers"][1]
+        self.assertIn("held back", before["waves"][0]["workers"][0]["delivery"])
+
+        for names, expected in ((["A_Light"], "partly merged: + A_Light; missing: held back "
+                                  "(quarantined, waiting for the user's accept): A_Other"),
+                                (None, "completed and merged")):
+            with self.subTest(names=names):
+                result = orchestrator.accept_quarantine(self.wave.id, names)
+                self.assertTrue(result.ok, result.text)
+                on_disk = json.loads(path.read_text())
+                worker = on_disk["waves"][0]["workers"][0]
+                self.assertEqual(on_disk, self.session["jobs"][0])
+                self.assertEqual(worker["delivery"], expected)
+                self.assertTrue(worker["merged"])
+                self.assertIn("+ A_Light", worker["merged_changes"])
+                self.assertEqual(on_disk["waves"][0]["workers"][1], other_worker)
+        self.assertEqual(worker["merged_changes"], ["+ A_Light", "+ A_Other"])
+
+    def test_failed_or_unmatched_accept_does_not_clear_held_names(self):
+        self.held_results("A_Light")
+        before = json.loads(json.dumps(self.wave.item))
+        self.assertTrue(orchestrator.accept_quarantine(self.wave.id, ["missing"]).ok)
+        self.assertEqual(self.wave.item, before)
+        with mock.patch.object(merge, "_accepted_home", side_effect=RuntimeError("cannot link")):
+            self.assertFalse(orchestrator.accept_quarantine(self.wave.id).ok)
+        self.assertEqual(self.wave.item, before)
+        card = next(i for i in self.session["items"] if i["kind"] == "merge")
+        self.assertEqual(card["resolved"], "")
+
+    def test_accept_preserves_conflicts_errors_and_other_waves(self):
+        self.held_results("A_Light")
+        row = self.crew[0].row
+        row.update(conflicts=["scene.camera"], merge_error="a: target did not arrive")
+        other = state.wave_row("a", "Other", "modeling")
+        other.update(status="done", quarantined=["A_Light"])
+        other_card = state.item_wave("another-wave", 99, [other])
+        self.session["items"].insert(0, other_card)
+        self.assertTrue(orchestrator.accept_quarantine(self.wave.id).ok)
+        self.assertEqual(other["quarantined"], ["A_Light"])
+        self.assertFalse(other["merged"])
+        self.assert_resolved_receipt("partly merged: + A_Light; missing: conflicted: scene.camera; "
+                                     "a: target did not arrive", ok=False)
+
+    def test_conflict_only_is_not_completion_in_receipts_and_saved_cards(self):
+        result = self.collect_merge_receipt({
+            "conflicts": [{"worker": "a", "pointer": "scene.camera", "reason": "live value changed"}],
+            "created": [{"worker": "b", "name": "B_Part", "id_type": "OBJECT"}]})
+        self.assert_delivery_receipt(result, "conflicted (nothing merged): scene.camera")
+        self.assertEqual(state.worker_outcome(self.crew[1].row), "completed and merged")
+
+    def test_partial_delivery_keeps_errors_alongside_what_merged(self):
+        error = "a: scene.camera target A_Camera did not arrive"
+        result = self.collect_merge_receipt({
+            "created": [{"worker": "a", "name": "A_Part", "id_type": "OBJECT"},
+                        {"worker": "b", "name": "B_Part", "id_type": "OBJECT"}],
+            "errors": [error]})
+        self.assert_delivery_receipt(result, "partly merged: + A_Part; missing: " + error, merged=True)
+        self.assertIn(error, self.crew[0].row["merge_error"])
+        self.assertNotIn("merge_error", self.crew[1].row)
+        self.assertEqual(state.worker_outcome(self.crew[1].row), "completed and merged")
+        self.assertFalse(orchestrator.delegate(wait=True).ok)
+
+    def test_partial_delivery_names_quarantine_and_conflicts_as_missing(self):
+        result = self.collect_merge_receipt({
+            "created": [{"worker": "a", "name": "A_Part", "id_type": "OBJECT"}],
+            "quarantined": [{"worker": "a", "name": "A_Light", "id_type": "OBJECT"}],
+            "conflicts": [{"worker": "a", "keys": ["OBJECT:A_Camera"], "reason": "live value changed"}]})
+        self.assert_delivery_receipt(
+            result, "partly merged: + A_Part; missing: held back (quarantined, waiting for the user's accept): "
+                    "A_Light; conflicted: OBJECT:A_Camera", merged=True)
+
+    def failed_merge_receipt(self, *, push=True, undo=False):
+        """Exercise merge_wave's real exception path after an object reached the scene."""
+        self.outcome_runtime()
+        self.wave.merge.side_effect = merge.merge_wave
+        self.wave.spawn.uid2spawn = lambda: {}
+        self.wave.spawn.path = self.wave.folder / "spawn.blend"
+        scene = []
+
+        def apply(*args):
+            scene.append("A_Part")
+            raise RuntimeError("pointer update failed")
+
+        def rollback(op, message=""):
+            if op == "push":
+                return push
+            if undo:
+                scene.clear()
+            return undo
+
+        with mock.patch.object(agent, "run_loop"), mock.patch.object(merge, "_undo", side_effect=rollback), \
+                mock.patch.object(merge, "_live_pointers", return_value={}), \
+                mock.patch.object(merge, "_merge_worker", side_effect=apply), mock.patch.object(merge, "_cleanup"):
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        self.assertEqual(scene, [] if undo else ["A_Part"])
+        return result
+
+    def assert_unconfirmed_merge(self, result):
+        expected = "merge failed; what reached the scene is unconfirmed"
+        for receipt in (result, orchestrator.delegate(wait=True)):
+            self.assertIn(expected, receipt.text)
+            self.assertNotIn("nothing merged", receipt.text)
+            self.assertNotIn("The live scene is as before", receipt.text)
+        merge_card = next(i for i in self.session["items"] if i["kind"] == "merge")
+        self.assertIn(expected, merge_card["text"])
+        self.assert_delivery_receipt(result, state.worker_outcome(self.crew[0].row))
+
+    def test_failed_merge_without_undo_never_claims_nothing_merged(self):
+        self.assert_unconfirmed_merge(self.failed_merge_receipt(push=False))
+
+    def test_failed_merge_with_failed_undo_never_claims_nothing_merged(self):
+        self.assert_unconfirmed_merge(self.failed_merge_receipt())
+
+    def test_failed_merge_with_confirmed_rollback_can_say_nothing_merged(self):
+        result = self.failed_merge_receipt(undo=True)
+        for text in (result.text, orchestrator.delegate(wait=True).text):
+            self.assertIn("failed (nothing merged)", text)
+            self.assertNotIn("what reached the scene is unconfirmed", text)
+        self.assert_delivery_receipt(result, state.worker_outcome(self.crew[0].row))
+
+    def test_stop_after_workers_finish_but_before_collection_discards_their_results(self):
+        self.outcome_runtime()
+        with mock.patch.object(agent, "run_loop"):
+            waves.start(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+            for worker in self.crew:
+                self.assertTrue(worker.ready.wait(2))
+                worker.thread.join(2)
+                self.assertEqual(worker.status, "done")
+            self.stop_workers()
+        result = orchestrator.delegate(wait=True)
+        self.assertEqual(result.text.count("stopped before finishing (nothing merged)"), 2)
+        self.wave.merge.assert_not_called()
+
+    def test_unavailable_boot_and_queued_worker_have_explicit_outcomes(self):
+        from loopcut.worker_host import WorkerUnavailable
+        self.outcome_runtime()
+        self.job.max_workers = 1
+        self.wave.make_runtime = mock.Mock(side_effect=WorkerUnavailable("cannot connect"))
+        with mock.patch.object(agent, "_request") as requested:
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        requested.assert_not_called()
+        self.wave.merge.assert_not_called()
+        for worker in self.crew:
+            self.assertEqual(state.worker_outcome(worker.row), "unavailable (nothing merged)")
+        for text in (result.text, orchestrator.delegate(wait=True).text):
+            self.assertIn("[a]", text)
+            self.assertIn("[b]", text)
+            self.assertIn("unavailable (nothing merged)", text)
+            self.assertNotIn("every worker has reported", text.lower())
+
+    def test_missing_result_file_is_a_failed_worker_even_when_sibling_merged(self):
+        self.outcome_runtime()
+        self.wave.merge.side_effect = None
+        self.wave.merge.return_value = {
+            "created": [{"worker": "a", "name": "A_Part", "id_type": "OBJECT"}],
+            "errors": ["b: no result file, nothing merged"]}
+        with mock.patch.object(agent, "run_loop"):
+            result = waves.run_wave(self.wave, lambda: False, lambda fn: fn())
+            self.crew += self.wave.crew
+        self.assertFalse(result.ok)
+        self.assertTrue(self.crew[0].row["merged"])
+        self.assertFalse(self.crew[1].row["merged"])
+        for text in (result.text, orchestrator.delegate(wait=True).text):
+            self.assertIn("failed (nothing merged): b: no result file", text)
+            self.assertIn("completed and merged", text)
+            self.assertIn("A_Part", text)
+            self.assertNotIn("every worker has reported", text.lower())
+
     def test_prepare_links_the_running_attempt_and_failed_boot_does_not_mark_it_started(self):
         from loopcut.worker_host import WorkerUnavailable
         card = state.item_tool("delegate", "Start helpers", "")
@@ -803,11 +1230,17 @@ class WorkerSteerTest(unittest.TestCase):
         self.assertEqual(len(self.turn.notes), 1, "the orchestrator still owns delivery")
 
     def test_steps_wait_for_a_reply_and_latest_action_uses_the_tool_summary(self):
+        from loopcut.ui import layout
         worker = self.worker()
+        worker.set_status("working")
+        self.assertFalse(layout._waiting_first_reply(worker.row))
         worker.before_request(1)
         self.assertEqual(worker.row["steps"], 0)
+        self.assertTrue(layout._waiting_first_reply(worker.row))
+        self.assertNotIn("0 steps", layout._worker_detail(worker.row))
         worker.on_usage({})
         self.assertEqual(worker.row["steps"], 1)
+        self.assertFalse(layout._waiting_first_reply(worker.row))
         worker.ready.set()
         worker.runtime = mock.Mock()
         worker.runtime.run_tool.return_value = tools.ToolResult("changed")
@@ -818,6 +1251,7 @@ class WorkerSteerTest(unittest.TestCase):
         self.assertNotIn("role", worker.row["summary"])
         worker.before_request(2)
         self.assertEqual(worker.row["steps"], 1, "the next pending request has not progressed yet")
+        self.assertFalse(layout._waiting_first_reply(worker.row))
 
     def test_latest_stored_scene_preview_is_kept_without_another_capture(self):
         worker = self.worker()
@@ -943,6 +1377,7 @@ class WaveTest(unittest.TestCase):
         self.addCleanup(owns.stop)
         self.registry = Registry()
         self.merges, self.checkpoint_calls, self.kept = [], [], []
+        self.quarantined = []
         self.crashes: dict[str, list[str]] = {}  # worker -> crash tool per attempt
         self.child_checks: dict[str, list] = {}
         self.facts: dict[str, dict] = {}  # worker -> what its child's finish measured (facts.deliverables)
@@ -965,8 +1400,9 @@ class WaveTest(unittest.TestCase):
         self.merges.append([r["brief"]["id"] for r in results])
         self.shared = [r.get("shared") for r in results]  # The notes may name a collection (merge._asked).
         self.kept.append(keep_spawn)
-        return types.SimpleNamespace(created=[f"OBJECT:{r['brief']['prefix']}" for r in results], replaced=[], renamed=[],
-                                     quarantined=["LIGHT:A_Test /a"], dropped_edits=[], conflicts=[], errors=[],
+        return types.SimpleNamespace(created=[{"worker": r["brief"]["id"], "name": r["brief"]["prefix"],
+                                               "id_type": "OBJECT"} for r in results], replaced=[], renamed=[],
+                                     quarantined=self.quarantined, dropped_edits=[], conflicts=[], errors=[],
                                      checkpoint="cp-1", seconds=0.2)
 
     def wave(self, briefs: list[dict], keep=None, references=None, **roles) -> waves.Wave:
@@ -1034,6 +1470,7 @@ class WaveTest(unittest.TestCase):
     # ---------------------------------------------------------------- tests
 
     def test_a_wave_merges_what_its_workers_built_and_reports_compactly(self):
+        self.quarantined = ["LIGHT:A_Test /a"]
         MODELS.scripts.update(a=[build(), finish("Chair built.", change_requests=[
             {"target": "Rug", "change": "raise 2 cm", "reason": "legs sink"}])], b=[build(), finish("Table built.")])
         with mock.patch.object(checkpoints, "ensure_for_wave", create=True,
@@ -1041,7 +1478,7 @@ class WaveTest(unittest.TestCase):
                                f"{label}|{message_index}|{item_index}"):
             wave = self.wave(["a", "b"])
             result = self.run_wave(wave)
-        self.assertTrue(result.ok, result.text)
+        self.assertFalse(result.ok, "a's extra light still needs the user's accept")
         self.assertEqual(self.merges, [["a", "b"]])
         self.assertEqual(self.checkpoint_calls, ["Before wave 1|3|1"], "the wave card's index, the delegate message's")
         self.assertEqual(self.rows(wave), {"a": "done", "b": "done"})
@@ -1051,7 +1488,7 @@ class WaveTest(unittest.TestCase):
         self.assertIn("Live checks after the merge: 2 of 2 pass.", result.text)
         merge = self.session["items"][-1]
         self.assertEqual((merge["kind"], merge["checkpoint"]), ("merge", "cp-1"))
-        self.assertEqual(merge["lines"], ["+ OBJECT:A", "+ OBJECT:B", "! LIGHT:A_Test /a (kept aside)"])
+        self.assertEqual(merge["lines"], ["+ A", "+ B", "! LIGHT:A_Test /a (kept aside)"])
         created = [{"worker": "a", "name": "Chair", "id_type": "OBJECT"}, {"worker": "a", "name": "Chair", "id_type": "MESH"},
                    {"worker": "a", "name": "Chair_Fabric", "id_type": "MATERIAL"}]
         self.assertEqual(waves.card_lines(types.SimpleNamespace(created=created, quarantined=[
@@ -1074,7 +1511,7 @@ class WaveTest(unittest.TestCase):
                                None, {"selection": [], "context_budget": 24_000, "account": None})
         drawn = {p["id"]: p.get("text") for p in display["prims"]}
         self.assertEqual((drawn["item1.wave.row0.status"], drawn["item1.wave.row1.detail"]),
-                         ("merged", "1m 06s · modeling · 2 steps · checks 1/1"), "a merged worker's row says so")
+                         ("partly merged", "1m 06s · modeling · 2 steps · checks 1/1"))
         self.assertEqual(drawn["item1.wave.row1.summary.l0"], "Table built.")
         conversations.save(self.session)
         loaded = conversations.load(self.session["id"])
@@ -1082,7 +1519,7 @@ class WaveTest(unittest.TestCase):
             redrawn = layout.build(session, 420, 2000, 1.0, lambda font, size, text: len(text) * size * 0.6,
                                     "fast", None, {"now": time.time() + 9999})
             text = {p["id"]: p.get("text") for p in redrawn["prims"]}
-            self.assertEqual(text["item1.wave.row0.status"], "merged")
+            self.assertEqual(text["item1.wave.row0.status"], "partly merged")
             self.assertEqual(text["item1.wave.row1.detail"], "1m 06s · modeling · 2 steps · checks 1/1")
             self.assertEqual(text["item1.wave.row1.summary.l0"], "Table built.")
         self.assertEqual(drawn["item2.merge.l2.l0"], "LIGHT:A_Test /a (kept aside)")
@@ -1120,7 +1557,9 @@ class WaveTest(unittest.TestCase):
         self.assertEqual([w["id"] for w in entry["workers"]], ["a", "b"], "worker 1 first, as the wave has them")
         self.assertLess(entry["workers"][0]["t"]["reported"], entry["workers"][1]["t"]["end"], "a reported while b ran")
         self.assertGreater(log["waited"], 0)
-        self.assertEqual(self.collect(wave.job).text, "Nothing to wait for: every worker has reported.")
+        repeated = self.collect(wave.job).text
+        self.assertIn("Nothing to wait for: every worker has reported.", repeated)
+        self.assertEqual(repeated.count("completed and merged"), 2)
 
     def test_workers_finishing_about_together_come_back_together(self):
         MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()])
@@ -1184,7 +1623,8 @@ class WaveTest(unittest.TestCase):
             self.run_wave(wave)
             waves.end_turn(self.session, self.turn)
         self.assertEqual(self.merges, [["a"], ["b"]])
-        self.assertIn("were waited for and merged; the agent did not review them", self.session["items"][-1]["text"])
+        self.assertIn("see each worker's outcome in its wave card", self.session["items"][-1]["text"])
+        self.assertIn("did not review them", self.session["items"][-1]["text"])
         self.assertEqual((self.turn.scene_before, self.turn.scene_after), ({"after": True}, {"after": True}))
 
     def test_the_seconds_budget_is_each_worker_runs_own(self):
@@ -1230,7 +1670,7 @@ class WaveTest(unittest.TestCase):
             self.assertIn('<loopcut-skills ids="', messages[0]['content'])
             self.assertFalse(any(m["role"] == "system" for m in messages))
         self.assertEqual((thread["deliverable"], thread["prefix"], thread["wave"], thread["created"]),
-                         ("A", "A", 1, ["A", "A_Mat"]), "an object's own mesh is not listed")
+                         ("A", "A", 1, ["A"]), "the continuation records what actually merged")
         (Path(thread["folder"]) / "images").mkdir(parents=True, exist_ok=True)
         (Path(thread["folder"]) / "images" / "look.png").write_bytes(b"png")
         earlier = len(thread["messages"])
@@ -2084,7 +2524,7 @@ class WaveTest(unittest.TestCase):
         self.assertTrue(session["items"][-1]["text"].endswith(
             "Checked: both rest on the rug.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
             "Requirements (the user's words): 2 of 2 covered."), session["items"][-1]["text"])
-        self.assertIn("Loopcut waited and merged them", " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
+        self.assertIn("Loopcut collected their outcomes", " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
         self.assertEqual((session["jobs"][0]["bounces"], session["jobs"][0]["late_bounces"]), (0, 1),
                          "the checks passed; the late workers are counted apart")
 

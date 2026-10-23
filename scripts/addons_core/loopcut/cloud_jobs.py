@@ -916,6 +916,96 @@ def _add_images(job):
     return names
 
 
+def _model_bounds(objects):
+    """Conservative evaluated world bounds for the existing size fit, excluding helper origins."""
+    import bpy
+    from mathutils import Vector
+    graph = bpy.context.evaluated_depsgraph_get()
+    points = []
+    for ob in objects:
+        if ob.type != "MESH":
+            continue
+        evaluated = ob.evaluated_get(graph)
+        if all(tuple(corner) == (-1, -1, -1) for corner in evaluated.bound_box):
+            continue  # Blender's sentinel for unavailable bounds.
+        points.extend(evaluated.matrix_world @ Vector(corner) for corner in evaluated.bound_box)
+    if not points:
+        return None
+    return (Vector(tuple(min(p[i] for p in points) for i in range(3))),
+            Vector(tuple(max(p[i] for p in points) for i in range(3))))
+
+
+def _model_geometry_bounds(objects):
+    """Actual evaluated world vertices for placement; rotated local box corners can lie in empty space."""
+    import bpy
+    import numpy as np
+    from mathutils import Vector
+    graph = bpy.context.evaluated_depsgraph_get()
+    low, high = None, None
+    for ob in objects:
+        if ob.type != "MESH":
+            continue
+        evaluated = ob.evaluated_get(graph)
+        vertices = evaluated.data.vertices
+        if not len(vertices):
+            continue
+        # One bulk read per mesh, with the transform and reductions in NumPy for large imports.
+        coordinates = np.empty(len(vertices) * 3, dtype=np.float32)
+        vertices.foreach_get("co", coordinates)
+        matrix = np.array(evaluated.matrix_world, dtype=np.float64)
+        world = coordinates.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+        mesh_low, mesh_high = world.min(axis=0), world.max(axis=0)
+        low = mesh_low if low is None else np.minimum(low, mesh_low)
+        high = mesh_high if high is None else np.maximum(high, mesh_high)
+    return (Vector(low), Vector(high)) if low is not None else None
+
+
+def _frame_model(objects):
+    """Best-effort Frame Selected in an existing viewport, without moving a locked camera."""
+    import bpy
+    try:
+        if bpy.app.background or not any(ob.type == "MESH" for ob in objects):
+            return False
+        for window in bpy.context.window_manager.windows:
+            if window.scene != bpy.context.scene or window.view_layer != bpy.context.view_layer:
+                continue
+            for area in window.screen.areas:
+                try:
+                    if area.type != "VIEW_3D":
+                        continue
+                    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+                    if region is None:
+                        continue
+                    space = area.spaces.active
+                    with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
+                        # Hidden geometry can make view_selected return FINISHED without moving the view.
+                        if not any(ob.type == "MESH" and ob.visible_get(view_layer=window.view_layer, viewport=space)
+                                   for ob in objects):
+                            continue
+                        if not bpy.ops.view3d.view_selected.poll():
+                            continue
+                        locked = space.lock_camera
+                        # An offset export can leave its root/armature origin far from the geometry.
+                        selection = [(ob, ob.select_get()) for ob in objects if ob.type != "MESH"]
+                        try:
+                            space.lock_camera = False
+                            for ob, _ in selection:
+                                ob.select_set(False)
+                            # EXEC_DEFAULT frames immediately, before camera lock is restored.
+                            result = bpy.ops.view3d.view_selected("EXEC_DEFAULT", use_all_regions=False)
+                        finally:
+                            for ob, selected in selection:
+                                ob.select_set(selected)
+                            space.lock_camera = locked
+                    if "FINISHED" in result:
+                        return True
+                except Exception as ex:  # A failed candidate must not prevent trying the next view.
+                    print(f"Loopcut: could not frame the imported model in this viewport: {ex!r}")
+    except Exception as ex:  # UI context can disappear while a cloud job is finishing.
+        print(f"Loopcut: could not frame the imported model: {ex!r}")
+    return False
+
+
 def _model_import(job):
     import bpy
     from mathutils import Vector
@@ -959,7 +1049,6 @@ def _model_import(job):
         collection.objects.link(root)
         imported_ids = {_identity(ob) for ob in objects}
         bpy.context.view_layer.update()
-        points = [ob.matrix_world @ Vector(corner) for ob in objects if ob.type == "MESH" for corner in ob.bound_box]
         for ob in objects:
             for parent_collection in list(ob.users_collection):
                 parent_collection.objects.unlink(ob)
@@ -968,15 +1057,24 @@ def _model_import(job):
                 matrix = ob.matrix_world.copy()
                 ob.parent = root
                 ob.matrix_world = matrix
-        # Generated props fit a 2m bounding box at the cursor. Assist tools keep source dimensions.
-        if points and job["provenance"]["kind"] == "gen":
-            low = Vector(tuple(min(p[i] for p in points) for i in range(3)))
-            high = Vector(tuple(max(p[i] for p in points) for i in range(3)))
-            extent = max(high - low)
-            units = bpy.context.scene.unit_settings.scale_length or 1
-            factor = 2 / units / extent if math.isfinite(extent) and extent > 0 else 1
-            root.scale = (factor,) * 3
-            root.location = bpy.context.scene.cursor.location - (low + high) * (.5 * factor)
+        # Generated props fit a 2m box and rest on the cursor's Z, centred on its X/Y.
+        # Assist tools keep source dimensions and placement.
+        bpy.context.view_layer.update()
+        if job["provenance"]["kind"] == "gen":
+            bounds = _model_bounds(objects)
+            if bounds:
+                low, high = bounds
+                extent = max(high - low)
+                units = bpy.context.scene.unit_settings.scale_length or 1
+                factor = 2 / units / extent if math.isfinite(extent) and extent > 0 else 1
+                root.scale = (factor,) * 3
+                bpy.context.view_layer.update()
+                bounds = _model_geometry_bounds(objects)
+                if bounds:
+                    low, high = bounds
+                    bottom = Vector(((low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2]))
+                    root.location = bpy.context.scene.cursor.location - bottom
+                    note += f"; placed on the ground at the 3D cursor, {(high[2] - low[2]) * units:.3g} m tall"
         bpy.context.view_layer.update()
         for ob in bpy.context.view_layer.objects:
             ob.select_set(False)
@@ -984,6 +1082,7 @@ def _model_import(job):
             ob.select_set(True)
         root.select_set(True)
         bpy.context.view_layer.objects.active = root
+        _frame_model([root, *objects])
         names.append(collection.name + note)
     return names
 

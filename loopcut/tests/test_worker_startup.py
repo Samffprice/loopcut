@@ -360,7 +360,10 @@ class WorkerStartup(unittest.TestCase):
             merge.assert_called_once()
             request = self.request(session)
             self.assertNotIn("delegate", {s["function"]["name"] for s in request["tools"]})
-            self.assertIn("Every worker has reported; continue in the main Blender", request["messages"][0]["content"])
+            note = request["messages"][0]["content"]
+            self.assertIn("No workers are running; continue in the main Blender", note)
+            self.assertIn("[failed] wave 1: unavailable (nothing merged)", note)
+            self.assertNotIn("delegate wait true", note)
             self.assertIn("wave", orchestrator.SCHEMAS[0]["function"]["parameters"]["properties"])
 
     def test_scheduler_stops_queued_workers(self):

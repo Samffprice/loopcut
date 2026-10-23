@@ -2021,7 +2021,7 @@ class AgentLoopTest(unittest.TestCase):
             turn = self.start("again")
             turn.thread.join(5)
             self.assertEqual(len([i for i in self.session["items"] if i["kind"] == "notice"]), 1, "warned once")
-            self.assertEqual(layout.usage_note(state.ui["account"]), ("Chat: 84% of this week used", 0.842))
+            self.assertEqual(layout.usage_note(state.ui["account"]), ("Chat 84% used (week)", 0.842))
             self.assertEqual(layout.usage_note({"week": {"used": 0.2}, "session": {"used": 0.5}}), ("", 0.5))
 
     def test_http_error_is_shown_not_swallowed(self):
@@ -2249,6 +2249,9 @@ class QueuedHelperNoteTest(unittest.TestCase):
         self.thread.join(2)
         self.assertFalse(self.thread.is_alive())
         self.assertEqual(self.turn.outcome, "completed")
+        self.assertEqual((self.turn.tool_steps, self.turn.executed_tools, len(self.requests)), (1, 1, 2))
+        self.assertFalse(self.turn.unrun_claim, "the helper wave ran before the final 'done' reply")
+        self.assertFalse(any(i.get("text") == agent.completion_guard.NOTICE for i in self.session["items"]))
         steers = [m["content"] for m in self.requests[1] if m.get(context.STEER)]
         self.assertEqual(steers, ["<steer>make it smaller</steer>"])
         self.assertNotIn("queued", queued)
@@ -2419,7 +2422,7 @@ class QueuedHelperNoteTest(unittest.TestCase):
             self.entered.set()
             if not self.return_wave.wait(2):
                 raise RuntimeError("final reply was not released")
-            return llm.Completion(text="done")
+            return llm.Completion(text="What size should it be?")
 
         with mock.patch.object(agent, "_request", side_effect=final_reply), \
                 mock.patch.object(agent, "_resend_on_main", side_effect=self.resend_on_main) as resent:
@@ -2706,8 +2709,8 @@ class LimitStateTest(unittest.TestCase):
         self.assertEqual(self.session["input"], "  make a chair  ")
         turn = self.send(self.session["input"])
         def complete(**kwargs):
-            kwargs["on_text"]("Done.")
-            return llm.Completion(text="Done.")
+            kwargs["on_text"]("What style should it be?")
+            return llm.Completion(text="What style should it be?")
         with index_patch(), mock.patch.object(llm, "stream_chat", side_effect=complete) as stream, \
                 mock.patch.object(agent, "_changes_item", return_value=None):
             agent.run_loop(self.session, turn, spec)
@@ -3405,6 +3408,326 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(session["items"], [])
 
 
+class UnrunCompletionTest(unittest.TestCase):
+    """The real loop with scripted completions; no Blender or local sockets."""
+
+    def run_replies(self, replies, request="Build a prop", *, previous=False, reject=False,
+                    checkpoint_error=False, max_steps=0, role="single", routed=None, on_final=None,
+                    session=None, resume=False, base_url="https://example.invalid/v1",
+                    tool_names=("run_python", "capture_viewport", "delegate")):
+        from loopcut import nudges
+        session = session if session is not None else state.new_session()
+        if previous:
+            session["messages"] = [
+                {"role": "user", "content": "Add a cube"},
+                {"role": "assistant", "tool_calls": [{"id": "old", "type": "function",
+                    "function": {"name": "run_python", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "old", "content": "Created a cube"},
+                {"role": "assistant", "content": "Done."}]
+            old = state.item_tool("run_python", "Add a cube", "")
+            old.update(status="done", output="Created a cube")
+            session["items"].append(old)
+        if not resume:
+            session["items"].append(state.item_user(request))
+            session["messages"].append({"role": "user", "content": request})
+        turn = agent.Turn()
+        turn.config = config.Config("test-key", base_url, "fake", "low", False, False,
+                                    max_steps, 24000)
+        turn.routed = routed
+        saved = []
+        spec = agent.LoopSpec(role=role, system=lambda s: "", schemas=lambda: [
+                                {"type": "function", "function": {"name": name}} for name in tool_names],
+                              save=lambda s: saved.append(json.loads(json.dumps(s["items"]))),
+                              asks=reject, checkpoints=checkpoint_error, changes_card=False, on_final=on_final)
+        pending = iter(replies)
+
+        def reply(*args):
+            completion = next(pending)
+            if isinstance(completion, Exception):
+                raise completion
+            item = state.item_assistant()
+            item.update(text=completion.text, streaming=False)
+            session["items"].append(item)
+            return completion
+
+        run = mock.Mock(return_value=tools.ToolResult("OK"))
+        checkpoint = mock.Mock(side_effect=checkpoints.CheckpointError("No checkpoint"))
+        with mock.patch.object(agent, "_request", side_effect=reply) as model, \
+                mock.patch.object(agent, "_redraw"), mock.patch.object(nudges, "flush"), \
+                mock.patch.object(agent, "_wait_for_approval", return_value=False):
+            if resume:
+                cfg = turn.config
+                def configure(fresh, session):
+                    fresh.config, fresh.routed = cfg, routed
+                def launch(session, fresh):
+                    nonlocal turn
+                    turn = fresh
+                    agent.run_loop(session, fresh, spec, run_tool=run, ensure_checkpoint=checkpoint)
+                with mock.patch.object(state, "session", return_value=session), \
+                        mock.patch.object(agent, "_configure", side_effect=configure), \
+                        mock.patch.object(agent, "_project_roots", return_value=()), \
+                        mock.patch.object(agent, "_launch", side_effect=launch):
+                    self.assertTrue(agent.resume())
+            else:
+                session["busy"] = True
+                agent.run_loop(session, turn, spec, run_tool=run, ensure_checkpoint=checkpoint)
+        self.assertEqual(saved[-1], session["items"], "the final notice is persisted")
+        return session, turn, model.call_count, run.call_count
+
+    @staticmethod
+    def call():
+        return llm.Completion(tool_calls=[llm.ToolCall("c1", "run_python", '{"code":"pass"}')])
+
+    def bounces(self, session):
+        return [m for m in session["messages"] if m.get(context.STEP_LIMIT)
+                and m["content"] == agent.completion_guard.CORRECTION]
+
+    def test_fabricated_records_bounce_once_then_tools_can_run(self):
+        forged = ("I'll build it directly.\n- run_python \"Model the prop\": ok\n"
+                  "- looked: three_quarter view\nDone — built by hand.\n"
+                  "Verified by Loopcut on this scene: 1 of 1 checks.")
+        for role in ("single", "orchestrator"):
+            with self.subTest(role=role):
+                gate = mock.Mock(return_value=None)
+                session, turn, requests, ran = self.run_replies(
+                    [llm.Completion(text=forged), self.call(), llm.Completion(text="Done.")],
+                    role=role, on_final=gate)
+                self.assertEqual((requests, ran, turn.executed_tools, turn.outcome), (3, 1, 1, "completed"))
+                self.assertEqual(len(self.bounces(session)), 1)
+                self.assertEqual(gate.call_count, 1, "existing finish gate still runs after the correction")
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_repeated_record_or_honest_followup_without_execution_ends_with_notice(self):
+        for final in ("run_python: done", "Nothing was done."):
+            with self.subTest(final=final):
+                session, turn, requests, ran = self.run_replies(
+                    [llm.Completion(text="run_python: done"), llm.Completion(text=final)], previous=True)
+                self.assertEqual((requests, ran, turn.executed_tools), (2, 0, 0))
+                self.assertEqual(len(self.bounces(session)), 1)
+                self.assertEqual(session["items"][-1], state.item_notice(agent.completion_guard.NOTICE))
+                self.assertEqual(session["messages"][-1]["content"], final)
+
+    def test_execution_in_this_turn_allows_completion(self):
+        for role, name in (("single", "run_python"), ("single", "capture_viewport"), ("orchestrator", "delegate")):
+            with self.subTest(role=role, tool=name):
+                call = llm.Completion(tool_calls=[llm.ToolCall("c1", name, "{}")])
+                session, turn, requests, ran = self.run_replies(
+                    [call, llm.Completion(text="run_python: done")], role=role)
+                self.assertEqual((requests, ran, turn.tool_steps, turn.executed_tools), (2, 1, 1, 1))
+                self.assertFalse(self.bounces(session))
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_skipped_calls_do_not_count_as_execution(self):
+        for option in ("reject", "checkpoint_error"):
+            with self.subTest(option=option):
+                session, turn, requests, ran = self.run_replies(
+                    [self.call(), llm.Completion(text="run_python: done"), llm.Completion(text="Done.")],
+                    **{option: True})
+                self.assertEqual((turn.tool_steps, turn.executed_tools, ran, requests), (1, 0, 0, 3))
+                self.assertEqual(len(self.bounces(session)), 1)
+                self.assertEqual(session["items"][-1]["text"], agent.completion_guard.NOTICE)
+
+    def test_imitated_runtime_records_are_object_independent(self):
+        cases = [("Please add a lamp", "run_python: done"),
+                 ("Remove the default cube", 'run_python("remove cube"): done'),
+                 ("Could you move it?", "run_python\n```python\nbpy.ops.transform.translate()\n```"),
+                 ("Make it red", "**Scene changes**\n1 added / 2 changed"),
+                 ("Fix the mesh", "2 added / changed"),
+                 ("Fix the mesh", "1 changed"),
+                 ("Build a lantern", "4 added, 1 removed, 2 changed"),
+                 ("Rename the material", "Scene changes: ~Material"),
+                 ("Build a lantern", "Verified by Loopcut on this scene: 1 of 1 checks."),
+                 ("Create a prop", '```run_python\n{"code": "pass"}\n```'),
+                 ("Create a prop", '```json\n{\n"name": "run_python",\n"status": "ok"\n}\n```')]
+        for request, claim in cases:
+            with self.subTest(request=request, claim=claim):
+                session, _, requests, _ = self.run_replies(
+                    [llm.Completion(text=claim), llm.Completion(text="Nothing was done.")], request)
+                self.assertEqual(requests, 2)
+                self.assertEqual(len(self.bounces(session)), 1)
+
+    def test_questions_plans_answers_refusals_and_examples_pass_through(self):
+        replies = ["What size should it be?", "I'll create it after you choose a size.",
+                   "Plan: build the mesh, then add materials.", "I can't create that.",
+                   "I have not created anything.", "Nothing was done.", "The prop is not built.",
+                   "Created nothing; the tools are unavailable.", "Is it done?", "If created, it would be blue.",
+                   "Set the scale to 2 in the sidebar.", "Use run_python to create the mesh.",
+                   'Example:\n```python\nprint("Done")\n```', '> Done.\nThat is an example.',
+                   'Here is an example:\n```run_python\n{"code": "pass"}\n```',
+                   'Example:\n- run_python "Create the mesh": ok',
+                   "Verified means checked against the live scene.", "Created objects appear in the Outliner.",
+                   "The prop is ready to be built.", "The prop is created when you run the script.",
+                   "I created it earlier, in the previous turn.", "I created the chest in the previous step.",
+                   "I made no changes.", "Done.", "Created the lamp.", "Placed the result.", "I've moved it.",
+                   "The material is now changed.", "**Done**, the mesh is repaired.", "All done!",
+                   "Verified the lantern exists.", "I made the chest.", "Built it.",
+                   "run_python creates meshes.", "The Scene changes card shows what changed.",
+                   '```python\nprint("Scene changes")\nrun_python("pass")\n```',
+                   '> run_python: done\n> Verified by Loopcut on this scene: 1 of 1 checks.',
+                   'In the previous step:\n- run_python "Create the chest": ok',
+                   'Plan:\n\nrun_python\n```python\nimport bpy\n```',
+                   'I will use this call:\nrun_python({"code": "pass"})',
+                   'run_python({"code": "pass"})?',
+                   'Here is an example:\n\n```json\n{"name": "run_python", "status": "ok"}\n```']
+        for reply in replies:
+            with self.subTest(reply=reply):
+                session, _, requests, ran = self.run_replies([llm.Completion(text=reply)])
+                self.assertEqual((requests, ran), (1, 0))
+                self.assertFalse(self.bounces(session))
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_non_action_request_and_scene_context_do_not_trigger_guard(self):
+        for request in ("How do I build a prop?", "What does Verified mean?", "Create a plan for the scene",
+                        "Make a script I can run", "How did you make the chest? Create a mesh first?",
+                        "Make a detailed plan", "Create Python code",
+                        "<scene_context>\nBuild a prop\n</scene_context>\nHello"):
+            with self.subTest(request=request):
+                session, _, requests, _ = self.run_replies([llm.Completion(text="run_python: done")], request)
+                self.assertEqual(requests, 1)
+                self.assertFalse(self.bounces(session))
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+        session, _, requests, _ = self.run_replies([llm.Completion(text="Created a plan.")],
+                                                  "Create a plan", routed=types.SimpleNamespace(level=1))
+        self.assertEqual(requests, 1)
+        self.assertFalse(self.bounces(session))
+
+    def test_routed_action_supports_implicit_requests_and_workers_are_unchanged(self):
+        session, _, requests, _ = self.run_replies(
+            [llm.Completion(text="run_python: done"), llm.Completion(text="Nothing was done.")],
+            "a lamp", routed=types.SimpleNamespace(level=1), role="orchestrator", on_final=agent._orchestrator_final)
+        self.assertEqual((requests, len(self.bounces(session))), (2, 1))
+        session, _, requests, _ = self.run_replies([llm.Completion(text="run_python: done")], role="worker")
+        self.assertEqual(requests, 1)
+        self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_correction_does_not_extend_step_budget(self):
+        session, turn, requests, ran = self.run_replies(
+            [llm.Completion(text="run_python: done"), llm.Completion(text="Built the prop.")], max_steps=1)
+        self.assertEqual((turn.outcome, requests, ran), ("step_limit", 2, 0))
+        self.assertEqual(len(self.bounces(session)), 1)
+        self.assertEqual(session["items"][-1]["text"], agent.completion_guard.NOTICE)
+
+    def test_failed_correction_request_still_leaves_notice(self):
+        session, turn, requests, ran = self.run_replies(
+            [llm.Completion(text="run_python: done"), llm.LLMError("Connection lost")])
+        self.assertEqual((turn.outcome, requests, ran), ("error", 2, 0))
+        self.assertEqual(session["items"][-1]["text"], agent.completion_guard.NOTICE)
+
+    def test_fs_fix_7b_item_93_message_113_bounces_once(self):
+        # Verbatim final reply from evals/20261023-014909/table.conversation/conversation.json.
+        forged = (Path(__file__).parent / "fixtures" / "fs-fix-7b-imitated-records.txt").read_text()
+        session, _, requests, ran = self.run_replies(
+            [llm.Completion(text=forged), llm.Completion(text="Nothing was done.")], "Build a medieval shovel")
+        self.assertEqual((requests, ran, len(self.bounces(session))), (2, 0, 1))
+
+    def test_tool_records_use_the_sessions_tool_list(self):
+        for name in ("capture_viewport", "delegate", "custom_scene_tool"):
+            for record in (f'{name} "Look at the result": ok', f"{name}\ndone",
+                           f'{name}({{"angle": "front"}})',
+                           f'```json\n{{"name": "{name}", "arguments": {{}}}}\n```'):
+                with self.subTest(name=name, record=record):
+                    session, _, requests, _ = self.run_replies(
+                        [llm.Completion(text=record), llm.Completion(text="Nothing was done.")], tool_names=(name,))
+                    self.assertEqual((requests, len(self.bounces(session))), (2, 1))
+                    session, _, requests, _ = self.run_replies([llm.Completion(text=record)], tool_names=())
+                    self.assertEqual((requests, len(self.bounces(session))), (1, 0))
+
+    def test_fabrication_is_wrong_on_every_route_so_all_routes_keep_the_narrow_guard(self):
+        for base_url in (config.SERVICE_BASE_URL, "chatgpt-plan://", "https://api.openai.com/v1",
+                         "http://localhost:1234/v1"):
+            with self.subTest(base_url=base_url):
+                session, _, requests, _ = self.run_replies(
+                    [llm.Completion(text="run_python: done"), llm.Completion(text="Nothing was done.")],
+                    base_url=base_url)
+                self.assertEqual((requests, len(self.bounces(session))), (2, 1))
+                self.assertEqual(session["items"][-1]["text"], agent.completion_guard.NOTICE)
+                session, _, requests, _ = self.run_replies([llm.Completion(text="Done.")], base_url=base_url)
+                self.assertEqual((requests, len(self.bounces(session))), (1, 0))
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_review_questions_plans_and_requested_code_pass_even_when_routed_to_action(self):
+        for request, reply in (
+                ("How did you make the chest? Create a mesh first?", "I created the chest in the previous step."),
+                ("Make a detailed plan", "Plan:\nrun_python: done"),
+                ("Create Python code", '```run_python\n{"code": "pass"}\n```'),
+                ("Create a plan", "Scene changes\n1 added / 2 changed")):
+            with self.subTest(request=request):
+                session, _, requests, ran = self.run_replies(
+                    [llm.Completion(text=reply)], request, routed=types.SimpleNamespace(level=1))
+                self.assertEqual((requests, ran, len(self.bounces(session))), (1, 0, 0))
+                self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def saved_session(self, session):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": tmp}):
+            conversations.save(session)
+            return conversations.load(session["id"])
+
+    def test_resume_after_tools_ran_never_bounces_even_after_save_load_or_steering(self):
+        for reload in (False, True):
+            for final in ("Done.", "run_python: done"):
+                with self.subTest(reload=reload, final=final):
+                    session, _, _, _ = self.run_replies([self.call(), llm.LLMError("Connection lost")])
+                    session["messages"].append({"role": "user", context.STEER: True, "content": "Make it red"})
+                    if reload:
+                        session = self.saved_session(session)
+                    session, turn, requests, ran = self.run_replies(
+                        [llm.Completion(text=final)], session=session, resume=True)
+                    self.assertEqual((requests, ran, turn.executed_tools, turn.unrun_claim), (1, 0, 1, False))
+                    self.assertFalse(self.bounces(session))
+                    self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_failed_correction_is_once_per_original_turn_across_repeated_resumes_and_save_load(self):
+        session, _, _, _ = self.run_replies(
+            [llm.Completion(text="run_python: done"), llm.LLMError("Connection lost")])
+        session = self.saved_session(session)
+        session, turn, requests, _ = self.run_replies(
+            [llm.LLMError("Still disconnected")], session=session, resume=True)
+        self.assertEqual((requests, turn.unrun_claim, len(self.bounces(session))), (1, True, 1))
+        session, turn, requests, _ = self.run_replies(
+            [llm.Completion(text="run_python: done")], session=session, resume=True)
+        self.assertEqual((requests, turn.unrun_claim, len(self.bounces(session))), (1, True, 1))
+        # A genuinely new user message gets its own one correction.
+        session, turn, requests, _ = self.run_replies(
+            [llm.Completion(text="run_python: done"), llm.Completion(text="Nothing was done.")], session=session)
+        self.assertEqual((requests, turn.executed_tools, len(self.bounces(session))), (2, 0, 2))
+
+    def test_resume_accumulates_executions_and_suppresses_notice_after_an_earlier_correction(self):
+        session, _, _, _ = self.run_replies(
+            [llm.Completion(text="run_python: done"), self.call(), llm.LLMError("Connection lost")])
+        session, turn, requests, ran = self.run_replies(
+            [self.call(), llm.LLMError("Connection lost again")], session=self.saved_session(session), resume=True)
+        self.assertEqual((requests, ran, turn.executed_tools, turn.unrun_claim), (2, 1, 2, True))
+        session, turn, requests, ran = self.run_replies(
+            [llm.Completion(text="run_python: done")], session=self.saved_session(session), resume=True)
+        self.assertEqual((requests, ran, turn.executed_tools, len(self.bounces(session))), (1, 0, 2, 1))
+        self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_runtime_record_appended_by_finish_hook_is_not_model_fabrication(self):
+        def verified(session, turn, completion):
+            session["items"][-1]["text"] += "\nVerified by Loopcut on this scene: 1 of 1 checks."
+        session, _, requests, _ = self.run_replies([llm.Completion(text="I made no changes.")], on_final=verified)
+        self.assertEqual((requests, len(self.bounces(session))), (1, 0))
+        self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_resume_after_rejected_call_can_correct_and_new_user_turn_forgets_old_execution(self):
+        for reject in (False, True):
+            with self.subTest(reject=reject):
+                session, _, _, _ = self.run_replies([self.call(), llm.LLMError("Connection lost")], reject=reject)
+                session, turn, requests, _ = self.run_replies(
+                    [llm.Completion(text="run_python: done"), llm.Completion(text="Nothing was done.")],
+                    session=session, resume=reject)
+                self.assertEqual((requests, turn.executed_tools, len(self.bounces(session))), (2, 0, 1))
+
+    def test_guard_markers_stay_private_on_the_wire(self):
+        session, _, _, _ = self.run_replies(
+            [llm.Completion(text="run_python: done"), self.call(), llm.Completion(text="Done.")])
+        original = session["messages"][0]
+        self.assertEqual((original[agent.completion_guard.EXECUTED], original[agent.completion_guard.CORRECTED]),
+                         (1, True))
+        wired = conversations.wire_messages(session["id"], session["messages"])
+        self.assertEqual(wired[0], {"role": "user", "content": "Build a prop"})
+
+
 class TurnEndTest(unittest.TestCase):
     """Transcript compatibility and correction status with in-process replies, without sockets."""
 
@@ -3569,6 +3892,7 @@ class PlanRetryTest(unittest.TestCase):
         return tools.ToolResult("workers[0].checks[0]: missing kind", ok=False, plan_refused=True)
 
     def assert_recovery(self, session, card, recovered, working=False):
+        from loopcut.ui import theme
         before = dict(card)
         display = layout.build(session, 900, 2000, 1.0, lambda f, s, t: len(t) * s * 0.5)
         self.assertEqual(card, before, "rendering must not rewrite the original attempt")
@@ -3577,6 +3901,9 @@ class PlanRetryTest(unittest.TestCase):
         self.assertEqual(text[prefix + "summary"], "Helper started" if recovered else
                          "Adjusting the helper plan…" if working else "Helper plan needs adjustment")
         self.assertEqual(text[prefix + "glyph"], "✓" if recovered else "…" if working else "✕")
+        glyph = next(p for p in display["prims"] if p["id"] == prefix + "glyph")
+        self.assertEqual(glyph["color"], theme.TEXT_MUTED if recovered or working else theme.ERROR)
+        self.assertNotIn("Bad arguments", " ".join(value for key, value in text.items() if key.startswith(prefix)))
 
     def test_shared_deliverable_does_not_resolve_different_workers_or_roles(self):
         first = {"id": "chair", "role": "modeling", "deliverable": "Chair"}
@@ -3760,8 +4087,141 @@ class PlanRetryTest(unittest.TestCase):
             self.assert_recovery(session, card, True)
         self.assertNotIn("plan_repair", cards[2])
 
+    def test_argument_rejection_is_neutral_then_recovers_at_matching_startup(self):
+        # The persona call: workers was a JSON string at the top level instead of inside wave.
+        crew = [{"id": "a", "role": "modeling", "deliverable": "A"}]
+        for arguments in ({"workers": json.dumps(crew)}, {"workers": crew},
+                          {"wave": {"workers": crew}, "unexpected": True}):
+            with self.subTest(arguments=arguments):
+                session = state.new_session()
+
+                def delegate(name, raw):
+                    cards = [i for i in session["items"] if i["kind"] == "tool"]
+                    if len(cards) == 1:
+                        return tools.execute(name, raw)  # Real signature validation, before plan validation.
+                    self.assert_recovery(session, cards[0], False, working=True)
+                    self.start_helper(session, cards[1],
+                                      before_start=lambda: self.assert_recovery(session, cards[0], False, working=True),
+                                      after_start=lambda: self.assert_recovery(session, cards[0], True))
+                    return tools.ToolResult("Started")
+
+                session, cards = self.run_calls([self.call(1, **arguments), self.call(2)], delegate,
+                                                session=session, starts=False)
+                self.assert_recovery(session, cards[0], True)
+                self.assertEqual(cards[0]["plan_workers"], [["a", "modeling"]])
+                self.assertIn("Bad arguments for delegate:", cards[0]["output"])
+                self.assertIn("Bad arguments for delegate:", next(m["content"] for m in session["messages"]
+                                                                 if m.get("tool_call_id") == "1"))
+                cards[1]["plan_workers"] = [["other", "modeling"]]
+                self.assert_recovery(session, cards[0], False)
+                cards[1]["plan_workers"] = [["a", "materials"]]
+                self.assert_recovery(session, cards[0], False)
+
+    def test_missing_ids_still_require_matching_deliverable_and_role(self):
+        for identity in ({"deliverable": "Chair", "role": "modeling"},
+                         {"deliverable": "Chair"}, {"role": "modeling"},
+                         {"id": [], "deliverable": "Chair", "role": "modeling"}):
+            for started in ({"id": "chair", "deliverable": "Chair", "role": "modeling"},
+                            {"id": "lamp", "deliverable": "Lamp", "role": "modeling"},
+                            {"id": "chair", "deliverable": "Chair", "role": "materials"}):
+                with self.subTest(identity=identity, started=started):
+                    session, cards = self.run_calls(
+                        [self.call(1, workers=[identity]), self.call(2, wave={"workers": [started]})],
+                        [self.refusal(), tools.ToolResult("Started")])
+                    matches = all(started[key] == value for key, value in identity.items() if key != "id")
+                    self.assert_recovery(session, cards[0], matches)
+                    with mock.patch.dict(session, busy=True,
+                                         turn=types.SimpleNamespace(plan_turn=cards[0]["plan_turn"])):
+                        self.assert_recovery(session, cards[0], matches, working=not matches)
+                    # Saved cards must carry the same evidence, without live helper state.
+                    restored = {**session, "items": json.loads(json.dumps(session["items"]))}
+                    self.assert_recovery(restored, restored["items"][session["items"].index(cards[0])], matches)
+                    # Earlier saved rejections had raw arguments but no name metadata.
+                    cards[0].pop("plan_names")
+                    self.assert_recovery(session, cards[0], matches)
+
+    def test_missing_ids_match_normalized_roles_in_recorded_and_saved_arguments(self):
+        for supplied, normalized in (("sculpting", "modeling"), ("lights", "lighting")):
+            for saved_arguments in (False, True):
+                with self.subTest(role=supplied, saved_arguments=saved_arguments):
+                    first = {"deliverable": "Chair", "role": supplied}
+                    second = {"id": "chair", "deliverable": "Chair", "role": normalized}
+                    session, cards = self.run_calls(
+                        [self.call(1, workers=[first]), self.call(2, wave={"workers": [second]})],
+                        [self.refusal(), tools.ToolResult("Started")])
+                    if saved_arguments:
+                        cards[0].pop("plan_names")
+                    else:
+                        self.assertEqual(cards[0]["plan_names"], [["Chair", normalized]])
+                    self.assert_recovery(session, cards[0], True)
+
+    def test_unidentified_attempt_cannot_skip_a_delegate_to_claim_a_later_start(self):
+        for intervening, result in ((self.call(2, dry_run=True), tools.ToolResult("Plan accepted")),
+                                    (self.call(2, wait=True), tools.ToolResult("Collected")),
+                                    (self.call(2), self.refusal())):
+            with self.subTest(intervening=intervening):
+                session, cards = self.run_calls(
+                    [llm.ToolCall("1", "delegate", "{}"), intervening, self.call(3, helper="Lamp")],
+                    [self.refusal(), result, tools.ToolResult("Started")])
+                self.assert_recovery(session, cards[0], False)
+                with mock.patch.dict(session, busy=True,
+                                     turn=types.SimpleNamespace(plan_turn=cards[0]["plan_turn"])):
+                    self.assert_recovery(session, cards[0], False, working=True)
+
+    def test_unidentified_arguments_require_a_real_start_in_the_same_turn(self):
+        for raw in ("", "{}", "[]", "null", "{broken", '{"unexpected": true}', '{"workers": [{}]}'):
+            with self.subTest(raw=raw):
+                enabled = {"turn": types.SimpleNamespace(roles=types.SimpleNamespace(orchestrate=True))}
+                with mock.patch.object(state, "session", return_value=enabled):
+                    refused = tools.execute("delegate", raw)
+                self.assertFalse(refused.ok)
+                self.assertTrue(refused.plan_refused)
+                call = llm.ToolCall("1", "delegate", raw)
+                session, cards = self.run_calls([call, self.call(2)], [refused, tools.ToolResult("Started")])
+                self.assert_recovery(session, cards[0], True)
+                # The result is derived from saved cards, including after removing a retry.
+                session["items"].remove(cards[1])
+                self.assert_recovery(session, cards[0], False)
+                with mock.patch.dict(session, busy=True, turn=types.SimpleNamespace(plan_turn=cards[0]["plan_turn"])):
+                    self.assert_recovery(session, cards[0], False, working=True)
+                self.run_calls([self.call(3)], [tools.ToolResult("Started")], session=session)
+                self.assert_recovery(session, cards[0], False)
+                for retry in (self.call(2, dry_run=True), self.call(2, wait=True),
+                              self.call(2, name="get_scene_info")):
+                    session, cards = self.run_calls([call, retry], [refused, tools.ToolResult("OK")])
+                    self.assert_recovery(session, cards[0], False)
+                session, cards = self.run_calls([call, self.call(2)], [refused, tools.ToolResult("No boot")],
+                                                starts=False)
+                self.assert_recovery(session, cards[0], False)
+
+    def test_argument_validation_does_not_reclassify_internal_or_other_tool_errors(self):
+        from loopcut import orchestrator
+
+        def broken(wave=None, dry_run=False, wait=False):
+            raise TypeError("internal failure")
+
+        with mock.patch.dict(orchestrator.DISPATCH, {"delegate": broken}):
+            result = tools.execute("delegate", "{}")
+        self.assertFalse(result.ok)
+        self.assertFalse(result.plan_refused)
+        for raw in ('{"unexpected": true}', "{broken", "[]"):
+            result = tools.execute("get_scene_info", raw)
+            self.assertFalse(result.ok)
+            self.assertFalse(result.plan_refused)
+
 
 class ToolCardLabelTest(unittest.TestCase):
+    def test_empty_or_invalid_delegate_plan_has_a_plain_title_and_keeps_arguments(self):
+        for arguments in ({}, {"workers": "[]"}, {"wave": "bad"}, {"wave": {}},
+                          *({"wave": {"workers": crew}} for crew in ([], None, 5, "bad", [None]))):
+            with self.subTest(arguments=arguments):
+                title, details = agent._describe(llm.ToolCall("1", "delegate", json.dumps(arguments)))
+                self.assertEqual(title, "Helper plan is empty or invalid")
+                self.assertEqual(json.loads(details), arguments)
+        for raw in ("[]", "null", "{broken"):
+            self.assertEqual(agent._describe(llm.ToolCall("1", "delegate", raw)),
+                             ("Helper plan is empty or invalid", raw))
+
     def test_undescribed_tool_uses_registered_title(self):
         for name in ("get_scene_info", "inspect_api"):
             with self.subTest(name=name):

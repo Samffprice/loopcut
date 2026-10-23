@@ -1,10 +1,17 @@
-"""Managed jobs, SSE/retry semantics and result provenance, without running Blender."""
+"""Managed jobs, SSE/retry semantics and result provenance, without running Blender.
 
+Placement uses NumPy; when absent, run those cases with Blender's bundled Python, as paint_tools does.
+"""
+
+import contextlib
 import copy
+import glob
 import hashlib
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -14,6 +21,11 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
+
+try:
+    import numpy  # Load before patch.dict(sys.modules) so each Blender mock does not reload NumPy.
+except ImportError:
+    numpy = None
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts" / "addons_core"))
@@ -513,15 +525,72 @@ class FakeList(list):
 class FakeObject(Block):
     def __init__(self, name, data=None, type="MESH"):
         super().__init__(name, type=type, data=data, parent=None, users_collection=[], selected=False,
-                         matrix_world=FakeMatrix(), bound_box=[(0, 0, 0), (1, 1, 1)])
+                         _matrix=FakeMatrix(), location=FakeVector((0, 0, 0)), scale=(1, 1, 1),
+                         bound_box=[(0, 0, 0), (1, 1, 1)])
+
+    @property
+    def matrix_world(self):
+        local = FakeMatrix(tuple(tuple(self.scale[i] if i == j else self.location[i] if j == 3 else 0
+                                       for j in range(4)) for i in range(3)) + ((0, 0, 0, 1),)) @ self._matrix
+        return self.parent.matrix_world @ local if self.parent is not None else local
+
+    @matrix_world.setter
+    def matrix_world(self, matrix):
+        # Imports reparent their top-level objects to the newly created identity root.
+        assert self.parent is None or self.parent.matrix_world.rows == FakeMatrix().rows
+        self._matrix = matrix
+        self.location, self.scale = FakeVector((0, 0, 0)), (1, 1, 1)
+
+    def evaluated_get(self, graph):
+        bounds = getattr(self, "evaluated_bound_box", self.bound_box)
+        return types.SimpleNamespace(matrix_world=self.matrix_world,
+                                     bound_box=bounds,
+                                     data=types.SimpleNamespace(vertices=FakeVertices(
+                                         getattr(self, "evaluated_vertices", bounds))))
+
+    def visible_get(self, *, view_layer, viewport):
+        return not any(space is viewport for space in getattr(self, "hidden_in", ()))
 
     def select_set(self, value):
         self.selected = value
 
+    def select_get(self):
+        return self.selected
+
+
+class FakeVector(tuple):
+    def __sub__(self, other):
+        return FakeVector(a - b for a, b in zip(self, other))
+
+
+class FakeVertices:
+    """Only bulk coordinate access, like Mesh.vertices.foreach_get."""
+    def __init__(self, coordinates):
+        self.coordinates = coordinates
+
+    def __len__(self):
+        return len(self.coordinates)
+
+    def foreach_get(self, attribute, buffer):
+        assert attribute == "co"
+        buffer[:] = [value for co in self.coordinates for value in co]
+
 
 class FakeMatrix:
+    def __init__(self, rows=((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
     def __matmul__(self, other):
-        return other
+        if isinstance(other, FakeMatrix):
+            return FakeMatrix(tuple(tuple(sum(self.rows[i][k] * other.rows[k][j] for k in range(4))
+                                          for j in range(4)) for i in range(4)))
+        return FakeVector(sum(row[i] * other[i] for i in range(3)) + row[3] for row in self.rows[:3])
 
     def copy(self):
         return self
@@ -561,31 +630,44 @@ class ModelImportTest(unittest.TestCase):
         scene_collection = FakeCollection("Scene Collection")
         self.scene = types.SimpleNamespace(render=types.SimpleNamespace(fps=24, fps_base=1.0),
                                            collection=scene_collection, unit_settings=types.SimpleNamespace(scale_length=1),
-                                           cursor=types.SimpleNamespace(location=(0, 0, 0)))
+                                           cursor=types.SimpleNamespace(location=FakeVector((0, 0, 0))))
         self.window = types.SimpleNamespace(screen="screen")
         self.overrides = []
-        layer_objects = FakeList()
+        layer_objects = FakeList(lambda name, data: FakeObject(name, data, type="EMPTY"))
         layer_objects.active = None
-        self.data = types.SimpleNamespace(objects=FakeList(FakeObject), collections=FakeList(FakeCollection),
+        self.data = types.SimpleNamespace(objects=layer_objects, collections=FakeList(FakeCollection),
                                           images=FakeList(), materials=FakeList(), scenes=[self.scene])
         self.calls = []
         context = types.SimpleNamespace(scene=self.scene, window=None, temp_override=self.temp_override,
                                         window_manager=types.SimpleNamespace(windows=[self.window]),
+                                        evaluated_depsgraph_get=lambda: None,
                                         view_layer=types.SimpleNamespace(update=lambda: None, objects=layer_objects))
         self.ops = types.SimpleNamespace(wm=types.SimpleNamespace(fbx_import=self.importer("wm.fbx_import")),
                                          import_scene=types.SimpleNamespace(fbx=self.importer("import_scene.fbx"),
                                                                             gltf=self.importer("import_scene.gltf")))
         self.bpy = types.SimpleNamespace(data=self.data, context=context, ops=self.ops,
+                                         app=types.SimpleNamespace(background=True),
                                          path=types.SimpleNamespace(abspath=lambda value: value))
-        mathutils = types.SimpleNamespace(Vector=tuple)
+        mathutils = types.SimpleNamespace(Vector=FakeVector)
         modules = patch.dict(sys.modules, {"bpy": self.bpy, "mathutils": mathutils})
         modules.start()
         self.addCleanup(modules.stop)
 
+    @contextlib.contextmanager
     def temp_override(self, **values):
-        import contextlib
         self.overrides.append(values)
-        return contextlib.nullcontext()
+        missing = object()
+        previous = {key: getattr(self.bpy.context, key, missing) for key in values}
+        try:
+            for key, value in values.items():
+                setattr(self.bpy.context, key, value)
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is missing:
+                    delattr(self.bpy.context, key)
+                else:
+                    setattr(self.bpy.context, key, value)
 
     def importer(self, name):
         """An import operator that adds what a real file would: an object, a packed (embedded) image,
@@ -608,6 +690,8 @@ class ModelImportTest(unittest.TestCase):
         return run
 
     def apply(self, suffix, data, kind="assist"):
+        if kind == "gen" and numpy is None:
+            self.skipTest("NumPy placement cases run in NumpyModelImportTest with Blender's Python")
         path = self.folder / f"0000-model{suffix}"
         path.write_bytes(data)
         result = job()
@@ -630,6 +714,250 @@ class ModelImportTest(unittest.TestCase):
         self.assertTrue(mesh.selected and root.selected)
         self.assertIs(self.bpy.context.view_layer.objects.active, root)
         self.assertIn("loopcut_provenance", mesh)
+
+    def import_objects(self, *objects):
+        def gltf(**options):
+            for ob in objects:
+                self.data.objects.append(ob)
+                self.scene.collection.objects.link(ob)
+            return {"FINISHED"}
+        self.ops.import_scene.gltf = gltf
+
+    def box(self, low, high):
+        return [(x, y, z) for x in (low[0], high[0]) for y in (low[1], high[1]) for z in (low[2], high[2])]
+
+    def assert_bounds(self, objects, low, high):
+        points = [ob.matrix_world @ corner for ob in objects
+                  for corner in getattr(ob, "evaluated_vertices", getattr(ob, "evaluated_bound_box", ob.bound_box))]
+        for axis in range(3):
+            self.assertAlmostEqual(min(p[axis] for p in points), low[axis])
+            self.assertAlmostEqual(max(p[axis] for p in points), high[axis])
+
+    def test_offset_generated_mesh_rests_on_ground_and_reports_actual_height(self):
+        mesh = FakeObject("Character")
+        mesh.bound_box = self.box((8, -7, -4), (10, -3, -.4))
+        self.import_objects(mesh)
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assert_bounds([mesh], (-.5, -1, 0), (.5, 1, 1.8))
+        self.assertEqual(mesh.parent.scale, (.5,) * 3)
+        self.assertEqual(summary, "Imported and selected models: Loopcut byok_test model; "
+                                 "placed on the ground at the 3D cursor, 1.8 m tall. "
+                                 "Job byok_test; provenance recorded.")
+
+    def test_rotated_import_uses_world_bounds_and_nonzero_cursor(self):
+        mesh = FakeObject("Rotated")
+        mesh.bound_box = self.box((-1, -2, -3), (1, 2, 3))
+        mesh.matrix_world = FakeMatrix(((1, 0, 0, 12), (0, .6, -.8, -7), (0, .8, .6, 5), (0, 0, 0, 1)))
+        self.scene.cursor.location = FakeVector((7, -4, 3))
+        self.import_objects(mesh)
+        self.apply(".glb", fake_glb(), kind="gen")
+        self.assert_bounds([mesh], (7 - 5 / 18, -5, 3), (7 + 5 / 18, -3, 3 + 17 / 9))
+        for scale in mesh.parent.scale:
+            self.assertAlmostEqual(scale, 5 / 18)
+
+    def test_rotated_tetrahedron_grounds_real_vertices_and_reports_half_metre_height(self):
+        mesh = FakeObject("Tetrahedron")
+        mesh.bound_box = self.box((0, 0, 0), (1, 1, 1))
+        mesh.evaluated_vertices = [(0, 0, 0), (1, 0, 1), (0, 1, 0), (0, 0, .5)]
+        c = 2 ** -.5
+        mesh.matrix_world = FakeMatrix(((c, 0, c, 0), (0, 1, 0, 0), (-c, 0, c, 0), (0, 0, 0, 1)))
+        self.import_objects(mesh)
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assert_bounds([mesh], (-1, -c, 0), (1, c, .5))
+        self.assertIn("0.5 m tall", summary)
+        for scale in mesh.parent.scale:
+            self.assertAlmostEqual(scale, 2 ** .5)  # Keep the existing bounding-box size fit.
+
+    def test_parent_rotated_deformed_vertices_are_centred_on_cursor_xy(self):
+        parent, mesh = FakeObject("Rig", type="ARMATURE"), FakeObject("Deformed tetrahedron")
+        mesh.parent = parent
+        mesh.bound_box = self.box((-20, -20, -20), (20, 20, 20))
+        mesh.data = types.SimpleNamespace(vertices=FakeVertices(mesh.bound_box))
+        mesh.evaluated_bound_box = self.box((0, 0, 0), (1, 1, 1))
+        mesh.evaluated_vertices = [(0, 0, 0), (1, 1, 0), (0, 0, 1), (0, .5, 0)]
+        c = 2 ** -.5
+        parent.matrix_world = FakeMatrix(((c, -c, 0, 12), (c, c, 0, -7), (0, 0, 1, 5), (0, 0, 0, 1)))
+        self.scene.cursor.location = FakeVector((7, -4, 3))
+        self.import_objects(parent, mesh)
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assert_bounds([mesh], (6.75, -5, 3), (7.25, -3, 3 + 2 ** .5))
+        self.assertIn("1.41 m tall", summary)
+        self.assertIs(mesh.parent, parent)
+
+    def test_empty_evaluated_mesh_does_not_claim_ground_placement(self):
+        mesh = FakeObject("Empty result")
+        mesh.evaluated_vertices = []
+        self.import_objects(mesh)
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assertNotIn("placed on the ground", summary)
+        self.assertTrue(mesh.selected and mesh.parent.selected)
+
+    def test_parented_import_fits_all_evaluated_meshes_and_keeps_hierarchy(self):
+        parent, first, second = FakeObject("Rig", type="ARMATURE"), FakeObject("Body"), FakeObject("Boots")
+        parent.matrix_world = FakeMatrix(((0, -1, 0, 50), (2, 0, 0, -20), (0, 0, 1, 7), (0, 0, 0, 1)))
+        first.parent = second.parent = parent
+        first.location, second.location = (10, 0, -5), (10, 3, -4)
+        second.evaluated_bound_box = self.box((0, 0, 0), (2, 1, 3))  # Deformed geometry differs from source.
+        self.scene.cursor.location = FakeVector((4, 8, 2.5))
+        self.import_objects(parent, first, second)
+        self.apply(".glb", fake_glb(), kind="gen")
+        self.assert_bounds([first, second], (3, 7, 2.5), (5, 9, 4.5))
+        self.assertIs(first.parent, parent)
+        self.assertIs(second.parent, parent)
+        self.assertEqual(parent.parent.scale, (.5,) * 3)
+        self.assertEqual(len(self.scene.collection.objects), 0)
+        self.assertTrue(all(ob.users_collection[0] is parent.parent.users_collection[0]
+                            for ob in (parent, first, second)))
+
+    def test_scene_units_keep_two_metre_fit_and_height_in_metres(self):
+        for units in (.01, 0):  # Zero retains the existing fallback to metres.
+            with self.subTest(units=units):
+                mesh = FakeObject("Character")
+                mesh.bound_box = self.box((-1, -2, -1), (1, 2, 2.6))
+                self.scene.unit_settings.scale_length = units
+                self.scene.cursor.location = FakeVector((10, 20, 30))
+                self.import_objects(mesh)
+                summary = self.apply(".glb", fake_glb(), kind="gen")
+                unit = units or 1
+                self.assert_bounds([mesh], (10 - .5 / unit, 20 - 1 / unit, 30),
+                                   (10 + .5 / unit, 20 + 1 / unit, 30 + 1.8 / unit))
+                self.assertIn("1.8 m tall", summary)
+
+    def test_assist_mesh_keeps_source_size_and_placement(self):
+        mesh = FakeObject("Retopologized")
+        mesh.location = (10, -20, 30)
+        self.import_objects(mesh)
+        summary = self.apply(".glb", fake_glb())
+        self.assert_bounds([mesh], (10, -20, 30), (11, -19, 31))
+        self.assertNotIn("placed on the ground", summary)
+
+    def viewport(self):
+        self.bpy.app.background = False
+        space = types.SimpleNamespace(lock_camera=True)
+        region = types.SimpleNamespace(type="WINDOW")
+        area = types.SimpleNamespace(type="VIEW_3D", regions=[region], spaces=types.SimpleNamespace(active=space))
+        self.window.screen = types.SimpleNamespace(areas=[area])
+        self.window.scene, self.window.view_layer = self.scene, self.bpy.context.view_layer
+        self.ops.view3d = types.SimpleNamespace(view_selected=unittest.mock.Mock(return_value={"FINISHED"}))
+        self.ops.view3d.view_selected.poll.return_value = True
+        return space, area, region
+
+    def test_framing_tries_second_view_when_first_hides_imported_geometry(self):
+        hidden_space, hidden_area, _ = self.viewport()
+        visible_space, visible_area, _ = self.viewport()
+        self.window.screen.areas = [hidden_area, visible_area]
+        mesh = FakeObject("Character")
+        mesh.hidden_in = [hidden_space]
+        self.import_objects(mesh)
+        framed = []
+        def frame(*args, **kwargs):
+            if self.bpy.context.area is visible_area:
+                framed.append(visible_area)
+            return {"FINISHED"}  # Blender also returns FINISHED when everything is hidden.
+        self.ops.view3d.view_selected.side_effect = frame
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assertEqual(framed, [visible_area])
+        self.ops.view3d.view_selected.assert_called_once()
+        self.assertTrue(hidden_space.lock_camera and visible_space.lock_camera)
+        self.assertIn("placed on the ground", summary)
+
+    def test_framing_polls_inside_each_override_and_continues_after_failures(self):
+        for failure in ("poll_false", "poll_error", "operator_error", "cancelled"):
+            with self.subTest(failure=failure):
+                first_space, first_area, _ = self.viewport()
+                second_space, second_area, second_region = self.viewport()
+                self.window.screen.areas = [first_area, second_area]
+                mesh = FakeObject("Character")
+                self.import_objects(mesh)
+                polled, framed = [], []
+                def poll():
+                    area = self.bpy.context.area
+                    self.assertIs(self.bpy.context.window, self.window)
+                    self.assertIs(self.bpy.context.region, area.regions[0])
+                    polled.append(area)
+                    if area is first_area:
+                        if failure == "poll_error":
+                            raise RuntimeError("poll context disappeared")
+                        return failure != "poll_false"
+                    return True
+                def frame(*args, **kwargs):
+                    area = self.bpy.context.area
+                    self.assertFalse(area.spaces.active.lock_camera)
+                    if area is first_area:
+                        if failure == "operator_error":
+                            raise RuntimeError("viewport closed")
+                        return {"CANCELLED"}
+                    framed.append(area)
+                    return {"FINISHED"}
+                self.ops.view3d.view_selected.poll.side_effect = poll
+                self.ops.view3d.view_selected.side_effect = frame
+                summary = self.apply(".glb", fake_glb(), kind="gen")
+                self.assertEqual(polled, [first_area, second_area])
+                self.assertEqual(framed, [second_area])
+                self.assertEqual(self.ops.view3d.view_selected.call_count,
+                                 1 if failure.startswith("poll_") else 2)
+                self.assertIs(self.overrides[-1]["region"], second_region)
+                self.assertTrue(first_space.lock_camera and second_space.lock_camera)
+                self.assertTrue(mesh.selected and mesh.parent.selected)
+                self.assertIn("placed on the ground", summary)
+
+    def test_frames_only_imported_meshes_without_camera_lock_then_restores_selection(self):
+        space, area, region = self.viewport()
+        cube = FakeObject("Cube")
+        cube.selected = True
+        self.data.objects.append(cube)
+        parent, mesh = FakeObject("Offset parent", type="EMPTY"), FakeObject("Character")
+        mesh.parent = parent
+        self.import_objects(parent, mesh)
+        observed = []
+        def frame(*args, **kwargs):
+            observed.append(([ob.name for ob in self.data.objects if ob.selected], space.lock_camera))
+            return {"FINISHED"}
+        self.ops.view3d.view_selected.side_effect = frame
+        self.apply(".glb", fake_glb(), kind="gen")
+        self.ops.view3d.view_selected.assert_called_once_with("EXEC_DEFAULT", use_all_regions=False)
+        self.assertEqual(observed, [(["Character"], False)])
+        self.assertEqual(self.overrides, [{"window": self.window, "screen": self.window.screen,
+                                          "area": area, "region": region}])
+        self.assertTrue(space.lock_camera)
+        self.assertTrue(all(ob.selected for ob in (parent, mesh, parent.parent)))
+        self.assertIs(self.bpy.context.view_layer.objects.active, parent.parent)
+        self.assertEqual(cube.matrix_world.rows, FakeMatrix().rows)
+        self.assertFalse(cube.selected)
+
+    def test_background_skips_framing_even_with_a_saved_viewport(self):
+        self.viewport()
+        self.bpy.app.background = True
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assertIn("placed on the ground", summary)
+        self.ops.view3d.view_selected.assert_not_called()
+        self.assertEqual(self.overrides, [])
+
+    def test_no_viewport_or_wrong_scene_or_layer_skips_framing(self):
+        for missing in ("windows", "area", "region", "scene", "view_layer"):
+            with self.subTest(missing=missing):
+                _, area, _ = self.viewport()
+                self.bpy.context.window_manager.windows = [self.window]
+                if missing == "windows":
+                    self.bpy.context.window_manager.windows = []
+                elif missing == "area":
+                    area.type = "CONSOLE"
+                elif missing == "region":
+                    area.regions = []
+                else:
+                    setattr(self.window, missing, object())
+                self.apply(".glb", fake_glb(), kind="gen")
+                self.ops.view3d.view_selected.assert_not_called()
+                self.assertEqual(self.overrides, [])
+
+    def test_framing_failure_does_not_fail_import_and_restores_selection_and_lock(self):
+        space, _, _ = self.viewport()
+        self.ops.view3d.view_selected.side_effect = RuntimeError("viewport closed")
+        summary = self.apply(".glb", fake_glb(), kind="gen")
+        self.assertIn("placed on the ground", summary)
+        self.assertTrue(space.lock_camera)
+        self.assertTrue(all(ob.selected for ob in self.data.objects))
+        self.assertTrue(all("loopcut_provenance" in ob for ob in self.data.objects))
 
     def test_fbx_uses_the_native_importer_with_a_borrowed_window(self):
         summary = self.apply(".fbx", self.FBX)
@@ -780,6 +1108,21 @@ class ModelImportTest(unittest.TestCase):
                                     client=Transport(final=final).client())
         self.assertEqual(Path(result["outputs"][0]["path"]).suffix, ".fbx")
         self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+
+
+@unittest.skipIf(numpy is not None, "NumPy is available: ModelImportTest ran in this Python")
+class NumpyModelImportTest(unittest.TestCase):
+    def test_model_import_with_bundled_numpy(self):
+        blender = os.environ.get("LOOPCUT_BLENDER") or str(REPO.parent / "tools/Blender.app/Contents/MacOS/Blender")
+        root = Path(blender).resolve().parent
+        found = sorted(glob.glob(str(root.parent / "Resources" / "*" / "python" / "bin" / "python3*")))
+        found += sorted(glob.glob(str(root / "*" / "python" / "bin" / "python3*")))
+        if not found:
+            self.skipTest("no NumPy or Blender Python found (set LOOPCUT_BLENDER)")
+        result = subprocess.run([found[0], "-B", "-m", "unittest", "-q", "test_cloud_jobs.ModelImportTest"],
+                                cwd=Path(__file__).parent, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("skipped", result.stderr)
 
 
 class MockJobsTest(unittest.TestCase):

@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from copy import deepcopy
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,8 +33,60 @@ def hit(display, id):
     return next(h for h in display["hits"] if h["id"] == id)
 
 
+class VerificationStyleTest(unittest.TestCase):
+    def test_model_text_cannot_get_runtime_verification_style_even_while_streaming(self):
+        for streaming in (True, False):
+            for text in ("Verified by Loopcut on this scene: 1 of 1 checks.",
+                         "**Verified by Loopcut on this scene: 1 of 1 checks.**",
+                         '```json\n{"verification": "Verified by Loopcut"}\n```'):
+                with self.subTest(streaming=streaming, text=text):
+                    session = state.new_session()
+                    session["items"] = [{"kind": "assistant", "text": text, "streaming": streaming}]
+                    drawn = build(session)
+                    self.assertFalse(any(".verification" in p["id"] for p in drawn["prims"]))
+                    self.assertTrue(any("Verified by Loopcut" in p.get("text", "") for p in drawn["prims"]))
+
+    def test_runtime_metadata_styles_only_the_appended_block_and_survives_save(self):
+        import os
+        import tempfile
+        from loopcut import conversations, llm, orchestrator
+        model = "Verified by Loopcut on this scene: 99 of 99 checks."
+        block = "Verified by Loopcut on this scene: 1 of 2 checks.\n- not met: contact"
+        session = state.new_session()
+        session["items"] = [{"kind": "assistant", "text": model, "streaming": False}]
+        session["messages"] = [{"role": "assistant", "content": model}]
+        orchestrator._append_to_reply(session, llm.Completion(text=model), block)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LOOPCUT_DATA_DIR": tmp}), \
+                patch.object(conversations, "rename_merged_tools"):
+            conversations.save(session)
+            loaded = conversations.load(session["id"])
+        self.assertEqual(loaded["items"][0]["verification"], block)
+        for width in (240, 420):
+            with self.subTest(width=width):
+                drawn = layout.build(loaded, width, 900, 1, measure)
+                prose = [p for p in drawn["prims"] if p["id"].startswith("item0.p")]
+                verified = [p for p in drawn["prims"] if p["id"].startswith("item0.verification.l")]
+                self.assertEqual(" ".join(p["text"] for p in prose), model)
+                self.assertTrue(all(p["color"] == T.TEXT for p in prose))
+                self.assertEqual(" ".join(p["text"] for p in verified), block.replace("\n", " "))
+                self.assertTrue(all(p["color"] == T.TEXT_MUTED for p in verified))
+                self.assertIn("item0.verification.rule", ids(drawn, "prims"))
+                for line in verified:
+                    self.assertLessEqual(line["x"] + measure("ui", line["size"], line["text"]), width - T.PAD)
+
+    def test_no_step_notice_is_plain_and_last(self):
+        from loopcut import completion_guard
+        session = state.new_session()
+        session["items"] = [{"kind": "assistant", "text": "Done.", "streaming": False},
+                            state.item_notice(completion_guard.NOTICE)]
+        drawn = build(session)
+        notice = [p for p in drawn["prims"] if p["id"].startswith("item1.") and p.get("text")]
+        self.assertEqual(" ".join(p["text"] for p in notice), completion_guard.NOTICE)
+        self.assertFalse(any(".verification" in p["id"] for p in drawn["prims"]))
+
+
 class LimitRecoveryTest(unittest.TestCase):
-    def test_expired_account_windows_disappear_from_footer_ring_and_tooltip(self):
+    def test_expired_account_windows_disappear_from_notice_ring_and_tooltip(self):
         from datetime import datetime
         reset = "2099-10-21T18:00:00Z"
         now = datetime.fromisoformat(reset).timestamp()
@@ -42,14 +95,14 @@ class LimitRecoveryTest(unittest.TestCase):
                 with self.subTest(window=window, offset=offset):
                     account = {window: {"used": 0.84, "resets_at": reset}}
                     before = build(account=account, now=now - 1, credits="100 credits")
-                    self.assertIn("84%", hit(before, "input.credits")["tip"])
+                    self.assertIn("84%", prim(before, "input.usage.l0")["text"])
                     after = build(account=account, now=now + offset, credits="100 credits")
-                    self.assertNotIn("Chat:", hit(after, "input.credits")["tip"])
+                    self.assertFalse(any(p["id"].startswith("input.usage") for p in after["prims"]))
                     self.assertNotIn("chat allowance", hit(after, "input.rings")["tip"])
                     self.assertEqual([p["id"] for p in after["prims"] if p["t"] == "ring"], ["input.ring.context"])
                     account[window]["resets_at"] = "2099-10-22T18:00:00Z"
                     fresh = build(account=account, now=now + offset, credits="100 credits")
-                    self.assertIn("84%", hit(fresh, "input.credits")["tip"])
+                    self.assertIn("84%", prim(fresh, "input.usage.l0")["text"])
 
     def test_refused_window_ring_and_tooltip_are_exhausted_without_mutating_usage(self):
         account = {"plan": "free", "session": {"used": 0.82, "used_with_reservations": 0.92},
@@ -183,7 +236,7 @@ class LimitRecoveryTest(unittest.TestCase):
         self.assertIn("Use my own API key", text)
         self.assertIn("Sign in with ChatGPT", text)
         self.assertNotIn("Try another route", text)
-        self.assertIn("Your credits pay for cloud tools and do not add chat time.", text)
+        self.assertIn("credits buy cloud tools, not more chat.", text)
 
     def test_limit_card_formats_its_reset_in_local_time_too(self):
         session = state.new_session()
@@ -837,56 +890,157 @@ class FooterTest(unittest.TestCase):
             display = build(account={"session": window, "week": window})
             self.assertEqual(len([p for p in display["prims"] if p["t"] == "ring"]), 1)
 
-    def test_high_chat_usage_is_visible_beside_credits_with_room_at_narrow_widths(self):
-        for width in (240, 320, 420):
-            for scale in (1, 2):
-                for plan in ("free", "pro", "max"):
-                    with self.subTest(width=width, scale=scale, plan=plan):
-                        session = state.new_session()
-                        session["input"] = "Keep working"
-                        ui = {"credits": "100 credits ($1.00)", "provider": "LOOPCUT",
-                              "account": {"plan": plan, "session": {"used": 0.3, "used_with_reservations": 0.74}}}
-                        drawn = layout.build(session, width * scale, 600 * scale, scale, measure, ui=ui)
-                        lines = [p for p in drawn["prims"] if p["id"].startswith("input.credits")]
-                        self.assertEqual(lines[0]["text"], "100 credits ($1.00)")
-                        self.assertIn("Chat: 74% of this 5-hour window used", " ".join(p["text"] for p in lines))
-                        for line in lines:
-                            self.assertLessEqual(line["x"] + measure("ui", line["size"], line["text"]),
-                                                 (width - T.PAD - T.CARD_PAD) * scale)
-                        model = prim(drawn, "input.model")
-                        self.assertLess(lines[-1]["y"] + 16 * scale, model["y"])
-                        input_lines = [p for p in drawn["prims"] if p["id"] == "input.l0"]
-                        self.assertTrue(input_lines)
-                        self.assertLess(max(p["y"] + 16 * scale for p in input_lines), lines[0]["y"])
+    def assert_disjoint(self, a, b):
+        def width(rect):
+            if "w" in rect:
+                return rect["w"]
+            if "width" in rect:
+                return rect["width"]
+            return measure(rect["font"], rect["size"], rect["text"])
+        self.assertFalse(
+            a["x"] < b["x"] + width(b) and b["x"] < a["x"] + width(a)
+            and a["y"] < b["y"] + b.get("h", b.get("height"))
+            and b["y"] < a["y"] + a.get("h", a.get("height")), (a, b))
 
-    def test_chat_footer_threshold_fuller_window_and_provider_filtering(self):
-        for used, expected in ((0.69, ""), (0.7, "Chat: 70% of this 5-hour window used"),
-                               (1, "Chat: 100% of this 5-hour window used")):
+    def usage_text(self, drawn):
+        return " ".join(p["text"] for p in drawn["prims"] if p["id"].startswith("input.usage."))
+
+    def test_usage_notice_footer_and_typing_targets_are_separate_and_stable(self):
+        sizes = ((240, 400), (240, 600), (320, 600), (420, 400), (420, 600))
+        messages = ("", "Keep working", "\n".join("Keep working" for _ in range(12)))
+        for (width, height), scale, busy, message in product(sizes, (1, 1.5, 2), (False, True), messages):
+            baseline = None
+            for used in (0, 0.71, 1):
+                with self.subTest(width=width, height=height, scale=scale, busy=busy, message=message, used=used):
+                    session = state.new_session()
+                    session.update(input=message, cursor=len(message), focused=True, busy=busy)
+                    ui = {"credits": "100 credits ($1.00)", "today": "Today: 0 credits",
+                          "selection": ["MW_Base"], "account": {"session": {"used": used}},
+                          "hover": "input.credits"}
+                    drawn = layout.build(session, round(width * scale), round(height * scale), scale, measure, ui=ui)
+                    box, focus = drawn["input"], hit(drawn, "input.card")
+                    footer = [p for p in drawn["prims"] if p["id"].startswith("input.credits")]
+                    notice = [p for p in drawn["prims"] if p["id"].startswith("input.usage.")]
+                    self.assertEqual(len(footer), 3 if width == 240 else 2)
+                    self.assertEqual(footer[0]["text"], "100 credits ($1.00)")
+                    self.assertEqual(hit(drawn, "input.credits")["tip"], "")
+                    self.assertNotIn("tooltip.bg", ids(drawn, "prims"))
+                    for p in footer + notice + [hit(drawn, "input.credits")]:
+                        self.assert_disjoint(box, p)
+                        self.assert_disjoint(focus, p)
+                    for p in footer + notice:
+                        self.assertLessEqual(right(p), (width - T.PAD) * scale)
+                    for p in notice:
+                        self.assertLess(p["y"] + p["h"], prim(drawn, "input.card")["y"])
+                    for a, b in zip(footer, footer[1:]):
+                        self.assert_disjoint(a, b)
+                    self.assertLess(footer[-1]["y"] + footer[-1]["h"], prim(drawn, "input.model")["y"])
+                    # Both occupied text and blank typing rows always focus, including at the edges.
+                    for dx, dy in product((0, box["width"] / 2, box["width"]),
+                                          (0, box["height"] / 2, box["height"])):
+                        self.assertEqual(layout.hit_test(drawn, box["x"] + dx, box["y"] + dy), ("focus", None))
+                    geometry = (box, focus, footer, hit(drawn, "input.credits"), prim(drawn, "input.card"))
+                    if baseline is None:
+                        baseline = geometry
+                    else:
+                        self.assertEqual(geometry, baseline, "usage must not move typing rows or footer links")
+                    text = " ".join(p.get("text", "") for p in drawn["prims"])
+                    usage = f"Chat {round(used * 100)}% used (5-hour window)"
+                    self.assertEqual(text.count(usage), int(used >= 0.7))
+                    self.assertEqual(text.count("AI use includes helpers, not time"), int(used >= 0.7))
+                    self.assertEqual(text.count("credits buy cloud tools, not more chat."), int(used >= 0.7))
+
+    def test_only_the_balance_label_opens_the_account(self):
+        drawn = build(credits="100 credits ($1.00)", today="Today: 0 credits")
+        balance, link = prim(drawn, "input.credits"), hit(drawn, "input.credits")
+        self.assertEqual((link["x"], link["y"], link["h"]), (balance["x"], balance["y"], balance["h"]))
+        self.assertAlmostEqual(link["w"], measure("ui", balance["size"], balance["text"]), delta=0.5)
+        self.assertEqual(layout.hit_test(drawn, link["x"] + 1, link["y"] + 1), ("open_account", None))
+        spend = prim(drawn, "input.credits1")
+        self.assertIsNone(layout.hit_test(drawn, spend["x"] + 1, spend["y"] + 1))
+        self.assertIsNone(layout.hit_test(drawn, link["x"] + link["w"] + 2, link["y"] + 1))
+
+    def test_all_hover_tooltips_stay_outside_the_composer(self):
+        for (width, height), scale, used, busy in product(((240, 400), (420, 600)), (1, 2), (0, 0.71, 1), (False, True)):
+            with self.subTest(width=width, height=height, scale=scale, used=used, busy=busy):
+                session = state.new_session()
+                session.update(input="Keep working", cursor=12, focused=True, busy=busy)
+                session["usage"] = {"context": 49_700, "input": 2_470_200, "output": 49_700}
+                ui = {"credits": "100 credits ($1.00)", "today": "Today: 0 credits",
+                      "account": {"session": {"used": used}, "week": {"used": 0.3}},
+                      "coming_soon": [idea("image_generate")]}
+                base = layout.build(session, width * scale, height * scale, scale, measure, ui=ui)
+                for target in base["hits"]:
+                    drawn = layout.build(session, width * scale, height * scale, scale, measure,
+                                         ui={**ui, "hover": target["id"]})
+                    tooltips = [p for p in drawn["prims"] if p["id"] == "tooltip.bg"]
+                    for tip in tooltips:
+                        self.assert_disjoint(drawn["input"], tip)
+                        self.assert_disjoint(prim(drawn, "input.zone"), tip)
+                        self.assertGreaterEqual(tip["x"], 0)
+                        self.assertGreaterEqual(tip["y"], 0)
+                        self.assertLessEqual(tip["x"] + tip["w"], width * scale)
+                        self.assertLessEqual(tip["y"] + tip["h"], height * scale)
+                    self.assertEqual(self.usage_text(drawn), self.usage_text(base))
+                    self.assertFalse(any("credits buy cloud tools" in p.get("text", "")
+                                         for p in drawn["prims"] if p["id"].startswith("tooltip.")))
+
+    def test_tooltip_is_omitted_when_it_cannot_fit_above_typing(self):
+        session = state.new_session()
+        session["input"] = "\n".join("Keep working" for _ in range(8))
+        drawn = layout.build(session, 240, 400, 1, measure, ui={
+            "credits": "100 credits", "today": "Today: 0 credits", "hover": "input.rings",
+            "account": {"session": {"used": 0.71}, "week": {"used": 0.3}}})
+        self.assertNotIn("tooltip.bg", ids(drawn, "prims"))
+
+    def test_chat_notice_threshold_fuller_window_and_provider_filtering(self):
+        for used, expected in ((0.69, ""), (0.7, "Chat 70% used (5-hour window)"),
+                               (1, "Chat 100% used (5-hour window)")):
             with self.subTest(used=used):
                 drawn = build(credits="100 credits", account={"session": {"used": used}})
-                text = " ".join(p["text"] for p in drawn["prims"] if p["id"].startswith("input.credits"))
+                text = self.usage_text(drawn)
                 if expected:
-                    self.assertIn(expected, text)
+                    self.assertTrue(text.startswith(expected))
+                    self.assertIn("AI use includes helpers, not time", text)
                 else:
-                    self.assertEqual(text, "100 credits This chat: 0 credits")
+                    self.assertEqual(text, "")
                     self.assertEqual(prim(drawn, "input.zone")["y"], prim(build(credits="100 credits"), "input.zone")["y"])
         account = {"session": {"used": 0.74}, "week": {"used": 0.91}}
-        self.assertIn("Chat: 91% of this week used", hit(build(account=account), "input.credits")["tip"])
+        self.assertIn("Chat 91% used (week)", self.usage_text(build(account=account)))
         for provider in ("OPENAI", "CUSTOM", "CHATGPT"):
             with self.subTest(provider=provider):
                 drawn = build(account=account, provider=provider, credits="100 credits", chatgpt_plan=True)
-                self.assertNotIn("Chat:", hit(drawn, "input.credits")["tip"])
+                self.assertEqual(self.usage_text(drawn), "")
+                self.assertEqual(hit(drawn, "input.credits")["tip"], "")
                 self.assertNotIn("chat allowance", hit(drawn, "input.rings")["tip"])
                 self.assertEqual([p["id"] for p in drawn["prims"] if p["t"] == "ring"], ["input.ring.context"])
+        for plan in ("free", "pro", "max"):
+            drawn = build(account={"plan": plan, "session": {"used": 0.3, "used_with_reservations": 0.74}})
+            self.assertIn("Chat 74% used (5-hour window)", self.usage_text(drawn))
 
-    def test_chat_footer_agrees_with_refusal_override_and_reset(self):
+    def test_chat_notice_agrees_with_refusal_override_and_reset(self):
         from datetime import datetime
         account = {"session": {"used": 0.3}}
         reset = "2099-10-21T18:00:00Z"
         notice = {"item": state.item_limit("Used up.", "session_limit", "free", reset, None)}
         now = datetime.fromisoformat(reset).timestamp()
-        self.assertEqual(layout.usage_note(account, notice, now - 1), ("Chat: 100% of this 5-hour window used", 1))
+        self.assertEqual(layout.usage_note(account, notice, now - 1), ("Chat 100% used (5-hour window)", 1))
         self.assertEqual(layout.usage_note(account, notice, now), ("", 0.3))
+        for width, height, busy in product((240, 420), (400, 600), (False, True)):
+            with self.subTest(width=width, height=height, busy=busy):
+                session = state.new_session()
+                session.update(input="Keep working", busy=busy)
+                drawn = layout.build(session, width, height, 1, measure, ui={
+                    "account": account, "allowance_notice": notice, "now": now - 1,
+                    "credits": "100 credits", "credit_balance": 100})
+                text = self.usage_text(drawn)
+                self.assertEqual(text.count("Chat 100% used (5-hour window)"), 1)
+                self.assertEqual(text.count("credits buy cloud tools, not more chat."), 1)
+                self.assertEqual(any(p["id"].startswith("input.limit.") for p in drawn["prims"]), not busy)
+                for p in drawn["prims"] + drawn["hits"]:
+                    if p["id"].startswith(("input.usage.", "input.limit.")):
+                        self.assert_disjoint(drawn["input"], p)
+                        self.assert_disjoint(hit(drawn, "input.card"), p)
 
     def test_without_an_account_there_is_one_ring(self):
         rings = [p for p in build()["prims"] if p["t"] == "ring"]
@@ -1029,6 +1183,20 @@ class QueuedTest(unittest.TestCase):
 
 
 class DelegateDetailsTest(unittest.TestCase):
+    def test_named_repair_matches_each_helper_without_reusing_a_start(self):
+        refused = dict(state.item_tool("delegate", "Start helpers", ""), status="failed",
+                       plan_repair="needed", plan_turn="turn1", plan_unidentified=True,
+                       plan_names=[["Chair", ""], ["Chair", "modeling"]])
+        retry = dict(state.item_tool("delegate", "Start helpers", ""), status="done",
+                     plan_turn="turn1", plan_started=True)
+        for names, expected in (([["Chair", "modeling"]], "needed"),
+                                ([["Chair", "modeling"], ["Lamp", "materials"]], "needed"),
+                                ([["Chair", "modeling"], ["Chair", "materials"]], "resolved"),
+                                ([["Chair", "materials"], ["Chair", "modeling"]], "resolved")):
+            with self.subTest(names=names):
+                retry["plan_names"] = names
+                self.assertEqual(layout._plan_repairs([refused, retry]), {0: expected})
+
     def test_legacy_dry_run_keeps_retry_wording_without_claiming_startup(self):
         refused = dict(state.item_tool("delegate", "Check a helper plan", ""), status="failed",
                        plan_repair="needed", plan_turn="turn1", plan_workers=[["a", "modeling"]])
@@ -1709,6 +1877,53 @@ def chat(item, busy=False):
 
 
 class WaveCardTest(unittest.TestCase):
+    def test_delivery_outcomes_are_visible_before_the_workers_own_summary(self):
+        cases = [
+            (worker("a", "stopped", summary="I will add more parts."),
+             "stopped before finishing (nothing merged)"),
+            (worker("a", "cancelled"), "stopped by the user before finishing (nothing merged)"),
+            (worker("a", "cancelled", note="not started: budget used"),
+             "stopped by the user before finishing (nothing merged)"),
+            (worker("a", "stopped", note="stopped by the user"),
+             "stopped by the user before finishing (nothing merged)"),
+            (worker("a", "stopped", note="not started: the job's $0.40 is used"),
+             "stopped by the budget before finishing (nothing merged)"),
+            (worker("a", "stopped", note="it ran out of time"),
+             "timed out before finishing (nothing merged)"),
+            (worker("a", "stopped", note="its 1800 s ran out"),
+             "timed out before finishing (nothing merged)"),
+            (worker("a", "failed"), "failed (nothing merged)"),
+            (worker("a", "failed", unavailable=True), "unavailable (nothing merged)"),
+            (worker("a", "done", merge_error="rolled back", merge_unchanged=True),
+             "failed (nothing merged): rolled back"),
+            (worker("a", "done", merge_error="undo unavailable"),
+             "merge failed; what reached the scene is unconfirmed: undo unavailable"),
+            (worker("a", "done", quarantined=["A_Light"]),
+             "held back (quarantined, waiting for the user's accept): A_Light"),
+            (worker("a", "done", conflicts=["scene.camera"]), "conflicted (nothing merged): scene.camera"),
+            (worker("a", "done", merged=True, merged_changes=["+ A_Part"], merge_error="A_Camera did not arrive"),
+             "partly merged: + A_Part; missing: A_Camera did not arrive"),
+            (worker("a", "done", merged=True, merged_changes=["+ A_Part", "~ A_Mat"]),
+             "completed and merged"),
+            (worker("a", "partial", merged=True), "partial and merged"),
+        ]
+        for row, outcome in cases:
+            for width in (260, 420):
+                with self.subTest(row=row, width=width):
+                    display = layout.build(chat(wave(row)), width, 2000, 1.0, measure, "fast", None, {})
+                    parts = [p for p in display["prims"] if p["id"].startswith("item0.wave.row0.outcome.l")]
+                    self.assertEqual(" ".join(p["text"] for p in parts), outcome)
+                    card = prim(display, "item0.wave.card")
+                    self.assertLess(parts[-1]["y"], card["y"] + card["h"])
+                    if row.get("merge_error"):
+                        self.assertEqual(prim(display, "item0.wave.row0.glyph")["color"], T.ERROR)
+                    if row.get("summary"):
+                        self.assertLess(parts[-1]["y"], prim(display, "item0.wave.row0.summary.l0")["y"])
+                    if row.get("merged_changes"):
+                        changes = [p["text"] for p in display["prims"]
+                                   if p["id"].startswith("item0.wave.row0.merged_changes.l")]
+                        self.assertEqual(" ".join(changes), "Merged: " + "; ".join(row["merged_changes"]))
+
     def test_live_elapsed_time_latest_action_and_singular_step(self):
         row = worker("a", "working", started_at=100, steps=1, summary="Adjust the shape")
         session = chat(wave(row), busy=True)
@@ -1760,6 +1975,26 @@ class WaveCardTest(unittest.TestCase):
     def test_old_saved_rows_display_only_the_steps_taken(self):
         display = build(chat(wave(worker("old", "partial", steps=30, cap=30))))
         self.assertEqual(texts(display)["item0.wave.row0.detail"], "modeling · 30 steps")
+
+    def test_first_reply_wait_is_visible_at_narrow_widths_then_becomes_steps(self):
+        row = worker("waiting", "working", steps=0, timing={"first_request": 0, "first_reply": None})
+        for width in (260, 420):
+            display = layout.build(chat(wave(row), busy=True), width, 2000, 1.0, measure, "fast", None, {})
+            self.assertNotIn("0 steps", texts(display)["item0.wave.row0.detail"])
+            waiting = [p["text"] for p in display["prims"] if p["id"].startswith("item0.wave.row0.waiting.l")]
+            self.assertEqual(" ".join(waiting), "Waiting for the model's first reply…")
+        row.update(steps=1, timing={"first_request": 0, "first_reply": 180})
+        display = build(chat(wave(row), busy=True))
+        self.assertEqual(texts(display)["item0.wave.row0.detail"], "modeling · 1 step")
+        self.assertFalse(any(".waiting." in p["id"] for p in display["prims"]))
+
+    def test_boot_queued_and_stopped_rows_do_not_claim_a_request_is_in_flight(self):
+        for status in ("queued", "starting", "stopped", "cancelled", "done", "failed"):
+            row = worker("x", status, steps=0, timing={"first_request": 0, "first_reply": None})
+            self.assertFalse(layout._waiting_first_reply(row))
+        self.assertFalse(layout._waiting_first_reply(worker("x", "working", steps=0)))
+        self.assertFalse(layout._waiting_first_reply(worker("x", "working", steps=0,
+                                                           timing={"first_request": None, "first_reply": None})))
 
     def test_running_rows_can_be_cancelled_one_at_a_time(self):
         item = wave(worker("armchair", "done"), worker("lamp", "working"), worker("rug", "queued"),

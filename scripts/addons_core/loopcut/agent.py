@@ -9,7 +9,8 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from copy import deepcopy
 from typing import Any, Callable
 
-from . import allowance, checkpoints, config, context, conversations, image_budget, llm, repeats, spending, state, videoref
+from . import (allowance, checkpoints, completion_guard, config, context, conversations, image_budget,
+               llm, repeats, spending, state, videoref)
 from .ui.markdown import finish_reply
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
@@ -201,6 +202,12 @@ class Turn:
         # Steps whose reply called tools: an empty reply after work ends the turn as before; one before any
         # work is an error the user can retry (_request).
         self.tool_steps = 0
+        # Actual dispatches, including Try it's first call and delegate's helper waves. tool_steps
+        # also counts rejected/skipped calls, so it cannot establish that anything ran.
+        self.executed_tools = 0
+        self.unrun_claim = False  # One record correction per user turn, including resume.
+        self.contact_checks: list = []  # Measurements and evaluated geometry fingerprints, only this turn.
+        self.contact_bounced = False   # At most one correction for a pass invalidated by later edits.
         # The turn's usage event (telemetry.py): when it started, what ran it, the first chat item it added,
         # and the machine code of the error that ended it.
         self.started: float | None = None
@@ -709,9 +716,10 @@ def _describe(call: llm.ToolCall, schemas: Callable | None = None) -> tuple[str,
     try:
         arguments = json.loads(call.arguments) if call.arguments.strip() else {}
     except ValueError:
-        return _tool_title(call.name, schemas), call.arguments
+        arguments = None
     if not isinstance(arguments, dict):
-        return _tool_title(call.name, schemas), call.arguments
+        title = "Helper plan is empty or invalid" if call.name == "delegate" else _tool_title(call.name, schemas)
+        return title, call.arguments
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
@@ -747,13 +755,37 @@ def _plan_attempt(card: dict, call: llm.ToolCall, session: dict, turn_id: str) -
         return
     card["plan_turn"] = turn_id
     card["plan_dry_run"] = orchestrator.only_reads(call.name, arguments)
-    wave = arguments.get("wave")
-    crew = wave.get("workers") if isinstance(wave, dict) else None
+    # Identity only, not argument repair: malformed calls still go through tools.execute unchanged.
+    # Some providers put workers at the top level or encode wave/workers as JSON strings.
+    def decoded(value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return None
+        return value
+
+    wave = decoded(arguments.get("wave"))
+    crew = decoded(wave.get("workers") if isinstance(wave, dict) else arguments.get("workers"))
     if isinstance(crew, list) and crew and all(
             isinstance(w, dict) and isinstance(w.get("id"), str) and w["id"].strip() for w in crew):
         live = {"threads": orchestrator.threads_of(session),
                 "busy": waves.busy(getattr(session.get("turn"), "job", None))}
         card["plan_workers"] = [[w["id"], orchestrator.effective_role(w, live)] for w in crew]
+    elif not isinstance(crew, list) or not any(
+            isinstance(w, dict) and isinstance(w.get("id"), str) and w["id"].strip() for w in crew):
+        # No worker ids: the view must match any supplied names, or (with no usable names)
+        # require the very next delegate call in this turn to start.
+        card["plan_unidentified"] = True
+    if isinstance(crew, list):
+        roles = dict(card.get("plan_workers") or [])
+        card["plan_names"] = [[value.strip() if isinstance(value, str) else "" for value in
+                               (w.get("deliverable"), roles.get(w["id"], w.get("role"))
+                                if isinstance(w.get("id"), str) else w.get("role"))]
+                              for w in crew if isinstance(w, dict)]
+        for pair in card["plan_names"]:
+            if pair[1]:
+                pair[1] = orchestrator.normalise_role(pair[1])
 
 
 def _wants_capture(arguments: str) -> bool:
@@ -1561,8 +1593,19 @@ def _wrap_up(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
 def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec, prompt: str = "") -> None:
     """The turn ends short of finishing: the wrap-up, then the spec's last word (it cannot bounce)."""
     completion = _wrap_up(session, turn, cfg, spec, prompt)
-    if spec.on_final and not turn.cancel.is_set():
-        spec.on_final(session, turn, completion)
+    _final_reply(session, turn, completion, spec)
+
+
+def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
+    """After the existing finish gate (including late merges), validate this turn's contact evidence."""
+    if turn.cancel.is_set():
+        return None
+    bounce = spec.on_final(session, turn, completion) if spec.on_final else None
+    if bounce and turn.outcome == "running":
+        return bounce
+    from . import contact
+    return contact.finish_gate(session, turn, completion,
+                               lambda: _on_main(lambda: contact.refresh(turn), turn.cancel.is_set))
 
 
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
@@ -1596,6 +1639,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
              ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     items, messages = session["items"], session["messages"]
     first_item = len(items)
+    request = next((m for m in reversed(messages) if context.is_turn_start(m)), {})
+    # A resumed loop has a fresh Turn, but these facts belong to the original user message.
+    # Keeping them there also preserves them through save/load and checkpoint restoration.
+    turn.executed_tools = request.get(completion_guard.EXECUTED, turn.executed_tools)
+    turn.unrun_claim = request.get(completion_guard.CORRECTED, turn.unrun_claim)
+    scene_action = completion_guard.scene_request(request)
     plan_turn = uuid.uuid4().hex
     alike = alike or _alike_on_main
     if run_tool is _run_tool_on_main:
@@ -1634,6 +1683,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     spec.on_turn_start(session, turn)
                     if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
                         spec = turn.spec
+                if scene_action is None:
+                    scene_action = bool(turn.routed and turn.routed.level > 0)
                 if spec.drive:
                     turn.outcome = spec.drive(session, turn, cfg, run_tool, ensure_checkpoint)
                     return
@@ -1651,7 +1702,15 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             first = None
             messages.append(completion.as_message())
             if not completion.tool_calls:
-                bounce = spec.on_final(session, turn, completion) if spec.on_final and not turn.cancel.is_set() else None
+                bounce = None
+                if (spec.role != "worker" and scene_action and not turn.executed_tools
+                        and not turn.unrun_claim and not turn.cancel.is_set()
+                        and completion_guard.imitates_records(completion.text, (
+                            s["function"]["name"] for s in _session_schemas(session, spec)))):
+                    turn.unrun_claim = request[completion_guard.CORRECTED] = True
+                    bounce = completion_guard.CORRECTION
+                if not bounce:
+                    bounce = _final_reply(session, turn, completion, spec)
                 if bounce:  # Sent back, marked so it continues the turn, and the loop goes on.
                     text = bounce if isinstance(bounce, str) else bounce.text
                     messages.append({"role": "user", context.STEP_LIMIT: True, "content": text})
@@ -1750,6 +1809,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 from . import cloud_account
                 with cloud_account.approval_context(_Consent(session, turn, card, spec.asks,
                                                              files_allowed=cfg.auto_run or session['auto_run'])):
+                    turn.executed_tools += 1
+                    request[completion_guard.EXECUTED] = turn.executed_tools
                     result = run_tool(call.name, arguments)
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
@@ -1928,6 +1989,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 item.pop("sending", None)
             elif item in items:
                 items.remove(item)
+        # Only a correction warrants this notice. Finish hooks may have appended real runtime
+        # records to the UI since the model's final text was checked above.
+        if (spec.role != "worker" and not spec.drive and not turn.executed_tools
+                and turn.unrun_claim):
+            items.append(state.item_notice(completion_guard.NOTICE))
         try:
             spec.save(session)
         except OSError as ex:

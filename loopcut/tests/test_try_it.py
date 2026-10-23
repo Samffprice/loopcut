@@ -64,6 +64,7 @@ class TryItTest(unittest.TestCase):
         self.patched(state, "_session", None)
         self.patched(state, "ui", {})
         self.events, self.requests, self.applied = [], [], []
+        self.reply = "Placed the result."
         self.transport = Mock(side_effect=AssertionError("A free sample must never contact a cloud service"))
         client = cloud_http.Client(base_url="https://service.test", api_key="lc_test", transport=self.transport)
         self.runtime = cloud.Runtime(client, self.root / "cloud", signed_in=True)
@@ -106,6 +107,9 @@ class TryItTest(unittest.TestCase):
     def apply(self, module, descriptor, job, scene):
         self.events.append("apply")
         self.applied.append(deepcopy(job))
+        if descriptor["apply"] == "import_model":
+            return tools.ToolResult(cloud_jobs.result_summary("import_model", job,
+                ["Loopcut try_photo_3d model; placed on the ground at the 3D cursor, 1.8 m tall"]))
         return tools.ToolResult("Applied " + job["id"] + ". Continue placing the result in the scene.")
 
     def run_tool(self, name, arguments):
@@ -121,21 +125,22 @@ class TryItTest(unittest.TestCase):
 
     def chat_request(self, build, *args):
         self.record_request(json.loads(build().data), "chat")
-        response = io.BytesIO(b'data: {"choices":[{"delta":{"content":"Placed the result."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        chunk = {"choices": [{"delta": {"content": self.reply}, "finish_reason": "stop"}]}
+        response = io.BytesIO(b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n")
         response.headers = {}
         return response
 
     def responses_request(self, **kwargs):
         body = chatgpt_responses.request_body(**{k: kwargs[k] for k in ("model", "messages", "tools", "reasoning_effort")})
         self.record_request(body, "responses")
-        kwargs["on_text"]("Placed the result.")
-        return llm.Completion(text="Placed the result.")
+        kwargs["on_text"](self.reply)
+        return llm.Completion(text=self.reply)
 
     def anthropic_request(self, **kwargs):
         body, _ = anthropic_messages.request_body(**{k: kwargs[k] for k in ("model", "messages", "tools", "reasoning_effort")})
         self.record_request(body, "anthropic")
-        kwargs["on_text"]("Placed the result.")
-        return llm.Completion(text="Placed the result.")
+        kwargs["on_text"](self.reply)
+        return llm.Completion(text=self.reply)
 
     def prepare(self, card_id="photo_3d", *, attached=True, source=None, route="hosted", orchestrate=False):
         self.session = state.reset()
@@ -211,6 +216,9 @@ class TryItTest(unittest.TestCase):
                     self.prepare(card, route=route)
                     self.run_turn()
                     self.assertEqual(self.events, ["checkpoint", "tool", "apply", "model"])
+                    self.assertEqual((self.turn.tool_steps, self.turn.executed_tools), (1, 1))
+                    self.assertFalse(self.turn.unrun_claim, "the synthetic first tool ran before the claiming reply")
+                    self.assertFalse(any(i.get("text") == agent.completion_guard.NOTICE for i in self.session["items"]))
                     call = self.assert_history()
                     arguments = json.loads(call["function"]["arguments"])
                     expected = {"image": "attached-clock.jpg"} if card == "photo_3d" else {
@@ -236,6 +244,8 @@ class TryItTest(unittest.TestCase):
                 self.prepare(card, orchestrate=True)
                 self.run_turn()
                 self.assertEqual(self.events, ["checkpoint", "tool", "apply", "model"])
+                self.assertEqual((self.turn.tool_steps, self.turn.executed_tools), (1, 1))
+                self.assertFalse(self.turn.unrun_claim)
                 self.assert_history()
         self.route.assert_not_called()
 
@@ -249,6 +259,8 @@ class TryItTest(unittest.TestCase):
         self.transport.assert_not_called()
 
     def test_a_build_missing_the_sample_does_not_force_a_paid_call(self):
+        # This tests sample availability and paid-call fallback, not an unearned completion claim.
+        self.reply = "The sample is unavailable."
         for card in ("photo_3d", "motion"):
             with self.subTest(card=card):
                 self.prepare(card)
@@ -280,6 +292,7 @@ class TryItTest(unittest.TestCase):
             self.run_turn()
         self.assertEqual(self.events, ["checkpoint", "tool", "apply", "model", "tool", "model"])
         self.assertEqual(self.turn.tool_steps, 2)
+        self.assertEqual(self.turn.executed_tools, 2)
         self.assertEqual(len(self.applied), 1)
         self.assertEqual([m["role"] for m in self.session["messages"]],
                          ["user", "assistant", "tool", "assistant", "tool", "assistant"])
@@ -297,7 +310,34 @@ class TryItTest(unittest.TestCase):
         self.assertEqual(self.events, ["model"])
         self.assertEqual(self.session["messages"][:-1], original)
 
+    def test_photo_card_can_remove_default_cube_after_grounded_import(self):
+        self.prepare("photo_3d")
+        code = "bpy.data.objects.remove(bpy.data.objects['Cube'], do_unlink=True)"
+        def request(**kwargs):
+            self.events.append("model")
+            if self.events.count("model") == 1:
+                result = kwargs["messages"][-1]
+                self.assertEqual(result["role"], "tool")
+                self.assertIn("placed on the ground at the 3D cursor, 1.8 m tall", result["content"])
+                return llm.Completion(tool_calls=[llm.ToolCall(id="call_remove", name="run_python",
+                    arguments=json.dumps({"code": code, "summary": "Remove the default cube"}))])
+            return llm.Completion(text="Done.")
+        execute, removed = tools.execute, []
+        def dispatch(name, arguments):
+            if name == "run_python":
+                removed.append(json.loads(arguments)["code"])
+                return tools.ToolResult("Removed the default cube.")
+            return execute(name, arguments)
+        self.session["auto_run"] = True
+        with patch.object(llm, "stream_chat", side_effect=request), patch.object(tools, "execute", side_effect=dispatch):
+            self.run_turn()
+        self.assertEqual(removed, [code])
+        self.assertEqual(self.events, ["checkpoint", "tool", "apply", "model", "tool", "model"])
+        self.assertEqual(len(self.applied), 1)
+
     def test_unmarked_missing_tool_and_missing_or_different_photo_leave_the_loop_alone(self):
+        # These card eligibility cases do no work; leave the ordinary model reply non-claiming.
+        self.reply = "What size should it be?"
         other = self.root / "other.jpg"
         other.write_bytes(b"not the card photo")
         for case in ("unmarked", "missing_tool", "missing_photo", "different_photo", "old_photo", "no_tool_card"):
@@ -333,6 +373,8 @@ class TryItTest(unittest.TestCase):
             for edited in (True, False):
                 self.session = state.reset()
                 self.events.clear()
+                # Editing the prompt removes the synthetic call; this test only checks that marker.
+                self.reply = "What size should it be?" if edited else "Placed the result."
                 self.session["try_it"] = (card["id"], card["prompt"])
                 self.assertTrue(agent.send(card["prompt"] + (" Make it blue." if edited else "")))
                 self.assertEqual(launched[-1].try_it, "" if edited else "motion")

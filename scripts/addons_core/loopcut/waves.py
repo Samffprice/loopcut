@@ -270,11 +270,16 @@ class Job:
         self.write()
 
     def write(self) -> None:
-        try:
-            self.folder.mkdir(parents=True, exist_ok=True)
-            (self.folder / "job.json").write_text(json.dumps(self.log, indent=1, default=str), encoding="utf-8")
-        except OSError as ex:
-            print(f"Loopcut: could not write the job log: {ex}")
+        _write_job_log(self.folder, self.log)
+
+
+def _write_job_log(folder: Path, log: dict) -> None:
+    """Persist receipts even after the turn's live Job is gone."""
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "job.json").write_text(json.dumps(log, indent=1, default=str), encoding="utf-8")
+    except OSError as ex:
+        print(f"Loopcut: could not write the job log: {ex}")
 
 
 def job_for(session: dict, turn) -> Job:
@@ -398,6 +403,7 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
     wave_id = str(getattr(spawn, "wave", "") or f"w{number}-{uuid.uuid4().hex[:4]}")
     rows = [state.wave_row(b["id"], b["deliverable"], b["role"]) for b in plan["workers"]]
     item = state.item_wave(wave_id, number, rows)
+    item["job"] = job.id
     session["items"].append(item)
     turn.delegations.append([b["deliverable"] for b in plan["workers"]])
     return Wave(session=session, turn=turn, job=job, number=number, id=wave_id, folder=folder, plan=plan,
@@ -552,6 +558,7 @@ class Worker:
         self.log: dict | None = None  # Its JobLog entry, once reported.
         self.t = {"spawn": None, "ready": None, "first_request": None, "first_reply": None, "end": None,
                   "reported": None}
+        self.row["timing"] = self.t  # The panel reads existing request/reply milestones, without polling.
 
     def _new_turn(self, cancel: threading.Event) -> agent.Turn:
         roles = self.wave.turn.roles
@@ -573,8 +580,12 @@ class Worker:
 
     def _stopped(self) -> None:
         """A row's Cancel is "cancelled"; Stop, for every worker of the turn, is "stopped"."""
+        # Startup can be cancelled before the parent turn is available.
+        parent_cancel = getattr(getattr(self.wave, "turn", None), "cancel", None)
         if self.user_cancelled:
             self.set_status("cancelled", "stopped by the user")
+        elif parent_cancel is not None and parent_cancel.is_set():
+            self.set_status("stopped", "stopped by the user")
         else:
             self.set_status("stopped")
 
@@ -794,6 +805,7 @@ class Worker:
                 if self.cancelled():
                     raise llm.Cancelled()
                 if wave.session.get("workers_unavailable"):
+                    self.row["unavailable"] = True
                     self.set_status("failed", UNAVAILABLE_NOTE)
                     return
                 self._boot()
@@ -801,6 +813,7 @@ class Worker:
                 if self.cancelled() or isinstance(self.boot_error, llm.Cancelled):
                     raise llm.Cancelled()
                 if isinstance(self.boot_error, WorkerUnavailable):
+                    self.row["unavailable"] = True
                     self.set_status("failed", UNAVAILABLE_NOTE)
                     return
                 if isinstance(self.boot_error, ChildCrashed):
@@ -1022,10 +1035,12 @@ def remember(wave: Wave, crew: list, merge_report=None) -> None:
 def cancel_worker(wave: str, worker: str) -> bool:
     """A row's Cancel: that worker stops and is not merged; the rest carry on."""
     found = _running.get((wave, worker))
-    if found is None:
+    if found is None or found.reported or found.row.get("merged"):
         return False
     found.user_cancelled = True
+    found.row["cancelled_before_merge"] = True
     found.turn.cancel.set()
+    found._stopped()
     found.kill()
     return True
 
@@ -1154,6 +1169,8 @@ def report_of(worker: Worker, merge_report=None) -> dict:
     report = worker.report or {}
     return {"worker": worker.id, "deliverable": worker.brief["deliverable"], "role": worker.brief["role"],
             "status": worker.status,
+            "outcome": state.worker_outcome(worker.row), "merged": bool(worker.row.get("merged")),
+            "merged_changes": list(worker.row.get("merged_changes") or []),
             "checks": {"passed": passed, "failed": failing, "fail_lines": fail_lines,
                        "deferred": [c["id"] for c, r in _paired(worker) if r.get("status") == "deferred"]},
             "created": _created(worker, merge_report),
@@ -1199,7 +1216,8 @@ def _belongs(entry, worker: str) -> bool:
 
 
 def _short(entry) -> str:
-    return str(entry.get("name") or entry.get("key")) if isinstance(entry, dict) else str(entry)
+    return str(entry.get("name") or entry.get("key") or entry.get("pointer")
+               or ", ".join(entry.get("keys") or [])) if isinstance(entry, dict) else str(entry)
 
 
 def _reason(entry, default: str) -> str:
@@ -1259,7 +1277,12 @@ def render_worker(report: dict) -> str:
     if report["numbers"]:
         lines.append("  its own numbers (unmeasured): " + workers.clip_items(report["numbers"], 140))
     budget = int(REPORT_TOKENS * context.CHARS_PER_TOKEN)
-    block, left = [_clip(head, 200)], budget - min(len(head), 200)
+    block = [_clip(head, 200)]
+    if report.get("outcome"):
+        block.append("  outcome: " + report["outcome"])
+    if report.get("merged"):
+        block.append("  merged: " + workers.clip_list(report.get("merged_changes") or ["no recorded datablock changes"], 240))
+    left = budget - len("\n".join(block))
     for line in lines:
         if len(line) + 1 <= left:
             block.append(line)
@@ -1267,9 +1290,11 @@ def render_worker(report: dict) -> str:
     return "\n".join(block)
 
 
-def _merge_line(merge_report, error: str, wave: Wave) -> tuple[str, list[str]]:
+def _merge_line(merge_report, error: str, wave: Wave, *, unchanged: bool = False) -> tuple[str, list[str]]:
     if error:
-        return f"Merge: not merged ({error}). The live scene is as before this wave.", []
+        if unchanged:
+            return f"Merge: not merged ({error}). The live scene is as before this merge.", []
+        return f"Merge: merge failed; what reached the scene is unconfirmed ({error}).", []
     if merge_report is None:
         return "Merge: nothing to merge.", []
     created, quarantined = _field(merge_report, "created"), _field(merge_report, "quarantined")
@@ -1382,16 +1407,115 @@ def unavailable_note(session: dict) -> str:
     return _still_running(_busy(job), job) if job is not None else UNAVAILABLE_NOTE + " Continue in the main Blender."
 
 
+def resolve_quarantine(session: dict, wave: str, entries: list[dict]) -> None:
+    """Reconcile confirmed scene changes with saved rows (also the live workers' rows)."""
+    cards = [item for item in session.get("items", [])
+             if item.get("kind") == "wave" and item.get("wave") == wave]
+    changed_jobs = {}
+    for card in cards:
+        for row in card.get("rows", []):
+            resolved = [entry for entry in entries if _belongs(entry, row["id"])
+                        and _short(entry) in row.get("quarantined", [])]
+            if not resolved:
+                continue
+            names = {_short(entry) for entry in resolved}
+            row["quarantined"] = [name for name in row["quarantined"] if name not in names]
+            row["merged"] = True
+            row["merge_unchanged"] = False
+            row["merged_changes"] = list(dict.fromkeys([
+                *row.get("merged_changes", []), *card_lines({"created": resolved})]))
+            # Job logs and continuation metadata must agree with the panel and later waits.
+            for job in session.get("jobs", []):
+                if job.get("job") != card.get("job"):
+                    continue
+                for logged_wave in job.get("waves", []):
+                    if logged_wave.get("n") == card.get("number"):
+                        for worker in logged_wave.get("workers", []):
+                            if worker.get("id") == row["id"]:
+                                worker.update(delivery=state.worker_outcome(row), merged=bool(row.get("merged")),
+                                              merged_changes=list(row.get("merged_changes", [])))
+                                changed_jobs[job["job"]] = job
+            thread = session.get("worker_threads", {}).get(row["id"])
+            if thread and thread.get("wave") == card.get("number"):
+                thread["merged"] = bool(row.get("merged"))
+                thread["created"] = list(dict.fromkeys([*thread.get("created", []), *map(_short, resolved)]))
+    names = {_short(entry) for entry in entries}
+    for item in session.get("items", []):
+        if item.get("kind") != "merge" or item.get("wave") != wave:
+            continue
+        held = item.get("quarantined", [])
+        changed = [name for name in held if name in names]
+        if not changed:
+            continue
+        remaining = [name for name in held if name not in names]
+        item["accepted"] = list(dict.fromkeys([*item.get("accepted", []), *changed]))
+        item["quarantined"] = remaining
+        if not remaining:
+            item["resolved"] = "accepted"
+    for job in changed_jobs.values():
+        if job.get("folder"):
+            _write_job_log(Path(job["folder"]), job)
+
+
+def accept_quarantine(session: dict, wave: str, names: list[str] | None = None) -> str:
+    """Main thread: acceptance and its delivery receipts are one operation for both UI and tool."""
+    resolved = []
+    text = merge.accept_quarantine(wave, names, resolved=resolved)
+    resolve_quarantine(session, wave, resolved)
+    return text
+
+
+def wait_result(session: dict, job: Job | None = None, lead: str = ""):
+    """Repeat delivery receipts even after the turn's Job is gone. Wave rows survive save/reload.
+    Use the latest job's cards, including earlier waves of that job, never a worker's promises."""
+    cards = [w.item for w in job.waves] if job is not None else []
+    if not cards:
+        saved = [i for i in session.get("items", []) if i.get("kind") == "wave"]
+        if saved:
+            def job_key(card):
+                return card.get("job") or str(card.get("wave", "")).rsplit("-w", 1)[0]
+            cards = [i for i in saved if job_key(i) == job_key(saved[-1])]
+    lines = [lead] if lead else []
+    rows = [row for card in cards for row in card.get("rows", [])]
+    if not rows:
+        lines.append("Nothing to wait for: no worker results are available.")
+    else:
+        complete = all(state.worker_complete(row) for row in rows)
+        lines.append("Nothing to wait for: every worker has reported." if complete
+                     else "Nothing to wait for. Worker outcomes:")
+        for card in cards:
+            for row in card.get("rows", []):
+                outcome = state.worker_outcome(row) or "unavailable (no merge confirmed)"
+                lines.append(f"[{row['id']}] {row.get('deliverable', row['id'])} "
+                             f"(wave {card['wave']}): {outcome}.")
+                if row.get("merged"):
+                    changes = row.get("merged_changes")
+                    lines.append("  merged: " + ("; ".join(changes) if changes else
+                                 "no recorded datablock changes" if changes == [] else "details unavailable in this saved result"))
+                elif row.get("note"):
+                    lines.append("  " + row["note"])
+    return tools.ToolResult("\n".join(lines), ok=not any(
+        row.get(key) for row in rows for key in ("merge_error", "quarantined", "conflicts")))
+
+
 def _still_running(busy: list, job: Job | None = None) -> str:
     """Every worker of the turn as done (reported), running or queued, with why the queued ones wait,
     and what to do meanwhile."""
     unavailable = job is not None and job.session.get("workers_unavailable")
-    if not busy and not unavailable:
+    if not busy and not unavailable and (job is None or all(
+            state.worker_complete(w.row) for w in job.crew)):
         return "Every worker has reported."
     running = [w for w in busy if _state(w) == "running"]
     queued = [w for w in busy if _state(w) == "queued"]
-    done = [w.id for w in job.crew if w.reported] if job is not None else []
+    done = [w.id for w in job.crew if w.reported and state.worker_complete(w.row)] if job else []
     lines = [f"Done: {', '.join(done)}."] if done else []
+    if job is not None and any(w.reported and not state.worker_complete(w.row) for w in job.crew):
+        lines = []
+        for worker in job.crew:
+            if worker.reported:
+                lines.append(f"[{worker.id}] wave {worker.wave.number}: {state.worker_outcome(worker.row)}.")
+                if worker.row.get("merged_changes"):
+                    lines.append("Merged: " + "; ".join(worker.row["merged_changes"]) + ".")
     if running:
         lines.append("Still running: " + ", ".join(f"{w.id} ({w.steps} step{'s' if w.steps != 1 else ''}, wave "
                                                    f"{w.wave.number})" for w in running) + ".")
@@ -1411,7 +1535,9 @@ def _still_running(busy: list, job: Job | None = None) -> str:
         if busy or ready:
             return " ".join([UNAVAILABLE_NOTE, *lines, "Use delegate wait true to collect the remaining results "
                              "before editing their objects in the main Blender."])
-        return UNAVAILABLE_NOTE + " Every worker has reported; continue in the main Blender."
+        return " ".join([UNAVAILABLE_NOTE, *lines, "No workers are running; continue in the main Blender."])
+    if not busy:
+        return " ".join([*lines, "No workers are running."])
     return " ".join(lines + ["Review the results above now and send fixes back with continues; delegate wait "
                              "true returns the next results."])
 
@@ -1454,6 +1580,8 @@ def _dedupe_requests(job: Job, worker: Worker) -> None:
 
 def _log_worker(worker: Worker, tokens: dict) -> dict:
     return {"id": worker.id, "role": worker.brief["role"], "status": worker.status, "steps": worker.steps,
+            "delivery": state.worker_outcome(worker.row), "merged": bool(worker.row.get("merged")),
+            "merged_changes": list(worker.row.get("merged_changes") or []),
             "cap_hit": worker.stopped_without_report, "outcome": worker.turn.outcome,
             "unfinished": _unfinished(worker) if worker.stopped_without_report else [],
             "retries": worker.retries, "rollbacks": worker.rollbacks,
@@ -1652,6 +1780,7 @@ def _schedule(job: Job, is_cancelled) -> None:
             for worker in queued:
                 if worker.wave.session.get("workers_unavailable"):
                     from .worker_host import UNAVAILABLE_NOTE
+                    worker.row["unavailable"] = True
                     worker.never_started(UNAVAILABLE_NOTE)
                     continue
                 if len(running) >= job.max_workers:
@@ -1700,7 +1829,8 @@ def _close(job: Job, wave: Wave, cancelled: bool = False) -> None:
     for worker in wave.crew:
         _running.pop((wave.id, worker.id), None)
     if cancelled:
-        wave.entry.update(workers=[w.log or _log_worker(w, {}) for w in wave.crew], cancelled=True,
+        wave.entry.update(workers=[w.log if w.log and w.row.get("merged") else _log_worker(w, {})
+                                  for w in wave.crew], cancelled=True,
                           seconds=round(time.monotonic() - wave.started, 1))
     reap_wave(wave.folder)
 
@@ -1713,9 +1843,16 @@ def stop(job: Job, close: bool = True) -> None:
         job.stopped = True
         busy_ = [w for w in job.crew if w.finished is None]
     _stop_all(busy_)
+    for worker in job.crew:
+        row = getattr(worker, "row", None)
+        if row is None:  # Helpers without a wave card still complete cancellation and note teardown.
+            continue
+        if not row.get("merged") and not row.get("merge_error") and worker.status != "failed":
+            row["cancelled_before_merge"] = True
+            worker._stopped()
     if close:
         for wave in job.waves:
-            _close(job, wave, cancelled=any(not w.reported for w in wave.crew))
+            _close(job, wave, cancelled=any(not w.row.get("merged") for w in wave.crew))
         job.write()
 
 
@@ -1739,6 +1876,9 @@ def collect(job: Job, is_cancelled, on_main, lead: str = "", scene_before=None):
     """The agent thread, as delegate's `then` (run_wave, or wait with no briefs): waits until a worker
     has finished, then up to BATCH_SECONDS more while others still run, and reports every one finished
     by then (report). Raises llm.Cancelled after a Stop."""
+    if job.stopped and not is_cancelled():
+        return wait_result(job.session, job, lead)
+
     def done():
         ready, busy_ = _ready(job), _busy(job)
         if not ready:
@@ -1747,7 +1887,7 @@ def collect(job: Job, is_cancelled, on_main, lead: str = "", scene_before=None):
     _wait(job, is_cancelled, done)
     ready = _ready(job)
     if not ready:
-        return tools.ToolResult("\n".join(([lead] if lead else []) + ["Nothing to wait for: every worker has reported."]))
+        return wait_result(job.session, job, lead)
     return report(job, ready, on_main, lead, scene_before)
 
 
@@ -1784,7 +1924,8 @@ def end_turn(session: dict, turn) -> None:
     late = drain(job, turn.cancel.is_set)
     if late is not None:
         session["items"].append(state.item_notice(
-            "Workers still running when the turn ended were waited for and merged; the agent did not review them."))
+            "Workers still running when the turn ended were waited for; see each worker's outcome in its wave card. "
+            "The agent did not review them."))
         if getattr(late, "scene_after", None) is not None:
             turn.scene_before = turn.scene_before or late.scene_before
             turn.scene_after = late.scene_after
@@ -1812,8 +1953,8 @@ def _settle(wave: Wave, crew: list[Worker], on_main) -> tuple[list[str], list, b
                 job.checks[(worker.id, check["id"])] = _pinned(check, wave)
     last = all(w.reported for w in wave.crew)
     mergeable = [w for w in crew if w.status in ("done", "partial", "question") and w.manifest is not None
-                 and not job.stopped]
-    merge_report, error = None, ""
+                 and not job.stopped and not w.user_cancelled]
+    merge_report, error, unchanged = None, "", False
     if mergeable:
         for worker in mergeable:
             worker.row["status"] = "merging"
@@ -1825,19 +1966,37 @@ def _settle(wave: Wave, crew: list[Worker], on_main) -> tuple[list[str], list, b
                                                       keep_spawn=not last))
         except llm.Cancelled:
             raise
-        except Exception as ex:  # merge_wave undid itself (MergeError), or could not start.
+        except Exception as ex:  # Only MergeError can confirm rollback or failure before any edits.
             error = f"{ex}"[:200] or type(ex).__name__
+            unchanged = isinstance(ex, merge.MergeError) and ex.scene_unchanged
         if not error:
             job.follow(wave.spawn)
         for worker in mergeable:
             worker.row["status"] = worker.status
             worker.row["merged"] = not error
-    headline, merge_lines = _merge_line(merge_report, error, wave)
+            if error:
+                worker.row["merge_error"] = error
+                worker.row["merge_unchanged"] = unchanged
+            else:
+                changes = {
+                    key: [e for e in _field(merge_report, key) if _belongs(e, worker.id)]
+                    for key in ("created", "replaced", "reused")}
+                worker.row["merged_changes"] = card_lines(changes)
+                for key in ("quarantined", "conflicts"):
+                    worker.row[key] = [_short(e) for e in _field(merge_report, key) if _belongs(e, worker.id)]
+                errors = [str(e) for e in _field(merge_report, "errors") if _belongs(e, worker.id)]
+                if errors:
+                    worker.row["merge_error"] = "; ".join(errors)
+                if errors or worker.row["quarantined"] or worker.row["conflicts"]:
+                    worker.row["merged"] = any(changes.values())
+                    worker.row["merge_unchanged"] = not worker.row["merged"]
+    headline, merge_lines = _merge_line(merge_report, error, wave, unchanged=unchanged)
     if mergeable:
         checkpoint = str(_field_value(merge_report, "checkpoint") or wave.checkpoint or "")
         session["items"].append(state.item_merge(wave.id, headline, merge_lines, checkpoint,
                                                  [_short(q) for q in _field(merge_report, "quarantined")]))
-    labelled = [(f"{w.id} {c['id']}", _pinned(c, wave)) for w in mergeable if not error for c in w.brief["checks"]]
+    labelled = [(f"{w.id} {c['id']}", _pinned(c, wave)) for w in mergeable if w.row.get("merged")
+                for c in w.brief["checks"]]
     tokens = {}
     for worker in crew:
         _dedupe_requests(job, worker)
@@ -1860,9 +2019,15 @@ def _settle(wave: Wave, crew: list[Worker], on_main) -> tuple[list[str], list, b
                       workers=[w.log for w in wave.crew if w.log])  # Worker 1 first, as the wave has them.
     if last:
         _close(job, wave)
-    title = (f"Wave {wave.number} ({wave.id}) finished in {seconds:.0f} s." if last and len(crew) == len(wave.crew)
-             else f"Wave {wave.number} ({wave.id}), {seconds:.0f} s in: {', '.join(w.id for w in crew)} finished.")
-    return [title, *(render_worker(r) for r in reports), headline], labelled, bool(mergeable) and not error, error
+    completed = all(state.worker_complete(w.row) for w in crew)
+    title = (f"Wave {wave.number} ({wave.id}) finished in {seconds:.0f} s."
+             if completed and last and len(crew) == len(wave.crew)
+             else f"Wave {wave.number} ({wave.id}), {seconds:.0f} s in: {', '.join(w.id for w in crew)} "
+                  + ("finished." if completed else "results."))
+    merge_error = error or "; ".join(state.worker_outcome(w.row) for w in crew
+                                    if any(w.row.get(key) for key in ("merge_error", "quarantined", "conflicts")))
+    return ([title, *(render_worker(r) for r in reports), headline], labelled,
+            any(w.row.get("merged") for w in crew), merge_error)
 
 
 def report(job: Job, batch: list[Worker], on_main, lead: str = "", scene_before=None):
