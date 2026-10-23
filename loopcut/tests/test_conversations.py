@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
@@ -49,6 +50,101 @@ class ConversationsTest(unittest.TestCase):
     def test_an_empty_conversation_is_not_written(self):
         cv.save(state.new_session())
         self.assertFalse(cv.root().exists())
+
+    def preview_session(self, path):
+        session = self.session("/work/desk.blend", "build")
+        row = state.wave_row("chair", "Chair", "modeling")
+        row.update(status="done", image_path=str(path))
+        session["items"].append(state.item_wave("w1", 1, [row]))
+        return session
+
+    def assert_preview_dropped(self, path):
+        session = self.preview_session(path)
+        cv.save(session)
+        with mock.patch("builtins.print") as log:
+            loaded = cv.load(session["id"])
+        expected_row = dict(session["items"][-1]["rows"][0])
+        del expected_row["image_path"]
+        self.assertEqual(loaded["items"][-1], {**session["items"][-1], "rows": [expected_row]})
+        self.assertEqual(loaded["items"][:-1], session["items"][:-1])
+        self.assertEqual(loaded["messages"], session["messages"])
+        log.assert_called_once()
+        self.assertIn("preview", log.call_args.args[0].lower())
+        self.assertIn(str(path), log.call_args.args[0])
+
+    def test_wave_preview_rejects_a_well_shaped_external_path(self):
+        with tempfile.TemporaryDirectory() as external:
+            path = Path(external) / "images" / ("c" * 64 + ".png")
+            path.parent.mkdir()
+            path.write_bytes(b"external capture")
+            self.assert_preview_dropped(path)
+
+    def test_wave_preview_rejects_directory_and_file_symlink_escapes(self):
+        with tempfile.TemporaryDirectory() as external:
+            outside = Path(external) / "images"
+            outside.mkdir()
+            image = outside / ("c" * 64 + ".png")
+            image.write_bytes(b"external capture")
+            linked = Path(self.tmp.name) / "linked"
+            linked.symlink_to(external, target_is_directory=True)
+            local = Path(self.tmp.name) / "images"
+            local.mkdir()
+            (local / image.name).symlink_to(image)
+            for path in (linked / "images" / image.name, local / image.name):
+                with self.subTest(path=path):
+                    self.assert_preview_dropped(path)
+
+    def test_wave_preview_accepts_alternate_case_data_root(self):
+        data_root = Path(self.tmp.name) / "LoopcutData"
+        data_root.mkdir()
+        alternate = data_root.with_name("loopcutdata")
+        if not alternate.exists():
+            self.skipTest("requires a case-insensitive filesystem")
+        self.assertTrue(data_root.samefile(alternate))
+        for folder in (data_root / "conversations" / ("a" * 32), data_root / "workers" / "job" / "chair"):
+            path = folder / "images" / ("c" * 64 + ".png")
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"owned capture")
+            session = self.preview_session(path)
+            with mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": str(data_root)}):
+                cv.save(session)
+            with self.subTest(folder=folder), mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": str(alternate)}):
+                self.assertEqual(cv.load(session["id"])["items"][-1]["rows"][0]["image_path"], str(path))
+
+    def test_wave_preview_uses_filesystem_identity_for_alternate_case_root(self):
+        data_root = Path(self.tmp.name).resolve() / "loopcutdata"
+        alternate = data_root.with_name("LoopcutData")
+        path = alternate / "workers" / "job" / "chair" / "images" / ("c" * 64 + ".png")
+        session = self.preview_session(path)
+        # Model a case-insensitive volume even when this test runs on a case-sensitive host.
+        def samefile(left, right):
+            return str(left).casefold() == str(right).casefold()
+
+        with mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": str(data_root)}):
+            cv.save(session)
+            with mock.patch.object(Path, "samefile", samefile):
+                self.assertEqual(cv.load(session["id"])["items"][-1]["rows"][0]["image_path"], str(path))
+
+    def test_wave_preview_resolution_failure_drops_only_the_preview(self):
+        path = Path(self.tmp.name) / "images" / ("c" * 64 + ".png")
+        resolve = Path.resolve
+
+        for error in (OSError("unreadable preview"), RuntimeError("symlink loop"), ValueError("bad path")):
+            def fail_preview(candidate, *args, **kwargs):
+                if candidate == path:
+                    raise error
+                return resolve(candidate, *args, **kwargs)
+
+            with self.subTest(error=error), mock.patch.object(Path, "resolve", fail_preview):
+                self.assert_preview_dropped(path)
+
+    def test_wave_preview_accepts_conversation_and_worker_captures_under_data_root(self):
+        for folder in (Path(self.tmp.name) / "conversations" / ("a" * 32),
+                       Path(self.tmp.name) / "workers" / "chat" / "job" / "w1" / "chair"):
+            path = folder / "images" / ("c" * 64 + ".png")
+            session = self.preview_session(path)
+            cv.save(session)
+            self.assertEqual(cv.load(session["id"])["items"][-1]["rows"][0]["image_path"], str(path))
 
     def test_work_in_flight_when_blender_closed_is_settled_on_load(self):
         session = self.session("/work/desk.blend", "go")
@@ -304,17 +400,24 @@ class CardImagePathTest(unittest.TestCase):
     def test_a_saved_card_may_only_point_at_a_stored_capture(self):
         session = state.new_session()
         card = state.item_tool("capture_viewport", "Look", "")
+        card["status"] = "done"
         session["items"].append(card)
-        good = f"/data/conversations/{session['id']}/images/" + "c" * 64 + ".png"
+        good = str(cv.root() / session["id"] / "images" / ("c" * 64 + ".png"))
         for value, ok in ((good, True), ("", True), ("/etc/passwd", False), ("images/" + "c" * 64 + ".png", False),
-                          (f"/x/images/../../etc/{'c' * 64}.png", False), ("/x/images/photo.png", False)):
+                          (f"/x/images/../../etc/{'c' * 64}.png", False), ("/x/images/photo.png", False),
+                          (None, False), (42, False)):
             card["image_path"] = value
             cv.save(session)
             if ok:
                 self.assertEqual(cv.load(session["id"])["items"][0]["image_path"], value)
             else:
-                with self.assertRaises(cv.ConversationError, msg=value):
-                    cv.load(session["id"])
+                with self.subTest(value=value), mock.patch("builtins.print") as log:
+                    loaded = cv.load(session["id"])
+                    expected = dict(card)
+                    del expected["image_path"]
+                    self.assertEqual(loaded["items"], [expected])
+                    log.assert_called_once()
+                    self.assertIn("preview", log.call_args.args[0].lower())
 
     def test_an_omitted_stale_inspection_takes_its_picture_off_the_card(self):
         from unittest import mock

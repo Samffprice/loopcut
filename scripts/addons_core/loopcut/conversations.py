@@ -95,14 +95,37 @@ def save(session: dict) -> None:
 
 def _own_image_path(value) -> bool:
     """"" or a path store_image makes: <a conversation's folder>/images/<sha256>.png (a worker's conversation
-    folder is named after the worker, so the folder's own name is not checked)."""
+    folder is named after the worker, so the folder's own name is not checked). Resolve symlinks
+    before checking ownership; conversation and worker captures must stay under Loopcut's data root."""
     if value == "":
         return True
     if not isinstance(value, str):
         return False
     path = Path(value)
-    return (path.is_absolute() and _IMAGE_NAME.match(path.name) is not None and path.parent.name == "images"
-            and ".." not in path.parts)
+    if not (path.is_absolute() and _IMAGE_NAME.match(path.name) is not None and path.parent.name == "images"
+            and ".." not in path.parts):
+        return False
+    try:
+        resolved, data_root = path.resolve(), checkpoints.data_root().resolve()
+        if resolved.is_relative_to(data_root):
+            return True
+        # POSIX path comparisons remain case-sensitive on macOS's usual case-insensitive volumes.
+        # Compare ancestors by filesystem identity after resolving symlinks, including file symlinks.
+        for parent in resolved.parents:
+            try:
+                if parent.samefile(data_root):
+                    return True
+            except OSError:
+                continue  # A missing capture directory can still have an existing, owned ancestor.
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _validate_preview(item: dict) -> None:
+    """A preview is optional: an unsafe or unreadable path must never hide the saved conversation."""
+    if not _own_image_path(item.get("image_path", "")):
+        print(f"Loopcut: dropping invalid preview path: {item.pop('image_path')!r}")
 
 
 def _audio_card(item: dict) -> bool:
@@ -147,18 +170,20 @@ def _validate(body) -> dict:
                 not isinstance(ref, dict) or ref.get("kind") not in ("file", "url")
                 or any(not isinstance(ref.get(key), str) for key in ("name", "target")) for ref in refs):
             raise ConversationError("malformed file references")
-        if not _own_image_path(item.get("image_path", "")):
-            # The panel loads this file: only a capture stored in this conversation's own images folder.
-            raise ConversationError("malformed image path")
+        _validate_preview(item)
         if "audio" in item and not _audio_card(item):
             raise ConversationError("malformed audio item")
         lines = item.get("lines", []) if item["kind"] in ("changes", "merge") else item.get("images", [])
         if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
             raise ConversationError(f"malformed {item['kind']} item")
         rows = item.get("rows", [])
-        if item["kind"] == "wave" and (not isinstance(rows, list) or any(
-                not isinstance(r, dict) or any(not isinstance(r.get(k), str) for k in ("id", "status")) for r in rows)):
-            raise ConversationError("malformed wave item")
+        if item["kind"] == "wave":
+            if not isinstance(rows, list) or any(
+                    not isinstance(r, dict) or any(not isinstance(r.get(k), str) for k in ("id", "status"))
+                    for r in rows):
+                raise ConversationError("malformed wave item")
+            for row in rows:
+                _validate_preview(row)
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in _ROLES:
             raise ConversationError(f"unknown message: {str(message)[:80]}")

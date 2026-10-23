@@ -292,6 +292,12 @@ def _is_loopback(base_url: str) -> bool:
         return False
 
 
+def wire_tools(schemas: list[dict]) -> list[dict]:
+    """Activity titles are local UI metadata, not part of the model's prompt or token budget."""
+    return [{**schema, "function": {key: value for key, value in schema["function"].items() if key != "title"}}
+            if isinstance(schema.get("function"), dict) else schema for schema in schemas]
+
+
 def stream_chat(
     *,
     base_url: str,
@@ -346,6 +352,7 @@ def stream_chat(
     the same Completion. It never sends the x-loopcut-* headers."""
     if prompt_id is not None and prompt_id not in ("single", "orchestrator", "worker", "router"):
         raise ValueError(f"Unknown Loopcut prompt_id: {prompt_id!r}")
+    tools = wire_tools(tools)
     if base_url.startswith("chatgpt-plan"):
         from . import chatgpt_responses
         return chatgpt_responses.stream(

@@ -165,15 +165,24 @@ def _image_file(session: dict, ws: Path, ref: str) -> Path | None:
 
 def turn_input(session: dict, ws: Path) -> list[dict]:
     """The message that started the turn as Codex input: its text (<scene_context>, what the user wrote, the
-    <workspace> note) and its images as local files. A turn resumed after it was sent goes on instead."""
-    message = next((m for m in reversed(session["messages"]) if context.is_turn_start(m)), None)
+    <workspace> note), images as local files, and tools already run for this request (Try it). A turn
+    resumed after it was sent goes on instead."""
+    messages = session["messages"]
+    start = next((i for i in range(len(messages) - 1, -1, -1) if context.is_turn_start(messages[i])), None)
+    message = messages[start] if start is not None else None
     if message is None or message.get(SENT):
         return [_text_input(RESUME)]
     content = message.get("content")
     refs = [p["image_url"]["url"] for p in content if isinstance(p, dict) and p.get("type") == "image_url"] \
         if isinstance(content, list) else []
     images = [path for path in (_image_file(session, ws, ref) for ref in refs) if path is not None]
-    return [_text_input(router._text(message)), *({"type": "localImage", "path": str(p)} for p in images)]
+    sent = [_text_input(router._text(message)), *({"type": "localImage", "path": str(p)} for p in images)]
+    recorded = [m for m in messages[start + 1:] if m.get("tool_calls") or m.get("role") == "tool"]
+    if recorded:
+        sent.append(_text_input("Loopcut recorded these tool calls and results for this request before starting "
+                                "Codex. Continue from their results without repeating completed work:\n"
+                                + json.dumps(recorded)))
+    return sent
 
 
 def data_url(path: Path) -> str:

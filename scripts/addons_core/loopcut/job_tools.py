@@ -23,6 +23,7 @@ STARTED_NOTE = ("\nThe job renders in the background and goes on after this turn
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "render_job",
+        "title": "Managing a background render",
         "description": "Durable background renders of a frozen scene copy; closing chat is safe. start: PNG "
                        "frames, or a silent MP4 from them, into folder (by the .blend; new or empty) or a NEW "
                        "subfolder of output_dir, never overwriting; File Output nodes are disabled. Needs "

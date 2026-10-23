@@ -64,6 +64,7 @@ RIM_BLEND = 0.3
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "bake_paint_masks",
+        "title": "Preparing paint guides",
         "description": (
             "Painterly step 1: per part (material slot) of meshes you own, bakes float Non-Color masks: edges, AO, key "
             "facing, position in metres, piece id. Returns their names and the texel scale. Materials stay as they are."),
@@ -76,6 +77,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "stylize_material",
+        "title": "Updating a material",
         "description": (
             "Painterly step 3: rebuilds a slot's material from your images (a shared or palette one is copied first): "
             "Mix of Principled (paint, ORM, tangent normal; glTF-ready) and Emission (paint x stepped key + rim) x AO. "

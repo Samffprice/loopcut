@@ -21,6 +21,7 @@ from pathlib import Path
 
 SCHEMAS = [{"type": "function", "function": {
     "name": "export_glb",
+    "title": "Exporting the model",
     "description": ("Export a .glb, checked against the scene (names, triangles, sizes, images, what glTF drops) "
                     "before it replaces path."),
     "parameters": {"type": "object", "required": ["path"], "properties": {

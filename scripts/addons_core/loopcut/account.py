@@ -30,6 +30,7 @@ SERVICE_URL = config.SERVICE_URL
 BASE_URL = f"{SERVICE_URL}/v1"
 WATCH_EVERY = 4.0          # Seconds between looks at /v1/me while the user upgrades in the browser.
 WATCH_FOR = 15 * 60.0      # How long to keep looking.
+USAGE_REFRESH_DELAYS = (30.0, 120.0, 600.0)  # Then wait for an explicit refresh or fresh turn usage.
 _watch_generation = 0
 _credential_generation = 0  # Account refreshes survive model/provider changes, but never a different sign-in.
 MODELS = (("fast", "Fast", "Quick answers"), ("pro", "Pro", "Thinks longer on hard scenes"))  # Until /v1/models answers.
@@ -46,6 +47,9 @@ _state = {
     "models": None,     # /v1/models rows once known: what the picker lists, with plan and usage notes
     "default_model": "fast",
     "fetched_at": 0.0,
+    "usage_refresh_at": None,
+    "usage_refresh_attempts": 0,
+    "usage_refresh_pending": False,
 }
 _cancel = threading.Event()
 _TIMEOUT = 15.0
@@ -297,7 +301,10 @@ def _store_key(key: str) -> int:
     from . import chatgpt_auth, settings
     global _credential_generation
     _credential_generation += 1
+    _state.update(usage_refresh_at=None, usage_refresh_attempts=0, usage_refresh_pending=False)
     state.clear_allowance_notice(invalidate=True)
+    state.ui.pop("warned_session_allowance", None)
+    state.ui.pop("warned_week_allowance", None)
     generation = _credential_generation
     credentials.store(BASE_URL, key)
     prefs = settings.preferences()
@@ -342,14 +349,18 @@ def _set_account(payload: dict | None) -> None:
     previous_plan = (_state["account"] or {}).get("plan") or ((notice or {}).get("item") or {}).get("plan")
     if payload is None:
         _credential_generation += 1
+        _state["usage_refresh_pending"] = False
         state.clear_allowance_notice(invalidate=True)
         state.ui.pop("warned_session_allowance", None)
+        state.ui.pop("warned_week_allowance", None)
     elif previous_plan and payload.get("plan") and payload["plan"] != previous_plan:
         state.clear_allowance_notice()
     elif notice and notice["item"].get("reason") in allowance.LIMIT_WINDOWS \
             and not allowance.refused_windows(payload, notice):
         state.clear_allowance_notice()
     _state["account"] = payload
+    if not any(allowance.expired((payload or {}).get(name)) for name in ("session", "week")):
+        _state.update(usage_refresh_at=None, usage_refresh_attempts=0)
     _state["fetched_at"] = time.monotonic()
     state.ui["account"] = payload  # The panel footer reads it without touching bpy.
 
@@ -431,7 +442,31 @@ def update_usage(info: dict) -> None:
     previous = (_state["account"] or {}).get("plan")
     _set_account({**(_state["account"] or {}), **info})
     if info.get("plan") and info["plan"] != previous:
+        _state["usage_refresh_at"] = time.monotonic()
         refresh_account()  # Model availability is account-specific too.
+    else:
+        refresh_expired_usage()
+
+
+def refresh_expired_usage() -> None:
+    """Main thread: bounded retries shared by UI polls and late helper reports."""
+    account = _state["account"] or {}
+    if not any(allowance.expired(account.get(name)) for name in ("session", "week")):
+        return
+    attempts = _state["usage_refresh_attempts"]
+    if _state["usage_refresh_pending"] or attempts > len(USAGE_REFRESH_DELAYS):
+        return
+    now = time.monotonic()
+    previous = _state.get("usage_refresh_at")
+    if attempts and previous is not None and now - previous < USAGE_REFRESH_DELAYS[attempts - 1]:
+        return
+    _state.update(usage_refresh_pending=True, usage_refresh_attempts=attempts + 1)
+
+    def done():
+        # Include the network wait and the queued main-thread update in the in-flight guard.
+        _state.update(usage_refresh_pending=False, usage_refresh_at=time.monotonic())
+
+    refresh_account(on_done=done)
 
 
 def watch_plan(previous: str, on_change) -> None:

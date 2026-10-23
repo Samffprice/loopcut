@@ -339,8 +339,14 @@ def _scene_context(text: str) -> str:
 
 def _wave_checkpoint(session: dict, number: int, message_index: int, item_index: int) -> str:
     """Before the workers start: restoring it returns the scene to before the delegate call, every merge
-    of the wave undone, and the conversation to just before it (message_index, the wave card's
-    item_index). Raises checkpoints.CheckpointError: then nothing starts, as no merge may go on without one."""
+    of the wave undone, and both transcripts to before the call. Raises checkpoints.CheckpointError:
+    then nothing starts, as no merge may go on without one."""
+    # prepare() receives the future wave card's index. Include the executing delegate card in the
+    # restore cut too: leaving its later "done" result would falsely recover earlier refused plans.
+    item_index = next((n for n in reversed(range(item_index))
+                       if session["items"][n].get("kind") == "tool"
+                       and session["items"][n].get("name") == "delegate"
+                       and session["items"][n].get("status") == "running"), item_index)
     return checkpoints.ensure_for_wave(session, f"Before wave {number}", message_index, item_index)
 
 
@@ -493,6 +499,7 @@ class Worker:
         roles = wave.turn.roles
         self.model = roles.worker.model
         self.session = state.new_session()
+        self.attempt_item_start = 0  # Earlier attempts stay in history, but their scene was discarded.
         self.folder = wave.folder / self.id
         conversations.FOLDERS[self.session["id"]] = self.folder
         thread = wave.threads.get(self.id)
@@ -629,6 +636,19 @@ class Worker:
         self.wave.job.budget.add(self.model, usage)
 
     def after_step(self, session: dict, turn) -> bool:
+        # The loop has already stored captures under stable conversation paths. Keep the latest
+        # scene preview within this attempt, without a new capture or a second copy of the image.
+        try:
+            start = getattr(self, "attempt_item_start", 0)
+            if start is not None:  # An unknown restart boundary must never reuse the discarded scene.
+                items = session.get("items") or []
+                preview = next((item["image_path"] for item in reversed(items[start:])
+                                if isinstance(item, dict) and item.get("name") in {"capture_viewport", "run_python"}
+                                and item.get("image_path")), None)
+                if preview:
+                    self.row["image_path"] = preview
+        except Exception:  # Optional UI bookkeeping must not interrupt work or crash recovery.
+            pass
         return self.report is not None or bool(self.crashed)
 
     def run_tool(self, name: str, arguments: str):
@@ -773,6 +793,12 @@ class Worker:
                 if not (self.crashed and attempt == 0 and not self.cancelled()):
                     break
                 self.kill()
+                self.attempt_item_start = None  # If bookkeeping fails, omit previews for the new attempt.
+                try:
+                    self.row.pop("image_path", None)
+                    self.attempt_item_start = len(self.session.get("items") or [])
+                except Exception:  # A preview must never prevent restarting the child.
+                    pass
                 self.retries += 1
                 self.session["messages"].append({"role": "user", context.STEER: True,
                                                  "content": CRASH_NOTE.format(tool=self.crashed)})

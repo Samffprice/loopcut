@@ -44,11 +44,13 @@ class ToolResult:
     guard_notes: list | None = None  # cost_guard.take: modifiers it switched off, shown in the panel too.
     file_image: bool = False  # The image is a file preview, not a look at the open scene.
     receipt: str = ""  # A paid cloud call that finished: what it used ("Used 6 credits ($0.06)"), for its card.
+    plan_refused: bool = False  # Local helper-plan validation; raw text still goes to the model and Details.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "run_python",
+        "title": "Updating the scene",
         "description": (
             "Run Python in the live Blender session, a new namespace each call (`bpy`, `math`, `bmesh`, "
             "`mathutils`, `Vector`, `Matrix` preloaded; reuse code via a Text block); "
@@ -67,6 +69,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "get_scene_info",
+        "title": "Checking the scene",
         "description": (
             "The scene as JSON, in as much detail as fits. Always: mode, frame, camera, counts by type and "
             "by collection. Then one row per matching object (type, location, bounds, materials, modifiers, "
@@ -89,6 +92,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "get_object_info",
+        "title": "Checking object details",
         "description": (
             "Full setup of up to 5 objects: modifier settings, material node trees, geometry-nodes "
             "inputs, constraints, animation, custom properties. Read before changing an existing setup."),
@@ -102,6 +106,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "inspect_api",
+        "title": "Checking Blender capabilities",
         "description": (
             "The Python API of THIS Blender, installed add-ons included: property names, enum values, "
             "defaults, operator arguments, node sockets. Use before an API you are not sure of, and after any AttributeError, "
@@ -115,6 +120,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "compare_with_reference",
+        "title": "Comparing with the reference",
         "description": (
             "One image: the reference the user attached on the left, a viewport capture on the right at "
             "the same height. Use it after each change when copying a reference, and fix what differs."),
@@ -129,6 +135,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "look_at_reference",
+        "title": "Looking at the reference",
         "description": (
             "The attached image at full resolution, or a part of it, to check a detail. `region` is "
             "[x0, y0, x1, y1] as fractions of width and height from the top-left; omit for the whole."),
@@ -139,6 +146,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "capture_viewport",
+        "title": "Checking the model’s appearance",
         "description": (
             "An image of the scene, framed by the tool from a 3/4 angle with materials, leaving the "
             "user's viewport untouched. Also lists the visible objects nearest first, which settles "

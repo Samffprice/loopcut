@@ -159,6 +159,8 @@ class ItemsTest(unittest.TestCase):
             session = state.new_session()
             rows = [state.wave_row("armchair", "Armchair", "modeling"), state.wave_row("lamp", "Lamp", "modeling")]
             rows[1]["status"] = "done"
+            preview = str(Path(data) / "helpers" / "armchair" / "images" / ("a" * 64 + ".png"))
+            rows[0]["image_path"] = preview
             session["items"] += [state.item_user("a room"), state.item_wave("w1", 1, rows),
                                  state.item_merge("w1", "Merged 2 workers", ["14 created"], "", ["LIGHT Lamp_Test"])]
             conversations.save(session)
@@ -166,8 +168,25 @@ class ItemsTest(unittest.TestCase):
         wave = loaded["items"][1]
         self.assertEqual(wave["text"], "Wave 1 · 2 workers")
         self.assertEqual([r["status"] for r in wave["rows"]], ["stopped", "done"])
+        self.assertEqual(wave["rows"][0]["image_path"], preview)
         self.assertEqual(loaded["items"][2]["quarantined"], ["LIGHT Lamp_Test"])
         self.assertEqual(loaded["turn_number"], 1)
+
+    def test_wave_preview_paths_follow_the_same_rules_as_tool_images(self):
+        with tempfile.TemporaryDirectory() as data, mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": data}):
+            for path in ("/tmp/anything.png", "../images/" + "a" * 64 + ".png", 12):
+                session = state.new_session()
+                row = state.wave_row("a", "A", "modeling")
+                row["image_path"] = path
+                session["items"] = [state.item_wave("w1", 1, [row])]
+                conversations.save(session)
+                with mock.patch("builtins.print") as log:
+                    loaded = conversations.load(session["id"])
+                expected = {**row, "status": "stopped"}
+                del expected["image_path"]
+                self.assertEqual(loaded["items"][0]["rows"], [expected])
+                log.assert_called_once()
+                self.assertIn("preview", log.call_args.args[0].lower())
 
     def test_a_worker_conversation_lives_in_its_own_folder(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as job, \
@@ -1330,21 +1349,48 @@ class PromptTest(unittest.TestCase):
         plan["workers"] = plan["workers"][:2]
         self.assertEqual(orchestrator.schedule_line(plan, roles, {}), "Schedule: all 2 start now.")
 
-    def test_approving_a_wave_says_what_it_allows(self):
-        summary, code = orchestrator.describe("delegate", {"wave": reference_wave()})
-        self.assertEqual(summary, "Start 2 workers in the background for Armchair, SideTable. Approving lets them run "
-                                  "scripts there without asking again until they report back or the budget runs out. "
-                                  "Workers can read and write your files (no sandbox yet). Budget: $0.40, 30 min per worker.")
+    def approval(self, base_url, usd=0.4, seconds=1800):
+        roles = types.SimpleNamespace(job_max_usd=usd, worker_max_seconds=seconds,
+                                      worker=types.SimpleNamespace(base_url=base_url))
+        with mock.patch.object(orchestrator, "_roles", return_value=roles):
+            return orchestrator.describe("delegate", {"wave": reference_wave()})
+
+    def test_hosted_approval_explains_allowance_and_keeps_internal_cost_in_details(self):
+        summary, code = self.approval(config.SERVICE_BASE_URL)
+        self.assertIn("Start 2 helpers", summary)
+        self.assertIn("up to 30 minutes per helper", summary)
+        self.assertIn("Uses your chat allowance, not credits.", summary)
+        self.assertNotIn("$", summary)
+        self.assertIn("run scripts without asking again", summary)
+        self.assertIn("read and write your files", summary)
+        self.assertIn("$0.40 shared by all helpers in this turn", code)
+        self.assertIn("not a price per approval", code)
         self.assertIn('"Armchair"', code)
         self.assertEqual(orchestrator.describe("delegate", {"wave": reference_wave(), "dry_run": True})[0],
-                         "Check a plan for workers: Armchair, SideTable")
+                         "Check a helper plan: Armchair, SideTable")
 
-    def test_approval_without_a_dollar_budget_says_only_time(self):
-        with mock.patch.object(orchestrator, "_roles", return_value=types.SimpleNamespace(
-                job_max_usd=0, worker_max_seconds=900)):
-            summary, _ = orchestrator.describe("delegate", {"wave": reference_wave()})
-        self.assertTrue(summary.endswith("Budget: 15 min per worker."))
+    def test_own_key_approval_labels_the_shared_api_spending_limit(self):
+        summary, _ = self.approval("https://api.example.com/v1", usd=1.25, seconds=900)
+        self.assertIn("API spending limit: $1.25 shared by all helpers in this turn.", summary)
+        self.assertIn("up to 15 minutes per helper", summary)
+        self.assertNotIn("chat allowance", summary)
+
+    def test_approval_uses_the_helpers_provider(self):
+        # The main loop can use a hosted plan while helpers use the user's key, or the reverse.
+        for helper_url, hosted in ((config.SERVICE_BASE_URL, True), ("https://api.example.com/v1", False)):
+            summary, _ = self.approval(helper_url)
+            self.assertEqual("Uses your chat allowance" in summary, hosted)
+            self.assertEqual("API spending limit" in summary, not hosted)
+        summary, _ = self.approval(config.CHATGPT_PLAN_BASE_URL)
+        self.assertIn("Uses your ChatGPT plan allowance.", summary)
         self.assertNotIn("$", summary)
+
+    def test_approval_without_a_dollar_budget_explains_time_and_usage(self):
+        for url in (config.SERVICE_BASE_URL, "https://api.example.com/v1"):
+            summary, _ = self.approval(url, usd=0, seconds=900)
+            self.assertIn("up to 15 minutes per helper", summary)
+            self.assertNotIn("$", summary)
+        self.assertIn("no API spending limit is set", summary)
 
     def test_a_dry_run_is_a_read_and_a_wave_asks_first(self):
         self.assertFalse(agent._changes_scene("delegate", json.dumps({"wave": {}, "dry_run": True})))
@@ -1354,7 +1400,7 @@ class PromptTest(unittest.TestCase):
     def test_waiting_for_the_running_workers_starts_nothing_so_it_is_not_asked(self):
         """The delegate that started them was approved; the wait only merges what they built."""
         self.assertEqual(agent._approval("delegate", json.dumps({"wait": True}), ()), "")
-        self.assertEqual(orchestrator.describe("delegate", {"wait": True}), ("Wait for the workers' next results", ""))
+        self.assertEqual(orchestrator.describe("delegate", {"wait": True}), ("Wait for the helpers' next results", ""))
         self.assertEqual(agent._approval("delegate", json.dumps({"wait": True, "wave": reference_wave()}), ()), "gate",
                          "briefs start workers, wait or not")
 
@@ -1718,6 +1764,27 @@ class ContinueTest(unittest.TestCase):
                              "style": "rolled arms, deeper tufting", **worker}]}
         return orchestrator.repair_wave(orchestrator.normalise_wave(wave), USER, self.live())
 
+    def test_effective_role_matches_repair_with_continuations_defaults_and_aliases(self):
+        for fields, thread_role, busy, expected in (
+                ({}, "lighting", False, "lighting"),
+                ({"role": None}, "lighting", False, "lighting"),
+                ({"role": ""}, "lighting", False, "lighting"),
+                ({}, " lights ", False, "lighting"),
+                ({}, "shot", False, "lighting"),
+                ({}, None, False, "modeling"),
+                ({"role": "cam"}, "lighting", False, "camera"),
+                ({"role": "sculpting"}, "lighting", False, "modeling"),
+                ({"continues": "unknown"}, "lighting", False, "modeling"),
+                ({}, "lighting", True, "modeling")):
+            with self.subTest(fields=fields, thread_role=thread_role, busy=busy):
+                worker = {"id": "key", "continues": "key", **fields}
+                before = dict(worker)
+                live = {"threads": {"key": {"role": thread_role}}, "busy": {"key": {}} if busy else {}}
+                plan, _ = orchestrator.repair_wave(orchestrator.normalise_wave({"workers": [worker]}), "", live)
+                self.assertEqual(plan["workers"][0]["role"], expected)
+                self.assertEqual(orchestrator.effective_role(worker, live), expected)
+                self.assertEqual(worker, before, "identity lookup must not change the submitted brief")
+
     def test_a_brief_sent_back_owns_what_that_worker_built(self):
         plan, repairs = self.repair({"continues": "armchair"})
         worker = plan["workers"][0]
@@ -1809,10 +1876,12 @@ class ReferencesTest(unittest.TestCase):
         session["references"] = [{"ref": "loopcut-image:" + "a" * 64 + ".png", "name": "ref1.jpg", "pinned": True}]
         wave = reference_wave()
         wave["workers"][0]["references"] = ["ref9"]
-        with mock.patch.object(orchestrator, "live_facts", lambda plan: json.loads(json.dumps(LIVE))):
-            result = orchestrator.delegate(wave, dry_run=True)
-        self.assertFalse(result.ok)
-        self.assertIn("workers[0] (armchair).references: 'ref9' not attached; the user attached ref1.jpg", result.text)
+        for dry_run in (True, False):
+            with mock.patch.object(orchestrator, "live_facts", lambda plan: json.loads(json.dumps(LIVE))):
+                result = orchestrator.delegate(wave, dry_run=dry_run)
+            self.assertFalse(result.ok)
+            self.assertTrue(result.plan_refused)
+            self.assertIn("workers[0] (armchair).references: 'ref9' not attached; the user attached ref1.jpg", result.text)
 
     def test_a_brief_sent_back_keeps_its_workers_references_unless_it_names_others(self):
         threads = {"armchair": {"deliverable": "Armchair", "role": "modeling", "prefix": "Armchair", "wave": 1,

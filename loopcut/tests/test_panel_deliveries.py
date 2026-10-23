@@ -140,13 +140,20 @@ class DeliveryPersistenceTest(unittest.TestCase):
         card = conversations.load(self.session['id'])['items'][-1]
         self.assertEqual(Path(card['image_path']).read_bytes(), b'image')
 
-    def test_malformed_delivery_metadata_is_rejected_on_load(self):
-        for fields in ({'image_path': []}, {'file_references': [{'kind': 'file'}]}):
-            with self.subTest(fields=fields):
-                self.session['items'] = [{'kind': 'assistant', 'text': '', **fields}]
-                conversations.save(self.session)
-                with self.assertRaises(conversations.ConversationError):
-                    conversations.load(self.session['id'])
+    def test_malformed_preview_is_dropped_on_load(self):
+        self.session['items'] = [{'kind': 'assistant', 'text': 'Saved', 'image_path': []}]
+        conversations.save(self.session)
+        with mock.patch('builtins.print') as log:
+            loaded = conversations.load(self.session['id'])
+        self.assertEqual(loaded['items'], [{'kind': 'assistant', 'text': 'Saved'}])
+        log.assert_called_once()
+        self.assertIn('preview', log.call_args.args[0].lower())
+
+    def test_malformed_file_references_are_rejected_on_load(self):
+        self.session['items'] = [{'kind': 'assistant', 'text': '', 'file_references': [{'kind': 'file'}]}]
+        conversations.save(self.session)
+        with self.assertRaises(conversations.ConversationError):
+            conversations.load(self.session['id'])
 
 
 if __name__ == '__main__':

@@ -21,7 +21,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, codex_app, config, context, conversations, state, tools, workspace  # noqa: E402
+from loopcut import agent, cloud, codex_app, config, context, conversations, llm, state, tools, try_it, workspace  # noqa: E402
 
 FAKE = Path(__file__).with_name("fake_codex_app_server.py")
 ENV = {"LOOPCUT_API_KEY": "", "LOOPCUT_BASE_URL": "", "LOOPCUT_MODEL": "", "LOOPCUT_AUTO_RUN": "false",
@@ -75,7 +75,8 @@ class CodexAppTest(unittest.TestCase):
         self.ran.append((name, json.loads(arguments)))
         return types.SimpleNamespace(text="x is 1", ok=True, image_path=None)
 
-    def start(self, text: str = "paint the cube red", scenario: str = "tool", auto_run: bool = True) -> agent.Turn:
+    def start(self, text: str = "paint the cube red", scenario: str = "tool", auto_run: bool = True,
+              card_id: str = "") -> agent.Turn:
         os.environ["FAKE_CODEX_SCENARIO"] = scenario
         os.environ["LOOPCUT_AUTO_RUN"] = "true" if auto_run else "false"
         session = self.session
@@ -83,6 +84,7 @@ class CodexAppTest(unittest.TestCase):
         session["messages"].append({"role": "user", "content": f"<scene_context>\nfile: unsaved\n</scene_context>\n\n{text}"})
         turn = agent.Turn()
         agent._configure(turn, session)
+        turn.try_it = card_id
         session["busy"], session["turn"] = True, turn
         turn.thread = threading.Thread(target=agent._run, daemon=True,
                                        args=(session, turn, lambda *a: self.run_tool(*a), lambda s: None))
@@ -173,6 +175,36 @@ class CodexAppTest(unittest.TestCase):
         methods = [m.get("method") for m in self.received()[1:]]
         self.assertEqual(methods[:4], ["initialize", "initialized", "thread/resume", "turn/start"])
 
+    def test_try_it_call_and_result_reach_the_codex_turn_after_running_once(self):
+        for card_id, name, arguments in (
+                ("photo_3d", "image_to_3d", {"image": "attached-clock.jpg"}),
+                ("motion", "motion_from_text", {"prompt": "a figure jumps for joy", "duration_s": 3})):
+            with self.subTest(card=card_id):
+                self.session = state.reset()
+                self.ran.clear()
+                self.record.unlink(missing_ok=True)
+                call = llm.ToolCall(id="Ab12Cd34E", name=cloud.PREFIX + name, arguments=json.dumps(arguments))
+                output = "Applied try_" + card_id + ". Continue placing the result in the scene."
+                prompt = next(c["prompt"] for c in try_it.CARDS if c["id"] == card_id)
+                run_tool = self.run_tool
+                def execute(name, raw):
+                    run_tool(name, raw)
+                    return tools.ToolResult(output)
+                with mock.patch.object(try_it, "first_call", return_value=call) as first, \
+                        mock.patch.object(self, "run_tool", side_effect=execute):
+                    turn = self.start(prompt, card_id=card_id)
+                    turn.thread.join(15)
+                self.assertEqual(turn.outcome, "completed", self.session["items"])
+                self.assertIs(turn.spec, agent.CODEX_SPEC)
+                first.assert_called_once()
+                self.assertEqual(self.ran.count((call.name, arguments)), 1)
+                sent = next(m["params"]["input"] for m in self.received() if m.get("method") == "turn/start")
+                text = "\n".join(p["text"] for p in sent if p["type"] == "text")
+                self.assertIn(prompt, text)
+                self.assertIn(json.dumps(llm.Completion(tool_calls=[call]).as_message()), text)
+                self.assertIn(output, text)
+                self.assertEqual(codex_app.turn_input(self.session, self.ws)[0]["text"], codex_app.RESUME)
+
     def test_a_thread_codex_lost_starts_again(self):
         self.session["codex_thread"] = "gone"
         turn = self.start()
@@ -245,6 +277,34 @@ class CodexAppTest(unittest.TestCase):
         self.assertEqual(sent[1], {"type": "localImage", "path": str(picture)})
         self.session["messages"][-1][codex_app.SENT] = True
         self.assertEqual(codex_app.turn_input(self.session, self.ws)[0]["text"], codex_app.RESUME)
+
+    def test_turn_input_keeps_images_and_only_the_current_requests_tool_results(self):
+        picture = self.ws / "ref1.jpg"
+        picture.write_bytes(b"jpeg")
+        self.session["workspace_refs"] = {"loopcut-image:a.png": picture.name}
+        old_call = llm.ToolCall(id="old123456", name="run_python", arguments='{"code": "old_work()"}')
+        call = llm.ToolCall(id="new123456", name=cloud.PREFIX + "image_to_3d", arguments='{"image": "ref1.jpg"}')
+        request = {"role": "user", "content": [
+            {"type": "text", "text": "Turn this photo into a model."},
+            {"type": "image_url", "image_url": {"url": "loopcut-image:a.png"}}]}
+        result = {"role": "tool", "tool_call_id": call.id, "content": "Not run: the checkpoint failed."}
+        self.session["messages"] = [
+            {"role": "user", "content": "An older request."},
+            llm.Completion(tool_calls=[old_call]).as_message(),
+            {"role": "tool", "tool_call_id": old_call.id, "content": "Old result."},
+            request, llm.Completion(tool_calls=[call]).as_message(), result,
+            {"role": "user", context.CAPTURE: True, "content": "Viewport capture: the scene."}]
+        sent = codex_app.turn_input(self.session, self.ws)
+        self.assertEqual(sent[0]["text"], "Turn this photo into a model.")
+        self.assertEqual(sent[1], {"type": "localImage", "path": str(picture)})
+        text = "\n".join(p["text"] for p in sent if p["type"] == "text")
+        self.assertIn(json.dumps(llm.Completion(tool_calls=[call]).as_message()), text)
+        self.assertIn(json.dumps(result), text)
+        self.assertNotIn("old_work", text)
+        self.assertNotIn("Old result", text)
+        self.assertNotIn(codex_app.SENT, request, "Preparing input must not mark it delivered.")
+        request[codex_app.SENT] = True
+        self.assertEqual(codex_app.turn_input(self.session, self.ws), [codex_app._text_input(codex_app.RESUME)])
 
     def test_tool_images_keep_their_origin(self):
         image = Path(self.tmp.name) / "preview.png"

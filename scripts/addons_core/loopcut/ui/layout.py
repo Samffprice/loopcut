@@ -317,6 +317,9 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     status = item["status"]
     glyph, glyph_color = STATUS_GLYPH[status]
+    plan_repair = item.get("plan_repair")
+    if plan_repair == "resolved":
+        glyph, glyph_color = "✓", T.TEXT_MUTED
     awaiting = status == "awaiting"
     expanded = awaiting or item.get("expanded", False)
     mark = len(f.prims)
@@ -326,6 +329,9 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     f.text(f"item{n}.tool.glyph", inner_x, cursor, glyph, size, glyph_color)
     label_x = inner_x + f.px(18)
     summary = item["summary"] or item["name"]
+    if plan_repair:
+        summary = ("Adjusted the helper plan and retried" if plan_repair == "resolved"
+                   else "Helper plan needs adjustment")
     show_name = expanded and item["name"].strip().casefold() != summary.strip().casefold()
     if awaiting:
         label_width = inner_w - f.px(18)
@@ -345,7 +351,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                    item["name"], small, T.TEXT_FAINT)
         cursor += row
 
-    if status == "failed" and not expanded:
+    if status == "failed" and not expanded and not plan_repair:
         reason = failure_reason(item.get("output") or "", item.get("exit_code"))
         f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
                small, T.TEXT_MUTED)
@@ -363,7 +369,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
             cursor += f.paragraph(f"item{n}.tool.ask{k}", inner_x, cursor, inner_w, line, small,
                                   T.TEXT_MUTED if k == 0 and item.get("worker") else T.TEXT)
     delegate = item["name"] == "delegate"
-    if expanded and delegate and item["code"]:
+    if expanded and delegate and (item["code"] or item["output"]):
         cursor += f.px(6)
         f.button(f"item{n}.tool.details", inner_x, cursor,
                  "Hide details" if item.get("details_expanded") else "Details", T.BUTTON_GHOST, T.TEXT_MUTED,
@@ -384,10 +390,11 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         f.button(f"item{n}.tool.image.open", inner_x, cursor, "Open image", T.BUTTON_GHOST, T.TEXT,
                  ("reference_open", image_path))
         cursor += f.px(24)
-    if expanded and item["output"]:
+    if expanded and item["output"] and (not delegate or item.get("details_expanded")):
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
-                              f.px(T.FONT_SIZE_CODE), T.ERROR if status == "failed" else T.TEXT_MUTED, "mono")
+                              f.px(T.FONT_SIZE_CODE),
+                              T.ERROR if status == "failed" and plan_repair != "resolved" else T.TEXT_MUTED, "mono")
     if expanded and (item.get("cloud_error") or {}).get("message"):
         cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
                               item["cloud_error"]["message"], small, T.ERROR)
@@ -811,6 +818,16 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
         if row.get("note"):
             cursor += f.paragraph(f"{id}.note", name_x, cursor, inner_x + inner_w - name_x, row["note"], small,
                                   T.TEXT_FAINT)
+        image_path = row.get("image_path")
+        if image_path and image_path not in f.ui.get("missing_paths", ()):
+            cursor += f.px(6)
+            image_w = inner_x + inner_w - name_x
+            image_h = min(image_w, f.px(180))
+            f.prims.append({"t": "image", "id": f"{id}.image", "path": image_path,
+                            "x": name_x, "y": cursor, "w": image_w, "h": image_h})
+            f.hit(f"{id}.image", name_x, cursor, image_w, image_h,
+                  ("reference_open", image_path), "Open latest preview")
+            cursor += image_h + f.px(6)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.wave.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
@@ -990,14 +1007,44 @@ def _first_run(f: Frame, x, cursor, width) -> int:
     return cursor
 
 
+def _plan_repairs(items: list) -> dict:
+    """Recovery is a view of the current transcript, so restore, undo and reload need no repair.
+    A deliverable can change during repair or belong to different helpers; match worker ids and roles."""
+    successful, repairs = set(), {}
+    for n in reversed(range(len(items))):
+        item = items[n]
+        if item.get("kind") != "tool" or item.get("name") != "delegate":
+            continue
+        if item.get("plan_repair"):
+            repairs[n] = "needed"
+        turn = item.get("plan_turn")
+        if not isinstance(turn, str) or not turn:
+            continue
+        crew = item.get("plan_workers")
+        if not isinstance(crew, list) or not crew or any(
+                not isinstance(w, list) or len(w) != 2 or not all(isinstance(s, str) for s in w)
+                or not w[0].strip() for w in crew):
+            continue
+        key = (turn, tuple(sorted(tuple(w) for w in crew)))
+        if item.get("plan_repair"):
+            if key in successful:
+                repairs[n] = "resolved"
+        elif item.get("status") == "done":
+            successful.add(key)
+    return repairs
+
+
 def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     """Lays the conversation out at y=0, then slides it into the viewport. Returns max scroll."""
     pad, gap = f.px(T.PAD), f.px(T.GAP)
     x, width = pad, f.width - 2 * pad
     items = list(session["items"])  # Snapshot: the worker thread appends while we draw.
+    repairs = _plan_repairs(items)
     first_prim, first_hit, cursor = len(f.prims), len(f.hits), 0
 
     for n, item in enumerate(items):
+        if n in repairs:
+            item = {**item, "plan_repair": repairs[n]}
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
     cursor = _cloud_jobs(f, cursor)
     # Queued notes do not replace the active stream or tool as the source of activity.
@@ -1199,6 +1246,10 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
         spending.valid_ledger(spend) and spend.get("credits")) else ""
     extras = [part for part in (chat, f.ui.get("today") or "") if part]
     lines = [f.ui["credits"]] if f.ui.get("credits") else []
+    if f.ui.get("provider", "LOOPCUT") == "LOOPCUT":
+        note, _ = usage_note(f.ui.get("account"), f.ui.get("allowance_notice"), f.ui.get("now"))
+        if note:
+            lines.extend(line.rstrip() for _, line in wrap(note, "ui", small, width, f.measure))
     if extras and f.measure("ui", small, " · ".join(extras)) <= width:
         return lines + [" · ".join(extras)]
     return lines + extras
@@ -1421,9 +1472,9 @@ def usage_lines(usage: dict, budget: int, account: dict | None, notice: dict | N
         lines.append(f"This conversation: {_k(total_in)} in, {_k(total_out)} out")
     refused = allowance.refused_windows(account, notice, now)
     for key, label in (("session", "Session"), ("week", "Week")):
-        used = 1.0 if key in refused else allowance.used((account or {}).get(key))
+        used = 1.0 if key in refused else allowance.used((account or {}).get(key), now)
         if used is not None:
-            lines.append(f"{label}: {round(used * 100)}% used, {round(max(0.0, 1 - used) * 100)}% left")
+            lines.append(f"{label} chat allowance: {round(used * 100)}% used, {round(max(0.0, 1 - used) * 100)}% left")
     return lines
 
 
@@ -1436,7 +1487,7 @@ def ring_shares(usage: dict, budget: int, account: dict | None, notice: dict | N
     rings = [("context", share, T.ERROR if share >= 1 else T.WARN if share >= 0.8 else T.ACCENT)]
     refused = allowance.refused_windows(account, notice, now)
     window = allowance.refused_window(account, notice, now) or next(iter(sorted(refused)), "session")
-    used = 1.0 if refused else allowance.used((account or {}).get(window))
+    used = 1.0 if refused else allowance.used((account or {}).get(window), now)
     if used is not None:
         left = max(0.0, min(1.0, 1 - used))
         rings.append((window, left, T.ERROR if left < 0.1 else T.WARN if left < 0.3 else T.OK))
@@ -1450,14 +1501,17 @@ def _k(tokens: int) -> str:
 SHOW_USAGE_FROM = 0.7  # The footer names the fuller window once this much of it is used.
 
 
-def usage_note(account: dict | None) -> tuple[str, float]:
+def usage_note(account: dict | None, notice: dict | None = None,
+               now: float | None = None) -> tuple[str, float]:
     """(text, share) for the footer: the fuller of the account's two windows once it is worth a
     glance, else ("", share)."""
     best = ("", 0.0)
+    refused = allowance.refused_windows(account, notice, now)
     for key in ("week", "session"):
-        used = allowance.used((account or {}).get(key))
+        used = 1.0 if key in refused else allowance.used((account or {}).get(key), now)
         if isinstance(used, (int, float)) and used > best[1]:
-            best = (f"{round(used * 100)}% of {key} used", float(used))
+            window = "this 5-hour window" if key == "session" else "this week"
+            best = (f"Chat: {round(used * 100)}% of {window} used", float(used))
     return best if best[1] >= SHOW_USAGE_FROM else ("", best[1])
 
 
@@ -1567,6 +1621,8 @@ def _rings(f: Frame, session: dict, right: int, y: int, height: int) -> None:
     diameter, thickness, gap = f.px(14), f.px(3), f.px(6)
     usage, budget, account = session.get("usage") or {}, int(f.ui.get("context_budget") or 0), f.ui.get("account")
     notice, now = f.ui.get("allowance_notice"), f.ui.get("now")
+    if f.ui.get("provider", "LOOPCUT") != "LOOPCUT":
+        account, notice = None, None
     rings = ring_shares(usage, budget, account, notice, now)
     total = len(rings) * diameter + (len(rings) - 1) * gap
     left, top = right - total, y + (height - diameter) // 2
@@ -1747,35 +1803,45 @@ def _ellipsize(f: Frame, text: str, size: int, max_width: float) -> str:
     return text.rstrip() + "…"
 
 
-def _update_banner(f: Frame, top: int) -> int:
-    """The update notice under the header (ui["update"], see update.banner_for): one line of
-    text, a button at the right, and a dismiss cross where the notice can be put off."""
+def _update_banner_height(f: Frame) -> int:
     banner = f.ui.get("update")
     if not banner:
         return 0
-    height, pad, small = f.px(T.BANNER_HEIGHT), f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    return f.px(T.BANNER_HEIGHT) + (f.line_height(f.px(T.FONT_SIZE_SMALL)) + f.px(4) if banner.get("detail") else 0)
+
+
+def _update_banner(f: Frame, top: int) -> int:
+    """The update notice under the header, with an optional second line for elevation."""
+    banner = f.ui.get("update")
+    if not banner:
+        return 0
+    height, pad, small = _update_banner_height(f), f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    line_height = f.px(T.BANNER_HEIGHT)
     f.rect("update.bg", 0, top, f.width, height, T.CARD)
     f.rect("update.rule", 0, top + height - 1, f.width, 1, T.CARD_BORDER)
     right = f.width - pad
     if banner.get("dismiss"):
         box = f.px(24)
-        bx, by = right - box, top + (height - box) // 2
+        bx, by = right - box, top + (line_height - box) // 2
         active = f.ui.get("hover") == "update.dismiss"
         if active:
             f.rect("update.dismiss.bg", bx, by, box, box, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
         glyph_w = round(f.measure("ui", small, "×"))
-        f.text("update.dismiss.glyph", bx + (box - glyph_w) // 2, top + (height - f.line_height(small)) // 2, "×",
+        f.text("update.dismiss.glyph", bx + (box - glyph_w) // 2, top + (line_height - f.line_height(small)) // 2, "×",
                small, T.TEXT if active else T.TEXT_MUTED)
-        f.hit("update.dismiss", bx, top, box, height, ("update_dismiss", None), tip="Not now")
+        f.hit("update.dismiss", bx, top, box, line_height, ("update_dismiss", None), tip="Hide update notice")
         right = bx - f.px(4)
     if banner.get("button"):
         label, kind = banner["button"]
         width = round(f.measure("ui", small, label)) + 2 * f.px(10)
-        f.button("update.button", right - width, top + (height - f.px(24)) // 2, label, T.BUTTON, T.BUTTON_TEXT,
+        f.button("update.button", right - width, top + (line_height - f.px(24)) // 2, label, T.BUTTON, T.BUTTON_TEXT,
                  (kind, None))
         right -= width + f.px(8)
     text = _ellipsize(f, banner["text"], small, right - pad)
-    f.text("update.text", pad, top + (height - f.line_height(small)) // 2, text, small, T.TEXT)
+    f.text("update.text", pad, top + (line_height - f.line_height(small)) // 2, text, small, T.TEXT)
+    if banner.get("detail"):
+        detail = _ellipsize(f, banner["detail"], small, f.width - 2 * pad)
+        f.text("update.detail", pad, top + line_height, detail, small, T.TEXT_MUTED)
     if banner.get("progress") is not None:
         bar = f.px(2)
         f.rect("update.progress.track", 0, top + height - 1 - bar, f.width, bar, T.CARD_BORDER)
@@ -1869,7 +1935,7 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     f.rect("bg", 0, 0, width, height, T.BG)
     input_top = height - (f.px(VOTE_FOOTER_HEIGHT) if view == "vote" else input_height(f, session))
     header_bottom = f.px(T.HEADER_HEIGHT)
-    top = header_bottom + (f.px(T.BANNER_HEIGHT) if ui.get("update") else 0)
+    top = header_bottom + _update_banner_height(f)
     if view == "jobs":
         max_scroll = 0.0
         _jobs(f, top, input_top)

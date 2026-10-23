@@ -1,0 +1,69 @@
+# Disposable real-Windows updater checks. No Blender is launched; the legacy restart target
+# is an inert marker probe. This runner is elevated with UAC off: UAC/AV still need manual QA.
+name: Windows updater
+
+on:
+  push:
+    branches: [fix/forced-update, 'rc/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep Python's redirected diagnostics in UTF-8, including Unicode paths in tracebacks.
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  unit:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          filter: blob:none
+          sparse-checkout: |
+            scripts/addons_core/loopcut
+            loopcut/tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Updater unit tests, including real Windows PowerShell argument handling
+        run: python -m unittest discover -s loopcut/tests -p test_update.py -v
+
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 19
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          filter: blob:none
+          sparse-checkout: |
+            scripts/addons_core/loopcut
+            loopcut/tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install public 0.2.9, then run both production helpers against the real MSI
+        run: python loopcut/tests/windows_update_smoke.py --out "$env:RUNNER_TEMP\loopcut-update-check"
+      - name: Keep helper results and MSI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-update-check
+          path: |
+            ${{ runner.temp }}/loopcut-update-check/**/*.log
+            ${{ runner.temp }}/loopcut-update-check/**/*.json
+            ${{ runner.temp }}/loopcut-update-check/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14

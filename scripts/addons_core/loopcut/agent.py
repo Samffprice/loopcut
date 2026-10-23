@@ -4,6 +4,7 @@ import dataclasses
 import json
 import threading
 import time
+import uuid
 from concurrent.futures import TimeoutError as FutureTimeout
 from copy import deepcopy
 from typing import Any, Callable
@@ -207,7 +208,7 @@ class Turn:
         self.error_code = ""
         self.allowance_generation = state.ui.get("allowance_generation", 0)
         self.hosted_requests = 0
-        self.allowance_notices: list = []  # (items, notice) emitted this turn, removed if admission later refuses.
+        self.allowance_notices: list = []  # (items, notice) retained if a refused send restores its draft.
         self.submission = None  # A new send can be returned to the input if its first request is refused.
         self.returned_submission = False
         # Its conversation log (session_logs.py): what ran it, or {} when the conversation is not uploaded.
@@ -521,28 +522,32 @@ def _hosted_reply(turn: Turn, cfg: config.Config, info: dict | None = None, *, s
             _update_account(info)
         if success:
             state.clear_allowance_notice()
-            if info and session is not None:
-                _warn_low_allowance(session, session["items"], info, turn=turn)
+        if info and session is not None:
+            _warn_low_allowance(session, session["items"], info, turn=turn)
     mainthread.run_on_main(apply)
 
 
-def _hosted_refusal(session: dict, turn: Turn, item: dict) -> None:
+def _hosted_refusal(session: dict, turn: Turn, item: dict, info: dict | None = None) -> None:
     """Return a refused new send to its own draft; retain one account notice, never a send gate."""
     def apply():
+        if info and turn.allowance_generation == state.ui.get("allowance_generation", 0):
+            _update_account(info)  # A plan change must clear old refusals before installing this one.
         previous = state.ui.get("allowance_notice") or {}
         windows = dict(previous.get("windows") or {})
         previous_item = previous.get("item") or {}
         previous_window = allowance.LIMIT_WINDOWS.get(previous_item.get("reason"))
         if previous_window:
             windows[previous_window] = dict(previous_item)
-        owner = turn.chat[1] if turn.chat else turn
-        for items, notice in owner.allowance_notices:
-            items[:] = [row for row in items if row is not notice]
-        owner.allowance_notices.clear()
-        snapshot = turn.submission if not turn.hosted_requests else None
+        owner = turn
+        while owner.chat:
+            owner = owner.chat[1]
+        # A Try it tool can already have changed the scene before the first hosted request.
+        snapshot = turn.submission if not turn.hosted_requests and not turn.tool_steps else None
         if snapshot:
             extra = [i["text"] for i in session["items"][len(snapshot["items"]) + 1:] if i.get("kind") == "user"]
             session["items"][:] = snapshot["items"]
+            session["items"].extend(notice for items, notice in owner.allowance_notices
+                                    if items is session["items"] and not any(row is notice for row in items))
             session["messages"][:] = snapshot["messages"]
             for key in ("references", "scene_seen", "scene_turn_start", "pending_checkpoint", "turn_number"):
                 session[key] = snapshot[key]
@@ -564,51 +569,85 @@ def _hosted_refusal(session: dict, turn: Turn, item: dict) -> None:
             if not snapshot:
                 session["items"].append(item)
         if turn.allowance_generation == state.ui.get("allowance_generation", 0):
-            info = state.ui.get("account") or {}
+            account_info = state.ui.get("account") or {}
             window = allowance.LIMIT_WINDOWS.get(item["reason"])
-            reported = info.get(window) or {}
+            reported = account_info.get(window) or {}
             if not item_to_show.get("resets_at") and isinstance(reported, dict):
                 item_to_show["resets_at"] = reported.get("resets_at") or ""
             if not item_to_show.get("plan"):
-                item_to_show["plan"] = info.get("plan") or ""
+                item_to_show["plan"] = account_info.get("plan") or ""
             if window:
                 windows[window] = dict(item_to_show)
             state.ui["allowance_notice"] = {"item": item_to_show, "conversation": session["id"], "windows": windows}
     _on_main(apply)
+    if info:
+        from . import mainthread
+        # Only draft restoration waits for the main thread, as in the ordinary refusal path.
+        # Its percentage warning is optional and never delays turn finalisation or saving.
+        mainthread.run_on_main(lambda: _warn_low_allowance(
+            session, session["items"], info, turn=turn, refused=allowance.LIMIT_WINDOWS.get(item["reason"])))
 
 
-def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | None = None) -> None:
-    """The session warning follows its reset, including across conversations; the weekly one is per chat."""
-    def warn(item):
-        items.append(item)
-        if turn is not None:
-            owner = turn.chat[1] if turn.chat else turn
-            owner.allowance_notices.append((items, item))
+def _allowance_notice_matches(row: dict, name: str, key: str, reset: str | None) -> bool:
+    if row.get("kind") != "notice":
+        return False
+    if row.get("allowance_window"):
+        return row["allowance_window"] == name and (row.get("resets_at") or row.get("plan") or "unknown") == key
+    # 0.2.9 stored only text. Its dated session reset identifies the window; relative
+    # resets and undated weekly notices may get one upgrade duplicate with new metadata.
+    if name != "session" or not reset:
+        return False
+    prefix, separator, suffix = row.get("text", "").partition("%")
+    return (bool(separator) and prefix.startswith("About ") and prefix[6:].isdigit()
+            and suffix == " of this session's chat allowance is left. "
+            f"Resets {state.reset_label(reset, now=0)}.")
 
-    window = info.get("session") or {}
-    used = allowance.used(window)
-    reset = window.get("resets_at") if isinstance(window, dict) else None
-    if isinstance(used, (int, float)) and LOW_ALLOWANCE <= used < 1:
+
+def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | None = None,
+                        refused: str | None = None) -> None:
+    """Main thread: warn once per server window; the ordinary conversation saves persist it."""
+    owner = turn
+    while owner is not None and owner.chat:
+        session, owner = owner.chat
+        items = session["items"]
+    if owner is not None:
+        if owner.allowance_generation != state.ui.get("allowance_generation", 0):
+            return
+        if owner.config is not None and not config.on_service(owner.config.base_url):
+            return
+    live = state.session()
+    if session is not live and (not session.get("id") or session.get("id") != live.get("id")):
+        return  # The conversation is closed; a later response can carry the same warning.
+    # Resolve reopened conversations by id, and unsaved/id-less sessions by object identity.
+    # Never append to a captured conversation or save from this callback.
+    session, items = live, live["items"]
+    refused_windows = allowance.refused_windows(info, state.ui.get("allowance_notice"))
+    for name in ("session", "week"):
+        if name == refused or name in refused_windows:
+            continue
+        window = info.get(name)
+        used = allowance.used(window)
+        if used is None or used < LOW_ALLOWANCE:
+            continue
+        reset = window.get("resets_at")
         key = reset or info.get("plan") or "unknown"
-        if state.ui.get("warned_session_allowance") != key:
-            state.ui["warned_session_allowance"] = key
-            left = max(0, round((1 - used) * 100))
-            when = f" Resets {state.reset_label(reset)}." if reset else ""
-            warn(state.item_notice(f"About {left}% of this session's chat allowance is left.{when}"))
-    used = allowance.used(info.get("week"))
-    if session.get("warned_low") or used is None or not LOW_ALLOWANCE <= used < 1:
-        return
-    session["warned_low"] = True
-    left, plan = max(0, round((1 - used) * 100)), str(info.get("plan") or "")
-    if not config.billing_open():
-        warn(state.item_notice(f"About {left}% of this week's allowance is left."))
-    elif plan == "free":
-        warn(state.item_notice(
-            f"About {left}% of this week's free allowance is left. Upgrading now keeps this conversation "
-            f"going without a stop.", "See plans", url=config.pricing_url("low_allowance")))
-    else:
-        warn(state.item_notice(f"About {left}% of this week's allowance is left on the {plan.capitalize()} plan.",
-                                       "Account", url=config.account_url()))
+        flag = f"warned_{name}_allowance"
+        warned = state.ui.get(flag) or []
+        if isinstance(warned, str):  # A hot reload can retain the old single-window marker.
+            warned = [warned]
+        in_history = any(_allowance_notice_matches(row, name, key, reset) for row in items)
+        if key in warned:
+            continue
+        state.ui[flag] = [*warned, key]  # Delayed helper replies may arrive out of window order.
+        if in_history:
+            continue
+        when = allowance.reset_sentence(reset)
+        item = state.item_notice(f"You've used about {round(used * 100)}% of {allowance.window_label(name)} "
+                                 f"chat allowance.{when}")
+        item.update(allowance_window=name, resets_at=reset or "", plan=info.get("plan") or "")
+        items.append(item)
+        if owner is not None:
+            owner.allowance_notices.append((items, item))
 
 
 def _limit_item(ex: llm.LLMError) -> dict:
@@ -660,9 +699,8 @@ def _tool_title(name: str, schemas: Callable | None = None) -> str:
         function = schema["function"]
         if function["name"] == name:
             title = str(function.get("title") or "").strip()
-            description = " ".join(str(function.get("description") or "").split())
-            if title or description:
-                return title or description.split(". ", 1)[0].rstrip(".")
+            if title:
+                return title
     return " ".join(name.replace("_", " ").replace(".", " ").split()).capitalize()
 
 
@@ -695,6 +733,25 @@ def _arguments(arguments: str) -> dict:
     except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _plan_attempt(card: dict, call: llm.ToolCall, session: dict, turn_id: str) -> None:
+    """Record identity before delegate can start workers or replace their continued threads.
+    The panel derives recovery from later successful cards still present in this turn."""
+    if call.name != "delegate":
+        return
+    from . import orchestrator, waves
+    arguments = _arguments(call.arguments)
+    if orchestrator.waits(call.name, arguments):
+        return
+    card["plan_turn"] = turn_id
+    wave = arguments.get("wave")
+    crew = wave.get("workers") if isinstance(wave, dict) else None
+    if isinstance(crew, list) and crew and all(
+            isinstance(w, dict) and isinstance(w.get("id"), str) and w["id"].strip() for w in crew):
+        live = {"threads": orchestrator.threads_of(session),
+                "busy": waves.busy(getattr(session.get("turn"), "job", None))}
+        card["plan_workers"] = [[w["id"], orchestrator.effective_role(w, live)] for w in crew]
 
 
 def _wants_capture(arguments: str) -> bool:
@@ -1119,6 +1176,8 @@ def _route(session: dict, turn: Turn) -> None:
     workspace on, a conversation that never delegated and whose turn is a look (router.to_workspace)
     goes to the single agent's workspace loop instead, for this turn and the rest of the conversation:
     no note, the orchestrator's model, WORKSPACE_SPEC (run_loop picks up turn.spec)."""
+    if turn.try_it and turn.tool_steps:
+        return  # The card already selected and ran its tool; continue with its result, without routing again.
     from . import router
     roles = getattr(turn, "roles", None)
     divert = router.to_workspace if getattr(turn, "may_divert", False) else None
@@ -1539,29 +1598,42 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
     try:
         cfg = turn.config or config.load()
-        last = messages[-1] if messages else {}
-        if spec.reference_card and last.get(conversations.ATTACHED) and not last.get(context.REFERENCE_CARD):
-            try:
-                names = _reference_card(session, cfg, last, turn.cancel.is_set, spec.role, turn)
-                if names:
-                    items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
-            except llm.LLMError as ex:
-                if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
-                    raise
-                print(f"Loopcut: could not describe the attached images: {ex}")
-        if spec.on_turn_start:
-            spec.on_turn_start(session, turn)
-            if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
-                spec = turn.spec
-        if spec.drive:
-            turn.outcome = spec.drive(session, turn, cfg, run_tool, ensure_checkpoint)
-            return
+        first = None
+        if turn.try_it and not turn.tool_steps:
+            from . import try_it
+            call = try_it.first_call(turn.try_it, session, _session_schemas(session, spec))
+            if call is not None:
+                first = llm.Completion(tool_calls=[call])
+        # A card's tool consumes its reference directly. No reference-model request is needed for it.
+        describe_reference = first is None
+        user_message = messages[-1] if messages else {}
+        started = False
         no_progress = repeats.NoProgress()
+        plan_turn = uuid.uuid4().hex
         step = 0
         while not cfg.max_steps or step < cfg.max_steps:
-            step += 1
             if turn.cancel.is_set():
                 raise llm.Cancelled()
+            if first is None and not started:
+                if (describe_reference and spec.reference_card and user_message.get(conversations.ATTACHED)
+                        and not user_message.get(context.REFERENCE_CARD)):
+                    try:
+                        names = _reference_card(session, cfg, user_message, turn.cancel.is_set, spec.role, turn)
+                        if names:
+                            items.append(state.item_notice("Studied the reference: " + ", ".join(names)))
+                    except llm.LLMError as ex:
+                        if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
+                            raise
+                        print(f"Loopcut: could not describe the attached images: {ex}")
+                if spec.on_turn_start:
+                    spec.on_turn_start(session, turn)
+                    if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
+                        spec = turn.spec
+                if spec.drive:
+                    turn.outcome = spec.drive(session, turn, cfg, run_tool, ensure_checkpoint)
+                    return
+                started = True
+            step += 1
             if spec.before_request:
                 spec.before_request(step)
             if turn.notes:
@@ -1569,7 +1641,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if no_progress:
                     no_progress.reset()
             _fold_notes(session, turn)
-            completion = _request(session, turn, cfg, spec)
+            # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
+            completion = first if first is not None else _request(session, turn, cfg, spec)
+            first = None
             messages.append(completion.as_message())
             if not completion.tool_calls:
                 bounce = spec.on_final(session, turn, completion) if spec.on_final and not turn.cancel.is_set() else None
@@ -1666,6 +1740,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
                 delegations = len(turn.delegations)
+                _plan_attempt(card, call, session, plan_turn)
                 from . import cloud_account
                 with cloud_account.approval_context(_Consent(session, turn, card, spec.asks,
                                                              files_allowed=cfg.auto_run or session['auto_run'])):
@@ -1703,6 +1778,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 # A paid call the user skipped did not fail: it is shown as skipped (spending.declined).
                 card["status"] = "done" if result.ok else "rejected" if card.get("declined") else "failed"
                 card["output"] = result.text
+                if card.get("plan_turn") and getattr(result, "plan_refused", False):
+                    card["plan_repair"] = "needed"
                 if getattr(result, "receipt", ""):
                     card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
                 for guard in getattr(result, "guard_notes", None) or ():  # Already in result.text too.
@@ -1765,8 +1842,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
     except (config.ConfigError, llm.LLMError) as ex:
         turn.outcome = "error"
         turn.error_code = _error_code(ex)
-        if getattr(ex, "account", None):
-            _hosted_reply(turn, cfg, ex.account)
+        handled_refusal = False
         from . import nudges
         stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
         if stopped is not None:
@@ -1774,7 +1850,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         elif getattr(ex, "status", None) == 402:
             item = _limit_item(ex)
             if config.on_service(cfg.base_url) and item["reason"] in state.HOSTED_LIMITS:
-                _hosted_refusal(session, turn, item)
+                _hosted_refusal(session, turn, item, ex.account)
+                handled_refusal = True
             else:
                 items.append(item)
             if config.on_service(cfg.base_url) and not ex.account:
@@ -1783,6 +1860,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         else:
             items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") in (llm.CONNECTION_LOST,
                                                                                      llm.EMPTY_REPLY)))
+        if getattr(ex, "account", None) and not handled_refusal:
+            _hosted_reply(turn, cfg, ex.account, session=session)
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
         turn.outcome = "error"
         turn.error_code = "connection_lost" if llm.dropped_connection(ex) else "internal"

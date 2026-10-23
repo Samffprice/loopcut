@@ -64,6 +64,7 @@ ADVISORY_TEXT = ("Any check kind, or no_modifiers name; flat_shaded name max_smo
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "delegate",
+        "title": "Planning background helpers",
         "description": (
             "Start a wave of workers, any number (the rest queue); returns once any finish: merged, reported, "
             "and who still runs or waits."),
@@ -102,6 +103,7 @@ SCHEMAS = [
                         "advisory": {"type": "array", "items": {"type": "object"}, "description": ADVISORY_TEXT}}}}}}}}}},
     {"type": "function", "function": {
         "name": "checks",
+        "title": "Checking the results",
         "description": (
             "No arguments: run every check now. add: as delegate's checks, run now and before your reply "
             "ends. retire: [{id, reason}], the reason quoting the user or what you measured. snapshot: names "
@@ -112,6 +114,7 @@ SCHEMAS = [
             "retire": {"type": "array", "items": {"type": "object"}}}}}},
     {"type": "function", "function": {
         "name": "accept_quarantine",
+        "title": "Accepting the changes kept aside",
         "description": "Move a wave's quarantined items into the scene.",
         "parameters": {"type": "object", "required": ["wave"], "properties": {
             "wave": {"type": "string"}, "names": {"type": "array", "items": {"type": "string"}}}}}},
@@ -300,6 +303,27 @@ _SHOTS = ("shot", "shots", "look")
 SHOT_ASPECTS = ["lighting", "camera"]  # A shot's worker owns its camera and the light it needs (audit item 8).
 
 
+def normalise_role(role) -> str:
+    """A role's known alias or default, after any continuation inheritance."""
+    if role in ROLES:
+        return role
+    return _ROLE_SYNONYMS.get(role.strip().lower(), "modeling") if isinstance(role, str) else "modeling"
+
+
+def _continued_thread(worker: dict, live: dict) -> dict | None:
+    wanted = worker.get("continues")
+    threads = live.get("threads")
+    if not isinstance(wanted, str) or not wanted or wanted in (live.get("busy") or {}):
+        return None
+    return threads.get(wanted) if isinstance(threads, dict) else None
+
+
+def effective_role(worker: dict, live: dict) -> str:
+    """The role plan repair and retry identity use, including a live continuation's inheritance."""
+    thread = _continued_thread(worker, live)
+    return normalise_role(worker.get("role") or (thread or {}).get("role"))
+
+
 def _unwrap_check(check: dict) -> bool:
     """A model sometimes nests a check's real fields one level down, under a key named for its own
     kind ({"kind": "dims", "dims": {"name": ..., "size": ...}}) or the generic "check"
@@ -460,7 +484,7 @@ def _repair_continues(worker: dict, label: str, workers: list, threads: dict, ke
     wanted = worker.get("continues")
     if wanted in (None, "") or wanted in (live.get("busy") or {}):  # A running worker's: validate_wave says so.
         return []
-    thread = threads.get(wanted) if isinstance(wanted, str) else None
+    thread = _continued_thread(worker, live)
     if thread is None:
         worker["continues"] = ""
         known = f" (earlier workers: {', '.join(sorted(threads))})" if threads else ""
@@ -651,19 +675,17 @@ def repair_wave(wave: dict, words: str, live: dict) -> tuple[dict, list[str]]:
         if not isinstance(worker, dict):
             continue
         label = f"workers[{index}]" + (f" ({worker.get('id')})" if isinstance(worker.get("id"), str) else "")
+        mapped = effective_role(worker, live)
         notes += _repair_continues(worker, label, workers, threads, kept_names, shared, objects, live)
 
         role = worker.get("role")
         if role not in ROLES:
-            mapped = _ROLE_SYNONYMS.get(role.strip().lower()) if isinstance(role, str) else None
-            if mapped and role.strip().lower() in _SHOTS:
-                notes.append(f"{label}.role: {role!r} mapped to {mapped!r}{_shot_aspects(worker, workers)}")
-            elif mapped:
-                notes.append(f"{label}.role: {role!r} mapped to {mapped!r}")
+            if isinstance(role, str) and role.strip().lower() in _ROLE_SYNONYMS:
+                aspects = _shot_aspects(worker, workers) if role.strip().lower() in _SHOTS else ""
+                notes.append(f"{label}.role: {role!r} mapped to {mapped!r}{aspects}")
             else:
-                mapped = "modeling"
                 notes.append(f"{label}.role: {role!r} is not a role or a known synonym; defaulted to 'modeling'")
-            worker["role"] = mapped
+        worker["role"] = mapped
 
         prefix = worker.get("prefix")
         if isinstance(prefix, str) and prefix and not _PREFIX.match(prefix):
@@ -1368,6 +1390,7 @@ def _last_assistant(messages: list) -> int:
 
 WAIT_SCHEMA = {"type": "function", "function": {
     "name": "delegate",
+    "title": "Collecting helper results",
     "description": "Collect existing workers' next results. Starting new workers is disabled for this session.",
     "parameters": {"type": "object", "properties": {"wait": {"type": "boolean", "enum": [True]}},
                    "required": ["wait"], "additionalProperties": False}}}
@@ -1400,7 +1423,7 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         return tools.ToolResult(waves.unavailable_note(session), ok=False)
     if not isinstance(wave, dict):
         return tools.ToolResult("delegate refused: wave must be an object {shared, workers}; or wait true, with no "
-                                "wave, for the running workers' next results.", ok=False)
+                                "wave, for the running workers' next results.", ok=False, plan_refused=True)
     words = user_words(session)
     plan = normalise_wave(wave)
     snapshot_errors = [error for n, w in enumerate(plan["workers"]) if isinstance(w, dict) for key in ("checks", "advisory")
@@ -1412,24 +1435,26 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
     plan, repairs = repair_wave(plan, words, live)  # Small mistakes fixed before validation ever sees them.
     errors = snapshot_errors + validate_wave(plan, words, live)
     if errors and dry_run:
-        return tools.ToolResult(dry_run_report(errors, repairs, [], [], layout_checked=False), ok=False)
+        return tools.ToolResult(dry_run_report(errors, repairs, [], [], layout_checked=False),
+                                ok=False, plan_refused=True)
     if errors:
         lines = ["delegate refused; nothing started. Fix these and call again:", *(f"- {e}" for e in errors)]
         if repairs:
             lines.append(_repairs_line(repairs))
-        return tools.ToolResult("\n".join(lines), ok=False)
+        return tools.ToolResult("\n".join(lines), ok=False, plan_refused=True)
     problems, layout_repairs, layout_warnings, notes = layout(plan, live, project)
     repairs = repairs + layout_repairs
     warnings = role_warnings(plan) + tool_warnings(plan) + layout_warnings
     budget = f"{budget_line(plan, roles, getattr(turn, 'job', None))}\n{schedule_line(plan, roles, live['busy'])}"
     if dry_run:
-        return tools.ToolResult(dry_run_report(problems, repairs, warnings, notes, budget=budget), ok=not problems)
+        return tools.ToolResult(dry_run_report(problems, repairs, warnings, notes, budget=budget),
+                                ok=not problems, plan_refused=bool(problems))
     if problems:
         lines = ["delegate refused; nothing started. The planned layout does not add up:",
                  *(f"- {p}" for p in problems), *(f"- warning: {w}" for w in warnings), *(f"  {n}" for n in notes)]
         if repairs:
             lines.append(_repairs_line(repairs))
-        return tools.ToolResult("\n".join(lines), ok=False)
+        return tools.ToolResult("\n".join(lines), ok=False, plan_refused=True)
     warnings = [f"- warning: {w}" for w in warnings]
     before = _snapshot()
     try:
@@ -1667,22 +1692,33 @@ def describe(name: str, arguments: dict):
     if name != "delegate":
         return None
     if waits(name, arguments):
-        return "Wait for the workers' next results", ""
+        return "Wait for the helpers' next results", ""
     wave = arguments.get("wave") if isinstance(arguments.get("wave"), dict) else {}
     workers = [w for w in wave.get("workers") or [] if isinstance(w, dict)]
     what = ", ".join(str(w.get("deliverable") or w.get("id") or "?") for w in workers) or "nothing"
     code = json.dumps(wave, indent=2)
     if only_reads(name, arguments):
-        return f"Check a plan for workers: {what}", code
+        return f"Check a helper plan: {what}", code
     roles = _roles()
     usd = roles.job_max_usd if roles else config.Roles.job_max_usd
     seconds = roles.worker_max_seconds if roles else config.Roles.worker_max_seconds
     count = len(workers)
-    budget = (f"${usd:.2f}, " if usd else "") + f"{seconds / 60:g} min per worker"
-    return (f"Start {count} worker{'s' if count != 1 else ''} in the background for {what}. Approving lets them run "
-            f"scripts there without asking again until they report back or the budget runs out. "
-            f"Workers can read and write your files (no sandbox "
-            f"yet). Budget: {budget}.", code)
+    worker = getattr(roles, "worker", None)
+    base_url = worker.base_url if worker else ""
+    if config.on_service(base_url):
+        usage = "Uses your chat allowance, not credits."
+    elif config.chatgpt_plan(base_url):
+        usage = "Uses your ChatGPT plan allowance."
+    else:
+        usage = (f"API spending limit: ${usd:.2f} shared by all helpers in this turn."
+                 if usd else "Uses your API key; no API spending limit is set.")
+    limits = (f"Internal token-cost ceiling: ${usd:.2f} shared by all helpers in this turn (not a price per approval)."
+              if usd else "No token-cost ceiling is set.")
+    code = f"{limits}\nTime limit: {seconds / 60:g} minutes per helper run.\n\n{code}"
+    return (f"Start {count} helper{'s' if count != 1 else ''} for {what}. "
+            f"Runs in the background (up to {seconds / 60:g} minutes per helper). {usage} "
+            "Approving lets helpers run scripts without asking again until they finish or reach a limit. "
+            "Helpers can read and write your files (no sandbox yet).", code)
 
 
 # ------------------------------------------------------------------ the finish gate

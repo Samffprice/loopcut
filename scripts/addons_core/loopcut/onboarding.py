@@ -31,6 +31,7 @@ from pathlib import Path
 import bpy
 
 from . import account, blender_import, chatgpt_auth, config, settings
+from .try_it import CARDS
 
 # left_chatgpt: "Use your own API key" moved the provider off a ChatGPT plan; "Back to model choices" puts it back.
 # no_account: "Continue without an account" was taken after a failed sign-in; the setup is not done this time.
@@ -948,6 +949,11 @@ def _draw_signed_in(layout, context) -> None:
         label, line = _credit_rows(credits)
         _text(group, label, scale=1.2, bold=True, center=True)
         _text(group, line, MUTED, center=True)
+    prefs = settings.preferences()
+    if prefs is None or prefs.provider == "LOOPCUT":
+        kind = "chat" if _account_plan() in ("pro", "max") else "free"
+        _text(column, "Credits pay for cloud tools; Loopcut chat has a separate\n"
+                      f"{kind} allowance that refreshes every 5 hours.", MUTED, center=True)
     if amount and not _state["claimed"]:
         _primary(column, "loopcut.onboarding_claim", "Claim credits")
         _, right = _footer(column)
@@ -1372,26 +1378,9 @@ def _draw_privacy(layout) -> None:
     _web_link(right, "Privacy policy ↗", _privacy_url())
 
 
-# The Try it screen's first projects. tool: the cloud tool a card runs, priced by its manifest estimate; a
-# per-second tool's estimate covers its default length (MOTION_DEFAULT_SECONDS), so "seconds" scales it. With
-# the default 80-credit model and 3 seconds of motion (6), both paid cards fit in 100 trial credits.
-# free: the card's cloud call is on the house (try_samples): its price shows struck through, next to 0 credits.
-# thumbnail: in media/, square, in the sample photo's studio look: our renders of the clay mannequin text to motion
-# puts on an empty scene, mid-jump with a pale ghost of its crouch, and of Poly Haven's CC0 "Treasure Chest", and the
-# photo.
+# CARDS is shared with the agent (try_it.py). A per-second tool's manifest estimate covers its default
+# length, so the card's "seconds" scales that price, shown struck through beside 0 credits for a free card.
 MOTION_DEFAULT_SECONDS = 5  # motion_from_text bills per second and defaults to 5 (its manifest description).
-CARDS = (
-    {"id": "motion", "title": "Make it move", "tool": "motion_from_text", "seconds": 3, "free": True,
-     "thumbnail": "card_motion.jpg", "line": "A figure jumps for joy, with text to motion.",
-     "prompt": "Remove the default cube, then use text to motion to make a figure jump for joy, 3 seconds long."},
-    {"id": "photo_3d", "title": "Photo to 3D model", "tool": "image_to_3d", "photo": True, "free": True,
-     "thumbnail": "alarm-clock.jpg", "line": "Turns this photo into a textured 3D model.",
-     "prompt": "Turn the attached photo into a textured 3D model and put it in the scene in place of the default "
-               "cube."},
-    {"id": "model", "title": "Model a treasure chest", "tool": None,
-     "thumbnail": "card_chest.jpg", "line": "Built step by step with Blender's own tools.",
-     "prompt": "Model a stylized treasure chest with gold trim"},  # A starter checked to finish on the free tier.
-)
 # True of Pro and not of Free, from PLANS (renders and every cloud tool run on any plan's credits).
 PRO_LINE = f"Pro plan: {PLANS['pro']['credits']:,} credits a month, Loopcut Pro and top-ups"
 _preview = {"collection": None}

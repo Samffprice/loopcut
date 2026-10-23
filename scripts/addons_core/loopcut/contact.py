@@ -53,6 +53,7 @@ STRAIGHT = 0.99         # Straight behind an open face: p - q this close to the 
 
 SCHEMAS = [{"type": "function", "function": {
     "name": "check_contact",
+    "title": "Checking object placement",
     "description": (
         "Measure placement on the evaluated geometry: gap or penetration in m per pair, every support "
         "(foot, leg) of rests_on separately, and the move that would fix a failure; moves nothing. An "

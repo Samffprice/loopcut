@@ -8,7 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
-from loopcut import contact as C, state  # noqa: E402
+from loopcut import contact as C, llm, state  # noqa: E402
 
 TOL = 0.002
 
@@ -232,7 +232,7 @@ class ReportTest(unittest.TestCase):
 
     def test_the_schema_stays_small(self):
         import json
-        self.assertLess(len(json.dumps(C.SCHEMAS)) / 4, 320)
+        self.assertLess(len(json.dumps(llm.wire_tools(C.SCHEMAS))) / 4, 320)
 
 
 class WatchTest(unittest.TestCase):

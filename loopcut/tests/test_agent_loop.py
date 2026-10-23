@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -164,6 +165,7 @@ class AgentLoopTest(unittest.TestCase):
         state.ui["account"] = None
         state.ui.pop("allowance_notice", None)
         state.ui.pop("warned_session_allowance", None)
+        state.ui.pop("warned_week_allowance", None)
         self.session = state.reset()
         self.ran: list[tuple[str, str]] = []
         self.checkpoint_calls: list[int] = []  # How many tools had run when each was requested.
@@ -2005,21 +2007,20 @@ class AgentLoopTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
                 mock.patch.object(mainthread, "run_on_main", side_effect=immediate):
             SCRIPT.headers.update({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.310",
-                                   "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2026-09-23T00:00:00Z"})
+                                   "x-loopcut-week-used": "0.842", "x-loopcut-week-resets-at": "2099-09-23T00:00:00Z"})
             SCRIPT.replies += [text_reply("One."), text_reply("Two.")]
             turn = self.start("hello")
             turn.thread.join(5)
             self.assertEqual(state.ui["account"]["plan"], "free")
-            self.assertEqual(state.ui["account"]["week"], {"used": 0.842, "resets_at": "2026-09-23T00:00:00Z"})
+            self.assertEqual(state.ui["account"]["week"], {"used": 0.842, "resets_at": "2099-09-23T00:00:00Z"})
             notices = [i for i in self.session["items"] if i["kind"] == "notice"]
             self.assertEqual(len(notices), 1)
-            self.assertIn("About 16% of this week's free allowance is left", notices[0]["text"])
-            self.assertEqual(notices[0]["action_label"], "See plans")
-            self.assertIn("/pricing?from=app&reason=low_allowance", notices[0]["url"])
+            self.assertIn("You've used about 84% of this week's chat allowance.", notices[0]["text"])
+            self.assertEqual(notices[0]["url"], "")
             turn = self.start("again")
             turn.thread.join(5)
             self.assertEqual(len([i for i in self.session["items"] if i["kind"] == "notice"]), 1, "warned once")
-            self.assertEqual(layout.usage_note(state.ui["account"]), ("84% of week used", 0.842))
+            self.assertEqual(layout.usage_note(state.ui["account"]), ("Chat: 84% of this week used", 0.842))
             self.assertEqual(layout.usage_note({"week": {"used": 0.2}, "session": {"used": 0.5}}), ("", 0.5))
 
     def test_http_error_is_shown_not_swallowed(self):
@@ -2113,6 +2114,7 @@ class AgentLoopTest(unittest.TestCase):
             # A completed worker clears session['turn'] before send() can return.
             turn = launched.call_args.args[1]
             turn.thread.join(5)
+            self.assertFalse(turn.thread.is_alive(), "the first turn must finish before the next send")
         self.assertEqual((turn.spec, turn.roles.max_workers), (agent.ORCH_SPEC, 2))
         with mock.patch.object(agent, "_launch", wraps=agent._launch) as launched:
             self.assertTrue(agent.send("hi again"))  # LOOPCUT_ORCHESTRATE=false: today's loop.
@@ -2401,11 +2403,18 @@ class FakeJob:
 
 class LimitStateTest(unittest.TestCase):
     def setUp(self):
+        import tempfile
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        data = mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": folder.name})
+        data.start()
+        self.addCleanup(data.stop)
         snapshot = mock.patch.dict(state.ui, {"account": None})
         snapshot.start()
         self.addCleanup(snapshot.stop)
         state.ui.pop("allowance_notice", None)
         state.ui.pop("warned_session_allowance", None)
+        state.ui.pop("warned_week_allowance", None)
         self.session = state.reset()
         self.cfg = agent.config.Config("test-key", agent.config.SERVICE_BASE_URL, "fast", "low", False, False, 0, 24000)
         from loopcut import mainthread
@@ -2449,10 +2458,12 @@ class LimitStateTest(unittest.TestCase):
         request.assert_called_once()
         return info
 
-    def test_first_hosted_refusal_restores_exact_draft_and_attachments_without_new_history(self):
+    def test_first_hosted_refusal_restores_exact_draft_and_only_warns_for_other_windows(self):
         for reason in state.HOSTED_LIMITS:
             with self.subTest(reason=reason):
                 self.session = state.reset()
+                state.clear_allowance_notice()
+                state.ui.pop("warned_session_allowance", None)
                 old = state.item_assistant()
                 old["text"] = "Earlier answer."
                 self.session["items"] = [old]
@@ -2468,7 +2479,10 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(self.session["input"], "  make more details  ")
                     self.assertEqual(self.session["attachments"], attachments)
                     self.assertEqual(self.session["references"], [])
-                    self.assertEqual((self.session["items"], self.session["messages"], self.session["turn_number"]), before)
+                    history = [i for i in self.session["items"] if i["kind"] != "notice"]
+                    self.assertEqual((history, self.session["messages"], self.session["turn_number"]), before)
+                    self.assertEqual(len(self.session["items"]), len(history) + (reason != "session_limit"),
+                                     "only an unrefused window adds a percentage warning")
                     self.assertFalse(state.can_resume(self.session))
                     self.assertEqual(state.ui["allowance_notice"]["item"]["reason"], reason)
                 self.assertEqual(state.ui["account"]["session"]["used"], 0.82)
@@ -2484,8 +2498,8 @@ class LimitStateTest(unittest.TestCase):
                     notice = state.ui["allowance_notice"]
                     self.assertEqual(state.ui["account"], reported, "refusals never overwrite reported usage")
                     self.assertEqual(layout.ring_shares({}, 1, reported, notice)[1][1], 0)
-                    self.assertIn(f"{window.capitalize()}: 100% used, 0% left", layout.usage_lines({}, 1, reported, notice))
-                    other = "Week: 52% used, 48% left" if window == "session" else "Session: 82% used, 18% left"
+                    self.assertIn(f"{window.capitalize()} chat allowance: 100% used, 0% left", layout.usage_lines({}, 1, reported, notice))
+                    other = "Week chat allowance: 52% used, 48% left" if window == "session" else "Session chat allowance: 82% used, 18% left"
                     self.assertIn(other, layout.usage_lines({}, 1, reported, notice))
                     agent._hosted_reply(turn, self.cfg, success_info, success=True)
                     self.assertNotIn("allowance_notice", state.ui)
@@ -2493,21 +2507,24 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(layout.usage_lines({}, 1, state.ui["account"], state.ui.get("allowance_notice")),
                                      layout.usage_lines({}, 1, expected))
 
-    def test_later_refusal_removes_this_turns_heads_up_but_keeps_history_and_other_notices(self):
+    def test_later_refusal_keeps_this_turns_heads_up_history_and_other_notices(self):
         for reason in ("session_limit", "week_limit"):
             with self.subTest(reason=reason):
                 self.session = state.reset()
                 state.ui.pop("warned_session_allowance", None)
+                state.ui.pop("warned_week_allowance", None)
                 older = state.item_notice("About 18% of this session's chat allowance is left.")
                 unrelated = state.item_notice("Scene saved.")
                 self.session["items"].append(older)
                 turn = self.send("continue")
-                info = {"plan": "free", "session": {"used": 0.82}, "week": {"used": 0.84}}
+                info = {"plan": "free", "session": {"used": 0.82, "resets_at": "2099-10-21T18:00:00Z"},
+                        "week": {"used": 0.84, "resets_at": "2099-10-25T18:00:00Z"}}
                 agent._hosted_reply(turn, self.cfg, info, success=True, session=self.session)
                 self.assertEqual(len(turn.allowance_notices), 2)
                 self.session["items"].append(unrelated)
+                notices = [i for i in self.session["items"] if i["kind"] == "notice"]
                 self.refuse(turn, reason)
-                self.assertEqual([i for i in self.session["items"] if i["kind"] == "notice"], [older, unrelated])
+                self.assertEqual([i for i in self.session["items"] if i["kind"] == "notice"], notices)
                 self.assertEqual(self.session["items"][-1]["reason"], reason)
 
     def test_refusing_the_other_window_keeps_both_overrides_until_success(self):
@@ -2519,24 +2536,24 @@ class LimitStateTest(unittest.TestCase):
         retry.config = self.cfg
         info = self.refuse(retry, "week_limit")
         lines = layout.usage_lines({}, 1, info, state.ui["allowance_notice"])
-        self.assertIn("Session: 100% used, 0% left", lines)
-        self.assertIn("Week: 100% used, 0% left", lines)
+        self.assertIn("Session chat allowance: 100% used, 0% left", lines)
+        self.assertIn("Week chat allowance: 100% used, 0% left", lines)
         from datetime import datetime, timezone
         after_session_reset = datetime(2099, 10, 22, tzinfo=timezone.utc).timestamp()
         lines = layout.usage_lines({}, 1, info, state.ui["allowance_notice"], after_session_reset)
-        self.assertIn("Session: 82% used, 18% left", lines)
-        self.assertIn("Week: 100% used, 0% left", lines)
+        self.assertFalse(any("Session chat allowance" in line for line in lines), "the cached session has expired")
+        self.assertIn("Week chat allowance: 100% used, 0% left", lines)
         agent._hosted_reply(retry, self.cfg, success=True)
         self.assertEqual(layout.usage_lines({}, 1, info, state.ui.get("allowance_notice")), layout.usage_lines({}, 1, info))
 
-    def test_worker_refusal_removes_heads_up_from_the_shared_parent_turn(self):
+    def test_worker_refusal_keeps_heads_up_in_the_shared_parent_turn(self):
         parent = self.send("make a model")
         agent._hosted_reply(parent, self.cfg, {"plan": "free", "session": {"used": 0.82}},
                             success=True, session=self.session)
         worker = agent.Turn()
         worker.chat = (self.session, parent)
         agent._hosted_refusal(state.new_session(), worker, state.item_limit("Used up.", "session_limit", "free", "", None))
-        self.assertFalse(any(i["kind"] == "notice" for i in self.session["items"]))
+        self.assertEqual(sum(i["kind"] == "notice" for i in self.session["items"]), 1)
 
     def test_real_request_path_restores_the_first_refusal_then_clears_notice_on_success(self):
         from prompt_index_fixture import index_patch
@@ -2669,6 +2686,7 @@ class LimitStateTest(unittest.TestCase):
         self.assertEqual(original["input"], "make a chair\nadd a cushion\nand arms")
         self.assertEqual(other["input"], "another conversation's draft")
         self.assertEqual(original["items"], [])
+        self.assertEqual(other["items"], [], "the refused send belongs to the original conversation")
         self.assertEqual(original["messages"], [])
 
     def test_non_hosted_refusal_keeps_normal_history_and_does_not_create_account_notice(self):
@@ -2689,49 +2707,762 @@ class LimitStateTest(unittest.TestCase):
                 agent._warn_low_allowance(self.session, self.session["items"], info)
         self.assertEqual(len(self.session["items"]), 1)
         notice = self.session["items"][0]
-        self.assertIn("About 20% of this session's chat allowance is left.", notice["text"])
-        self.assertIn(state.reset_label(reset), notice["text"])
+        self.assertIn("You've used about 80% of this 5-hour chat allowance.", notice["text"])
+        from datetime import datetime
+        self.assertIn(datetime.fromisoformat(reset).astimezone().strftime("%a %d %b, %H:%M"), notice["text"])
         self.assertEqual(notice["url"], "")
-        fresh = state.new_session()
+        fresh = state.reset()
         agent._warn_low_allowance(fresh, fresh["items"], info)
         self.assertEqual(fresh["items"], [], "one warning per server session window, across chats")
         info["session"]["resets_at"] = "2099-10-22T18:00:00Z"
         agent._warn_low_allowance(fresh, fresh["items"], info)
         self.assertEqual(len(fresh["items"]), 1)
 
+    def test_warning_without_session_ids_does_not_match_a_different_live_session(self):
+        for live_id, owner_id in ((None, None), (None, "owner"), ("live", None)):
+            with self.subTest(live_id=live_id, owner_id=owner_id):
+                state.ui.pop("warned_week_allowance", None)
+                live, session, items = {"items": []}, {}, []
+                if live_id:
+                    live["id"] = live_id
+                if owner_id:
+                    session["id"] = owner_id
+                with mock.patch.object(state, "session", return_value=live):
+                    agent._warn_low_allowance(session, items, {"week": {"used": .95}})
+                self.assertEqual(items, [])
+                self.assertEqual(live["items"], [])
+                self.assertNotIn("warned_week_allowance", state.ui)
+
+    def test_hosted_turns_can_send_again_without_ever_pumping_main_thread_callbacks(self):
+        from concurrent.futures import Future
+        from loopcut import mainthread
+        from prompt_index_fixture import index_patch
+        for spec in (agent.SINGLE_SPEC, agent.ORCH_SPEC, agent.WORKSPACE_SPEC):
+            for usage in (None, {"week": {"used": .95}}):
+                with self.subTest(spec=spec, usage=usage):
+                    self.session = state.reset()
+                    callbacks = []
+
+                    def enqueue(fn):
+                        future = Future()
+                        callbacks.append((fn, future))
+                        return future
+
+                    def configure(turn, session):
+                        turn.config, turn.spec = self.cfg, spec
+
+                    def complete(**kwargs):
+                        kwargs["on_text"]("Done.")
+                        return llm.Completion(text="Done.", account=usage)
+
+                    with index_patch(), mock.patch.object(mainthread, "run_on_main", side_effect=enqueue), \
+                            mock.patch.object(agent, "_configure", side_effect=configure), \
+                            mock.patch.object(agent, "_project_roots", return_value=()), \
+                            mock.patch.object(agent, "_scene_context", return_value="scene"), \
+                            mock.patch.object(agent, "_scene_snapshot", return_value=None), \
+                            mock.patch.object(agent, "_setup_line", return_value=""), \
+                            mock.patch.object(agent, "_addons_line", return_value=""), \
+                            mock.patch.object(agent, "_session_schemas", return_value=[]), \
+                            mock.patch.object(agent, "_route"), mock.patch.object(agent, "_workspace_turn"), \
+                            mock.patch.object(llm, "stream_chat", side_effect=complete), \
+                            mock.patch.object(agent, "_launch", wraps=agent._launch) as launch:
+                        for text in ("hi", "hi again"):
+                            launch.reset_mock()
+                            self.assertTrue(agent.send(text))
+                            launch.assert_called_once()
+                            turn = launch.call_args.args[1]
+                            turn.thread.join(2)
+                            self.assertFalse(turn.thread.is_alive())
+                            self.assertEqual(turn.outcome, "completed")
+                            self.assertFalse(self.session["busy"])
+                            self.assertIsNone(self.session["turn"])
+                    self.assertTrue(callbacks)
+                    self.assertTrue(all(not future.done() for _, future in callbacks))
+
+    def test_real_streamed_main_and_worker_replies_deliver_reservation_aware_warnings(self):
+        from prompt_index_fixture import index_patch
+        for role in ("single", "worker"):
+            with self.subTest(role=role):
+                state.ui.pop("warned_session_allowance", None)
+                self.session = state.reset()
+                parent = self.send("continue")
+                session, turn = self.session, parent
+                if role == "worker":
+                    session, turn = state.new_session(), agent.Turn()
+                    session["messages"] = [{"role": "user", "content": "continue"}]
+                    turn.config = self.cfg
+                    turn.chat = (self.session, parent)
+                info = llm.account_from_headers({"x-loopcut-plan": "free", "x-loopcut-session-used": "0.2",
+                    "x-loopcut-session-used-with-reservations": "0.84", "x-loopcut-session-resets-at": "2099-10-21T18:00:00Z"})
+                def complete(**kwargs):
+                    kwargs["on_text"]("Done.")
+                    return llm.Completion(text="Done.", account=info)
+                spec = agent.LoopSpec(role=role, system=lambda _: "", schemas=lambda: [], save=mock.Mock(), reference_card=False)
+                with index_patch(), mock.patch.object(llm, "stream_chat", side_effect=complete) as stream, \
+                        mock.patch.object(agent, "_changes_item", return_value=None):
+                    agent.run_loop(session, turn, spec)
+                    stream.assert_called_once()
+                notices = [i for i in self.session["items"] if i["kind"] == "notice"]
+                self.assertEqual(len(notices), 1)
+                self.assertIn("84% of this 5-hour chat allowance", notices[0]["text"])
+                if role == "worker":
+                    self.assertFalse(any(i["kind"] == "notice" for i in session["items"]))
+
+    def test_queued_main_and_helper_warnings_never_delay_or_repeat_the_final_save(self):
+        from concurrent.futures import Future
+        from copy import deepcopy
+        from loopcut import mainthread
+        from prompt_index_fixture import index_patch
+        for role in ("single", "worker", "reopened"):
+            with self.subTest(role=role):
+                state.ui.pop("warned_session_allowance", None)
+                self.session = state.reset()
+                parent = self.send("continue")
+                helper = agent.Turn()
+                helper.config, helper.chat = self.cfg, (self.session, parent)
+                callbacks = []
+                saved = []
+                info = {"session": {"used": 0.84, "resets_at": "2099-10-21T18:00:00Z"}}
+
+                def enqueue(fn):
+                    future = Future()
+                    callbacks.append((fn, future))
+                    return future
+
+                def complete(**kwargs):
+                    kwargs["on_text"]("Done.")
+                    if role == "worker":
+                        agent._hosted_reply(helper, self.cfg, info, success=True, session=state.new_session())
+                    return llm.Completion(text="Done.", account=info if role != "worker" else None)
+
+                save = conversations.save
+
+                def record_save(session):
+                    saved.append((threading.current_thread(), deepcopy(session["items"])))
+                    save(session)
+
+                spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [],
+                                      save=lambda session: conversations.save(session), reference_card=False)
+                with index_patch(), mock.patch.object(mainthread, "run_on_main", side_effect=enqueue), \
+                        mock.patch.object(llm, "stream_chat", side_effect=complete), \
+                        mock.patch.object(conversations, "save", side_effect=record_save), \
+                        mock.patch.object(agent, "_changes_item", return_value=None):
+                    thread = threading.Thread(target=agent.run_loop, args=(self.session, parent, spec), daemon=True)
+                    thread.start()
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive(), "turn must finish even if main-thread callbacks never run")
+                    self.assertFalse(self.session["busy"])
+                    self.assertIsNone(self.session["turn"])
+                    self.assertEqual(len(saved), 1, "the ordinary final save does not wait for warnings")
+                    self.assertIs(saved[0][0], thread)
+                    self.assertFalse(any(i["kind"] == "notice" for i in saved[0][1]))
+                    self.assertTrue(callbacks)
+                    if role == "reopened":
+                        reopened = state.replace(deepcopy(self.session))
+                        reopened["items"].append(state.item_user("newer message"))
+                        reopened["messages"].append({"role": "user", "content": "newer message"})
+                        reopened["input"] = "newer draft"
+                        save(reopened)
+                    for fn, future in callbacks:
+                        future.set_result(fn())
+                self.assertEqual(parent.outcome, "completed")
+                self.assertEqual(len(saved), 1, "warnings never add a separate conversation save")
+                loaded = conversations.load(self.session["id"])
+                self.assertFalse(any(i["kind"] == "notice" for i in loaded["items"]))
+                self.assertEqual(sum(i["kind"] == "notice" for i in state.session()["items"]), 1)
+                if role == "reopened":
+                    self.assertEqual(loaded["messages"], reopened["messages"])
+                    self.assertEqual(loaded["input"], "newer draft")
+                    self.assertEqual(reopened["input"], "newer draft")
+                    self.assertEqual(reopened["items"][-2], state.item_user("newer message"))
+
+    def test_hosted_refusals_restore_draft_then_save_before_worker_folder_cleanup(self):
+        from concurrent.futures import Future
+        from loopcut import mainthread
+        for stage in ("first", "later", "worker"):
+            with self.subTest(stage=stage):
+                state.clear_allowance_notice()
+                state.ui.pop("warned_week_allowance", None)
+                self.session = state.reset()
+                parent = self.send("make a chair")
+                session, turn = self.session, parent
+                if stage == "first":
+                    self.assertTrue(agent.send("and a cushion"))
+                    session["input"] = "with arms"
+                elif stage == "later":
+                    turn.hosted_requests = 1
+                else:
+                    session, turn = state.new_session(), agent.Turn()
+                    turn.config, turn.chat = self.cfg, (self.session, parent)
+                    session.update(busy=True, turn=turn)
+                    worker_folder = Path(os.environ["LOOPCUT_DATA_DIR"]) / "job" / "worker"
+                    conversations.FOLDERS[session["id"]] = worker_folder
+                    self.addCleanup(conversations.FOLDERS.pop, session["id"], None)
+                callbacks = []
+                queued = threading.Event()
+
+                def enqueue(fn):
+                    future = Future()
+                    callbacks.append((fn, future))
+                    queued.set()
+                    return future
+
+                info = {"plan": "free", "session": {"used": .95}, "week": {"used": .92}}
+                refusal = llm.LLMError("Used up.", 402, "session_limit", {"plan": "free"}, account=info)
+                save = mock.Mock(wraps=conversations.save)
+                turn.spec = agent.LoopSpec(role="worker" if stage == "worker" else "single",
+                                          system=lambda _: "", schemas=lambda: [], save=save, reference_card=False)
+                with mock.patch.object(mainthread, "run_on_main", side_effect=enqueue), \
+                        mock.patch.object(agent, "_request", side_effect=refusal), \
+                        mock.patch.object(agent, "_changes_item", return_value=None):
+                    turn.thread = threading.Thread(target=agent._run, args=(session, turn), daemon=True)
+                    turn.thread.start()
+                    self.assertTrue(queued.wait(2))
+                    save.assert_not_called()
+                    # Base behavior: draft restoration finishes before teardown and saving.
+                    fn, future = callbacks.pop(0)
+                    future.set_result(fn())
+                    turn.thread.join(2)
+                    self.assertFalse(turn.thread.is_alive(), "the optional warning must not delay finalisation")
+                    self.assertEqual(turn.outcome, "error")
+                    self.assertEqual(turn.error_code, "session_limit")
+                    save.assert_called_once_with(session)
+                    if stage == "worker":
+                        self.assertTrue((worker_folder / "conversation.json").is_file())
+                        conversations.FOLDERS.pop(session["id"])
+                    self.assertTrue(callbacks, "the warning is still queued after the final save")
+                    for fn, future in callbacks:
+                        future.set_result(fn())
+                save.assert_called_once_with(session)
+                self.assertFalse(session["busy"])
+                self.assertIsNone(session["turn"])
+                self.assertEqual(state.ui["allowance_notice"]["item"]["reason"], "session_limit")
+                notices = [item for item in self.session["items"] if item["kind"] == "notice"]
+                self.assertEqual(len(notices), 1)
+                self.assertEqual(notices[0]["allowance_window"], "week")
+                if stage == "first":
+                    self.assertEqual(session["input"], "make a chair\nand a cushion\nwith arms")
+                    self.assertEqual(session["messages"], [])
+                    self.assertEqual(session["items"], notices)
+                if stage == "later":
+                    loaded = conversations.load(session["id"])
+                    self.assertEqual(loaded["input"], session["input"])
+                    self.assertNotIn(notices[0], loaded["items"])
+                elif stage == "worker":
+                    self.assertFalse((conversations.root() / session["id"]).exists(),
+                                     "late warnings must not write a worker transcript to ordinary storage")
+
+    def test_late_helper_warning_preserves_reopened_messages_and_draft_until_ordinary_save(self):
+        from concurrent.futures import Future
+        from loopcut import mainthread
+        parent = self.send("continue")
+        self.session.update(busy=False, turn=None)
+        conversations.save(self.session)
+        helper = agent.Turn()
+        helper.config, helper.chat = self.cfg, (self.session, parent)
+        callbacks = []
+
+        def enqueue(fn):
+            future = Future()
+            callbacks.append((fn, future))
+            return future
+
+        with mock.patch.object(mainthread, "run_on_main", side_effect=enqueue):
+            agent._hosted_reply(helper, self.cfg, {"session": {
+                "used": 0.84, "resets_at": "2099-10-21T18:00:00Z"}}, success=True, session=state.new_session())
+        other = state.reset()
+        other["input"] = "other draft"
+        reopened = state.replace(conversations.load(self.session["id"]))
+        reopened["items"].append(state.item_user("newer message"))
+        reopened["messages"].append({"role": "user", "content": "newer message"})
+        reopened["input"] = "newer draft"
+        conversations.save(reopened)
+        before = conversations.load(reopened["id"])
+        with mock.patch.object(conversations, "save", wraps=conversations.save) as save:
+            for fn, future in callbacks:
+                future.set_result(fn())
+            after = conversations.load(reopened["id"])
+            self.assertEqual(after["messages"], before["messages"])
+            self.assertEqual(after["input"], "newer draft")
+            save.assert_not_called()
+        self.assertEqual(after["items"], before["items"], "late warnings wait for the next ordinary save")
+        self.assertEqual(reopened["messages"], before["messages"])
+        self.assertEqual(reopened["input"], "newer draft")
+        self.assertEqual(sum(i["kind"] == "notice" for i in reopened["items"]), 1)
+        self.assertEqual(other["input"], "other draft")
+        self.assertEqual(other["items"], [])
+        conversations.save(reopened)
+        loaded = conversations.load(reopened["id"])
+        self.assertEqual(loaded["messages"], before["messages"])
+        self.assertEqual(loaded["input"], "newer draft")
+        self.assertEqual(sum(i["kind"] == "notice" for i in loaded["items"]), 1)
+
+    def test_queued_warnings_require_an_open_conversation_even_without_ids(self):
+        from concurrent.futures import Future
+        from loopcut import mainthread
+        for identity in ("id", "missing", "empty"):
+            for closed in (False, True):
+                with self.subTest(identity=identity, closed=closed):
+                    state.ui.clear()
+                    session = state.reset()
+                    if identity == "missing":
+                        session.pop("id")
+                    elif identity == "empty":
+                        session["id"] = ""
+                    turn = agent.Turn()
+                    info = {"session": {"used": .84, "resets_at": "2099-10-21T18:00:00Z"}}
+                    callbacks = []
+
+                    def enqueue(fn):
+                        callbacks.append(fn)
+                        return Future()
+
+                    with mock.patch.object(mainthread, "run_on_main", side_effect=enqueue), \
+                            mock.patch.object(conversations, "save") as save:
+                        agent._hosted_reply(turn, self.cfg, info, success=True, session=session)
+                        if closed:
+                            live = state.reset()
+                            if identity == "missing":
+                                live.pop("id")
+                            elif identity == "empty":
+                                live["id"] = ""
+                            live["input"] = "new draft"
+                        for fn in callbacks:
+                            fn()
+                        save.assert_not_called()
+                    if closed:
+                        self.assertEqual(session["items"], [])
+                        self.assertEqual(live["items"], [])
+                        self.assertEqual(live["input"], "new draft")
+                        self.assertNotIn("warned_session_allowance", state.ui)
+                        state.replace(session)
+                        agent._hosted_reply(turn, self.cfg, info, success=True, session=session)
+                    self.assertEqual(len(session["items"]), 1)
+                    self.assertEqual(session["items"][0]["allowance_window"], "session")
+
+    def test_029_dated_session_notice_matches_the_same_reset_after_upgrade(self):
+        reset = "2099-10-21T18:00:00Z"
+        # 0.2.9's literal text, without allowance_window or resets_at metadata.
+        legacy = state.item_notice("About 16% of this session's chat allowance is left. "
+                                   f"Resets {state.reset_label(reset, now=0)}.")
+        self.session["items"].append(legacy)
+        conversations.save(self.session)
+        loaded = state.replace(conversations.load(self.session["id"]))
+        agent._warn_low_allowance(loaded, loaded["items"], {"session": {"used": 0.9, "resets_at": reset}})
+        self.assertEqual(len(loaded["items"]), 1)
+        agent._warn_low_allowance(loaded, loaded["items"], {"session": {
+            "used": 0.9, "resets_at": "2099-10-22T18:00:00Z"}})
+        self.assertEqual(len(loaded["items"]), 2, "a different dated window still warns")
+
+    def test_029_ambiguous_notices_allow_at_most_one_upgrade_duplicate_per_window(self):
+        # Relative session resets and undated weekly text cannot identify a window reliably.
+        # Accept one duplicate on upgrade; its new metadata survives subsequent restarts.
+        for window, text in (("session", "About 16% of this session's chat allowance is left. Resets in about 2 h."),
+                             ("week", "About 16% of this week's allowance is left.")):
+            with self.subTest(window=window):
+                session = state.reset()
+                session["items"].append(state.item_notice(text))
+                info = {window: {"used": 0.9, "resets_at": "2099-10-21T18:00:00Z"}}
+                for _ in range(3):
+                    conversations.save(session)
+                    state.ui.clear()
+                    session = state.replace(conversations.load(session["id"]))
+                    agent._warn_low_allowance(session, session["items"], info)
+                    self.assertEqual(len(session["items"]), 2)
+
+    def test_loaded_warning_identity_prevents_duplicates_after_restart_or_sign_in(self):
+        for lifecycle in ("restart", "sign_in"):
+            with self.subTest(lifecycle=lifecycle):
+                state.ui.clear()
+                session = state.reset()
+                reset = "2099-10-21T18:00:00Z"
+                info = {name: {"used": 0.84, "resets_at": reset} for name in ("session", "week")}
+                agent._warn_low_allowance(session, session["items"], info)
+                conversations.save(session)
+                if lifecycle == "restart":
+                    state.ui.clear()
+                else:
+                    state.clear_allowance_notice(invalidate=True)
+                    state.ui.pop("warned_session_allowance", None)
+                    state.ui.pop("warned_week_allowance", None)
+                loaded = state.replace(conversations.load(session["id"]))
+                agent._warn_low_allowance(loaded, loaded["items"], info)
+                self.assertEqual(len(loaded["items"]), 2, "loaded history remembers both window identities")
+                self.assertEqual({i["allowance_window"] for i in loaded["items"]}, {"session", "week"})
+                self.assertTrue(all(i["resets_at"] == reset for i in loaded["items"]))
+                info["session"]["resets_at"] = "2099-10-22T18:00:00Z"
+                agent._warn_low_allowance(loaded, loaded["items"], info)
+                self.assertEqual(len(loaded["items"]), 3, "a new window can still warn")
+                info["session"]["resets_at"] = reset
+                agent._warn_low_allowance(loaded, loaded["items"], info)
+                self.assertEqual(len(loaded["items"]), 3, "a delayed old report stays deduplicated")
+
+    def test_expired_reports_do_not_warn_or_consume_the_next_window_marker(self):
+        from datetime import datetime
+        reset = "2099-10-21T18:00:00Z"
+        for role in ("single", "worker"):
+            for offset in (0, 1):
+                with self.subTest(role=role, offset=offset):
+                    state.ui.clear()
+                    self.session = state.reset()
+                    parent = self.send("continue")
+                    session, turn = self.session, parent
+                    if role == "worker":
+                        session, turn = state.new_session(), agent.Turn()
+                        turn.config, turn.chat = self.cfg, (self.session, parent)
+                    info = {name: {"used": 0.84, "resets_at": reset} for name in ("session", "week")}
+                    with mock.patch.object(agent.allowance.time, "time", return_value=datetime.fromisoformat(reset).timestamp() + offset):
+                        agent._hosted_reply(turn, self.cfg, info, success=True, session=session)
+                        self.assertFalse(any(i["kind"] == "notice" for i in self.session["items"]))
+                        self.assertNotIn("warned_session_allowance", state.ui)
+                        self.assertNotIn("warned_week_allowance", state.ui)
+                        for window in info.values():
+                            window["resets_at"] = "2099-10-22T18:00:00Z"
+                        agent._hosted_reply(turn, self.cfg, info, success=True, session=session)
+                    self.assertEqual(sum(i["kind"] == "notice" for i in self.session["items"]), 2)
+
+    def test_refusal_headers_only_warn_for_the_other_window_and_keep_history(self):
+        from prompt_index_fixture import index_patch
+        for role in ("single", "worker"):
+            for window in ("session", "week"):
+                with self.subTest(role=role, window=window):
+                    state.ui.clear()
+                    self.session = state.reset()
+                    older = state.item_notice("Earlier warning: 81% used.")
+                    self.session["items"].append(older)
+                    parent = self.send("continue")
+                    session, turn = self.session, parent
+                    if role == "worker":
+                        session, turn = state.new_session(), agent.Turn()
+                        session["messages"] = [{"role": "user", "content": "continue"}]
+                        turn.config, turn.chat = self.cfg, (self.session, parent)
+                    info = {"plan": "free", "session": {"used": 0.82, "resets_at": "2099-10-21T18:00:00Z"},
+                            "week": {"used": 0.91, "resets_at": "2099-10-25T18:00:00Z"}}
+                    refusal = llm.LLMError("Used up.", 402, window + "_limit", {"plan": "free"}, account=info)
+                    spec = agent.LoopSpec(role=role, system=lambda _: "", schemas=lambda: [],
+                                          save=conversations.save, reference_card=False)
+                    with index_patch(), mock.patch.object(llm, "stream_chat", side_effect=refusal), \
+                            mock.patch.object(agent, "_changes_item", return_value=None):
+                        agent.run_loop(session, turn, spec)
+                    notices = [i for i in self.session["items"] if i["kind"] == "notice"]
+                    self.assertEqual(len(notices), 2, "only the other window adds a new percentage warning")
+                    self.assertIs(notices[0], older)
+                    self.assertIn("91%" if window == "session" else "82%", notices[1]["text"])
+                    self.assertNotIn(f"warned_{window}_allowance", state.ui)
+                    self.assertEqual(layout.usage_note(info, state.ui["allowance_notice"])[1], 1)
+                    if role == "worker":
+                        conversations.save(self.session)  # The owning turn's ordinary save persists helper notices.
+                    loaded = conversations.load(self.session["id"])
+                    self.assertEqual([i for i in loaded["items"] if i["kind"] == "notice"], notices)
+
+    def test_helpers_warn_the_original_conversation_once_per_window_on_every_hosted_plan(self):
+        for plan in ("free", "pro", "max"):
+            with self.subTest(plan=plan):
+                state.ui.pop("warned_session_allowance", None)
+                state.ui.pop("warned_week_allowance", None)
+                self.session = state.reset()
+                parent = self.send("continue")
+                helpers = []
+                for _ in range(2):
+                    worker = agent.Turn()
+                    worker.config = self.cfg
+                    worker.chat = (self.session, parent)
+                    helpers.append((state.new_session(), worker))
+                # Changing the visible chat drops helpers' warnings without consuming dedupe keys.
+                visible = state.reset()
+                info = {"plan": plan, "session": {"used": 0.2, "used_with_reservations": 0.82,
+                                                  "resets_at": "2099-10-21T18:00:00Z"},
+                        "week": {"used": 0.91, "resets_at": "2099-10-25T18:00:00Z"}}
+                for private, worker in helpers:
+                    agent._hosted_reply(worker, self.cfg, info, success=True, session=private)
+                    self.assertEqual(private["items"], [])
+                self.assertEqual(self.session["items"][-1]["kind"], "user")
+                self.assertNotIn("warned_session_allowance", state.ui)
+                self.assertNotIn("warned_week_allowance", state.ui)
+                state.replace(self.session)
+                for private, worker in helpers:
+                    agent._hosted_reply(worker, self.cfg, info, success=True, session=private)
+                agent._hosted_reply(parent, self.cfg, info, success=True, session=self.session)
+                notices = [i for i in self.session["items"] if i["kind"] == "notice"]
+                self.assertEqual(len(notices), 2)
+                self.assertIn("82% of this 5-hour chat allowance", notices[0]["text"])
+                self.assertIn("91% of this week's chat allowance", notices[1]["text"])
+                self.assertTrue(all("It resets at" in i["text"] for i in notices))
+                self.assertEqual(visible["items"], [])
+                # A different conversation still shares these server windows.
+                state.replace(visible)
+                agent._hosted_reply(agent.Turn(), self.cfg, info, success=True, session=visible)
+                self.assertEqual(visible["items"], [])
+                state.replace(self.session)
+                info["week"]["resets_at"] = "2099-11-01T18:00:00Z"
+                agent._hosted_reply(parent, self.cfg, info, success=True, session=self.session)
+                self.assertEqual(sum(i["kind"] == "notice" for i in self.session["items"]), 3)
+                # An older helper finishing late cannot warn for either window again.
+                info["week"]["resets_at"] = "2099-10-25T18:00:00Z"
+                private, worker = helpers[0]
+                agent._hosted_reply(worker, self.cfg, info, success=True, session=private)
+                self.assertEqual(sum(i["kind"] == "notice" for i in self.session["items"]), 3)
+
+    def test_full_or_overfull_reports_warn_once_and_refusal_keeps_the_notice(self):
+        for window in ("session", "week"):
+            for used in (0.8, 1, 1.2):
+                with self.subTest(window=window, used=used):
+                    state.ui.pop(f"warned_{window}_allowance", None)
+                    self.session = state.reset()
+                    turn = self.send("continue")
+                    info = {"plan": "free", window: {"used": 0.1, "used_with_reservations": used,
+                                                     "resets_at": "2099-10-25T18:00:00Z"}}
+                    agent._hosted_reply(turn, self.cfg, info, session=self.session)
+                    agent._hosted_refusal(self.session, turn, state.item_limit("Used up.", window + "_limit",
+                                                                             "free", "", None))
+                    notices = self.session["items"]
+                    self.assertEqual(len(notices), 1)
+                    self.assertEqual(notices[0]["kind"], "notice")
+                    self.assertIn(f"about {round(min(used, 1) * 100)}%", notices[0]["text"])
+                    self.assertEqual(self.session["input"], "continue")
+                    agent._hosted_reply(turn, self.cfg, info, success=True, session=self.session)
+                    self.assertEqual(len(notices), 1)
+
+    def test_foreign_providers_and_stale_responses_do_not_emit_warnings(self):
+        info = {"plan": "free", "session": {"used": 0.9}, "week": {"used": 0.9}}
+        for route in ("https://own.test/v1", config.CHATGPT_PLAN_BASE_URL):
+            with self.subTest(route=route):
+                parent = agent.Turn()
+                parent.config = dataclasses.replace(self.cfg, base_url=route)
+                agent._hosted_reply(parent, parent.config, info, success=True, session=self.session)
+                worker = agent.Turn()
+                worker.chat = (self.session, parent)
+                agent._hosted_reply(worker, self.cfg, info, success=True, session=state.new_session())
+                self.assertEqual(self.session["items"], [])
+        stale = agent.Turn()
+        state.clear_allowance_notice(invalidate=True)
+        agent._hosted_reply(stale, self.cfg, info, success=True, session=self.session)
+        late_helper = agent.Turn()
+        late_helper.chat = (self.session, stale)
+        agent._hosted_reply(late_helper, self.cfg, info, success=True, session=state.new_session())
+        self.assertEqual(self.session["items"], [])
+        self.assertNotIn("warned_session_allowance", state.ui)
+        self.assertNotIn("warned_week_allowance", state.ui)
+
     def test_heads_up_uses_reservation_total_and_falls_back_on_malformed_values(self):
         for window in ("session", "week"):
             for reserved in (0.82, "0.82", None, "bad", float("nan"), float("inf"), -1, True, [], {}):
                 with self.subTest(window=window, reserved=reserved):
                     state.ui.pop("warned_session_allowance", None)
-                    session = state.new_session()
+                    state.ui.pop("warned_week_allowance", None)
+                    session = state.reset()
                     valid = reserved in (0.82, "0.82")
                     info = {"plan": "free", window: {"used": 0.62 if valid else 0.82,
                                                      "used_with_reservations": reserved}}
                     agent._warn_low_allowance(session, session["items"], info)
                     self.assertEqual(len(session["items"]), 1)
-                    self.assertIn("About 18%", session["items"][0]["text"])
+                    self.assertIn("You've used about 82%", session["items"][0]["text"])
+                    self.assertNotIn("resets", session["items"][0]["text"], "no reset time is invented")
             for reported in ({"used": 0.82, "used_with_reservations": 0},
-                             {"used": 0.82, "used_with_reservations": 1.2},
                              {"used": float("nan")}, [], "bad"):
                 with self.subTest(window=window, reported=reported):
                     state.ui.pop("warned_session_allowance", None)
-                    session = state.new_session()
+                    state.ui.pop("warned_week_allowance", None)
+                    session = state.reset()
                     agent._warn_low_allowance(session, session["items"], {window: reported})
                     self.assertEqual(session["items"], [])
 
 
+class PlanRetryTest(unittest.TestCase):
+    """Real loop and cards with in-process model replies; no sockets or Blender."""
+
+    def call(self, number, *, name="delegate", helper="A", dry_run=True, **arguments):
+        if not arguments:
+            arguments = {"wave": {"workers": [{"id": helper.lower(), "deliverable": helper,
+                                              "checks": [] if number == 1 else [{"kind": "exists"}]}]},
+                         "dry_run": dry_run}
+        return llm.ToolCall(str(number), name, json.dumps(arguments))
+
+    def run_calls(self, calls, results, session=None):
+        session = session or state.new_session()
+        session["messages"].append({"role": "user", "content": "Make the requested changes"})
+        turn = agent.Turn()
+        turn.config = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast",
+                                   reasoning_effort="low", auto_run=True, auto_look=False,
+                                   max_steps=0, context_budget=40_000)
+        spec = agent.LoopSpec(role="orchestrator", system=lambda session: "", schemas=lambda: [],
+                              save=lambda session: None, asks=False, checkpoints=False, changes_card=False,
+                              scene_changed=lambda result: False)
+        replies = [llm.Completion(tool_calls=[call]) for call in calls] + [llm.Completion(text="Done")]
+        with mock.patch.object(agent, "_request", side_effect=replies), \
+                mock.patch.object(agent, "_redraw"), mock.patch.object(agent, "_note_level"), \
+                mock.patch.object(agent, "_record_level"):
+            agent.run_loop(session, turn, spec, run_tool=mock.Mock(side_effect=results))
+        self.assertEqual(turn.outcome, "completed")
+        return session, [item for item in session["items"] if item["kind"] == "tool"]
+
+    def refusal(self):
+        return tools.ToolResult("workers[0].checks[0]: missing kind", ok=False, plan_refused=True)
+
+    def assert_recovery(self, session, card, recovered):
+        before = dict(card)
+        display = layout.build(session, 900, 2000, 1.0, lambda f, s, t: len(t) * s * 0.5)
+        self.assertEqual(card, before, "rendering must not rewrite the original attempt")
+        prefix = f"item{session['items'].index(card)}.tool."
+        text = {p["id"]: p["text"] for p in display["prims"] if p["t"] == "text"}
+        self.assertEqual(text[prefix + "summary"], "Adjusted the helper plan and retried" if recovered
+                         else "Helper plan needs adjustment")
+        self.assertEqual(text[prefix + "glyph"], "✓" if recovered else "✕")
+
+    def test_shared_deliverable_does_not_resolve_different_workers_or_roles(self):
+        first = {"id": "chair", "role": "modeling", "deliverable": "Chair"}
+        for second in ({**first, "id": "other"}, {**first, "role": "materials"}):
+            with self.subTest(second=second):
+                session, cards = self.run_calls(
+                    [self.call(1, wave={"workers": [first]}), self.call(2, wave={"workers": [second]})],
+                    [self.refusal(), tools.ToolResult("Plan accepted")])
+                self.assert_recovery(session, cards[0], False)
+
+    def test_repaired_deliverable_and_reordered_workers_still_resolve(self):
+        first = [{"id": "chair", "role": "modeling"},
+                 {"id": "table", "role": "modeling", "deliverable": "Old table"}]
+        second = [{**first[1], "deliverable": "Table"}, {**first[0], "deliverable": "Chair"}]
+        session, cards = self.run_calls(
+            [self.call(1, wave={"workers": first}), self.call(2, wave={"workers": second})],
+            [self.refusal(), tools.ToolResult("Plan accepted")])
+        self.assert_recovery(session, cards[0], True)
+
+    def test_retry_matches_the_orchestrators_normalized_worker_role(self):
+        for fields, role in (({}, "modeling"), ({"role": None}, "modeling"), ({"role": ""}, "modeling"),
+                             ({"role": "sculpting"}, "modeling"), ({"role": " lights "}, "lighting"),
+                             ({"role": "shot"}, "lighting")):
+            with self.subTest(fields=fields):
+                first = {"id": "chair", "deliverable": "Chair", **fields}
+                second = {**first, "role": role}
+                session, cards = self.run_calls(
+                    [self.call(1, wave={"workers": [first]}), self.call(2, wave={"workers": [second]})],
+                    [self.refusal(), tools.ToolResult("Plan accepted")])
+                self.assert_recovery(session, cards[0], True)
+                self.assertEqual(cards[0]["plan_workers"], [["chair", role]])
+                self.assertEqual(cards[1]["plan_workers"], cards[0]["plan_workers"])
+
+    def test_retry_matches_the_role_inherited_from_the_live_thread(self):
+        for fields in ({}, {"role": None}, {"role": ""}):
+            with self.subTest(fields=fields):
+                session = state.new_session()
+                session["worker_threads"] = {"key": {"role": "lighting"}}
+                first = {"id": "key", "continues": "key", **fields}
+                second = {**first, "role": "lighting"}
+                session, cards = self.run_calls(
+                    [self.call(1, wave={"workers": [first]}), self.call(2, wave={"workers": [second]})],
+                    [self.refusal(), tools.ToolResult("Plan accepted")], session=session)
+                self.assertEqual(cards[0]["plan_workers"], [["key", "lighting"]])
+                self.assertEqual(cards[1]["plan_workers"], cards[0]["plan_workers"])
+                self.assert_recovery(session, cards[0], True)
+
+    def test_continuation_identity_is_recorded_before_the_retry_replaces_its_thread(self):
+        session = state.new_session()
+        session["worker_threads"] = {"key": {"role": "lighting"}}
+        first = {"id": "renamed", "continues": "key"}
+        second = {**first, "deliverable": "Key light"}
+
+        def delegate(name, arguments):
+            if "deliverable" not in json.loads(arguments)["wave"]["workers"][0]:
+                return self.refusal()
+            # waves.remember moves the continued thread to its new worker id before returning.
+            session["worker_threads"]["renamed"] = session["worker_threads"].pop("key")
+            return tools.ToolResult("Started")
+
+        session, cards = self.run_calls(
+            [self.call(1, wave={"workers": [first]}), self.call(2, wave={"workers": [second]})],
+            delegate, session=session)
+        self.assertEqual(cards[0]["plan_workers"], [["renamed", "lighting"]])
+        self.assertEqual(cards[1]["plan_workers"], cards[0]["plan_workers"])
+        self.assert_recovery(session, cards[0], True)
+
+    def test_restore_reload_and_undo_recompute_recovery_from_remaining_items(self):
+        session, cards = self.run_calls([self.call(1), self.call(2, dry_run=False)],
+                                        [self.refusal(), tools.ToolResult("Started")])
+        self.assert_recovery(session, cards[0], True)
+        # Real checkpoint restore/save/reload and undo, with only Blender's snapshot I/O replaced.
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(filepath="/work/scene.blend"),
+                                     ops=types.SimpleNamespace(wm=types.SimpleNamespace(
+                                         loopcut_snapshot_restore=lambda **kwargs: {"FINISHED"})))
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": folder}), \
+                mock.patch.dict(sys.modules, {"bpy": fake}), \
+                mock.patch.object(checkpoints, "_blocking_job", return_value=None), \
+                mock.patch.object(checkpoints, "in_place_supported", return_value=True):
+            def snapshot(store, kind, label, **extra):
+                entry = {"id": f"{len(store.entries) + 1:032x}", "kind": kind, "label": label,
+                         "source": fake.data.filepath, "in_place": True, "size": 1, "expired": False, **extra}
+                store.folder.mkdir(parents=True, exist_ok=True)
+                store.snapshot_path(entry["id"]).write_bytes(b"snapshot stand-in")
+                store.add(entry, 10_000)
+                return entry
+
+            with mock.patch.object(checkpoints, "_write_snapshot", side_effect=snapshot):
+                message_index = next(i for i, m in enumerate(session["messages"])
+                                     if any(c["id"] == "2" for c in m.get("tool_calls", [])))
+                # prepare() checkpoints while delegate is running, just before appending its wave card.
+                with mock.patch.dict(cards[1], {"status": "running"}):
+                    checkpoint = waves._wave_checkpoint(session, 1, message_index,
+                                                        session["items"].index(cards[1]) + 1)
+                checkpoints.restore(session, checkpoint)
+                self.assert_recovery(session, cards[0], False)
+                self.assertFalse(any(m.get("tool_call_id") == "2" for m in session["messages"]))
+                session = conversations.load(session["id"])
+                refused = next(i for i in session["items"] if i.get("plan_repair"))
+                self.assert_recovery(session, refused, False)
+                checkpoints.restore(session, session["items"][-1]["checkpoint"])
+                self.assert_recovery(session, refused, True)
+                session = conversations.load(session["id"])
+                self.assert_recovery(session, next(i for i in session["items"] if i.get("plan_repair")), True)
+
+    def test_successful_dry_run_or_start_resolves_the_original_card_and_keeps_diagnostics(self):
+        for dry_run in (True, False):
+            session, cards = self.run_calls([self.call(1), self.call(2, dry_run=dry_run)],
+                                            [self.refusal(), tools.ToolResult("Plan accepted")])
+            self.assert_recovery(session, cards[0], True)
+            self.assertEqual(cards[0]["plan_repair"], "needed", "rendering must not rewrite history")
+            self.assertEqual(cards[0]["status"], "failed", "retain the actual attempt's outcome")
+            self.assertIn("workers[0].checks[0]", cards[0]["output"])
+            message = next(m for m in session["messages"] if m.get("tool_call_id") == "1")
+            self.assertIn("workers[0].checks[0]", message["content"])
+            self.assertEqual(cards[1]["status"], "done")
+
+    def test_unrelated_success_wait_or_failed_retry_does_not_resolve_a_plan(self):
+        for call, result in ((self.call(2, helper="B"), tools.ToolResult("Other plan accepted")),
+                             (self.call(2, wait=True), tools.ToolResult("Collected results")),
+                             (self.call(2, name="get_scene_info"), tools.ToolResult("Scene info")),
+                             (self.call(2), tools.ToolResult("Could not save the copy", ok=False))):
+            session, cards = self.run_calls([self.call(1), call], [self.refusal(), result])
+            self.assert_recovery(session, cards[0], False)
+
+    def test_runtime_failures_and_previous_turns_are_not_marked_as_repaired(self):
+        _, cards = self.run_calls([self.call(1), self.call(2)],
+                                 [tools.ToolResult("Could not save the copy", ok=False), tools.ToolResult("Started")])
+        self.assertNotIn("plan_repair", cards[0])
+        session, cards = self.run_calls([self.call(1)], [self.refusal()])
+        self.run_calls([self.call(2)], [tools.ToolResult("Plan accepted")], session=session)
+        self.assert_recovery(session, cards[0], False)
+
+    def test_all_refused_attempts_for_a_plan_are_resolved_by_its_successful_retry(self):
+        # Different arguments make these real attempts, not identical calls suppressed by the ledger.
+        last = self.call(3, dry_run=False)
+        session, cards = self.run_calls([self.call(1), self.call(2), last],
+                                       [self.refusal(), self.refusal(), tools.ToolResult("Started")])
+        for card in cards[:2]:
+            self.assert_recovery(session, card, True)
+        self.assertNotIn("plan_repair", cards[2])
+
+
 class ToolCardLabelTest(unittest.TestCase):
-    def test_undescribed_tool_uses_registered_description(self):
+    def test_undescribed_tool_uses_registered_title(self):
         for name in ("get_scene_info", "inspect_api"):
             with self.subTest(name=name):
                 call = llm.ToolCall("c1", name, "{}")
                 title, code = agent._describe(call)
-                description = next(s["function"]["description"] for s in tools.SCHEMAS
+                registered_title = next(s["function"]["title"] for s in tools.SCHEMAS
                                    if s["function"]["name"] == name)
                 self.assertNotEqual(title, name)
                 self.assertNotIn("_", title)
-                self.assertTrue(description.startswith(title))
+                self.assertEqual(title, registered_title)
                 self.assertEqual(code, "")
                 self.assertEqual((call.name, call.arguments), (name, "{}"))
 
@@ -2758,11 +3489,11 @@ class ToolCardLabelTest(unittest.TestCase):
             self.assertEqual(agent._describe(llm.ToolCall("c1", "read_custom_data", "{}")),
                              ("Read custom data", ""))
 
-    def test_active_registry_supplies_the_description(self):
+    def test_missing_title_never_falls_back_to_a_description(self):
         schema = {"type": "function", "function": {"name": "read_custom_data",
                   "description": "Read additional data. Returns the stored values."}}
         self.assertEqual(agent._describe(llm.ToolCall("c1", "read_custom_data", "{}"), lambda: [schema]),
-                         ("Read additional data", ""))
+                         ("Read custom data", ""))
 
     def test_invalid_arguments_keep_the_title_and_technical_detail(self):
         title = agent._describe(llm.ToolCall("c1", "get_scene_info", "{}"))[0]

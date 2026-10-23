@@ -6,6 +6,7 @@ Blender's preferences file.
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 
@@ -373,7 +374,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     auto_update: bpy.props.BoolProperty(
         name="Download updates automatically", default=True,
         description="Look for a newer Loopcut now and then and download it in the background. "
-                    "Installing waits until you choose Restart to update")
+                    "Updates install when you close Blender. A pending update can restart a fresh launch; "
+                    "choose Not now to keep working")
     openai_vendor_key: bpy.props.StringProperty(
         name="OpenAI", subtype="PASSWORD", options={"SKIP_SAVE"}, get=_get_openai_key, set=_set_openai_key,
         description="Set or replace your Images API key; environment OPENAI_API_KEY takes precedence")
@@ -510,10 +512,13 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             column.prop(self, "auto_update")
             row = column.row(align=True)
             row.label(text=update.preferences_line())
-            status = update.state()["status"]
+            update_state = update.state()
+            status = update_state["status"]
+            if sys.platform == "win32" and status == "ready" and not update_state["legacy_fallback"]:
+                column.label(text="Windows will ask to allow the update after Blender closes.")
             if status == "ready":
                 row.operator("loopcut.restart_to_update")
-            elif status not in ("checking", "downloading", "installing"):
+            elif status not in ("checking", "downloading", "preparing", "installing", "applying"):
                 row.operator("loopcut.check_for_updates", text="Check Now")
 
         draw_privacy(layout, self)

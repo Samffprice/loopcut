@@ -41,6 +41,7 @@ LAST_RENDER = scratch.folder() / "last_render.png"
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "list_files",
+        "title": "Listing files",
         "description": (
             "Files in a folder: name, size, modified. The .blend's folder, the render output folder and "
             "Blender's temp folder are open; elsewhere the user is asked first. Hidden files are never shown."),
@@ -51,6 +52,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "read_file",
+        "title": "Reading a file",
         "description": (
             "A text file, or a range of its lines; or an image file (png, jpg, exr, ...), which you then "
             "see: a render, a texture, a photo. Same access rule as list_files."),
@@ -62,6 +64,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "write_file",
+        "title": "Writing a file",
         "description": "Write a text file. Refuses to replace an existing file unless overwrite is true. Asks the user.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
@@ -71,6 +74,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "move_file",
+        "title": "Moving a file",
         "description": (
             "Move a file or folder, or copy it with copy=true; into `destination` when that is an existing "
             "folder. Never replaces anything. Asks the user."),
@@ -82,6 +86,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "see_render",
+        "title": "Viewing the render",
         "description": (
             "The user's last render (F12) as an image you see. With render=true, a new render through the "
             "scene camera: sized for you and capped in samples unless full=true. A render blocks Blender "

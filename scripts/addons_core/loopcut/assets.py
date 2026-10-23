@@ -39,6 +39,7 @@ KINDS = {"polyhaven": {"model": "models", "material": "textures", "hdri": "hdris
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "search_assets",
+        "title": "Searching for assets",
         "description": (
             "Omit source to search the user's libraries and Loopcut's index together. "
             "Returns numbered matches, a thumbnail sheet and import IDs. Sources: blenderkit, the largest: models "
@@ -64,6 +65,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "import_asset",
+        "title": "Adding an asset",
         "description": (
             "Download and import an asset from search_assets, from the same source. A model or collection "
             "arrives at the origin in meters (the result gives its bounds: place and scale it); a material "

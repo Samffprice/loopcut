@@ -244,10 +244,11 @@ def schema(descriptor):
     if _packs_scene(descriptor):  # The model cannot build a bundle; the contract's bundle field is filled per call.
         description += " Loopcut packs and uploads the current scene as its bundle itself."
     return {"type": "function", "function": {"name": PREFIX + descriptor["name"],
-            "description": description, "parameters": parameters}}
+            "title": descriptor["title"], "description": description, "parameters": parameters}}
 
 
 JOB_SCHEMA = {"type": "function", "function": {"name": PREFIX + "job_status",
+    "title": "Checking background progress",
     "description": "Check a long cloud job's progress and apply its finished outputs to the scene. Call again if running.",
     "parameters": {"type": "object", "properties": {"job_id": {"type": "string"},
                    "cancel": {"type": "boolean", "description": "Cancel this job."}}, "required": ["job_id"]}}}
@@ -906,7 +907,8 @@ def unavailable_line(runtime=None):
 def offer_schema(locked):
     """One short tool, sent only while something is locked: the model asks the add-on to show the way."""
     titles = ", ".join(row["title"] for row in locked)
-    return {"type": "function", "function": {"name": PREFIX + OFFER, "description":
+    return {"type": "function", "function": {"name": PREFIX + OFFER,
+            "title": "Checking tool availability", "description":
             f"Locked Loopcut cloud tools: {titles}. Only when the user asks for what one does, call this once "
             "so the app shows them how to unlock it. Never call it unprompted.",
             "parameters": {"type": "object", "properties": {"tool": {"type": "string",

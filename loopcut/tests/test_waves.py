@@ -663,8 +663,73 @@ class WorkerSteerTest(unittest.TestCase):
         worker.runtime.run_tool.return_value = tools.ToolResult("changed")
         worker.run_tool("run_python", json.dumps({"code": "pass", "summary": "Adjust the shape"}))
         self.assertEqual(worker.row["summary"], "Adjust the shape")
+        worker.run_tool("capture_viewport", "{}")
+        self.assertEqual(worker.row["summary"], "Checking the model’s appearance")
+        self.assertNotIn("role", worker.row["summary"])
         worker.before_request(2)
         self.assertEqual(worker.row["steps"], 1, "the next pending request has not progressed yet")
+
+    def test_latest_stored_scene_preview_is_kept_without_another_capture(self):
+        worker = self.worker()
+        for name, path, expected in (("capture_viewport", "/saved/first.png", "/saved/first.png"),
+                                     ("run_python", "/saved/second.png", "/saved/second.png"),
+                                     ("look_at_reference", "/saved/reference.png", "/saved/second.png")):
+            worker.session["items"].append({"kind": "tool", "name": name, "image_path": path})
+            self.assertFalse(worker.after_step(worker.session, worker.turn))
+            self.assertEqual(worker.row["image_path"], expected)
+        worker.session["items"].append({"kind": "tool", "name": "capture_viewport", "output": "No image"})
+        worker.report = {"summary": "Done"}
+        self.assertTrue(worker.after_step(worker.session, worker.turn))
+        self.assertEqual(worker.row["image_path"], "/saved/second.png")
+
+    def test_crash_restart_clears_preview_until_the_new_attempt_captures(self):
+        worker = self.worker()
+        registry = Registry()
+        previews = []
+
+        def runtime(wave, worker):
+            previews.append(worker.row.get("image_path"))
+            return FakeRuntime(registry, worker)
+
+        def run_loop(session, turn, spec, run_tool, *args):
+            if not worker.retries:
+                session["items"].append({"kind": "tool", "name": "capture_viewport",
+                                          "image_path": "/saved/discarded.png"})
+                self.assertFalse(worker.after_step(session, turn))
+                worker._crashed("run_python", "child exited")
+            else:
+                session["items"].append({"kind": "tool", "name": "run_python", "output": "Changed"})
+                self.assertFalse(worker.after_step(session, turn))
+                previews.append(worker.row.get("image_path"))
+                session["items"].append({"kind": "tool", "name": "capture_viewport",
+                                          "image_path": "/saved/restarted.png"})
+                worker.after_step(session, turn)
+                previews.append(worker.row.get("image_path"))
+
+        self.wave.make_runtime = runtime
+        with mock.patch.object(agent, "run_loop", side_effect=run_loop), mock.patch.object(worker, "_end"):
+            worker._work()
+        self.assertEqual(worker.retries, 1)
+        self.assertEqual(previews, [None, None, None, "/saved/restarted.png"])
+        self.assertTrue(any(i.get("image_path") == "/saved/discarded.png" for i in worker.session["items"]),
+                        "keep the old attempt in history without reusing its preview")
+
+    def test_preview_update_errors_do_not_hide_crashes_or_reports(self):
+        class UnwritablePreview(dict):
+            def __setitem__(self, key, value):
+                if key == "image_path":
+                    raise RuntimeError("preview unavailable")
+                super().__setitem__(key, value)
+
+        worker = self.worker()
+        worker.row = UnwritablePreview()
+        worker.session["items"].append({"name": "capture_viewport", "image_path": "/saved/preview.png"})
+        self.assertFalse(worker.after_step(worker.session, worker.turn))
+        worker._crashed("run_python", "child exited")
+        self.assertTrue(worker.after_step(worker.session, worker.turn))
+        worker.crashed = ""
+        worker.report = {"summary": "Done"}
+        self.assertTrue(worker.after_step(worker.session, worker.turn))
 
     def test_stop_prevents_delivery_and_elapsed_time_is_kept_when_the_worker_ends(self):
         worker = self.worker()

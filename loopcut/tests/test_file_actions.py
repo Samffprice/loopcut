@@ -107,6 +107,18 @@ class FileActionsTest(unittest.TestCase):
 
 
 class HostActionsTest(unittest.TestCase):
+    def test_helper_previews_are_retained_and_checked_for_missing_files(self):
+        row = state.wave_row("a", "A", "modeling")
+        row["image_path"] = "/missing/helper.png"
+        self.session["items"] = [state.item_wave("w1", 1, [row])]
+        self.refresh(self.session)
+        self.assertEqual(self.missing(self.session), {"/missing/helper.png"})
+        self.prune()
+        self.retain.assert_called_with({"/missing/helper.png"})
+        row["image_path"] = "/missing/new-preview.png"
+        self.prune()
+        self.retain.assert_called_with({"/missing/new-preview.png"})
+
     def setUp(self):
         self.open = Mock(return_value={'FINISHED'})
         self.browser = Mock()
@@ -123,7 +135,7 @@ class HostActionsTest(unittest.TestCase):
                                                                     area=self.area, region=SimpleNamespace(width=420, height=600),
                                                                     view_layer=None, scene=None,
                                                                     preferences=SimpleNamespace(system=SimpleNamespace(ui_scale=1.0)))),
-                     'account': SimpleNamespace(open_browser=self.browser), 'layout': layout,
+                     'account': SimpleNamespace(open_browser=self.browser, refresh_expired_usage=Mock()), 'layout': layout,
                      'draw': SimpleNamespace(retain_images=self.retain, render=Mock(),
                                              measure=lambda font, size, text: len(text) * size * 0.6), 'is_host': bool,
                      'settings': SimpleNamespace(preferences=lambda: SimpleNamespace(), model_label=str),

@@ -31,6 +31,24 @@ def hit(display, id):
 
 
 class LimitRecoveryTest(unittest.TestCase):
+    def test_expired_account_windows_disappear_from_footer_ring_and_tooltip(self):
+        from datetime import datetime
+        reset = "2099-10-21T18:00:00Z"
+        now = datetime.fromisoformat(reset).timestamp()
+        for window in ("session", "week"):
+            for offset in (0, 1):
+                with self.subTest(window=window, offset=offset):
+                    account = {window: {"used": 0.84, "resets_at": reset}}
+                    before = build(account=account, now=now - 1, credits="100 credits")
+                    self.assertIn("84%", hit(before, "input.credits")["tip"])
+                    after = build(account=account, now=now + offset, credits="100 credits")
+                    self.assertNotIn("Chat:", hit(after, "input.credits")["tip"])
+                    self.assertNotIn("chat allowance", hit(after, "input.rings")["tip"])
+                    self.assertEqual([p["id"] for p in after["prims"] if p["t"] == "ring"], ["input.ring.context"])
+                    account[window]["resets_at"] = "2099-10-22T18:00:00Z"
+                    fresh = build(account=account, now=now + offset, credits="100 credits")
+                    self.assertIn("84%", hit(fresh, "input.credits")["tip"])
+
     def test_refused_window_ring_and_tooltip_are_exhausted_without_mutating_usage(self):
         account = {"plan": "free", "session": {"used": 0.82, "used_with_reservations": 0.92},
                    "week": {"used": 0.48, "used_with_reservations": 0.58}}
@@ -43,7 +61,7 @@ class LimitRecoveryTest(unittest.TestCase):
                     rings = [p for p in display["prims"] if p["t"] == "ring"]
                     self.assertEqual(len(rings), 2)
                     self.assertEqual((rings[1]["id"], rings[1]["share"]), ("input.ring." + window, 0.0))
-                    self.assertIn(f"{window.capitalize()}: 100% used, 0% left", hit(display, "input.rings")["tip"])
+                    self.assertIn(f"{window.capitalize()} chat allowance: 100% used, 0% left", hit(display, "input.rings")["tip"])
         self.assertEqual(account, before)
 
     def test_refusal_override_expires_at_reset_even_without_an_account_refresh(self):
@@ -55,7 +73,7 @@ class LimitRecoveryTest(unittest.TestCase):
                 account = {"plan": "free", "session": {"used": 0.82}, "week": {"used": 0.42}}
                 notice = {"item": card}
                 before = build(account=account, allowance_notice=notice, now=reset - 1)
-                self.assertIn(f"{window.capitalize()}: 100% used, 0% left", hit(before, "input.rings")["tip"])
+                self.assertIn(f"{window.capitalize()} chat allowance: 100% used, 0% left", hit(before, "input.rings")["tip"])
                 after = build(account=account, allowance_notice=notice, now=reset)
                 self.assertEqual(hit(after, "input.rings")["tip"], hit(build(account=account), "input.rings")["tip"])
                 self.assertFalse(any(p["id"].startswith("input.limit") for p in after["prims"]))
@@ -618,7 +636,7 @@ class FooterTest(unittest.TestCase):
         tip = hit(display, "input.rings")["tip"].split("\n")
         self.assertEqual(tip, ["Context: 6.0k of 24.0k tokens (25%) before compaction",
                                "This conversation: 30.0k in, 2.0k out",
-                               "Session: 25% used, 75% left", "Week: 50% used, 50% left"])
+                               "Session chat allowance: 25% used, 75% left", "Week chat allowance: 50% used, 50% left"])
 
     def test_reservations_drive_ring_tooltip_and_usage_note_with_defensive_fallback(self):
         for value, expected in ((0.91, 0.91), ("0.9", 0.9), (0, 0), (1.2, 1),
@@ -630,12 +648,63 @@ class FooterTest(unittest.TestCase):
                 ring = next(p for p in display["prims"] if p["id"] == "input.ring.session")
                 self.assertAlmostEqual(ring["share"], 1 - expected)
                 for label in ("Session", "Week"):
-                    self.assertIn(f"{label}: {round(expected * 100)}% used, {round((1 - expected) * 100)}% left",
+                    self.assertIn(f"{label} chat allowance: {round(expected * 100)}% used, {round((1 - expected) * 100)}% left",
                                   hit(display, "input.rings")["tip"])
                 self.assertEqual(layout.usage_note(account)[1], expected)
         for window in (None, [], "bad", {"used": "nan", "used_with_reservations": False}):
             display = build(account={"session": window, "week": window})
             self.assertEqual(len([p for p in display["prims"] if p["t"] == "ring"]), 1)
+
+    def test_high_chat_usage_is_visible_beside_credits_with_room_at_narrow_widths(self):
+        for width in (240, 320, 420):
+            for scale in (1, 2):
+                for plan in ("free", "pro", "max"):
+                    with self.subTest(width=width, scale=scale, plan=plan):
+                        session = state.new_session()
+                        session["input"] = "Keep working"
+                        ui = {"credits": "100 credits ($1.00)", "provider": "LOOPCUT",
+                              "account": {"plan": plan, "session": {"used": 0.3, "used_with_reservations": 0.74}}}
+                        drawn = layout.build(session, width * scale, 600 * scale, scale, measure, ui=ui)
+                        lines = [p for p in drawn["prims"] if p["id"].startswith("input.credits")]
+                        self.assertEqual(lines[0]["text"], "100 credits ($1.00)")
+                        self.assertIn("Chat: 74% of this 5-hour window used", " ".join(p["text"] for p in lines))
+                        for line in lines:
+                            self.assertLessEqual(line["x"] + measure("ui", line["size"], line["text"]),
+                                                 (width - T.PAD - T.CARD_PAD) * scale)
+                        model = prim(drawn, "input.model")
+                        self.assertLess(lines[-1]["y"] + 16 * scale, model["y"])
+                        input_lines = [p for p in drawn["prims"] if p["id"] == "input.l0"]
+                        self.assertTrue(input_lines)
+                        self.assertLess(max(p["y"] + 16 * scale for p in input_lines), lines[0]["y"])
+
+    def test_chat_footer_threshold_fuller_window_and_provider_filtering(self):
+        for used, expected in ((0.69, ""), (0.7, "Chat: 70% of this 5-hour window used"),
+                               (1, "Chat: 100% of this 5-hour window used")):
+            with self.subTest(used=used):
+                drawn = build(credits="100 credits", account={"session": {"used": used}})
+                text = " ".join(p["text"] for p in drawn["prims"] if p["id"].startswith("input.credits"))
+                if expected:
+                    self.assertIn(expected, text)
+                else:
+                    self.assertEqual(text, "100 credits This chat: 0 credits")
+                    self.assertEqual(prim(drawn, "input.zone")["y"], prim(build(credits="100 credits"), "input.zone")["y"])
+        account = {"session": {"used": 0.74}, "week": {"used": 0.91}}
+        self.assertIn("Chat: 91% of this week used", hit(build(account=account), "input.credits")["tip"])
+        for provider in ("OPENAI", "CUSTOM", "CHATGPT"):
+            with self.subTest(provider=provider):
+                drawn = build(account=account, provider=provider, credits="100 credits", chatgpt_plan=True)
+                self.assertNotIn("Chat:", hit(drawn, "input.credits")["tip"])
+                self.assertNotIn("chat allowance", hit(drawn, "input.rings")["tip"])
+                self.assertEqual([p["id"] for p in drawn["prims"] if p["t"] == "ring"], ["input.ring.context"])
+
+    def test_chat_footer_agrees_with_refusal_override_and_reset(self):
+        from datetime import datetime
+        account = {"session": {"used": 0.3}}
+        reset = "2099-10-21T18:00:00Z"
+        notice = {"item": state.item_limit("Used up.", "session_limit", "free", reset, None)}
+        now = datetime.fromisoformat(reset).timestamp()
+        self.assertEqual(layout.usage_note(account, notice, now - 1), ("Chat: 100% of this 5-hour window used", 1))
+        self.assertEqual(layout.usage_note(account, notice, now), ("", 0.3))
 
     def test_without_an_account_there_is_one_ring(self):
         rings = [p for p in build()["prims"] if p["t"] == "ring"]
@@ -757,6 +826,39 @@ class QueuedTest(unittest.TestCase):
 
 
 class DelegateDetailsTest(unittest.TestCase):
+    def test_plan_diagnostics_and_budget_stay_behind_details(self):
+        for repair in ("needed", "resolved"):
+            for expanded in (False, True):
+                item = state.item_tool("delegate", "Check a helper plan", '{"workers": [{"id": "chair"}]}')
+                item.update(status="failed", expanded=expanded, plan_repair="needed", plan_turn="turn1",
+                            plan_workers=[["chair", "modeling"]],
+                            output="workers[0].checks[0]: missing kind. Budget: $0.40")
+                session = chat(item)
+                if repair == "resolved":
+                    retry = state.item_tool("delegate", "Start a helper", item["code"])
+                    retry.update(status="done", plan_turn="turn1", plan_workers=[["chair", "modeling"]])
+                    session["items"].append(retry)
+                display = build(session)
+                visible = " ".join(texts(display).values())
+                self.assertNotIn("workers[0]", visible)
+                self.assertNotIn("$0.40", visible)
+                self.assertNotIn("item0.tool.reason", ids(display, "prims"))
+                expected = ("Adjusted the helper plan and retried" if repair == "resolved"
+                            else "Helper plan needs adjustment")
+                # The collapsed line may ellipsize at narrow widths.
+                self.assertTrue(expected.startswith(texts(display)["item0.tool.summary"].rstrip("…")))
+                if repair == "resolved":
+                    self.assertNotEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+                item.update(expanded=True, details_expanded=True)
+                self.assertIn("workers[0].checks[0]", " ".join(texts(build(session)).values()))
+
+    def test_successful_helper_output_keeps_internal_budget_in_details(self):
+        item = state.item_tool("delegate", "Start a helper", "Internal ceiling: $0.40")
+        item.update(status="done", expanded=True, output="Budget: $0.400 of $0.40 left")
+        self.assertNotIn("$0.40", " ".join(texts(build(chat(item))).values()))
+        item["details_expanded"] = True
+        self.assertIn("$0.40", " ".join(texts(build(chat(item))).values()))
+
     def test_arguments_stay_behind_details_even_in_an_open_or_awaiting_card(self):
         for status in ("running", "awaiting", "done"):
             item = state.item_tool("delegate", "Ask helpers", '{"workers": []}')
@@ -861,6 +963,20 @@ class GuardNoticeTest(unittest.TestCase):
 
 
 class UpdateBannerTest(unittest.TestCase):
+    def test_elevation_notice_reserves_space_and_not_now_has_an_action(self):
+        banner = {"text": "Updating Loopcut to 0.2.10…", "button": ("Not now", "update_defer"),
+                  "dismiss": False, "progress": None,
+                  "detail": "Windows will ask to allow the update after Blender closes."}
+        session = state.new_session()
+        session["items"].append(state.item_user("hi"))
+        plain, notice = build(session), build(session, update=banner)
+        bg = next(p for p in notice["prims"] if p["id"] == "update.bg")
+        card = lambda d: next(p for p in d["prims"] if p["id"] == "item0.user.card")
+        self.assertGreater(bg["h"], T.BANNER_HEIGHT)
+        self.assertEqual(card(notice)["y"] - card(plain)["y"], bg["h"])
+        self.assertEqual(hit(notice, "update.button")["action"], ("update_defer", None))
+        self.assertIn("update.detail", ids(notice, "prims"))
+
     def test_no_banner_leaves_the_chat_under_the_header(self):
         display = build()
         self.assertNotIn("update.bg", ids(display, "prims"))
@@ -1319,6 +1435,20 @@ def worker(id, status, **extra):
 
 def wave(*rows):
     return state.item_wave("w1", 1, list(rows))
+
+
+class HelperPreviewTest(unittest.TestCase):
+    def test_latest_preview_opens_and_missing_files_are_omitted(self):
+        row = worker("a", "working", image_path="/saved/preview.png")
+        display = build(chat(wave(row)))
+        preview = prim(display, "item0.wave.row0.image")
+        self.assertEqual(preview["path"], row["image_path"])
+        self.assertEqual(hit(display, "item0.wave.row0.image")["action"], ("reference_open", row["image_path"]))
+        card = prim(display, "item0.wave.card")
+        self.assertLessEqual(preview["y"] + preview["h"], card["y"] + card["h"])
+        missing = build(chat(wave(row)), missing_paths=[row["image_path"]])
+        self.assertNotIn("item0.wave.row0.image", ids(missing, "prims"))
+        self.assertNotIn("item0.wave.row0.image", ids(missing, "hits"))
 
 
 def merge(**extra):

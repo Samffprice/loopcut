@@ -41,6 +41,7 @@ GAP = 8
 
 SCHEMAS = [{"type": "function", "function": {  # Sent with every request: every word here is paid for on every step.
     "name": "inspect_texture",
+    "title": "Checking a texture",
     "description": (
         "Read-only: each image node of a material, its path to the shader socket, UV map, colour space, size, "
         "packed or file, and a pixel hash any edit changes. Samples as mapped, at uv points or an object's faces. "

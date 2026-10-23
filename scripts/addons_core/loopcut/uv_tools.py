@@ -86,6 +86,7 @@ SINGLE_ONLY = {"transfer_textures"}
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "inspect_uv",
+        "title": "Checking texture mapping",
         "description": (
             "UV audit, read-only: per object islands, faces outside 0-1, zero-area and flipped faces, overlaps, "
             "stretch, texel density (px/m at resolution), gutters, worst face ids. Before painting or blaming a "
@@ -102,6 +103,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "uv_unwrap",
+        "title": "Preparing texture mapping",
         "description": (
             "Unwrap meshes you own into 0-1, one texel density, packed with padding; returns inspect_uv's audit. "
             "method: smart (by angle), cube/cylinder/sphere (about local Z), seams (marked ones), angle_seams (mark "
@@ -119,6 +121,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
     }},
     {"type": "function", "function": {
         "name": "transfer_textures",
+        "title": "Copying textures",
         "description": (
             "Images follow the UV map they read: a new layout moves the artwork. Bakes the images the materials "
             "read through from_uv (the painted layout) onto to_uv, same size and colour space, normal maps for "

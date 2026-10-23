@@ -33,6 +33,7 @@ from .tools import ToolError, ToolResult
 
 SCHEMAS = [{"type": "function", "function": {  # Sent with every request: every word here is paid for on every step.
     "name": "frame_camera",
+    "title": "Framing the camera",
     "description": (
         "Aim a camera and fit objects in its render frame, solved exactly. Returns where each object lands "
         "(frame 0..1), % inside, clipped edges, margins, the camera transform. Use it, not camera math in "

@@ -136,6 +136,7 @@ LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport",
 SCHEMAS = [  # Sent with every workspace request: every word here is paid for on every step.
     {"type": "function", "function": {
         "name": "shell",
+        "title": "Running a command",
         "description": (
             "Run a workspace command; returns exit code and output (over 8,000 chars clipped, full log in "
             "logs/). No input. Windows: cmd.exe; inline Python refused: write_file a .py, then python3 file.py."),
@@ -147,6 +148,7 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     }},
     {"type": "function", "function": {
         "name": "run_blender",
+        "title": "Updating the model",
         "description": (
             "Run a Python script in a background Blender on a .blend: blender -b <blend> --python <script> -- <args>. "
             "The live scene is untouched. Returns the exit code (1 on an exception), the log's tail (all of it in "
@@ -160,6 +162,7 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     }},
     {"type": "function", "function": {
         "name": "edit_file",
+        "title": "Editing a file",
         "description": ("Replace exact text in a text file: old_text must occur exactly once, unless replace_all. "
                         "New files: write_file."),
         "parameters": {"type": "object", "properties": {
@@ -171,6 +174,7 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     }},
     {"type": "function", "function": {
         "name": "view_image",
+        "title": "Viewing an image",
         "description": ("See an image file: a render, a texture, a reference. The whole image or "
                         f"region [x0, y0, x1, y1] (fractions from the top-left), up to {VIEW_MAX_SIDE} px."),
         "parameters": {"type": "object", "properties": {
@@ -180,6 +184,7 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     }},
     {"type": "function", "function": {
         "name": "apply_build",
+        "title": "Applying the changes",
         "description": (
             "Bring a .blend you built into the live scene. Everything the build created comes in (objects with "
             "their data, materials, images, worlds, text blocks; images from the workspace packed). What you "
@@ -195,6 +200,7 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
     }},
     {"type": "function", "function": {
         "name": "snapshot_scene",
+        "title": "Copying the scene",
         "description": (f"Save the live scene as {SOURCE} again (the previous one kept as source-<n>.blend), for "
                         "builds that start from what is live now: after the user changed the scene, or to build "
                         "on work already applied."),

@@ -20,6 +20,7 @@ _generation = 0
 
 SCHEMAS = [{"type": "function", "function": {
     "name": "inspect_scene",
+    "title": "Checking the scene",
     "description": "Inspect named cameras and frames in one annotated contact sheet (max 12 views), each "
     "view's exposure and colour in numbers. geometry uses Workbench; materials an EEVEE studio-light rig; "
     "final_lighting the scene's own engine and lighting, capped in resolution and samples. Renders a "

@@ -67,19 +67,19 @@ class BetaGatesTest(unittest.TestCase):
             self.assertNotIn(token, cleaned)
 
     def test_low_allowance_notices_have_facts_and_no_purchase(self):
-        for plan in ('free', 'pro'):
-            session, items = {}, []
-            self.agent._warn_low_allowance(session, items, {'plan': plan, 'week': {'used': .95}})
-            self.agent._warn_low_allowance(session, items, {'plan': plan, 'week': {'used': .96}})
-            self.assertEqual(len(items), 1)
-            self.assertIn('5%', items[0]['text'])
-            self.assert_no_purchase(items)
-            self.assert_no_purchase(self.display(*items))
-        with patch.object(self.config, 'billing_open', return_value=True):
-            items = []
-            self.agent._warn_low_allowance({}, items, {'plan': 'free', 'week': {'used': .95}})
-            self.assertEqual(items[0]['url'], self.config.pricing_url('low_allowance'))
-            self.assertEqual(items[0]['action_label'], 'See plans')
+        for day, (plan, billing) in enumerate((('free', False), ('pro', False), ('free', True)), 21):
+            with self.subTest(plan=plan, billing=billing), patch.object(self.config, 'billing_open', return_value=billing):
+                session = self.state.reset()
+                items = session['items']
+                reset = f'2099-10-{day}T18:00:00Z'  # Each case exercises a distinct server window.
+                self.agent._warn_low_allowance(session, items, {'plan': plan, 'week': {'used': .95, 'resets_at': reset}})
+                self.agent._warn_low_allowance(session, items, {'plan': plan, 'week': {'used': .96, 'resets_at': reset}})
+                self.assertEqual(len(items), 1)
+                self.assertIn("95% of this week's chat allowance", items[0]['text'])
+                self.assertEqual(items[0]['url'], '')
+                self.assertEqual(items[0]['action_label'], '')
+                self.assert_no_purchase(items)
+                self.assert_no_purchase(self.display(*items))
 
     def test_limit_state_and_saved_cards_suppress_offers_and_keep_reset(self):
         offer = {'url': self.config.pricing_url(), 'label': 'Upgrade', 'note': 'Purchase Pro now'}
@@ -144,7 +144,7 @@ class BetaGatesTest(unittest.TestCase):
             names = [entry[1] for entry in layout.calls if entry[0] == 'operator']
             self.assertEqual('loopcut.blenderkit_get_key' in names, not beta)
             texts = [entry[1] for entry in layout.calls if entry[0] == 'label']
-            self.assertIn('Loopcut 0.2.10' + (' beta' if beta else ''), texts)
+            self.assertIn('Loopcut 0.2.11' + (' beta' if beta else ''), texts)
             if beta:
                 self.assert_no_purchase(texts)
                 self.assertNotIn('Workers and routing run on Loopcut plans', texts)
@@ -204,18 +204,18 @@ class BetaGatesTest(unittest.TestCase):
         self.assertIn('tester@example.test  ·  Pro plan', before)
 
     def test_version_display_and_machine_versions_are_separate(self):
-        self.assertEqual(self.config.version_label(), '0.2.10 beta')
-        self.assertIn('0.2.10 beta', [p.get('text') for p in self.display()['prims']])
-        self.assertEqual(self.update.current_version(), (0, 2, 10))
-        self.assertTrue(self.cloud_http.contract_headers()['x-loopcut-client'].startswith('loopcut-addon/0.2.10 blender/5.2.0 os/'))
-        release = {'version': (0, 2, 11), 'label': '0.2.11', 'asset': None}
+        self.assertEqual(self.config.version_label(), '0.2.11 beta')
+        self.assertIn('0.2.11 beta', [p.get('text') for p in self.display()['prims']])
+        self.assertEqual(self.update.current_version(), (0, 2, 11))
+        self.assertTrue(self.cloud_http.contract_headers()['x-loopcut-client'].startswith('loopcut-addon/0.2.11 blender/5.2.0 os/'))
+        release = {'version': (0, 2, 12), 'label': '0.2.12', 'asset': None}
         status = {'release': release, 'status': 'available', 'dismissed': False, 'error': '', 'progress': 0}
-        self.assertIn('0.2.11 beta', self.update.banner_for(status, False)['text'])
-        self.assertIn('0.2.11 beta', self.update.status_line(status, (0, 2, 10)))
+        self.assertIn('0.2.12 beta', self.update.banner_for(status, False)['text'])
+        self.assertIn('0.2.12 beta', self.update.status_line(status, (0, 2, 11)))
         for state in ('idle', 'current'):
-            self.assertIn('0.2.10 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 10)))
+            self.assertIn('0.2.11 beta', self.update.status_line({**status, 'status': state, 'release': None}, (0, 2, 11)))
         with patch.object(self.config, 'BETA', False):  # The label alone; sales follow billing_open.
-            self.assertEqual(self.config.version_label(), '0.2.10')
+            self.assertEqual(self.config.version_label(), '0.2.11')
             self.assertNotIn('beta', self.update.banner_for(status, False)['text'])
 
     def test_config_environment_switches(self):
@@ -243,7 +243,7 @@ class BetaGatesTest(unittest.TestCase):
                 self.draw_help(expect_loopcut=True)
                 splash = Splash()
                 self.support._draw_info(types.SimpleNamespace(layout=splash), None)
-                self.assertIn(('label', 'Loopcut 0.2.10 beta'), splash.records)
+                self.assertIn(('label', 'Loopcut 0.2.11 beta'), splash.records)
                 self.assertEqual(splash.operators()[0][1], 'loopcut.report_bug')
                 with patch.object(self.config, 'BUG_REPORT_URL', 'https://example.test/form'):
                     self.support.LOOPCUT_OT_report_bug().execute(None)

@@ -183,6 +183,70 @@ class WorkerStartup(unittest.TestCase):
         self.assertIn("crashed during run_python", worker.session["messages"][0]["content"])
         worker._end.assert_called_once()
 
+    def test_crash_retry_handles_empty_and_populated_transcripts(self):
+        old = {"name": "capture_viewport", "image_path": "/saved/discarded.png"}
+        for items in (None, [], [old], (old,)):
+            with self.subTest(items=items):
+                worker, runtime = self.worker()
+                worker.session["items"] = items
+                worker.row["image_path"] = old["image_path"]
+
+                def run(session, turn, *args):
+                    if not worker.retries:
+                        worker._crashed("run_python", "child exited")
+                        return
+                    self.assertNotIn("image_path", worker.row)
+                    self.assertFalse(worker.after_step(session, turn))
+                    self.assertNotIn("image_path", worker.row, "the old attempt stays out of the preview")
+                    session["items"] = list(items or []) + [
+                        {"name": "capture_viewport", "image_path": "/saved/restarted.png"}]
+                    self.assertFalse(worker.after_step(session, turn))
+                    self.assertEqual(worker.row["image_path"], "/saved/restarted.png")
+
+                with mock.patch.object(agent, "run_loop", side_effect=run) as loop:
+                    worker._work()
+                self.assertEqual((runtime.start.call_count, loop.call_count, worker.retries), (2, 2, 1))
+                worker._end.assert_called_once()
+
+    def test_preview_bookkeeping_errors_never_prevent_crash_retries(self):
+        class UnreadableItems(list):
+            def __len__(self):
+                raise RuntimeError("transcript unavailable")
+
+        class UnclearableRow(dict):
+            def pop(self, key, default=None):
+                raise RuntimeError("preview unavailable")
+
+        old = {"name": "capture_viewport", "image_path": "/saved/discarded.png"}
+        for during_init in (False, True):
+            for failure in ("boundary", "row"):
+                with self.subTest(during_init=during_init, failure=failure):
+                    error = [worker_host.ChildCrashed("init", "child exited", ""), None] if during_init else None
+                    worker, runtime = self.worker(error=error)
+                    if failure == "boundary":
+                        worker.session["items"] = UnreadableItems([old])
+                        worker.row["image_path"] = old["image_path"]
+                    else:
+                        worker.row = UnclearableRow()
+
+                    def run(session, turn, *args):
+                        if not worker.retries:
+                            worker._crashed("run_python", "child exited")
+                            self.assertTrue(worker.after_step(session, turn))
+                            return
+                        # Even if the transcript becomes readable, an unknown boundary cannot reuse it.
+                        session["items"] = [old]
+                        self.assertFalse(worker.after_step(session, turn))
+                        self.assertNotIn("image_path", worker.row)
+
+                    with mock.patch.object(agent, "run_loop", side_effect=run) as loop:
+                        worker._work()
+                    self.assertEqual(runtime.start.call_count, 2)
+                    self.assertEqual(loop.call_count, 1 if during_init else 2)
+                    self.assertEqual(worker.retries, 1)
+                    self.assertFalse(worker.wave.session.get("workers_unavailable"))
+                    worker._end.assert_called_once()
+
     def test_delegate_removed_for_later_turns_and_new_sessions_unaffected(self):
         session = {"workers_unavailable": True}
         spec = types.SimpleNamespace(schemas=lambda: orchestrator.SCHEMAS)

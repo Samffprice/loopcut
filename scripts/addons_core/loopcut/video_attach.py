@@ -40,6 +40,7 @@ FRAME_PARAMETER = {"type": "integer", "description": "For an attached clip: a cl
 LOOK_FRAME_PARAMETER = {"type": "integer", "description": "For an attached clip: a clip frame (as in beats.json)"}
 SCHEMAS = [{"type": "function", "function": {  # Offered only while a clip is attached: see with_clip_tools.
     "name": "clip_background",
+    "title": "Adding a video reference",
     "description": (
         "Show an attached clip in a camera's view as a movie-clip background image, at the clip's frame rate "
         "(the scene's frame rate is set to it), the clip's first used frame at start_frame. Returns which "

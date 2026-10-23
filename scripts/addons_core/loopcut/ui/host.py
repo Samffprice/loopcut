@@ -40,6 +40,7 @@ def is_host(area) -> bool:
 
 
 def tag_redraw_all() -> None:
+    account.refresh_expired_usage()
     _refresh_missing_paths(state.session())
     _prune_images()  # lifecycle's regular poll also catches panels closed through Blender's UI.
     for window in bpy.context.window_manager.windows:
@@ -177,6 +178,7 @@ def draw_area() -> None:
                            draw.measure, model, _checkpoint_statuses(session),
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
                             "key_needed": key_needed,
+                            "provider": getattr(prefs, "provider", "LOOPCUT"),
                             "allowance_notice": state.ui.get("allowance_notice"),
                             "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
                             "context_budget": budget, "model_options": options, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
@@ -197,7 +199,10 @@ def draw_area() -> None:
 
 
 def _image_paths(session):
-    return {item["image_path"] for item in session["items"] if item.get("image_path")}
+    paths = {item["image_path"] for item in session["items"] if item.get("image_path")}
+    paths.update(row["image_path"] for item in session["items"] if item.get("kind") == "wave"
+                 for row in item.get("rows", []) if row.get("image_path"))
+    return paths
 
 
 def _missing_paths(session):
@@ -694,6 +699,8 @@ def _do_action(session: dict, action) -> None:
         update.open_notes()
     elif kind == "update_dismiss":
         update.dismiss()
+    elif kind == "update_defer":
+        update.defer_startup()
 
 
 def _accept_quarantine(session: dict, item: dict) -> None:

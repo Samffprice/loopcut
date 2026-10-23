@@ -15,6 +15,7 @@ from . import acceptance, agent, assets, camera, contact, ownership, paint_tools
 
 _CAPTURE = {"type": "function", "function": {
     "name": "capture_viewport",
+    "title": "Checking the model’s appearance",
     "description": ("A render of your copy of the scene set up for your role (modeling clay, materials studio, "
                     "lighting with the scene's engine capped, camera through the camera with guides, animation a "
                     "sheet of frames)."),
@@ -41,11 +42,13 @@ _CAPTURE = {"type": "function", "function": {
 SCHEMAS_OWN = [
     {"type": "function", "function": {
         "name": "check_brief",
+        "title": "Checking the requested changes",
         "description": ("Run your brief's checks on your copy now: pass or fail for each, with the measured "
                         "numbers and, where known, the fix. Your status is decided by these checks."),
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "report_back",
+        "title": "Reporting the results",
         "description": "End your work with a report to the orchestrator. Call it once, last, after check_brief.",
         "parameters": {"type": "object", "required": ["summary"], "properties": {
             "summary": {"type": "string", "description": "1-3 sentences: what you built and refined, what is left"},

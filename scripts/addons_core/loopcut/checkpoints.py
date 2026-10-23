@@ -194,9 +194,10 @@ def ensure_for_turn(session: dict) -> None:
 def ensure_for_wave(session: dict, label: str, message_index: int, item_index: int) -> str:
     """Main thread, as a wave's workers start (waves.prepare): snapshot the scene and return the
     checkpoint's id, which each of the wave's merges names. message_index and item_index point at the
-    orchestrator's delegate message and the wave card, so restoring puts the scene back to before the
-    delegate call, every merge of the wave undone, and cuts the conversation to just before the wave
-    was asked for. Raises CheckpointError; the wave must not start without one."""
+    orchestrator's delegate message and tool card (or the wave card when started directly), so restoring
+    puts the scene back to before the delegate call, every merge of the wave undone, and cuts the
+    conversation to just before the wave was asked for. Raises CheckpointError; the wave must not
+    start without one."""
     entry = _write_snapshot(_store(session), "wave", label, message_index=message_index, item_index=item_index)
     return entry["id"]
 

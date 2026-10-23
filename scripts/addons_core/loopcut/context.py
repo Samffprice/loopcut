@@ -221,7 +221,7 @@ def fixed_tokens(system_prompt: str, tools: list, *, prompt_id=None, index=None)
         from . import cloud
         index = cloud.hosted_index(required=True)
     hosted = prompt_index.prompt_chars(index, prompt_id) if prompt_id else 0
-    return round((len(system_prompt) + hosted + len(json.dumps(tools))) / CHARS_PER_TOKEN)
+    return round((len(system_prompt) + hosted + len(json.dumps(llm.wire_tools(tools)))) / CHARS_PER_TOKEN)
 
 
 def estimate_tokens(messages: list, fixed: int = FIXED_TOKENS, *, skill_index=None) -> int:

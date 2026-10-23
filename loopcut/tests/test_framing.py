@@ -18,7 +18,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, camera, framing as F, tools  # noqa: E402
+from loopcut import agent, camera, framing as F, llm, tools  # noqa: E402
 
 CHANGES_SCENE = agent._changes_scene  # test_agent_loop stubs these two; keep the real ones.
 TOOL_SCHEMAS = agent._tool_schemas
@@ -491,7 +491,7 @@ class ReportTest(unittest.TestCase):
 
 class ToolTest(unittest.TestCase):
     def test_schema_is_small_and_offered(self):
-        schema = json.dumps(camera.SCHEMAS[0])
+        schema = json.dumps(llm.wire_tools([camera.SCHEMAS[0]]))
         self.assertLessEqual(len(schema) / 4, 350)
         self.assertIn("frame_camera", [s["function"]["name"] for s in TOOL_SCHEMAS()])
         self.assertIn(camera.frame_camera, [camera.DISPATCH.get("frame_camera")])

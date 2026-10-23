@@ -1012,6 +1012,15 @@ class OnboardingTest(unittest.TestCase):
         service.assert_called_once_with(runtime)
         catalog.assert_called_once_with()
 
+    def test_draw_passes_provider_to_filter_chat_allowance_even_with_a_connected_account(self):
+        session = self.state.new_session()
+        runtime = types.SimpleNamespace(signed_in=True, lock=threading.RLock(), vote_notice="")
+        for provider in ("LOOPCUT", "CHATGPT", "OPENAI", "CUSTOM"):
+            with self.subTest(provider=provider):
+                self.prefs.provider = provider
+                build, _, _ = self.draw(session, runtime)
+                self.assertEqual(build.call_args.args[-1]["provider"], provider)
+
     def test_service_actions_keep_settings_project_and_upgrade_routes(self):
         session = self.state.new_session()
         self.state.ui.update(model_menu=True, picker={})
@@ -1240,6 +1249,19 @@ class OnboardingTest(unittest.TestCase):
                     done.assert_called_once_with()
                     self.assertIn("allowance_notice", self.state.ui, "same-plan refresh is display only and never gates a request")
 
+    def test_changing_accounts_clears_both_allowance_warning_windows(self):
+        for change in ("sign_out", "sign_in"):
+            with self.subTest(change=change), patch.object(self.account.credentials, "store"), \
+                    patch.object(self.account, "on_signed_in", []), patch.object(self.account, "_redraw"):
+                self.state.ui.update(warned_session_allowance=["same session reset"],
+                                     warned_week_allowance=["same weekly reset"])
+                if change == "sign_out":
+                    self.account.sign_out()
+                else:
+                    self.account._store_key("different-account")
+                self.assertNotIn("warned_session_allowance", self.state.ui)
+                self.assertNotIn("warned_week_allowance", self.state.ui)
+
     def test_changed_plan_clears_notice_and_refreshes_cached_model_locks(self):
         with patch.dict(self.account._state, account={"plan": "free"}), \
                 patch.object(self.account, "refresh_account") as refresh:
@@ -1247,6 +1269,104 @@ class OnboardingTest(unittest.TestCase):
             self.account.update_usage({"plan": "pro"})
             self.assertNotIn("allowance_notice", self.state.ui)
             refresh.assert_called_once_with()
+
+    def test_expired_usage_refreshes_after_idle_reset_and_late_helper_report(self):
+        from datetime import datetime
+        reset = "2099-10-21T18:00:00Z"
+        now = datetime.fromisoformat(reset).timestamp()
+        for window in ("session", "week"):
+            with self.subTest(window=window), patch.dict(self.account._state, account=None), \
+                    patch.object(self.account, "refresh_account") as refresh, \
+                    patch.object(self.host, "_refresh_missing_paths"), patch.object(self.host, "_prune_images"), \
+                    patch.object(self.fake.context, "window_manager", types.SimpleNamespace(windows=[]), create=True), \
+                    patch.object(self.account.time, "time", return_value=now - 1) as clock:
+                self.account._set_account(None)
+                payload = {"plan": "free", window: {"used": 0.84, "resets_at": reset}}
+                self.account._set_account(payload)
+                self.host.tag_redraw_all()
+                refresh.assert_not_called()
+                clock.return_value = now
+                self.host.tag_redraw_all()
+                refresh.assert_called_once()
+                self.assertEqual(self.account.usage_lines(), [])
+                self.host.tag_redraw_all()
+                self.account.update_usage(payload)
+                refresh.assert_called_once()  # No request storm while an expired report remains cached.
+                self.account._set_account(None)
+                self.account._set_account({"plan": "free"})
+                refresh.reset_mock()
+                self.account.update_usage(payload)  # A helper can deliver an already expired window.
+                refresh.assert_called_once()
+                self.assertEqual(self.account.usage_lines(), [])
+
+    def test_expired_usage_offline_backs_off_and_stops_over_a_simulated_hour(self):
+        now = [0.0]
+        attempts = []
+
+        def offline(path, key):
+            self.assertEqual(path, "/v1/me")
+            attempts.append(now[0])
+            raise self.account.AccountError("Offline")
+
+        def immediate_thread(target, args=(), **kwargs):
+            return types.SimpleNamespace(start=lambda: target(*args))
+
+        with patch.dict(self.account._state), \
+                patch.object(self.account.credentials, "api_key", return_value="fixture"), \
+                patch.object(self.account, "_get", side_effect=offline), \
+                patch.object(self.account.threading, "Thread", side_effect=immediate_thread), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=lambda fn: fn()), \
+                patch.object(self.account.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(self.account, "_redraw"):
+            self.account._set_account(None)
+            stale = {"plan": "free", "session": {"used": 0.84, "resets_at": "2000-01-01T00:00:00Z"}}
+            self.account._set_account(stale)
+            for second in range(3600):
+                now[0] = float(second)
+                self.account.refresh_expired_usage()
+                self.account.update_usage(stale)  # Late helper reports do not restart the retry budget.
+            self.assertEqual(attempts, [0, 30, 150, 750])
+            self.account.refresh_account()  # An explicit user action still works after automatic retries stop.
+            self.assertEqual(len(attempts), 5)
+            fresh = {"plan": "free", "session": {"used": 0.1, "resets_at": "2099-10-21T18:00:00Z"}}
+            with patch.object(self.account, "_get", side_effect=[fresh, {"data": []}]):
+                self.account.refresh_account()
+            self.assertEqual(self.state.ui["account"], fresh)
+            self.account.refresh_expired_usage()
+            self.assertEqual(len(attempts), 5)
+            self.account.update_usage(stale)  # Fresh usage rearms the budget for the next expiry.
+            self.assertEqual(len(attempts), 6)
+
+    def test_expired_usage_has_one_in_flight_refresh_until_its_main_thread_callback(self):
+        now = [0.0]
+        workers, callbacks = [], []
+
+        def queued_thread(target, args=(), **kwargs):
+            return types.SimpleNamespace(start=lambda: workers.append(lambda: target(*args)))
+
+        with patch.dict(self.account._state), \
+                patch.object(self.account.credentials, "api_key", return_value="fixture"), \
+                patch.object(self.account.threading, "Thread", side_effect=queued_thread), \
+                patch.object(self.account.mainthread, "run_on_main", side_effect=callbacks.append), \
+                patch.object(self.account.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(self.account, "_get", side_effect=self.account.AccountError("Offline")), \
+                patch.object(self.account, "_redraw"):
+            self.account._set_account(None)
+            self.account._set_account({"session": {"used": 0.84, "resets_at": "2000-01-01T00:00:00Z"}})
+            self.account.refresh_expired_usage()
+            now[0] = 3600.0
+            self.account.refresh_expired_usage()
+            self.assertEqual(len(workers), 1, "a slow request cannot overlap another refresh")
+            workers.pop(0)()
+            self.account.refresh_expired_usage()
+            self.assertEqual(workers, [], "wait for the main-thread result before retrying")
+            callbacks.pop(0)()
+            now[0] += 29
+            self.account.refresh_expired_usage()
+            self.assertEqual(workers, [])
+            now[0] += 1
+            self.account.refresh_expired_usage()
+            self.assertEqual(len(workers), 1)
 
     def test_account_refresh_preserves_reservations_and_refusal_until_reset_or_plan_change(self):
         reset = "2099-10-21T18:00:00Z"
@@ -1514,6 +1634,8 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(texts[0], "Claim credits")
         self.assertIn("100 free credits", labels)
         self.assertIn("$1.00 for cloud tools", labels)
+        self.assertIn("Credits pay for cloud tools; Loopcut chat has a separate "
+                      "free allowance that refreshes every 5 hours.", " ".join(labels))
         self.assertIn("Skip", texts)  # Cosmetic: never a gate.
         with patch.object(self.onboarding, "_credits", return_value=self.grant()), \
                 patch.object(self.onboarding.nudges if hasattr(self.onboarding, "nudges") else
@@ -1530,6 +1652,21 @@ class OnboardingTest(unittest.TestCase):
         self.assertIn("See plans ↗", texts)  # In the slot Skip had: the screen keeps its height.
         self.press_step(splash, "Continue")
         self.assertEqual(self.onboarding._state["step"], "how")
+
+    def test_claim_step_omits_hosted_chat_allowance_for_other_providers(self):
+        for provider in ("CHATGPT", "OPENAI", "CUSTOM"):
+            with self.subTest(provider=provider):
+                self.prefs.provider = provider
+                _, labels, buttons = self.signed_in_account_step(self.grant())
+                self.assertIn("Claim credits", buttons)
+                self.assertFalse(any("allowance" in label for label in labels))
+
+    def test_paid_claim_step_does_not_describe_its_chat_allowance_as_free(self):
+        for plan in ("pro", "max"):
+            with self.subTest(plan=plan), patch.object(self.onboarding, "_account_plan", return_value=plan):
+                _, labels, _ = self.signed_in_account_step(self.grant())
+                self.assertIn("chat allowance that refreshes every 5 hours.", " ".join(labels))
+                self.assertNotIn("free allowance", " ".join(labels))
 
     def test_no_claim_without_a_fresh_unspent_grant_and_the_copy_stays_honest(self):
         for credits, billing, expected in (

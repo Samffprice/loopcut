@@ -3,6 +3,7 @@ and render jobs one render_job: each call must reach the same implementation wit
 arguments, and keep the approval it had. Calls to the old names in saved conversations stay
 readable but are never dispatched. No Blender, no network."""
 
+import io
 import json
 import sys
 import types
@@ -46,6 +47,42 @@ def call(call_id: str, name: str, arguments) -> dict:
 
 
 class OfferedTest(unittest.TestCase):
+    def test_activity_titles_stay_local_and_do_not_change_the_prompt_budget(self):
+        schemas = [{"type": "function", "function": {
+            "name": "read_data", "title": "Reading data", "description": "Read the stored data.",
+            "parameters": {"type": "object", "properties": {"field": {"type": "string", "title": "Field"}}}}}]
+        expected = json.loads(json.dumps(schemas))
+        expected[0]["function"].pop("title")
+        response = io.BytesIO(b'data: {"choices":[{"delta":{"content":"Done"}}]}\n\ndata: [DONE]\n\n')
+        response.headers = {}
+        with mock.patch.object(llm.urllib.request, "urlopen", return_value=response) as opened:
+            llm.stream_chat(base_url="https://api.example.com/v1", api_key="k", model="test", messages=[],
+                            tools=schemas, reasoning_effort="low", on_text=lambda text: None,
+                            is_cancelled=lambda: False)
+        sent = json.loads(opened.call_args.args[0].data)
+        self.assertEqual(sent["tools"], expected)
+        self.assertEqual(schemas[0]["function"]["title"], "Reading data", "the UI registry must stay intact")
+        self.assertEqual(context.fixed_tokens("prompt", schemas), context.fixed_tokens("prompt", expected))
+
+    def test_every_tool_has_a_short_activity_title_in_every_loop(self):
+        from loopcut import cloud, orchestrator, video_attach, workers
+        from loopcut.byok import catalog
+        descriptors = catalog.descriptors(no_generation=False, private_mode=False, keys_set={})
+        registries = [TOOL_SCHEMAS(), agent._orchestrator_schemas(), agent._workspace_schemas(), workers.schemas(),
+                      video_attach.SCHEMAS, [orchestrator.WAIT_SCHEMA, cloud.JOB_SCHEMA],
+                      [cloud.schema(d) for d in descriptors],
+                      [cloud.offer_schema([{"name": "test", "title": "Example"}])]]
+        for schemas in registries:
+            for schema in schemas:
+                function = schema["function"]
+                with self.subTest(tool=function["name"]):
+                    title = function.get("title", "").strip()
+                    self.assertTrue(title, "Every callable tool needs an explicit activity title")
+                    self.assertLessEqual(len(title), 70)
+                    self.assertNotIn("\n", title)
+                    self.assertNotIn("_", title)
+                    self.assertEqual(agent._tool_title(function["name"], lambda: schemas), title)
+
     def test_every_offered_tool_is_dispatched_and_no_old_name_is_offered(self):
         schemas = {s["function"]["name"]: s["function"] for s in TOOL_SCHEMAS()}
         self.assertEqual(len(schemas), len(TOOL_SCHEMAS()), "a tool offered twice")
