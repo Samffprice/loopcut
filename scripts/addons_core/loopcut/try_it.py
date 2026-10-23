@@ -6,14 +6,15 @@ import uuid
 # tool: the first call the agent makes; arguments: its fixed input, except the attached photo's name.
 # free: try_samples supplies the shipped result. seconds: scales the manifest's displayed motion price.
 # thumbnail: in media/, our studio renders of the jumping mannequin and Poly Haven's CC0 Treasure Chest,
-# alongside the card photo. The setup continues to expose these definitions as onboarding.CARDS.
+# alongside the card photo (our dwarf warrior concept). The setup continues to expose these definitions as
+# onboarding.CARDS.
 CARDS = (
     {"id": "motion", "title": "Make it move", "tool": "motion_from_text", "seconds": 3, "free": True,
      "arguments": {"prompt": "a figure jumps for joy", "duration_s": 3},
      "thumbnail": "card_motion.jpg", "line": "A figure jumps for joy, with text to motion.",
      "prompt": "Remove the default cube, then use text to motion to make a figure jump for joy, 3 seconds long."},
     {"id": "photo_3d", "title": "Photo to 3D model", "tool": "image_to_3d", "photo": True, "free": True,
-     "thumbnail": "alarm-clock.jpg", "line": "Turns this photo into a textured 3D model.",
+     "thumbnail": "dwarf-warrior.jpg", "line": "Turns this photo into a textured 3D model.",
      "prompt": "Turn the attached photo into a textured 3D model and put it in the scene in place of the default "
                "cube."},
     {"id": "model", "title": "Model a treasure chest", "tool": None,

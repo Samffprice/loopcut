@@ -175,6 +175,7 @@ class Turn:
         self.spec: "LoopSpec | None" = None
         self.job = None              # waves.Job once this turn delegates: budget, checks, JobLog.
         self.delegations: list = []  # Deliverables of each wave this turn started (waves.prepare).
+        self.plan_turn = ""         # Identifies this loop's plan attempts, including while a retry is running.
         self.level_first: int | None = None  # Levels inferred from what the model did; see _note_level.
         self.level_max = 0
         # router.py: whether this turn was routed, the decision (None: none), and whether its one
@@ -416,10 +417,10 @@ def _scene_snapshot() -> dict:
     return scene_diff.snapshot()
 
 
-def _resend_on_main(text: str) -> None:
+def _resend_on_main(text: str, note_items: list[dict]) -> None:
     """A note that arrived too late to be folded in starts the next turn by itself."""
     from . import mainthread
-    mainthread.run_on_main(lambda: send(text))
+    mainthread.run_on_main(lambda: send(text, note_items=note_items))
 
 
 def _restore_input_on_main(text: str, session: dict | None = None) -> None:
@@ -745,6 +746,7 @@ def _plan_attempt(card: dict, call: llm.ToolCall, session: dict, turn_id: str) -
     if orchestrator.waits(call.name, arguments):
         return
     card["plan_turn"] = turn_id
+    card["plan_dry_run"] = orchestrator.only_reads(call.name, arguments)
     wave = arguments.get("wave")
     crew = wave.get("workers") if isinstance(wave, dict) else None
     if isinstance(crew, list) and crew and all(
@@ -1593,6 +1595,8 @@ def _error_code(ex) -> str:
 def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_main,
              ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     items, messages = session["items"], session["messages"]
+    first_item = len(items)
+    plan_turn = uuid.uuid4().hex
     alike = alike or _alike_on_main
     if run_tool is _run_tool_on_main:
         run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
@@ -1609,7 +1613,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         user_message = messages[-1] if messages else {}
         started = False
         no_progress = repeats.NoProgress()
-        plan_turn = uuid.uuid4().hex
+        plan_turn = turn.plan_turn = uuid.uuid4().hex
+        session["active_turn_id"] = plan_turn
         step = 0
         while not cfg.max_steps or step < cfg.max_steps:
             if turn.cancel.is_set():
@@ -1673,6 +1678,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     raise llm.Cancelled()
                 summary, code = _describe(call, spec.schemas)
                 card = state.item_tool(call.name, summary, code)
+                card["turn_id"] = plan_turn  # Keep correction status scoped to this turn, including folded notes.
                 items.append(card)
                 key = repeats.call_key(call.name, call.arguments)
                 read = _same_while_unchanged(call.name, call.arguments)
@@ -1873,6 +1879,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
+        end_failed = False
         if spec.on_end:
             try:
                 spec.on_end(session, turn)
@@ -1880,6 +1887,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 import traceback
                 traceback.print_exc()
                 items.append(state.item_error(f"Internal error while ending the turn: {ex!r}"))
+                end_failed = True
         if spec.role != "worker" and not turn.returned_submission:
             _record_level(session, turn)
         changed = _changes_item(session, turn) if spec.changes_card and not turn.returned_submission else None
@@ -1896,33 +1904,50 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 finish_reply(item, turn.roots[0] if turn.roots else None)
             if item.get("status") in ("awaiting", "running"):
                 item["status"] = "rejected"
+        # Keep the display outcome on the last tool, including account notices and teardown errors.
+        # Error/stop/notice items keep their existing shape. Restoring before this tool drops the marker.
+        turn_cards = [i for i in items[first_item:] if i.get("kind") == "tool" and i.get("turn_id") == plan_turn]
+        if turn_cards:
+            turn_cards[-1]["turn_outcome"] = "error" if end_failed else turn.outcome
         # Notes that arrived after the last fold: sent as the next message, or, after a stop, put
         # back in the input box for the user to decide. Retire under the append lock so a sender
         # that already captured this turn either joins this drain or retries against the session.
         with turn.notes_lock:
             session["turn_outcome"] = turn.outcome
             session["busy"] = False
+            session.pop("active_turn_id", None)
             session["turn"] = None
             late = list(turn.notes)
             turn.notes.clear()
+        resend = (spec.role != "worker" and turn.error_code not in state.HOSTED_LIMITS
+                  and (not turn.cancel.is_set() or turn.send_notes_on_stop))
         for _, item in late:
-            if item in items:
+            if resend:
+                # Keep the original note and its helper receipts in history, including this save.
+                item.pop("queued", None)
+                item.pop("sending", None)
+            elif item in items:
                 items.remove(item)
         try:
             spec.save(session)
         except OSError as ex:
             items.append(state.item_error(f"Could not save this conversation: {ex}"))
+            if turn_cards:
+                turn_cards[-1]["turn_outcome"] = "error"
         if late and spec.role != "worker":  # Workers' copies of a note never send or restore into the user's chat.
             joined = "\n".join(text for text, _ in late)
             if turn.error_code in state.HOSTED_LIMITS:
                 _restore_input_on_main(joined, session)  # Refused for allowance: the user decides.
             else:
-                restore = turn.cancel.is_set() and not turn.send_notes_on_stop
-                (_restore_input_on_main if restore else _resend_on_main)(joined)
+                if resend:
+                    _resend_on_main(joined, [item for _, item in late])
+                else:
+                    _restore_input_on_main(joined)
         _redraw()
 
 
-def send(text: str) -> bool:
+def send(text: str, *, note_items: list[dict] | None = None) -> bool:
+    """Send a new message, or reuse the original notes handed off by a completed turn."""
     session = state.session()
     draft = text
     text = text.strip()
@@ -1937,15 +1962,18 @@ def send(text: str) -> bool:
         with turn.notes_lock:
             if session.get("turn") is not turn:
                 continue
-            item = state.item_user(text)
-            item["queued"] = True
-            if turn.send_notes_on_stop:
-                item["sending"] = True
-            session["items"].append(item)
-            turn.notes.append((text, item))
+            queued = note_items if note_items is not None else [state.item_user(text)]
+            for item in queued:
+                item["queued"] = True
+                if turn.send_notes_on_stop:
+                    item["sending"] = True
+                if not any(existing is item for existing in session["items"]):
+                    session["items"].append(item)
+                turn.notes.append((item["text"], item))
         if turn.job is not None:
             from . import waves
-            waves.steer(turn.job, text)
+            for item in queued:
+                waves.steer(turn.job, item["text"], item)
         return True
     if not (text or attachments):
         return False
@@ -1972,9 +2000,15 @@ def send(text: str) -> bool:
     if card and prompt.strip() == text:  # Edited first, it is the user's own request.
         turn.try_it = card
     session["turn_number"] = session.get("turn_number", 0) + 1
-    user_item = state.item_user(text, [a["name"] for a in attachments])
-    checkpoints.begin_turn(session, user_item)
-    session["items"].append(user_item)
+    user_items = note_items if note_items is not None else [state.item_user(text, [a["name"] for a in attachments])]
+    if note_items is not None and attachments:
+        user_items[0]["images"] = [*user_items[0].get("images", []), *[a["name"] for a in attachments]]
+    checkpoints.begin_turn(session, user_items[0], text=text)
+    for item in user_items:
+        item.pop("queued", None)
+        item.pop("sending", None)
+        if not any(existing is item for existing in session["items"]):
+            session["items"].append(item)
     # The model also gets what the user is looking at, and what changed since it last acted; the
     # chat shows only what they typed. The snapshot taken here is what changed_only measures from.
     content = f"{_scene_context(text, session.get('scene_seen'))}\n\n{text or 'See the attached images.'}"

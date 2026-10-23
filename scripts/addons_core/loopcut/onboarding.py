@@ -61,9 +61,9 @@ OPERATORS = ("import_blender_settings", "onboarding_step", "onboarding_own_key",
 STARTING_PATIENCE = 15  # Seconds of "Loopcut is starting…" before it says to restart.
 _registered = False  # Between register() and unregister(): the watchdog never opens a setup outside it.
 MEDIA = Path(__file__).parent / "media"
-# Our own Cycles render of Poly Haven's CC0 "Alarm Clock 01" (polyhaven.com/a/alarm_clock_01) lit by its CC0
-# "Studio Small 09" HDRI: ours to ship, and no one's product photo.
-SAMPLE_PHOTO = MEDIA / "alarm-clock.jpg"
+# Our own generated concept art of a dwarf warrior (made for the 2026-10-21 image to 3D comparison): ours to
+# ship, and no one's product photo or likeness.
+SAMPLE_PHOTO = MEDIA / "dwarf-warrior.jpg"
 
 
 def _source():

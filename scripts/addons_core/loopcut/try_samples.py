@@ -13,13 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MEDIA = Path(__file__).parent / "media"
-SAMPLE_PHOTO = MEDIA / "alarm-clock.jpg"  # The same file as onboarding.SAMPLE_PHOTO.
+SAMPLE_PHOTO = MEDIA / "dwarf-warrior.jpg"  # The same file as onboarding.SAMPLE_PHOTO.
 SAMPLES = MEDIA / "samples"
 TICK = 0.25  # Seconds between cancel checks while a run plays.
 
 # card id → its tool, the photo it must be given (None: no file) and its outputs as the server returns them:
-# (name, type, mime, file in media/samples, meta). photo_3d: Rodin Gen-2.5 High (the final tier) on alarm-clock.jpg,
-# decimated to 100K triangles with 2K JPEG textures to ship; motion: Kimodo, "a figure jumps for joy", 3 s.
+# (name, type, mime, file in media/samples, meta). photo_3d: Tripo H3.1 with HD texture on dwarf-warrior.jpg
+# (it beat Rodin Gen-2.5 High on this character, owner-judged 2026-10-21), decimated from 1.47M to 300K triangles
+# with 2K JPEG textures (10.9 MB) to ship;
+# motion: Kimodo, "a figure jumps for joy", 3 s.
 CARDS = {
     "photo_3d": {"tool": "image_to_3d", "photo": SAMPLE_PHOTO,
                  "outputs": (("model", "model_3d", "model/gltf-binary", "photo_3d.glb", {"topology": "triangles"}),)},
@@ -31,14 +33,14 @@ CARDS = {
 
 
 def timeline(tool: str, arguments: dict) -> list[tuple[float, int, str]]:
-    """(seconds from the start, pct, message) as the job card shows them, ending at the run's length. Lengths are
-    production's succeeded-job averages on 2026-10-21 (image_to_3d final 149 s over 13, draft 33 s over 3;
-    motion_from_text 36 s over 20). Messages and pct follow the server adapters: fal.ts (5% queued, then
-    10 + elapsed / 180 s (draft 60 s) × 80, at most 95, every 2 s) and motion.ts ("Queued" at 0%, then the
-    worker's "Generating motion" at 5%)."""
+    """(seconds from the start, pct, message) as the job card shows them, ending at the run's length. Messages
+    and pct follow the server adapters: fal.ts (5% queued, then 10 + elapsed / scale × 80, at most 95, every
+    2 s) and motion.ts ("Queued" at 0%, then the worker's "Generating motion" at 5%). Motion lasts as long as
+    production's average (36 s over 20 jobs, 2026-10-21). The photo sample is shorter than a real model (149 s
+    final, 33 s draft over production's 2026-10-21 jobs): the owner wants it 30 s (2026-10-23), with the same
+    climb compressed into it."""
     if tool == "image_to_3d":
-        draft = arguments.get("quality") == "draft"
-        length, scale = (33.0, 60.0) if draft else (149.0, 180.0)
+        length, scale = 30.0, 25.0  # Final or draft alike.
         steps = [(0.0, 5, "Queued for model processing.")]
         t = 2.0
         while t < length:

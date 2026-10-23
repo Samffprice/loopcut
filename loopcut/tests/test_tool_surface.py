@@ -5,7 +5,9 @@ readable but are never dispatched. No Blender, no network."""
 
 import io
 import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -17,8 +19,8 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import (agent, asset_libraries, assets, blenderkit, camera, contact, context,  # noqa: E402
-                     conversations, files, inspection, job_tools, llm, polyhaven, polypizza, texture_tools, tools,
+from loopcut import (agent, asset_libraries, assets, blenderkit, camera, config, contact, context,  # noqa: E402
+                     conversations, files, inspection, job_tools, llm, polyhaven, polypizza, state, texture_tools, tools,
                      uv_tools)
 
 TOOL_SCHEMAS = agent._tool_schemas  # test_agent_loop stubs these three; keep the real ones.
@@ -231,6 +233,91 @@ class ApprovalTest(unittest.TestCase):
         session, cfg = {"auto_heavy": True, "auto_run": False}, types.SimpleNamespace(auto_run=False)
         self.assertFalse(agent._asks("heavy", "render_job", session, cfg))
         self.assertTrue(agent._asks("heavy", "render_job", {**session, "auto_heavy": False}, cfg))
+
+
+class CodeTurnTest(unittest.TestCase):
+    def test_loop_scopes_corrections_to_one_turn_without_changing_approval_or_results(self):
+        from loopcut.ui import layout
+        session = state.new_session()
+        saved_turns = []
+        for continues in (False, True):
+            with self.subTest(continues=continues):
+                session['items'].append(state.item_user('Build a chest'))
+                session['messages'].append({'role': 'user', 'content': 'Build a chest'})
+                session['busy'] = True
+                turn = agent.Turn()
+                turn.config = config.Config('test-key', 'https://example.invalid/v1', 'fake', 'low',
+                                            False, False, 0, 24000)
+                spec = agent.LoopSpec(role='worker', system=lambda s: '', schemas=lambda: [], save=lambda s: None,
+                                      asks=True, checkpoints=False, changes_card=False)
+                failed_output = 'SyntaxError: invalid syntax\n\nScene changes: none.'
+                results = iter([tools.ToolResult(failed_output, ok=False), tools.ToolResult('OK')])
+                calls = [llm.Completion(tool_calls=[llm.ToolCall('bad', 'run_python', '{"code": "invalid?"}')])]
+                if continues:
+                    calls.append(llm.Completion(tool_calls=[llm.ToolCall('later', 'run_python', '{"code": "pass"}')]))
+                calls.append(llm.Completion())
+                replies = iter(calls)
+
+                def request(*args):
+                    cards = [i for i in session['items'] if i.get('turn_id') == session['active_turn_id']]
+                    if cards:
+                        self.assertEqual(cards[0]['output'], failed_output)
+                        index = session['items'].index(cards[0])
+                        repairs = layout._code_repairs(session['items'], True, session['active_turn_id'])
+                        self.assertEqual(repairs[index], 'correcting')
+                    return next(replies)
+
+                with mock.patch.object(agent, '_request', side_effect=request), \
+                        mock.patch.object(agent, '_redraw'), \
+                        mock.patch.object(agent, '_wait_for_approval', return_value=True) as approval:
+                    agent.run_loop(session, turn, spec, run_tool=lambda *args: next(results))
+                self.assertEqual(turn.outcome, 'completed')
+                self.assertEqual(approval.call_count, 2 if continues else 1)
+                cards = [i for i in session['items'] if i.get('kind') == 'tool'][-(2 if continues else 1):]
+                self.assertEqual(cards[0]['status'], 'failed')
+                self.assertEqual(cards[0]['output'], failed_output)
+                self.assertTrue(all(c['turn_id'] == cards[0]['turn_id'] for c in cards))
+                saved_turns.append(cards[0]['turn_id'])
+                self.assertNotIn('active_turn_id', session)
+                self.assertFalse(session['busy'])
+                self.assertEqual(cards[-1]['turn_outcome'], 'completed')
+        self.assertNotEqual(*saved_turns)
+        failed = [n for n, i in enumerate(session['items']) if i.get('status') == 'failed']
+        self.assertEqual(layout._code_repairs(session['items'], False), {failed[-1]: 'continued'})
+
+    def test_completed_and_error_outcomes_keep_the_same_correction_status_after_save_and_restore(self):
+        from loopcut.ui import layout
+        for ends_with_error in (False, True):
+            with self.subTest(ends_with_error=ends_with_error), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {'LOOPCUT_DATA_DIR': tmp}):
+                session = state.new_session()
+                session['items'].append(state.item_user('Fix the lid'))
+                session['messages'].append({'role': 'user', 'content': 'Fix the lid'})
+                session['busy'] = True
+                turn = agent.Turn()
+                turn.config = config.Config('test-key', 'https://example.invalid/v1', 'fake', 'low',
+                                            False, False, 0, 24000)
+                spec = agent.LoopSpec(role='worker', system=lambda s: '', schemas=lambda: [], save=conversations.save,
+                                      asks=False, checkpoints=False, changes_card=False)
+                replies = [llm.Completion(tool_calls=[llm.ToolCall('bad', 'run_python', '{"code": "invalid?"}')]),
+                           llm.Completion(tool_calls=[llm.ToolCall('read', 'run_python',
+                                                                   '{"code": "print(scene.frame_current)"}')]),
+                           llm.LLMError('Connection dropped') if ends_with_error else llm.Completion()]
+                results = iter([tools.ToolResult('SyntaxError: invalid syntax\n\nScene changes: none.', ok=False),
+                                tools.ToolResult('1')])
+                with mock.patch.object(agent, '_request', side_effect=replies), mock.patch.object(agent, '_redraw'):
+                    agent.run_loop(session, turn, spec, run_tool=lambda *args: next(results))
+                self.assertEqual(turn.outcome, 'error' if ends_with_error else 'completed')
+                expected = {} if ends_with_error else {1: 'continued'}
+                self.assertEqual(layout._code_repairs(session['items'], False), expected)
+                loaded = conversations.load(session['id'])
+                self.assertEqual(loaded['items'], session['items'])
+                self.assertEqual(layout._code_repairs(loaded['items'], False), expected)
+                if ends_with_error:
+                    error = next(i for i in loaded['items'] if i['kind'] == 'error')
+                    self.assertEqual(error, state.item_error('Connection dropped'))
+                loaded['items'] = loaded['items'][:2]  # Restore before the unrelated successful call.
+                self.assertEqual(layout._code_repairs(loaded['items'], False), {})
 
 
 class OldCallsTest(unittest.TestCase):

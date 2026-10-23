@@ -210,7 +210,7 @@ class Job:
         self.lock = threading.Lock()                    # crew, scheduler, stopped: the job's thread, collect and Stop.
         self.scheduler: threading.Thread | None = None
         self.stopped = False                            # Stop: nothing more starts or merges.
-        self.steers: list[str] = []                     # User corrections; each worker reads its own cursor.
+        self.steers: list[tuple[str, dict | None]] = []  # Corrections and parent chat items; each worker has a cursor.
         self.on_main: Callable | None = None            # fn -> fn() on the main thread, for the finish gate's drain.
         self.held: list[tuple[str, dict]] = []          # Live checks naming a worker still running: run once it merges.
         self.sheets = 0
@@ -314,7 +314,9 @@ class Wave:
     started: float = 0.0
     crew: list = dataclasses.field(default_factory=list)  # Its workers (start).
     entry: dict | None = None  # Its JobLog entry: filled in as its workers report.
-    steer_index: int = 0       # Earlier corrections are already in this wave's opening user messages.
+    steer_index: int = 0       # Live corrections after this cursor arrive before each request.
+    opening_notes: dict = dataclasses.field(default_factory=dict)  # Worker id -> note items kept in its opening.
+    plan_card: dict | None = None  # The delegate attempt, marked only after a helper successfully boots.
 
 
 def _mentions(brief: dict, shared: dict) -> str:
@@ -342,7 +344,7 @@ def _wave_checkpoint(session: dict, number: int, message_index: int, item_index:
     of the wave undone, and both transcripts to before the call. Raises checkpoints.CheckpointError:
     then nothing starts, as no merge may go on without one."""
     # prepare() receives the future wave card's index. Include the executing delegate card in the
-    # restore cut too: leaving its later "done" result would falsely recover earlier refused plans.
+    # restore cut too: leaving its startup marker would falsely recover earlier refused plans.
     item_index = next((n for n in reversed(range(item_index))
                        if session["items"][n].get("kind") == "tool"
                        and session["items"][n].get("name") == "delegate"
@@ -361,26 +363,34 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
     job = job_for(session, turn)
     with job.lock:
         steer_index = len(job.steers)
+        note_ids = {id(note[1]) for note in job.steers if not isinstance(note, str)}
     number = session.setdefault("wave_count", 0) + 1
     folder = job.folder / f"w{number}"
     folder.mkdir(parents=True, exist_ok=True)
     shared = plan["shared"]
     for brief in plan["workers"]:
         brief["owned"] = _owned_keys(brief)
-    openings, threads = {}, {}
-    requests = [item["text"] for item in session["items"] if item.get("kind") == "user"]  # The user's own words.
+    openings, threads, opening_notes = {}, {}, {}
+    request_items = [item for item in session["items"] if item.get("kind") == "user"]
+    requests = [item["text"] for item in request_items]  # The user's own words.
     for brief in plan["workers"]:
+        included = []
         others = [w for w in plan["workers"] if w is not brief]
         scene = (scene_context or _scene_context)(_mentions(brief, shared))
         thread = (session.get("worker_threads") or {}).get(brief.get("continues") or "")
         if thread is not None:
             threads[brief["id"]] = thread
             openings[brief["id"]] = workers.continuation(brief, shared, others, scene, requests, thread["role"],
-                                                         merged=thread.get("merged", True), status=thread.get("status", ""))
+                                                         merged=thread.get("merged", True), status=thread.get("status", ""),
+                                                         request_indices=included)
         else:
-            openings[brief["id"]] = workers.opening(brief, shared, others, scene, requests)
+            openings[brief["id"]] = workers.opening(brief, shared, others, scene, requests, request_indices=included)
+        opening_notes[brief["id"]] = [request_items[n] for n in included if id(request_items[n]) in note_ids]
     palette = [n for n in shared.get("palette") or () if isinstance(n, str)]
     item_index = len(session["items"])  # Where the wave card goes.
+    plan_card = next((item for item in reversed(session["items"])
+                     if item.get("kind") == "tool" and item.get("name") == "delegate"
+                     and item.get("status") == "running"), None)
     checkpoint = _wave_checkpoint(session, number, message_index, item_index)
     spawn = save_spawn(folder) if save_spawn else _save_spawn(folder, palette)
     job.absorb(spawn)
@@ -392,7 +402,8 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
     turn.delegations.append([b["deliverable"] for b in plan["workers"]])
     return Wave(session=session, turn=turn, job=job, number=number, id=wave_id, folder=folder, plan=plan,
                 spawn=spawn, openings=openings, item=item, message_index=message_index,
-                item_index=item_index, checkpoint=checkpoint, threads=threads, steer_index=steer_index)
+                item_index=item_index, checkpoint=checkpoint, threads=threads, steer_index=steer_index,
+                opening_notes=opening_notes, plan_card=plan_card)
 
 
 # ------------------------------------------------------------------ the child, the merge, the checks
@@ -610,11 +621,22 @@ class Worker:
                 raise llm.Cancelled()
             notes = job.steers[self.steer_index:]
             self.steer_index += len(notes)
-        for text in notes:
+        for note in notes:
+            text = note if isinstance(note, str) else note[0]  # Jobs started before receipts stored strings.
             item = state.item_user(text)
             self.session["items"].append(item)
             with self.turn.notes_lock:
                 self.turn.notes.append((f"{workers.STEER_INSTRUCTION}\n\n{text}", item))
+        try:
+            with job.lock:
+                # Only the older notes actually kept in this opening receive a first-request receipt.
+                opening_notes = self.wave.opening_notes.get(self.id, []) if self.steps == 1 else []
+                for item in opening_notes + [note[1] for note in notes if not isinstance(note, str)]:
+                    _note_delivery(item, self, self.steps)
+            if opening_notes or notes:
+                agent._redraw()
+        except Exception:  # Receipts must not interrupt note delivery, requests or crash recovery.
+            pass
 
     def on_usage(self, usage: dict) -> None:
         self.row["steps"] = self.steps  # A reply has arrived; an outstanding request is not a step yet.
@@ -787,6 +809,12 @@ class Worker:
                     raise self.boot_error
                 else:
                     # A sibling's failed boot must not discard this child's successful startup/work.
+                    try:
+                        card = getattr(wave, "plan_card", None)
+                        if isinstance(card, dict):
+                            card["plan_started"] = True
+                    except Exception:  # Plan recovery is UI bookkeeping, never a condition for work/retry.
+                        pass
                     self.set_status("working")
                     agent.run_loop(self.session, self.turn, self.spec, self.run_tool, lambda session: None,
                                    getattr(wave, "alike", None))
@@ -1548,12 +1576,44 @@ def pending(job: Job) -> bool:
         return any(not w.reported for w in job.crew)
 
 
-def steer(job: Job, text: str) -> None:
+def _note_delivery(item: dict | None, worker: Worker, step: int | None = None) -> None:
+    """Under job.lock: publish a per-helper receipt without changing the parent's pending reply.
+    Replace the list so the panel and conversation saver can safely snapshot it while helpers read.
+    Missing or unusable metadata may omit a receipt, but must never stop a helper or a correction."""
+    try:
+        if not isinstance(item, dict):
+            return
+        delivery = {"wave": worker.wave.id, "worker": worker.id, "deliverable": worker.brief["deliverable"]}
+        if step is not None:
+            delivery.update(step=step, read_at=time.time())
+        saved = item.get("helper_deliveries")
+        if not isinstance(saved, (list, tuple)):
+            saved = ()
+        receipts = [r for r in saved if isinstance(r, dict) and all(k in r for k in ("wave", "worker", "deliverable"))]
+        for n, receipt in enumerate(receipts):
+            if (receipt["wave"], receipt["worker"]) == (worker.wave.id, worker.id):
+                if "step" not in receipt:
+                    receipts[n] = delivery
+                break
+        else:
+            receipts.append(delivery)
+        item["helper_deliveries"] = receipts
+    except Exception:  # A stale parent item or partial worker must not affect delivery to other helpers.
+        pass
+
+
+def steer(job: Job, text: str, item: dict | None = None) -> None:
     """Broadcast without draining the orchestrator's notes. Workers read before their next request;
     their cursor survives a child retry, whose conversation already contains earlier corrections."""
     with job.lock:
         if not job.stopped:
-            job.steers.append(text)
+            job.steers.append((text, item))
+            try:
+                for worker in job.crew:
+                    if getattr(worker, "finished", None) is None:
+                        _note_delivery(item, worker)
+            except Exception:  # The correction is queued even when its optional receipts are unavailable.
+                pass
 
 
 def _state(worker: Worker) -> str:

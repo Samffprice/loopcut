@@ -320,7 +320,7 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_a_note_too_late_to_fold_in_starts_the_next_turn(self):
         resent = []
-        with mock.patch.object(agent, "_resend_on_main", side_effect=resent.append), \
+        with mock.patch.object(agent, "_resend_on_main", side_effect=lambda text, items: resent.append(text)), \
                 mock.patch.object(agent, "_fold_notes"):  # As if the note came during the final request.
             SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
                                text_reply("Done.")]
@@ -331,7 +331,8 @@ class AgentLoopTest(unittest.TestCase):
             agent.decide(True)
             turn.thread.join(5)
         self.assertEqual(resent, ["and a sphere"])
-        self.assertNotIn(item, self.session["items"], "the queued item is replaced by the turn it starts")
+        self.assertIn(item, self.session["items"], "the next turn reuses the note and its helper receipts")
+        self.assertNotIn("queued", item)
         self.assertFalse(self.session["busy"])
 
     def test_a_note_left_over_after_a_stop_goes_back_to_the_input(self):
@@ -2175,7 +2176,8 @@ class QueuedHelperNoteTest(unittest.TestCase):
                                          max_steps=0, context_budget=40_000)
         self.session.update(busy=True, turn=self.turn)
         self.session["messages"].append({"role": "user", "content": "make an object"})
-        self.helper = types.SimpleNamespace(id="a", turn=agent.Turn(), thread=None, finished=None, kill=mock.Mock())
+        self.helper = types.SimpleNamespace(id="a", turn=agent.Turn(), thread=None, finished=None, kill=mock.Mock(),
+                                            wave=types.SimpleNamespace(id="w1"), brief={"deliverable": "A"})
         self.helper.never_started = lambda: setattr(self.helper, "finished", time.monotonic())
         self.job = types.SimpleNamespace(lock=threading.Lock(), steers=[], stopped=False, crew=[self.helper],
                                          waves=[], log={}, write=mock.Mock(), on_main=None)
@@ -2225,7 +2227,7 @@ class QueuedHelperNoteTest(unittest.TestCase):
         self.thread.start()
         self.assertTrue(self.entered.wait(2), "orchestrator did not reach its helper wait")
 
-    def resend(self, text):
+    def resend(self, text, note_items):
         self.assertTrue(self.job.stopped)
         self.assertTrue(self.helper.turn.cancel.is_set())
         self.helper.kill.assert_called()
@@ -2235,9 +2237,14 @@ class QueuedHelperNoteTest(unittest.TestCase):
     def test_correction_reaches_the_next_orchestrator_request_after_the_wave_returns(self):
         self.start()
         self.assertTrue(agent.send("make it smaller"))
-        self.assertEqual(self.job.steers, ["make it smaller"])
         queued = self.session["items"][-1]
+        self.assertEqual(self.job.steers, [("make it smaller", queued)])
+        self.assertEqual(queued["helper_deliveries"], [{"wave": "w1", "worker": "a", "deliverable": "A"}])
+        with self.job.lock:
+            waves._note_delivery(queued, self.helper, 26)
         self.assertTrue(queued["queued"])
+        self.assertEqual(len(self.turn.notes), 1, "helper receipt must not consume the main agent's note")
+        self.assertEqual(len(self.requests), 1, "the main agent is still waiting for the helper")
         self.return_wave.set()
         self.thread.join(2)
         self.assertFalse(self.thread.is_alive())
@@ -2245,6 +2252,7 @@ class QueuedHelperNoteTest(unittest.TestCase):
         steers = [m["content"] for m in self.requests[1] if m.get(context.STEER)]
         self.assertEqual(steers, ["<steer>make it smaller</steer>"])
         self.assertNotIn("queued", queued)
+        self.assertEqual(queued["helper_deliveries"][0]["step"], 26)
         self.assertEqual(self.resent, [])
 
     def test_send_now_stops_helpers_then_sends_all_notes_once(self):
@@ -2262,6 +2270,44 @@ class QueuedHelperNoteTest(unittest.TestCase):
         self.assertFalse(any(i.get("queued") for i in self.session["items"]))
         self.assertEqual(self.session["messages"][-1]["role"], "tool", "cancel closes the delegate call")
 
+    def test_send_now_preserves_original_notes_and_receipts_through_save_and_resend(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": folder}), \
+                mock.patch.object(agent, "_resend_on_main", side_effect=self.resend_on_main):
+            self.spec = dataclasses.replace(self.spec, save=conversations.save)
+            self.start()
+            agent.send("smaller")
+            agent.send("also red")
+            notes = [item for _, item in self.turn.notes]
+            waves._note_delivery(notes[0], self.helper, 26)
+            receipts = [json.loads(json.dumps(item["helper_deliveries"])) for item in notes]
+            self.assertTrue(agent.send_queued_now())
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive())
+            saved = conversations.load(self.session["id"])
+            self.assertEqual([i.get("helper_deliveries") for i in saved["items"] if i["kind"] == "user"], receipts)
+            with mock.patch.object(agent, "_configure"), \
+                    mock.patch.object(agent, "_project_roots", return_value=()), \
+                    mock.patch.object(agent, "_scene_context", return_value="scene"), \
+                    mock.patch.object(agent, "_scene_snapshot", return_value=None), \
+                    mock.patch.object(agent, "_setup_line", return_value=""), \
+                    mock.patch.object(agent, "_addons_line", return_value=""), \
+                    mock.patch.object(checkpoints, "begin_turn"), \
+                    mock.patch.object(agent, "_launch") as launched:
+                self.assertEqual(len(self.callbacks), 1)
+                self.callbacks.pop()()
+                launched.assert_called_once()
+            retained = [i for i in self.session["items"] if i["kind"] == "user"]
+            self.assertEqual(len(retained), 2)
+            for original, item, receipt in zip(notes, retained, receipts):
+                self.assertIs(item, original)
+                self.assertEqual(item["helper_deliveries"], receipt)
+                self.assertNotIn("queued", item)
+                self.assertNotIn("sending", item)
+            self.assertEqual(self.session["messages"][-1]["content"], "scene\n\nsmaller\nalso red")
+            saved = conversations.load(self.session["id"])
+            self.assertEqual([i.get("helper_deliveries") for i in saved["items"] if i["kind"] == "user"], receipts)
+
     def test_ordinary_stop_keeps_returning_the_note_to_the_input(self):
         self.start()
         agent.send("smaller")
@@ -2272,6 +2318,96 @@ class QueuedHelperNoteTest(unittest.TestCase):
         self.assertEqual(self.restored, ["smaller"])
         self.assertEqual(self.resent, [])
         self.assertTrue(self.job.stopped)
+
+    def restore_resent_notes(self, texts, *, legacy=False):
+        def write_snapshot(filepath):
+            Path(filepath).write_bytes(b"scene snapshot")
+            return {"FINISHED"}
+
+        blender = types.SimpleNamespace(
+            data=types.SimpleNamespace(filepath="/project/scene.blend"),
+            app=types.SimpleNamespace(is_job_running=lambda job: False),
+            ops=types.SimpleNamespace(wm=types.SimpleNamespace(
+                loopcut_snapshot_write=write_snapshot,
+                loopcut_snapshot_restore=mock.Mock(return_value={"FINISHED"}))))
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": folder}), \
+                mock.patch.dict(sys.modules, {"bpy": blender}), \
+                mock.patch.object(config, "checkpoint_budget_mb", return_value=2048), \
+                mock.patch.object(agent, "_resend_on_main", side_effect=self.resend_on_main), \
+                mock.patch.object(agent, "_configure"), \
+                mock.patch.object(agent, "_project_roots", return_value=()), \
+                mock.patch.object(agent, "_scene_context", return_value="scene"), \
+                mock.patch.object(agent, "_scene_snapshot", return_value=None), \
+                mock.patch.object(agent, "_setup_line", return_value=""), \
+                mock.patch.object(agent, "_addons_line", return_value=""), \
+                mock.patch("loopcut.telemetry.first_use"), \
+                mock.patch.object(agent, "_launch") as launched:
+            self.session["items"].append(state.item_user("make an object"))
+            self.start()
+            before_notes = list(self.session["items"])
+            for text in texts:
+                self.assertTrue(agent.send(text))
+            notes = [item for _, item in self.turn.notes]
+            waves._note_delivery(notes[0], self.helper, 26)
+            receipts = json.loads(json.dumps([item["helper_deliveries"] for item in notes]))
+            self.assertTrue(agent.send_queued_now())
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive())
+            before_messages = list(self.session["messages"])
+            self.assertEqual(len(self.callbacks), 1)
+            self.callbacks.pop()()
+            launched.assert_called_once()
+            checkpoints.ensure_for_turn(self.session)
+            checkpoint_id = notes[0]["checkpoint"]
+            store = checkpoints._store(self.session)
+            target = store.get(checkpoint_id)
+            self.assertEqual(target["item_index"], len(before_notes))
+            self.assertEqual(target["message_index"], len(before_messages))
+            if legacy:  # Older checkpoints recover their input from the first removed user item.
+                target.pop("input")
+                store.save_index()
+            checkpoints.restore(self.session, checkpoint_id)
+            self.assertEqual(self.session["items"][:-1], before_notes)
+            self.assertEqual(self.session["messages"], before_messages)
+            self.assertEqual(self.session["input"], "\n".join(texts))
+            self.assertEqual(self.session["cursor"], len(self.session["input"]))
+            self.assertIsNone(self.session["anchor"])
+            undo = self.session["items"][-1]["checkpoint"]
+            checkpoints.restore(self.session, undo)
+            restored_notes = [i for i in self.session["items"] if i.get("helper_deliveries")]
+            self.assertEqual([i["text"] for i in restored_notes], texts)
+            self.assertEqual([i["helper_deliveries"] for i in restored_notes], receipts)
+
+    def test_send_now_checkpoint_restore_returns_the_note_to_the_input(self):
+        self.restore_resent_notes(["smaller"])
+
+    def test_send_now_checkpoint_restore_returns_all_notes_to_the_input(self):
+        self.restore_resent_notes(["smaller", "also red"])
+
+    def test_checkpoint_restore_still_reads_older_checkpoints_without_saved_input(self):
+        self.restore_resent_notes(["smaller"], legacy=True)
+
+    def test_resend_handoff_queues_original_notes_if_another_turn_started(self):
+        agent.send("smaller")
+        agent.send("also red")
+        notes = [item for _, item in self.turn.notes]
+        waves._note_delivery(notes[0], self.helper, 26)
+        receipts = json.loads(json.dumps(notes[0]["helper_deliveries"]))
+        self.turn.notes.clear()
+        next_turn = agent.Turn()
+        self.session["turn"] = next_turn
+        self.resend_on_main("smaller\nalso red", notes)
+        self.callbacks.pop()()
+        self.assertEqual(next_turn.notes, [("smaller", notes[0]), ("also red", notes[1])])
+        retained = [i for i in self.session["items"] if i["kind"] == "user"]
+        self.assertEqual(len(retained), 2)
+        for original, item in zip(notes, retained):
+            self.assertIs(item, original)
+        agent._fold_notes(self.session, next_turn)
+        self.assertEqual(notes[0]["helper_deliveries"], receipts)
+        self.assertEqual([m["content"] for m in self.session["messages"] if m.get(context.STEER)],
+                         ["<steer>smaller</steer>", "<steer>also red</steer>"])
 
     def test_stale_send_now_action_does_nothing(self):
         self.assertFalse(agent.send_queued_now())
@@ -2289,19 +2425,20 @@ class QueuedHelperNoteTest(unittest.TestCase):
                 mock.patch.object(agent, "_resend_on_main", side_effect=self.resend_on_main) as resent:
             self.start()
             self.assertTrue(agent.send("smaller"))
+            note = self.turn.notes[-1][1]
             if click_first:
                 self.assertTrue(agent.send_queued_now())
             self.return_wave.set()
             self.thread.join(2)
             self.assertFalse(self.thread.is_alive())
             self.assertEqual(self.turn.outcome, "cancelled" if click_first else "completed")
-            resent.assert_called_once_with("smaller")
+            resent.assert_called_once_with("smaller", [note])
             self.assertIsNone(self.session["turn"])
             self.assertFalse(agent.send_queued_now(), "completion already handed the note to automatic resend")
             self.assertEqual(len(self.callbacks), 1)
             with mock.patch.object(agent, "send", return_value=True) as sent:
                 self.callbacks[0]()
-            sent.assert_called_once_with("smaller")
+            sent.assert_called_once_with("smaller", note_items=[note])
         self.assertFalse(any(i.get("queued") for i in self.session["items"]))
         self.assertFalse(self.turn.notes)
         self.assertEqual(self.restored, [])
@@ -3268,20 +3405,142 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(session["items"], [])
 
 
+class TurnEndTest(unittest.TestCase):
+    """Transcript compatibility and correction status with in-process replies, without sockets."""
+
+    def test_terminal_items_keep_their_shape_and_failed_code_stays_red(self):
+        stopped = state.item_error("Stopped after 2 steps without finishing.")
+        cases = [
+            ("revoked", llm.LLMError("HTTP 403: This key was revoked."), "error",
+             state.item_error("HTTP 403: This key was revoked.")),
+            ("overloaded", llm.LLMError("HTTP 503: Overloaded."), "error",
+             state.item_error("HTTP 503: Overloaded.")),
+            ("cancelled", llm.Cancelled(), "cancelled", state.item_error("Stopped.")),
+            ("step_limit", llm.Completion(text="Some work remains."), "step_limit", stopped),
+            ("summary_failed", llm.LLMError("Bad request."), "step_limit", stopped),
+            ("summary_tools", llm.Completion(tool_calls=[llm.ToolCall("unused", "get_scene_info", "{}")]),
+             "step_limit", stopped),
+            ("on_end", llm.Completion(), "completed",
+             state.item_error("Internal error while ending the turn: RuntimeError('teardown failed')")),
+            ("save", llm.Completion(), "completed", state.item_error("Could not save this conversation: disk full")),
+            ("notice", llm.LLMError("Account stopped"), "error", state.item_notice("Account stopped")),
+        ]
+        from loopcut import nudges
+        from loopcut.ui import theme
+        for ending, final_reply, outcome, expected in cases:
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": tmp}):
+                session = state.new_session()
+                session["items"].append(state.item_user("Build a chest"))
+                session["messages"].append({"role": "user", "content": "Build a chest"})
+                session["busy"] = True
+                turn = agent.Turn()
+                turn.config = config.Config("test-key", "https://example.invalid/v1", "fake", "low", False, False,
+                                            2 if outcome == "step_limit" else 0, 24000)
+
+                def save(session):
+                    if ending == "save" and not session["busy"]:
+                        raise OSError("disk full")
+                    conversations.save(session)
+
+                spec = agent.LoopSpec(role="single", system=lambda s: "", schemas=lambda: [], save=save,
+                                      asks=False, checkpoints=False,
+                                      on_end=mock.Mock(side_effect=RuntimeError("teardown failed"))
+                                      if ending == "on_end" else None)
+                replies = [llm.Completion(tool_calls=[llm.ToolCall("bad", "run_python", '{"code":"invalid?"}')]),
+                           llm.Completion(tool_calls=[llm.ToolCall("later", "run_python", '{"code":"pass"}')]),
+                           final_reply]
+
+                def run_tool(name, arguments):
+                    if "invalid?" in arguments:
+                        return tools.ToolResult("SyntaxError: invalid syntax\n\nScene changes: none.", ok=False)
+                    # A folded note is a visible user item, but still belongs to this turn.
+                    session["items"].append(state.item_user("Keep the lid open"))
+                    return tools.ToolResult("OK")
+
+                with mock.patch.object(agent, "_request", side_effect=replies), \
+                        mock.patch.object(agent, "_redraw"), mock.patch.object(agent, "_record_level"), \
+                        mock.patch.object(agent, "_changes_item", return_value=state.item_changes("1 added", ["+ Cube"], "")), \
+                        mock.patch.object(nudges, "flush"), \
+                        mock.patch.object(nudges, "chatgpt_card", return_value=dict(expected) if ending == "notice" else None), \
+                        mock.patch("traceback.print_exc"):
+                    agent.run_loop(session, turn, spec, run_tool=run_tool)
+                self.assertEqual(turn.outcome, outcome)
+                terminal = [i for i in session["items"] if i["kind"] in {"error", "limit", "notice"}]
+                self.assertEqual(terminal, [expected])
+                self.assertEqual(layout._code_repairs(session["items"], False), {})
+                # Save again after the simulated disk failure so the final in-memory transcript is checked too.
+                conversations.save(session)
+                loaded = conversations.load(session["id"])
+                self.assertEqual(loaded["items"], session["items"])
+                display = layout.build(loaded, 900, 3000, 1.0, lambda f, s, t: len(t) * s * 0.5)
+                glyph = next(p for p in display["prims"] if p["id"] == "item1.tool.glyph")
+                self.assertEqual(glyph["color"], theme.ERROR)
+
+
 class PlanRetryTest(unittest.TestCase):
     """Real loop and cards with in-process model replies; no sockets or Blender."""
 
-    def call(self, number, *, name="delegate", helper="A", dry_run=True, **arguments):
+    def start_helper(self, session, card, error=None, before_start=None, after_start=None):
+        """Drive Worker construction, boot and its loop; replace only the child and model I/O."""
+        turn = session["turn"]
+        turn.roles = config.Roles(orchestrator=turn.config, worker=turn.config, orchestrate=True)
+        worker_id, role = card["plan_workers"][0]
+        brief = {"id": worker_id, "role": role, "deliverable": "Helper", "checks": [], "owns": [], "prefix": "Helper"}
+        runtime = mock.Mock()
+        runtime.check.return_value = []
+        runtime.finish.return_value = {}
+
+        def start():
+            self.assertNotIn("plan_started", card)
+            if before_start:
+                before_start()
+            if error:
+                raise error
+
+        def request(*args):
+            self.assertTrue(card["plan_started"])
+            self.assertEqual(card["status"], "running", "startup is recorded before delegate returns")
+            if after_start:
+                after_start()
+            return llm.Completion(text="done")
+
+        runtime.start.side_effect = start
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(conversations, "save"), \
+                mock.patch.object(agent, "_request", side_effect=request) as requested:
+            job = types.SimpleNamespace(folder=Path(folder), budget=waves.JobBudget(0, 1800),
+                                        lock=threading.Lock(), crew=[], steers=[], stopped=False)
+            wave = waves.Wave(session=session, turn=turn, job=job, number=1, id="w1", folder=Path(folder),
+                              plan={"workers": [brief]}, spawn=None, openings={worker_id: "Build the helper's object"},
+                              item=state.item_wave("w1", 1, [state.wave_row(worker_id, "Helper", role)]),
+                              message_index=0, item_index=0, plan_card=card, started=time.monotonic(),
+                              make_runtime=lambda wave, worker: runtime)
+            worker = waves.Worker(wave, brief, 0)
+            job.crew.append(worker)
+            worker.started = job.budget.clock()
+            worker._work()
+            runtime.start.assert_called_once()
+            if error:
+                requested.assert_not_called()
+                self.assertNotIn("plan_started", card)
+            else:
+                requested.assert_called_once()
+                self.assertEqual(worker.turn.outcome, "completed")
+        return worker
+
+    def call(self, number, *, name="delegate", helper="A", dry_run=False, **arguments):
         if not arguments:
             arguments = {"wave": {"workers": [{"id": helper.lower(), "deliverable": helper,
                                               "checks": [] if number == 1 else [{"kind": "exists"}]}]},
                          "dry_run": dry_run}
         return llm.ToolCall(str(number), name, json.dumps(arguments))
 
-    def run_calls(self, calls, results, session=None):
+    def run_calls(self, calls, results, session=None, starts=True, start_error=None):
         session = session or state.new_session()
         session["messages"].append({"role": "user", "content": "Make the requested changes"})
         turn = agent.Turn()
+        session.update(busy=True, turn=turn)
         turn.config = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast",
                                    reasoning_effort="low", auto_run=True, auto_look=False,
                                    max_steps=0, context_budget=40_000)
@@ -3289,25 +3548,35 @@ class PlanRetryTest(unittest.TestCase):
                               save=lambda session: None, asks=False, checkpoints=False, changes_card=False,
                               scene_changed=lambda result: False)
         replies = [llm.Completion(tool_calls=[call]) for call in calls] + [llm.Completion(text="Done")]
+        execute = mock.Mock(side_effect=results)
+
+        def run_tool(name, arguments):
+            result = execute(name, arguments)
+            card = next(i for i in reversed(session["items"]) if i["kind"] == "tool")
+            if starts and result.ok and card.get("plan_workers") and not card.get("plan_dry_run"):
+                self.start_helper(session, card, error=start_error)
+            return result
+
         with mock.patch.object(agent, "_request", side_effect=replies), \
                 mock.patch.object(agent, "_redraw"), mock.patch.object(agent, "_note_level"), \
                 mock.patch.object(agent, "_record_level"):
-            agent.run_loop(session, turn, spec, run_tool=mock.Mock(side_effect=results))
+            agent.run_loop(session, turn, spec, run_tool=run_tool)
         self.assertEqual(turn.outcome, "completed")
+        session.update(busy=False, turn=None)
         return session, [item for item in session["items"] if item["kind"] == "tool"]
 
     def refusal(self):
         return tools.ToolResult("workers[0].checks[0]: missing kind", ok=False, plan_refused=True)
 
-    def assert_recovery(self, session, card, recovered):
+    def assert_recovery(self, session, card, recovered, working=False):
         before = dict(card)
         display = layout.build(session, 900, 2000, 1.0, lambda f, s, t: len(t) * s * 0.5)
         self.assertEqual(card, before, "rendering must not rewrite the original attempt")
         prefix = f"item{session['items'].index(card)}.tool."
         text = {p["id"]: p["text"] for p in display["prims"] if p["t"] == "text"}
-        self.assertEqual(text[prefix + "summary"], "Adjusted the helper plan and retried" if recovered
-                         else "Helper plan needs adjustment")
-        self.assertEqual(text[prefix + "glyph"], "✓" if recovered else "✕")
+        self.assertEqual(text[prefix + "summary"], "Helper started" if recovered else
+                         "Adjusting the helper plan…" if working else "Helper plan needs adjustment")
+        self.assertEqual(text[prefix + "glyph"], "✓" if recovered else "…" if working else "✕")
 
     def test_shared_deliverable_does_not_resolve_different_workers_or_roles(self):
         first = {"id": "chair", "role": "modeling", "deliverable": "Chair"}
@@ -3414,17 +3683,57 @@ class PlanRetryTest(unittest.TestCase):
                 session = conversations.load(session["id"])
                 self.assert_recovery(session, next(i for i in session["items"] if i.get("plan_repair")), True)
 
-    def test_successful_dry_run_or_start_resolves_the_original_card_and_keeps_diagnostics(self):
+    def test_only_start_resolves_the_original_card_and_keeps_diagnostics(self):
         for dry_run in (True, False):
             session, cards = self.run_calls([self.call(1), self.call(2, dry_run=dry_run)],
                                             [self.refusal(), tools.ToolResult("Plan accepted")])
-            self.assert_recovery(session, cards[0], True)
+            self.assert_recovery(session, cards[0], not dry_run)
             self.assertEqual(cards[0]["plan_repair"], "needed", "rendering must not rewrite history")
             self.assertEqual(cards[0]["status"], "failed", "retain the actual attempt's outcome")
             self.assertIn("workers[0].checks[0]", cards[0]["output"])
             message = next(m for m in session["messages"] if m.get("tool_call_id") == "1")
             self.assertIn("workers[0].checks[0]", message["content"])
             self.assertEqual(cards[1]["status"], "done")
+
+    def test_plan_is_neutral_during_repair_and_recovers_before_the_retry_returns(self):
+        session = state.new_session()
+
+        def delegate(name, arguments):
+            cards = [i for i in session["items"] if i["kind"] == "tool"]
+            if len(cards) == 1:
+                return self.refusal()
+            self.assert_recovery(session, cards[0], False, working=True)
+            self.assertEqual(cards[1]["status"], "running")
+            self.start_helper(session, cards[1],
+                              before_start=lambda: self.assert_recovery(session, cards[0], False, working=True),
+                              after_start=lambda: self.assert_recovery(session, cards[0], True))
+            return tools.ToolResult("Started")
+
+        session, cards = self.run_calls([self.call(1), self.call(2)], delegate, session=session, starts=False)
+        self.assert_recovery(session, cards[0], True)
+
+    def test_failed_startup_does_not_recover_a_completed_delegate_card(self):
+        from loopcut.worker_host import WorkerUnavailable
+        session, cards = self.run_calls([self.call(1), self.call(2)],
+                                       [self.refusal(), tools.ToolResult("No helper could boot")],
+                                       start_error=WorkerUnavailable("handshake failed"))
+        self.assertEqual(cards[1]["status"], "done")
+        self.assert_recovery(session, cards[0], False)
+
+    def test_completion_without_confirmed_start_does_not_recover_the_plan(self):
+        session, cards = self.run_calls([self.call(1), self.call(2)],
+                                       [self.refusal(), tools.ToolResult("No helper could boot")], starts=False)
+        self.assert_recovery(session, cards[0], False)
+
+    def test_reloaded_running_retry_retains_the_confirmed_start(self):
+        session, cards = self.run_calls([self.call(1), self.call(2)],
+                                       [self.refusal(), tools.ToolResult("Started")])
+        cards[1]["status"] = "running"
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": folder}):
+            conversations.save(session)
+            loaded = conversations.load(session["id"])
+        refused = next(i for i in loaded["items"] if i.get("plan_repair"))
+        self.assert_recovery(loaded, refused, True)
 
     def test_unrelated_success_wait_or_failed_retry_does_not_resolve_a_plan(self):
         for call, result in ((self.call(2, helper="B"), tools.ToolResult("Other plan accepted")),
@@ -3445,7 +3754,7 @@ class PlanRetryTest(unittest.TestCase):
     def test_all_refused_attempts_for_a_plan_are_resolved_by_its_successful_retry(self):
         # Different arguments make these real attempts, not identical calls suppressed by the ledger.
         last = self.call(3, dry_run=False)
-        session, cards = self.run_calls([self.call(1), self.call(2), last],
+        session, cards = self.run_calls([self.call(1, dry_run=True), self.call(2, dry_run=True), last],
                                        [self.refusal(), self.refusal(), tools.ToolResult("Started")])
         for card in cards[:2]:
             self.assert_recovery(session, card, True)

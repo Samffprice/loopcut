@@ -25,6 +25,8 @@ STATUS_GLYPH = {
     "rejected": ("–", T.TEXT_FAINT),
 }
 
+CODE_TOOLS = {"run_python", "run_blender"}
+
 
 def wrap(text: str, font: str, size: int, max_width: float, measure) -> list[tuple[int, str]]:
     """Greedy word wrap. Returns (offset of the line in `text`, line) so a caret can be placed."""
@@ -163,8 +165,9 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     text_width = width - 2 * pad
-    if item.get("queued"):  # Sent while the agent was working: it goes in at the agent's next step.
-        tag = "queued"
+    deliveries = list(item.get("helper_deliveries") or [])
+    if item.get("queued"):  # Helper delivery and the main agent's pending reply are separate.
+        tag = "sent" if deliveries else "pending reply"
         tag_width = round(f.measure("ui", small, tag))
         f.text(f"item{n}.queued", x + width - pad - tag_width, y + pad, tag, small, T.TEXT_FAINT)
         text_width -= tag_width + f.px(8)
@@ -174,15 +177,21 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
         text_height += f.px(4) if item["text"] else 0
         text_height += _image_chips(f, f"item{n}.image", x + pad, y + pad + text_height, width - 2 * pad,
                                     item["images"], removable=False)
+    for k, delivery in enumerate(deliveries):
+        note = f"Sent to the helper building {delivery['deliverable']}"
+        note += (f" (it read it at step {delivery['step']})" if "step" in delivery else " (not read yet)")
+        text_height += f.px(6) + f.paragraph(f"item{n}.helper_delivery{k}", x + pad,
+                                            y + pad + text_height + f.px(6), width - 2 * pad,
+                                            note, small, T.TEXT_MUTED)
     if item.get("queued"):
         helpers = sum(row.get("status") in state.WAVE_RUNNING
                       for card in f.session["items"] if card.get("kind") == "wave"
                       for row in card.get("rows", [])) if f.session.get("busy") else 0
         sending = item.get("sending")
         helper = "helper" if helpers == 1 else "helpers"
-        note = (f"Stopping {helper}; queued for the main agent" if sending else
-                f"Queued for the main agent; {helper} can read this before another request" if helpers else
-                "Queued for the main agent")
+        note = (f"Stopping {helper}; Loopcut will reply after they stop" if sending else
+                "Loopcut will reply when the helpers report back" if helpers else
+                "Waiting for Loopcut to reply")
         text_height += f.px(6) + f.paragraph(f"item{n}.delivery", x + pad, y + pad + text_height + f.px(6),
                                             width - 2 * pad, note, small, T.TEXT_MUTED)
         if helpers and not sending:
@@ -318,8 +327,15 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     status = item["status"]
     glyph, glyph_color = STATUS_GLYPH[status]
     plan_repair = item.get("plan_repair")
-    if plan_repair == "resolved":
+    code_failure = (status == "failed" and item["name"] in CODE_TOOLS
+                    and not item.get("output", "").startswith("Not run."))
+    code_repair = item.get("code_repair") if code_failure else None
+    if plan_repair in {"resolved", "retried"}:
         glyph, glyph_color = "✓", T.TEXT_MUTED
+    elif plan_repair == "adjusting":
+        glyph, glyph_color = "…", T.TEXT_MUTED
+    if code_repair:
+        glyph, glyph_color = ("–" if code_repair == "continued" else "↻"), T.TEXT_MUTED
     awaiting = status == "awaiting"
     expanded = awaiting or item.get("expanded", False)
     mark = len(f.prims)
@@ -330,8 +346,9 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     label_x = inner_x + f.px(18)
     summary = item["summary"] or item["name"]
     if plan_repair:
-        summary = ("Adjusted the helper plan and retried" if plan_repair == "resolved"
-                   else "Helper plan needs adjustment")
+        summary = {"resolved": "Helper started", "retried": "Adjusted the helper plan and retried",
+                   "adjusting": "Adjusting the helper plan…"}.get(
+            plan_repair, "Helper plan needs adjustment")
     show_name = expanded and item["name"].strip().casefold() != summary.strip().casefold()
     if awaiting:
         label_width = inner_w - f.px(18)
@@ -351,7 +368,27 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                    item["name"], small, T.TEXT_FAINT)
         cursor += row
 
-    if status == "failed" and not expanded and not plan_repair:
+    if code_failure:
+        output = item.get("output") or ""
+        # The measured report is appended after stdout; an earlier printed claim is not evidence.
+        reports = re.findall(r"(?m)^Scene changes(: none\.| \(\+ added)", output)
+        effect = (" and didn't change the scene" if reports and reports[-1] == ": none."
+                  else "; some scene changes remain" if reports else "")
+        if code_repair == "continued":
+            note = ("This step changed the scene before failing; Loopcut carried on."
+                    if reports and reports[-1] != ": none."
+                    else "This step had a mistake; Loopcut carried on.")
+        elif code_repair == "correcting":
+            note = f"This step had a mistake{effect}; Loopcut is correcting it."
+        else:
+            note = f"This step failed{effect}."
+        cursor += f.paragraph(f"item{n}.tool.correction", inner_x, cursor, inner_w, note, small,
+                              T.TEXT_MUTED if code_repair else T.ERROR)
+        cursor += f.px(4)
+        f.button(f"item{n}.tool.details", inner_x, cursor, "Hide details" if expanded else "Details",
+                 T.BUTTON_GHOST, T.TEXT_MUTED, ("toggle", n))
+        cursor += f.px(24)
+    if status == "failed" and not expanded and not plan_repair and not code_failure:
         reason = failure_reason(item.get("output") or "", item.get("exit_code"))
         f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
                small, T.TEXT_MUTED)
@@ -383,18 +420,25 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     # An image shows until the user collapses its card; the code and output stay behind the toggle.
     if item.get("expanded", True) and image_path and image_path not in f.ui.get("missing_paths", ()):
         cursor += f.px(6)
-        height = min(inner_w, f.px(220))
-        f.prims.append({"t": "image", "id": f"item{n}.tool.image", "path": image_path,
-                        "x": inner_x, "y": cursor, "w": inner_w, "h": height})
-        cursor += height + f.px(6)
-        f.button(f"item{n}.tool.image.open", inner_x, cursor, "Open image", T.BUTTON_GHOST, T.TEXT,
-                 ("reference_open", image_path))
-        cursor += f.px(24)
+        if item["name"] == "capture_viewport":
+            cursor += _image_preview(f, f"item{n}.tool.image", image_path, item.get("summary") or "Scene preview",
+                                     inner_x, cursor, inner_w, 220, button=True)
+        else:
+            # Delivered files keep their original card and default-app action, even with a hashed stored path.
+            height = min(inner_w, f.px(220))
+            f.prims.append({"t": "image", "id": f"item{n}.tool.image", "path": image_path,
+                            "x": inner_x, "y": cursor, "w": inner_w, "h": height})
+            cursor += height + f.px(6)
+            f.button(f"item{n}.tool.image.open", inner_x, cursor, "Open image", T.BUTTON_GHOST, T.TEXT,
+                     ("reference_open", image_path))
+            cursor += f.px(24)
     if expanded and item["output"] and (not delegate or item.get("details_expanded")):
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
                               f.px(T.FONT_SIZE_CODE),
-                              T.ERROR if status == "failed" and plan_repair != "resolved" else T.TEXT_MUTED, "mono")
+                              T.ERROR if status == "failed" and not code_repair
+                              and plan_repair not in {"resolved", "retried", "adjusting"}
+                              else T.TEXT_MUTED, "mono")
     if expanded and (item.get("cloud_error") or {}).get("message"):
         cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
                               item["cloud_error"]["message"], small, T.ERROR)
@@ -689,32 +733,52 @@ _CHANGE_COLORS = {"+": T.OK, "-": T.ERROR, "~": T.TEXT_MUTED}
 CHANGES_PREVIEW_LINES = 6
 
 
+def _change_summary(lines: list[str]) -> str:
+    """Names from the saved diff; all measured values stay in the expandable original lines."""
+    names = []
+    for line in lines:
+        if line[:2] not in {"+ ", "- ", "~ "}:
+            continue
+        text = line[2:]
+        name = ("Scene settings" if text.startswith("scene ") else
+                "Interaction mode" if text.startswith("mode ") else
+                re.split(r": | \(|; | at \[", text, maxsplit=1)[0])
+        name = name[:45].rstrip() + "…" if len(name) > 48 else name
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names[:3]) + (", and more." if len(names) > 3 else "." if names else "")
+
+
 def _item_changes(f: Frame, n: int, item: dict, x, y, width) -> int:
     """What the turn did to the scene, and the way back: the panel's diff view."""
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
     f.text(f"item{n}.changes.title", inner_x, cursor, "Scene changes", size, T.TEXT)
-    count_width = round(f.measure("ui", small, item["text"]))
-    f.text(f"item{n}.changes.count", x + width - pad - count_width,
-           cursor + (f.line_height(size) - f.line_height(small)) // 2, item["text"], small, T.TEXT_MUTED)
     cursor += f.line_height(size) + f.px(4)
+    cursor += f.paragraph(f"item{n}.changes.count", inner_x, cursor, inner_w, item["text"], small, T.TEXT)
 
     lines, expanded = item.get("lines", []), item.get("expanded", False)
+    summary = _change_summary(lines)
+    if summary:
+        cursor += f.paragraph(f"item{n}.changes.summary", inner_x, cursor, inner_w, summary, small, T.TEXT_MUTED)
     code = f.px(T.FONT_SIZE_CODE)
-    rows = [(k, row, line[:1], text) for k, line in enumerate(lines)
-            for row, (_, text) in enumerate(wrap(line[2:], "mono", code, inner_w - f.px(14), f.measure))]
-    overflow = len(rows) > CHANGES_PREVIEW_LINES
-    shown = rows if expanded or not overflow else rows[:CHANGES_PREVIEW_LINES - 1]
-    for k, row, sign, text in shown:
+    rows = []
+    if expanded:
+        for k, line in enumerate(lines):
+            signed = line[:2] in {"+ ", "- ", "~ "}
+            rows.extend((k, row, line[:1] if signed else "", text)
+                        for row, (_, text) in enumerate(wrap(line[2:] if signed else line, "mono", code,
+                                                             inner_w - f.px(14), f.measure)))
+    for k, row, sign, text in rows:
         if row == 0:
             f.text(f"item{n}.changes.sign{k}", inner_x, cursor, sign, code,
                    _CHANGE_COLORS.get(sign, T.TEXT_MUTED), "mono")
         f.text(f"item{n}.changes.l{k}.l{row}", inner_x + f.px(14), cursor, text.rstrip(), code,
-               T.TEXT if sign in "+-" else T.TEXT_MUTED, "mono")
+               T.TEXT if sign in {"+", "-"} else T.TEXT_MUTED, "mono")
         cursor += f.line_height(code)
-    if overflow:
-        label = "Show less" if expanded else f"Show {len(rows) - len(shown)} more"
+    if lines:
+        label = "Show less" if expanded else "Show more"
         f.text(f"item{n}.changes.more", inner_x + f.px(14), cursor + f.px(2), label, small, T.ACCENT)
         f.hit(f"item{n}.changes.more", inner_x, cursor, inner_w, f.line_height(small) + f.px(4), ("toggle", n))
         cursor += f.line_height(small) + f.px(4)
@@ -821,13 +885,8 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
         image_path = row.get("image_path")
         if image_path and image_path not in f.ui.get("missing_paths", ()):
             cursor += f.px(6)
-            image_w = inner_x + inner_w - name_x
-            image_h = min(image_w, f.px(180))
-            f.prims.append({"t": "image", "id": f"{id}.image", "path": image_path,
-                            "x": name_x, "y": cursor, "w": image_w, "h": image_h})
-            f.hit(f"{id}.image", name_x, cursor, image_w, image_h,
-                  ("reference_open", image_path), "Open latest preview")
-            cursor += image_h + f.px(6)
+            cursor += _image_preview(f, f"{id}.image", image_path, row.get("deliverable") or "Helper preview",
+                                     name_x, cursor, inner_x + inner_w - name_x, 180)
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.wave.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
@@ -1007,17 +1066,17 @@ def _first_run(f: Frame, x, cursor, width) -> int:
     return cursor
 
 
-def _plan_repairs(items: list) -> dict:
+def _plan_repairs(items: list, active_turn: str = "") -> dict:
     """Recovery is a view of the current transcript, so restore, undo and reload need no repair.
     A deliverable can change during repair or belong to different helpers; match worker ids and roles."""
-    successful, repairs = set(), {}
+    successful, repairs = {}, {}
     for n in reversed(range(len(items))):
         item = items[n]
         if item.get("kind") != "tool" or item.get("name") != "delegate":
             continue
-        if item.get("plan_repair"):
-            repairs[n] = "needed"
         turn = item.get("plan_turn")
+        if item.get("plan_repair"):
+            repairs[n] = "adjusting" if active_turn and turn == active_turn else "needed"
         if not isinstance(turn, str) or not turn:
             continue
         crew = item.get("plan_workers")
@@ -1028,9 +1087,48 @@ def _plan_repairs(items: list) -> dict:
         key = (turn, tuple(sorted(tuple(w) for w in crew)))
         if item.get("plan_repair"):
             if key in successful:
-                repairs[n] = "resolved"
-        elif item.get("status") == "done":
-            successful.add(key)
+                repairs[n] = successful[key]
+        elif item.get("plan_started"):
+            successful[key] = "resolved"
+        elif item.get("status") == "done" and "plan_dry_run" not in item:
+            # 0.2.11 also saved dry runs this way: completion proves a retry, not a helper boot.
+            successful.setdefault(key, "retried")
+    return repairs
+
+
+def _code_repairs(items: list, busy: bool, active_turn_id=None) -> dict:
+    """Describe whether the turn carried on, never whether later work repaired a failed step.
+    Derive from the remaining transcript so reload and checkpoint restore give the same view."""
+    turns, errors, last_step = [], set(), {}
+    legacy = 0
+    current = ("legacy", legacy)
+    for n, item in enumerate(items):
+        kind = item.get("kind")
+        if kind == "user" and not item.get("queued"):
+            legacy += 1
+            current = ("legacy", legacy)
+        turn = item.get("turn_id")
+        if isinstance(turn, str) and turn:
+            current = ("turn", turn)
+        turns.append(current)
+        if (kind in {"error", "limit"}
+                or item.get("turn_outcome") in {"error", "cancelled", "step_limit", "budget", "no_progress"}):
+            errors.add(current)
+        if kind == "tool" and item.get("status") in {"done", "failed"}:
+            last_step[current] = n
+        if kind in {"changes", "error", "limit"}:
+            legacy += 1
+            current = ("legacy", legacy)
+    active = ("turn", active_turn_id) if active_turn_id else current
+    repairs = {}
+    for n, item in enumerate(items):
+        if (item.get("kind") != "tool" or item.get("name") not in CODE_TOOLS
+                or item.get("status") != "failed" or item.get("output", "").startswith("Not run.")):
+            continue
+        if busy and turns[n] in {active, ("legacy", legacy)}:
+            repairs[n] = "correcting"
+        elif turns[n] not in errors and last_step.get(turns[n]) != n:
+            repairs[n] = "continued"
     return repairs
 
 
@@ -1039,12 +1137,16 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     pad, gap = f.px(T.PAD), f.px(T.GAP)
     x, width = pad, f.width - 2 * pad
     items = list(session["items"])  # Snapshot: the worker thread appends while we draw.
-    repairs = _plan_repairs(items)
+    active_turn = getattr(session.get("turn"), "plan_turn", "") if session.get("busy") else ""
+    repairs = _plan_repairs(items, active_turn)
+    code_repairs = _code_repairs(items, session.get("busy", False), session.get("active_turn_id"))
     first_prim, first_hit, cursor = len(f.prims), len(f.hits), 0
 
     for n, item in enumerate(items):
         if n in repairs:
             item = {**item, "plan_repair": repairs[n]}
+        if item.get("kind") == "tool" and item.get("name") in CODE_TOOLS:
+            item = {**item, "code_repair": code_repairs.get(n)}
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
     cursor = _cloud_jobs(f, cursor)
     # Queued notes do not replace the active stream or tool as the source of activity.
@@ -1679,7 +1781,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
             f.text(f"input.l{n}", inner_x, text_y + n * line_height, line.rstrip(), size, T.TEXT)
     else:
         placeholder = "Say what to do with these" if session.get("attachments") else \
-            "Add a note; it goes in at the next step" if busy else "Plan, build, fix anything in your scene"
+            "Add a note; Loopcut replies when it can" if busy else "Plan, build, fix anything in your scene"
         f.text("input.placeholder", inner_x, text_y, placeholder, size, T.TEXT_FAINT)
 
     if focused:
@@ -1925,6 +2027,26 @@ def _jobs(f: Frame, top, bottom):
         f.button("jobs.previous", pad, cursor, "Previous", T.BUTTON_GHOST, T.TEXT, ("jobs_page", page - 1))
     if (page + 1) * count < len(rows):
         f.button("jobs.next", pad + f.px(100), cursor, "Next", T.BUTTON_GHOST, T.TEXT, ("jobs_page", page + 1))
+
+
+def _image_preview(f: Frame, id: str, path: str, title: str, x, y, width, thumbnail_size,
+                   *, button=False) -> int:
+    """Expand the existing cached thumbnail in its card; the chat and input remain usable."""
+    title = " ".join(title.split())[:120] or "Scene preview"
+    opened = f.ui.get("preview") == {"path": path, "title": title, "conversation": f.session.get("id")}
+    cursor = y
+    if opened:
+        cursor += f.paragraph(id + ".title", x, cursor, width, title, f.px(T.FONT_SIZE_SMALL), T.TEXT) + f.px(6)
+    image_w = width if opened else min(width * 2 // 3, f.px(thumbnail_size))
+    image_h = min(width, f.px(520)) if opened else image_w
+    action = ("preview_open", (path, title))
+    f.prims.append({"t": "image", "id": id, "path": path, "x": x, "y": cursor, "w": image_w, "h": image_h})
+    f.hit(id, x, cursor, image_w, image_h, action, "Close preview" if opened else "Enlarge preview")
+    cursor += image_h + f.px(6)
+    if button or opened:
+        f.button(id + ".open", x, cursor, "Close preview" if opened else "Open preview", T.BUTTON_GHOST, T.TEXT, action)
+        cursor += f.px(24)
+    return cursor - y
 
 
 def build(session: dict, width: int, height: int, scale: float, measure, model: str = "",

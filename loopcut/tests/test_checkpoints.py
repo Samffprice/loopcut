@@ -22,6 +22,24 @@ def entry(n: int, size_mb: int, kind: str = "turn", expired: bool = False) -> di
     return {"id": f"{n:032x}", "kind": kind, "size": size_mb * MB, "expired": expired}
 
 
+class BeginTurnTest(unittest.TestCase):
+    def test_new_message_starts_after_history_even_when_its_text_was_sent_before(self):
+        session = state.new_session()
+        session["items"] = [state.item_user("smaller"), state.item_error("Stopped.")]
+        session["messages"] = [{"role": "user", "content": "smaller"}]
+        cp.begin_turn(session, state.item_user("smaller"))
+        pending = session["pending_checkpoint"]
+        self.assertEqual((pending["item_index"], pending["message_index"]), (2, 1))
+        self.assertEqual(pending["input"], "smaller")
+
+    def test_reused_note_starts_at_its_own_position_even_when_an_earlier_note_is_equal(self):
+        session = state.new_session()
+        note = state.item_user("smaller")
+        session["items"] = [state.item_user("smaller"), note, state.item_error("Stopped.")]
+        cp.begin_turn(session, note)
+        self.assertEqual(session["pending_checkpoint"]["item_index"], 1)
+
+
 class RestoredPathTest(unittest.TestCase):
     def test_goes_beside_the_original_and_never_onto_it(self):
         path = cp.restored_path("/work/desk.blend", Path("/data/restored"), NOW, exists=lambda p: False)

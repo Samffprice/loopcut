@@ -190,20 +190,23 @@ def _bounds(value) -> str:
 MAX_USER_WORDS = 3000  # Characters of the user's own messages a worker reads, newest kept first.
 
 
-def user_request(texts) -> str:
+def user_request(texts, included: list[int] | None = None) -> str:
     """The user's messages this conversation, oldest first, each on one line: whole while they fit in
     MAX_USER_WORDS, the newest first (a newest one too long alone is clipped between items), then how
-    many earlier ones were left out. Workers used to see only the orchestrator's quoted fragments."""
-    texts = [" ".join(str(t).split()) for t in texts or () if str(t).strip()]
+    many earlier ones were left out. included records the original indices that enter the request,
+    including a clipped newest message, so receipts follow items rather than matching their text."""
+    texts = [(n, " ".join(str(t).split())) for n, t in enumerate(texts or ()) if str(t).strip()]
     kept, left = [], MAX_USER_WORDS
-    for text in reversed(texts):
+    for n, text in reversed(texts):
         if len(text) + 3 > left:
             if not kept:
-                kept.append(clip(text, left - 3))
+                kept.append((n, clip(text, left - 3)))
             break
-        kept.append(text)
+        kept.append((n, text))
         left -= len(text) + 3
-    lines = [f'- "{text}"' for text in reversed(kept)]
+    if included is not None:
+        included.extend(n for n, _ in reversed(kept))
+    lines = [f'- "{text}"' for _, text in reversed(kept)]
     if len(kept) < len(texts):
         lines.insert(0, f"({len(texts) - len(kept)} earlier message{'s' if len(texts) - len(kept) != 1 else ''} "
                         f"left out)")
@@ -248,23 +251,25 @@ CONTINUE_UNMERGED = ("[Loopcut] More work on your deliverable. Nothing you built
 
 
 def continuation(brief: dict, shared: dict, others: list[dict], scene: str, requests=(), role: str = "",
-                 merged: bool = True, status: str = "") -> str:
+                 merged: bool = True, status: str = "", request_indices: list[int] | None = None) -> str:
     """The message that sends a worker that built this before a new brief: CONTINUE, or when its
     earlier work never merged (it failed, crashed or was stopped) CONTINUE_UNMERGED, so it does not
     take the objects of its own earlier steps for the scene's; then the same fields as opening; the
     role notes again only when the role changed (role: its earlier one)."""
     lead = CONTINUE if merged else CONTINUE_UNMERGED.format(
         status=f"ended {status} and was not merged" if status else "was not merged")
-    return f"{lead}\n{opening(brief, shared, others, scene, requests, notes=role != brief['role'])}"
+    body = opening(brief, shared, others, scene, requests, notes=role != brief["role"], request_indices=request_indices)
+    return f"{lead}\n{body}"
 
 
-def opening(brief: dict, shared: dict, others: list[dict], scene: str, requests=(), notes: bool = True) -> str:
+def opening(brief: dict, shared: dict, others: list[dict], scene: str, requests=(), notes: bool = True,
+            request_indices: list[int] | None = None) -> str:
     """The worker's first message: what everyone shares (the user's own messages first), its brief,
     the craft notes for its role, and the scene context of its copy (made in the parent from the live
     scene at spawn). requests: the user's messages this conversation, oldest first."""
     keep = shared.get("keep") or {}
     lines = ["<shared>"]
-    said = user_request(requests)
+    said = user_request(requests, request_indices)
     if said:
         lines += ["the user's words (their messages, oldest first; the brief quotes the parts that are yours):", said]
     lines.append(f"units: {shared.get('units')}")

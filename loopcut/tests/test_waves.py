@@ -277,9 +277,10 @@ class WorkerSteerTest(unittest.TestCase):
         self.addCleanup(lambda: [conversations.FOLDERS.pop(w.session["id"], None) for w in self.crew])
         self.crew = []
 
-    def prepare(self):
+    def prepare(self, continues=False):
         plan = orchestrator.normalise_wave({"workers": [
             {"id": name, "deliverable": name.upper(), "role": "modeling", "prefix": name.upper(),
+             "continues": name if continues else "",
              "requirements": [{"quote": "small", "do": "small"}], "checks": []} for name in ("a", "b")]})
         return waves.prepare(self.session, self.turn, plan, message_index=0,
                              save_spawn=lambda folder: types.SimpleNamespace(wave=str(folder), tokens={}),
@@ -318,6 +319,39 @@ class WorkerSteerTest(unittest.TestCase):
         self.assertEqual(self.steers(self.session), ["<steer>make it smaller</steer>", "<steer>also red</steer>"])
         self.assertFalse(any(i.get("queued") for i in self.session["items"]))
 
+    def test_receipts_identify_each_helper_and_its_consuming_step_and_survive_reload(self):
+        first, queued = self.worker(0), self.worker(1)
+        self.job.crew = [first, queued]
+        first.steps = 25
+        self.assertTrue(agent.send("same note"))
+        note = self.turn.notes[0][1]
+        self.assertEqual([(r["worker"], r["deliverable"]) for r in note["helper_deliveries"]],
+                         [("a", "A"), ("b", "B")])
+        self.assertTrue(all("step" not in r for r in note["helper_deliveries"]))
+        self.take_step(first, 26)
+        read = dict(note["helper_deliveries"][0])
+        self.assertEqual((read["wave"], read["step"]), (self.wave.id, 26))
+        self.assertIsInstance(read["read_at"], float)
+        self.assertNotIn("step", note["helper_deliveries"][1])
+        self.take_step(queued, 1)
+        self.take_step(first, 27)
+        self.assertEqual([r["step"] for r in note["helper_deliveries"]], [26, 1])
+        self.assertEqual(note["helper_deliveries"][0], read, "later steps must not rewrite the receipt")
+        self.assertTrue(note["queued"], "the main agent has not consumed this note")
+        agent.send("same note")
+        second_note = self.turn.notes[1][1]
+        self.assertTrue(all("step" not in r for r in second_note["helper_deliveries"]))
+        self.take_step(first, 28)
+        self.assertEqual(second_note["helper_deliveries"][0]["step"], 28)
+        self.assertEqual(note["helper_deliveries"][0], read, "identical text still has separate receipts")
+        conversations.save(self.session)
+        loaded = conversations.load(self.session["id"])
+        saved = [i for i in loaded["items"] if i.get("text") == "same note"]
+        self.assertEqual(saved[0]["helper_deliveries"], note["helper_deliveries"])
+        agent._fold_notes(self.session, self.turn)
+        self.assertNotIn("queued", note)
+        self.assertEqual(note["helper_deliveries"][0], read)
+
     def test_a_note_arriving_during_the_first_reply_wait_reaches_that_request(self):
         worker = self.worker(1)
         self.wave.first_reply = mock.Mock()
@@ -325,6 +359,64 @@ class WorkerSteerTest(unittest.TestCase):
         self.wave.first_reply.wait.side_effect = lambda timeout: agent.send("smaller")
         self.take_step(worker, 1)
         self.assertEqual(self.steers(worker.session), [self.worker_steer("smaller")])
+
+    def test_receipt_failures_do_not_interrupt_notes_or_crash_retries(self):
+        class UnreadableNote(dict):
+            def get(self, key, default=None):
+                raise RuntimeError("note unavailable")
+
+        class UnwritableNote(dict):
+            def __setitem__(self, key, value):
+                raise RuntimeError("receipt unavailable")
+
+        for failure, note in (("no item", None), ("invalid item", []),
+                              ("null receipts", {"helper_deliveries": None}),
+                              ("invalid receipts", {"helper_deliveries": 1}),
+                              ("invalid entries", {"helper_deliveries": [None, {}, "old"]}),
+                              ("read", UnreadableNote()), ("write", UnwritableNote()),
+                              ("recorder", {})):
+            with self.subTest(failure=failure):
+                self.job.steers = []
+                worker = self.worker()
+                self.job.crew = [worker]
+                registry = Registry()
+                self.wave.make_runtime = lambda wave, w: FakeRuntime(
+                    registry, w, crash="run_python" if not w.retries else "")
+                received = []
+
+                def request(session, *args):
+                    received.append(self.steers(session))
+                    if not worker.retries:
+                        waves.steer(self.job, "red", note)
+                        return llm.Completion(tool_calls=[llm.ToolCall("build", "run_python", '{"code":"make()"}')])
+                    return llm.Completion(tool_calls=[llm.ToolCall("done", "report_back", '{"summary":"Built it."}')])
+
+                error = RuntimeError("receipt recorder unavailable") if failure == "recorder" else None
+                with mock.patch.object(waves, "_note_delivery", wraps=waves._note_delivery, side_effect=error), \
+                        mock.patch.object(agent, "_request", side_effect=request) as requested:
+                    waves.steer(self.job, "smaller", note)
+                    worker._work()
+                self.assertEqual((registry.started, worker.retries, requested.call_count), (["a", "a"], 1, 2))
+                self.assertEqual(worker.status, "done")
+                self.assertEqual(worker.turn.outcome, "completed")
+                self.assertEqual(worker.report["summary"], "Built it.")
+                self.assertEqual(worker.steer_index, 2)
+                self.assertEqual(received, [[self.worker_steer("smaller")],
+                                            [self.worker_steer("smaller"), waves.CRASH_NOTE.format(tool="run_python"),
+                                             self.worker_steer("red")]])
+
+    def test_legacy_string_notes_and_partial_workers_keep_delivery_working(self):
+        worker = self.worker()
+        self.job.crew = [types.SimpleNamespace(), worker]
+        self.job.steers.append("smaller")
+        note = {"helper_deliveries": (None, {}, {"wave": "old", "worker": "a", "deliverable": "A", "step": 3})}
+        waves.steer(self.job, "red", note)
+        self.job.crew = [worker]
+        self.take_step(worker, 1)
+        self.take_step(worker, 2)
+        self.assertEqual(self.steers(worker.session), [self.worker_steer("smaller"), self.worker_steer("red")])
+        self.assertEqual([(r["wave"], r["worker"], r["step"]) for r in note["helper_deliveries"]],
+                         [("old", "a", 3), (self.wave.id, "a", 1)])
 
     def test_cancel_as_first_reply_wait_ends_does_not_consume_notes_or_request(self):
         worker = self.worker(1)
@@ -344,6 +436,7 @@ class WorkerSteerTest(unittest.TestCase):
         self.assertEqual((worker.steps, worker.steer_index, self.job.budget.steps), (0, 0, 0))
         self.assertEqual(self.steers(worker.session), [])
         self.assertEqual([text for text, _ in self.turn.notes], ["smaller"])
+        self.assertFalse(any("step" in r for r in self.turn.notes[0][1].get("helper_deliveries", [])))
 
     def test_retry_keeps_its_cursor_and_reads_new_notes(self):
         worker = self.worker()
@@ -355,17 +448,51 @@ class WorkerSteerTest(unittest.TestCase):
         self.take_step(worker, 1)
         self.assertIs(worker.turn.cancel, cancel)
         self.assertEqual(self.steers(worker.session), [self.worker_steer("smaller"), self.worker_steer("red")])
+        self.assertEqual([item["helper_deliveries"][0]["step"] for _, item in self.turn.notes], [1, 2])
 
     def test_new_wave_has_earlier_notes_in_its_opening_and_only_receives_later_steers(self):
         agent.send("smaller")
+        first = self.worker()
+        self.take_step(first, 1)
         later = self.prepare()
         worker = self.worker(wave=later)
         self.assertIn("smaller", later.openings[worker.id])
         self.take_step(worker, 1)
         self.assertEqual(self.steers(worker.session), [])
+        earlier, receipt = self.turn.notes[0][1]["helper_deliveries"]
+        self.assertEqual(earlier["wave"], self.wave.id)
+        self.assertEqual((receipt["wave"], receipt["worker"], receipt["step"]), (later.id, worker.id, 1))
         agent.send("red")
         self.take_step(worker, 2)
         self.assertEqual(self.steers(worker.session), [self.worker_steer("red")])
+
+    def test_new_wave_receipts_only_credit_notes_kept_in_the_opening(self):
+        # Identical text must not make an omitted, older note look delivered.
+        agent.send("make it red")
+        omitted = self.turn.notes[-1][1]
+        agent.send("filler " * 500)
+        agent.send("make it red")
+        included = self.turn.notes[-1][1]
+        self.session["worker_threads"] = {
+            name: {"role": "modeling", "messages": [], "folder": self.data.name} for name in ("a", "b")}
+        for continues in (False, True):
+            with self.subTest(continues=continues):
+                later = self.prepare(continues=continues)
+                worker = self.worker(wave=later)
+                self.assertEqual(later.openings[worker.id].count('"make it red"'), 1)
+                self.assertEqual(later.openings[worker.id].startswith(workers.CONTINUE), continues)
+
+                def request(session, turn, cfg, spec):
+                    self.assertEqual(session["messages"][0]["content"], later.openings[worker.id])
+                    self.assertFalse(any(r["wave"] == later.id for r in omitted.get("helper_deliveries", [])))
+                    receipt, = [r for r in included["helper_deliveries"] if r["wave"] == later.id]
+                    self.assertEqual((receipt["worker"], receipt["step"]), (worker.id, 1))
+                    return llm.Completion(text="done")
+
+                with mock.patch.object(agent, "_request", side_effect=request) as requested:
+                    agent.run_loop(worker.session, worker.turn, worker.spec)
+                requested.assert_called_once()
+                self.assertEqual(worker.turn.outcome, "completed")
 
     def test_loop_folds_a_workers_note_before_requesting(self):
         worker = self.worker()
@@ -374,6 +501,7 @@ class WorkerSteerTest(unittest.TestCase):
         def request(session, turn, cfg, spec):
             self.assertEqual(self.steers(session), [self.worker_steer("smaller")])
             self.assertFalse(turn.notes)
+            self.assertEqual(self.turn.notes[0][1]["helper_deliveries"][0]["step"], 1)
             return llm.Completion(text="done")
 
         with mock.patch.object(agent, "_request", side_effect=request) as requested:
@@ -408,6 +536,22 @@ class WorkerSteerTest(unittest.TestCase):
             scheduler.join(2)
             self.assertFalse(scheduler.is_alive())
 
+    def test_prepare_links_the_running_attempt_and_failed_boot_does_not_mark_it_started(self):
+        from loopcut.worker_host import WorkerUnavailable
+        card = state.item_tool("delegate", "Start helpers", "")
+        self.session["items"].append(card)
+        later = self.prepare()
+        self.assertIs(later.plan_card, card)
+        worker = self.worker(wave=later)
+        runtime = mock.Mock()
+        runtime.start.side_effect = WorkerUnavailable("cannot connect")
+        later.make_runtime = lambda wave, worker: runtime
+        with mock.patch.object(agent, "_request") as requested:
+            worker._work()
+        requested.assert_not_called()
+        self.assertNotIn("plan_started", card)
+        self.assertEqual(worker.status, "failed")
+
     def test_blocking_startup_keeps_steering_available_and_notes_precede_first_requests(self):
         registry = Registry()
         entered = [threading.Event(), threading.Event()]
@@ -426,14 +570,18 @@ class WorkerSteerTest(unittest.TestCase):
 
         def request(session, *args):
             self.assertEqual(self.steers(session), [self.worker_steer("smaller")])
+            self.assertTrue(self.wave.plan_card["plan_started"])
+            self.assertEqual(self.wave.plan_card["status"], "running")
             return llm.Completion(tool_calls=[llm.ToolCall("r1", "report_back", '{"summary":"Built it."}')])
 
         self.wave.make_runtime = runtime
+        self.wave.plan_card = {"status": "running"}
         sent = []
         sender = threading.Thread(target=lambda: sent.append(agent.send("smaller")), daemon=True)
         with mock.patch.object(agent, "_request", side_effect=request) as requested:
             try:
                 waves.start(self.wave, self.turn.cancel.is_set, lambda fn: fn())
+                self.assertNotIn("plan_started", self.wave.plan_card)
                 self.crew += self.wave.crew
                 self.assertTrue(all(event.wait(2) for event in entered), "both children prewarm concurrently")
                 requested.assert_not_called()
@@ -493,6 +641,7 @@ class WorkerSteerTest(unittest.TestCase):
                 self.assertTrue(entered.wait(2))
                 self.crew += self.wave.crew
                 self.assertTrue(agent.send("smaller"))
+                note = self.turn.notes[-1][1]
                 self.assertTrue(agent.send_queued_now())
                 self.assertTrue(cleaning.wait(2))
                 parent.join(0.2)
@@ -503,7 +652,7 @@ class WorkerSteerTest(unittest.TestCase):
                 self.assertFalse(parent.is_alive())
                 self.assertEqual(self.turn.outcome, "cancelled")
                 requested.assert_called_once()  # Only the orchestrator's delegate; no worker model spend.
-                resent.assert_called_once_with("smaller")
+                resent.assert_called_once_with("smaller", [note])
                 restored.assert_not_called()
                 self.assertTrue(all(w.finished is not None and w.status == "stopped" for w in self.crew))
                 self.assertFalse(self.session.get("workers_unavailable"))
@@ -598,7 +747,8 @@ class WorkerSteerTest(unittest.TestCase):
         self.assertIsNotNone(worker.finished)
         self.assertEqual(worker.steer_index, 0)
         self.assertEqual(self.steers(worker.session), [])
-        self.assertEqual(self.job.steers, ["Make A smaller"])
+        self.assertEqual([text for text, _ in self.job.steers], ["Make A smaller"])
+        self.assertFalse(any("step" in r for r in self.turn.notes[0][1].get("helper_deliveries", [])))
         self.assertEqual([text for text, _ in self.turn.notes], ["Make A smaller"])
         self.assertTrue(self.turn.notes[0][1]["queued"])
         resent.assert_not_called()

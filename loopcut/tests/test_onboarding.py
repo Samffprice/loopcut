@@ -594,16 +594,16 @@ class OnboardingTest(unittest.TestCase):
             self.assertEqual(ready.readiness()["status"], "idle")
             self.assertEqual(self.prefs.model, "gpt-6-sol")
 
-    def test_offline_mode_skips_readiness_without_a_worker(self):
+    def test_blender_online_access_off_still_checks_chatgpt(self):
         ready = self.chatgpt_ui
         self.prefs.provider = "CHATGPT"
         with patch.object(ready.chatgpt_ready, "account_key", return_value=("client", "issuer", "subject")), \
                 self.chatgpt_plan(), patch.object(self.fake.app, "online_access", False, create=True), \
+                patch.object(ready.chatgpt_ready, "verified", return_value=False), \
                 patch.object(ready.threading, "Thread") as worker:
             ready._start_readiness()
-            worker.assert_not_called()
-            self.assertEqual(ready.readiness()["code"], "offline")
-            self.assertTrue(ready.can_continue())
+            worker.assert_called_once()
+            self.assertEqual(ready.readiness()["status"], "checking")
 
     def test_only_a_definite_refusal_or_a_short_check_holds_setup_back(self):
         ready = self.chatgpt_ui

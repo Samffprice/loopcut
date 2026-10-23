@@ -30,7 +30,8 @@ class SampleTest(unittest.TestCase):
         for sample in try_samples.CARDS.values():
             for output in sample["outputs"]:
                 self.assertTrue((try_samples.SAMPLES / output[3]).is_file(), output[3])
-        self.assertLess((try_samples.SAMPLES / "photo_3d.glb").stat().st_size, 8 * 1024 * 1024)
+        # Ships in every installer and update: the 300K-triangle dwarf (owner 2026-10-23) is 10.4 MiB.
+        self.assertLess((try_samples.SAMPLES / "photo_3d.glb").stat().st_size, 12 * 1024 * 1024)
 
     def test_only_the_cards_own_tool_and_photo_are_taken_over(self):
         self.assertEqual(try_samples.match("photo_3d", "image_to_3d", {"image": str(self.photo)})["card"], "photo_3d")
@@ -51,18 +52,18 @@ class SampleTest(unittest.TestCase):
         stored.parent.mkdir()
         stored.write_bytes(b"stored copy")
         session = {"id": "c1", "references": [
-            {"ref": "loopcut-image:abc.png", "full": "loopcut-image:abc.png", "name": "alarm-clock.jpg", "pinned": True,
+            {"ref": "loopcut-image:abc.png", "full": "loopcut-image:abc.png", "name": "dwarf-warrior.jpg", "pinned": True,
              "source": str(try_samples.SAMPLE_PHOTO)},
             {"ref": "loopcut-image:abc.png", "name": "gone.jpg", "pinned": True, "source": str(self.tmp / "gone.jpg")}]}
         fake = types.SimpleNamespace(data=types.SimpleNamespace(images={}, objects={}))
         with patch.object(state, "_session", session), patch.dict(sys.modules, {"bpy": fake}), \
                 patch.object(conversations, "image_path", return_value=stored):
-            self.assertEqual(cloud_jobs.attached_image("alarm-clock.jpg"), try_samples.SAMPLE_PHOTO)
+            self.assertEqual(cloud_jobs.attached_image("dwarf-warrior.jpg"), try_samples.SAMPLE_PHOTO)
             self.assertEqual(cloud_jobs.attached_image("gone.jpg"), stored)  # The original moved: the stored copy.
             self.assertIsNone(cloud_jobs.attached_image("other.jpg"))
             files = cloud_jobs.resolve_files({"file_inputs": [{"field": "image", "required": False,
                                                                "accept": ["image/jpeg", "image/png"]}]},
-                                             {"image": "alarm-clock.jpg"}, self.tmp / "job")
+                                             {"image": "dwarf-warrior.jpg"}, self.tmp / "job")
         self.assertEqual(try_samples.match("photo_3d", "image_to_3d", files)["card"], "photo_3d")
 
     def test_a_build_without_the_files_runs_the_ordinary_call(self):
@@ -81,14 +82,15 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(job["input"], {"prompt": "jump"})
         self.assertEqual(job["apply_args"], {"target_armature": "Armature"})
 
-    def test_runs_last_as_long_as_productions_and_show_the_servers_messages(self):
+    def test_runs_show_the_servers_messages_and_the_photo_sample_lasts_30_seconds(self):
         final = try_samples.timeline("image_to_3d", {"quality": "final"})
         self.assertEqual(final[0], (0.0, 5, "Queued for model processing."))
-        self.assertEqual(final[-1][0], 149.0)
+        self.assertEqual(final[-1][0], 30.0)
+        self.assertGreaterEqual(final[-2][1], 90)  # The climb still nearly finishes before Done.
         running = final[1:-1]
         self.assertTrue(all(m == "Generating model." and 10 <= p <= 95 for _, p, m in running))
         self.assertEqual([p for _, p, _ in running], sorted(p for _, p, _ in running))
-        self.assertEqual(try_samples.timeline("image_to_3d", {"quality": "draft"})[-1][0], 33.0)
+        self.assertEqual(try_samples.timeline("image_to_3d", {"quality": "draft"})[-1][0], 30.0)
         self.assertEqual([m for _, _, m in try_samples.timeline("motion_from_text", {})],
                          ["Queued", "Generating motion", "Done"])
 

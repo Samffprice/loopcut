@@ -183,6 +183,32 @@ class WorkerStartup(unittest.TestCase):
         self.assertIn("crashed during run_python", worker.session["messages"][0]["content"])
         worker._end.assert_called_once()
 
+    def test_plan_bookkeeping_never_prevents_crash_retries(self):
+        class UnwritableCard(dict):
+            def __setitem__(self, key, value):
+                raise RuntimeError("plan card unavailable")
+
+        for during_init in (False, True):
+            for card in (None, [], object(), {}, UnwritableCard()):
+                with self.subTest(during_init=during_init, card=type(card).__name__):
+                    error = [worker_host.ChildCrashed("init", "child exited", ""), None] if during_init else None
+                    worker, runtime = self.worker(error=error)
+                    worker.wave.plan_card = card
+
+                    def run(*args):
+                        if type(card) is dict:
+                            self.assertTrue(card["plan_started"], "record successful boot before the request")
+                        if not worker.retries:
+                            worker._crashed("run_python", "child exited")
+
+                    with mock.patch.object(agent, "run_loop", side_effect=run) as loop:
+                        worker._work()
+                    self.assertEqual(runtime.start.call_count, 2)
+                    self.assertEqual(loop.call_count, 1 if during_init else 2)
+                    self.assertEqual(worker.retries, 1)
+                    self.assertFalse(worker.wave.session.get("workers_unavailable"))
+                    worker._end.assert_called_once()
+
     def test_crash_retry_handles_empty_and_populated_transcripts(self):
         old = {"name": "capture_viewport", "image_path": "/saved/discarded.png"}
         for items in (None, [], [old], (old,)):

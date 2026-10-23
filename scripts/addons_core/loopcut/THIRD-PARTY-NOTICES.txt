@@ -7,8 +7,8 @@ icons/*.png
   list-checks, hammer, scan-eye and wrench, rasterised to 64 px and recoloured to Loopcut's
   palette. Licence below.
 
-alarm-clock.jpg, card_chest.jpg
-  Our own Cycles renders of Poly Haven's CC0 models "Alarm Clock 01" and "Treasure Chest",
+card_chest.jpg
+  Our own Cycles render of Poly Haven's CC0 model "Treasure Chest",
   lit by Poly Haven's CC0 "Studio Small 09" HDRI (polyhaven.com). CC0 needs no notice; it is
   listed so the source is known.
 

@@ -720,6 +720,39 @@ class ModelImportTest(unittest.TestCase):
         self.assertIsNot(mesh.material_slots[0].material, shared)
         self.assertEqual(mesh.material_slots[0].material.name, "Retopo.001")
 
+    def vendor_export(self):
+        """A glTF import named the way Tripo exports: node, material and textures tagged with its UUID."""
+        uid = "3b97ab15-5c1f-4366-9b92-d244544ff68d"
+        def gltf(**options):
+            self.calls.append(("import_scene.gltf", options))
+            self.data.objects.append(FakeObject(f"tripo_node_{uid}", type="EMPTY"))  # EMPTY: no bounds to fit
+            self.data.materials.append(Block(f"tripo_material_{uid}", node_tree=Block("Shader Nodetree")))
+            self.data.images.extend([Block(f"Color_{uid}", packed_file=object(), filepath="c.png"),
+                                     Block("Wood.png", packed_file=object(), filepath="Wood.png")])
+            return {"FINISHED"}
+        self.ops.import_scene.gltf = gltf
+
+    def test_generated_models_drop_the_vendor_export_names(self):
+        self.vendor_export()
+        self.apply(".glb", fake_glb(), kind="gen")
+        label = "Loopcut byok_test model"
+        self.assertEqual([ob.name for ob in self.data.objects], [f"{label} mesh", label])
+        self.assertEqual([m.name for m in self.data.materials], [f"{label} material"])
+        self.assertEqual([i.name for i in self.data.images], [f"{label} Color", "Wood.png"])
+        self.assertEqual(self.data.materials[0].node_tree.name, "Shader Nodetree")
+
+    def test_assist_results_keep_their_names(self):
+        self.vendor_export()
+        self.apply(".glb", fake_glb())
+        self.assertTrue(self.data.objects[0].name.startswith("tripo_node_"))
+        self.assertTrue(self.data.materials[0].name.startswith("tripo_material_"))
+
+    def test_neutral_name_leaves_ordinary_names_alone(self):
+        for name, expected in (("Chair", None), ("ORM_3b97ab15-5c1f-4366-9b92-d244544ff68d", "L ORM"),
+                               ("rodin_mesh", "L mesh"), ("Tripod legs", None), ("geometry_0", None)):
+            with self.subTest(name=name):
+                self.assertEqual(cloud_jobs._neutral_name(name, "L"), expected)
+
     def test_not_binary_fbx_is_refused_before_import(self):
         for data in (b"; FBX 7.4.0 project file", fake_glb()):
             with self.subTest(data=data[:8]), self.assertRaisesRegex(cloud_http.CloudError, "not a binary FBX"):

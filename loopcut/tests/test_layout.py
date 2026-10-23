@@ -1,6 +1,8 @@
 """The display list for the header, the input footer and the popups, with a stand-in for blf."""
 
+import json
 import sys
+import types
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -591,6 +593,186 @@ class ToolFailureCardTest(unittest.TestCase):
         self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
 
 
+class CodeCorrectionTest(unittest.TestCase):
+    OUTPUT = 'Traceback (most recent call last):\nSyntaxError: invalid syntax\n\nScene changes: none.'
+
+    def card(self, status="failed", **extra):
+        return {**state.item_tool("run_python", "Build the chest", "invalid? python"),
+                "status": status, "output": self.OUTPUT if status == "failed" else "OK", **extra}
+
+    def display(self, items, busy=False, width=420, scale=1, **session_values):
+        session = {**state.new_session(), "items": items, "busy": busy, **session_values}
+        before = deepcopy(items)
+        display = layout.build(session, width, 3000, scale, measure)
+        self.assertEqual(items, before, "correction status is a view, not a rewrite of the failure")
+        return display
+
+    def note(self, display, index=0):
+        return " ".join(p["text"] for p in display["prims"]
+                        if p["id"].startswith(f"item{index}.tool.correction."))
+
+    def test_failed_step_is_neutral_while_correcting_and_details_keep_diagnostics(self):
+        for width, scale in ((240, 1), (420, 1), (640, 1.5)):
+            with self.subTest(width=width, scale=scale):
+                card = self.card()
+                display = self.display([card], busy=True, width=width, scale=scale)
+                self.assertEqual(self.note(display),
+                                 "This step had a mistake and didn't change the scene; Loopcut is correcting it.")
+                self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.TEXT_MUTED)
+                self.assertEqual(hit(display, "item0.tool.details")["action"], ("toggle", 0))
+                self.assertEqual(prim(display, "item0.tool.details.label")["text"], "Details")
+                self.assertFalse(any("SyntaxError" in p.get("text", "") or "invalid?" in p.get("text", "")
+                                     for p in display["prims"]))
+                for p in display["prims"]:
+                    if p["t"] == "text" and p["id"].startswith("item0.tool."):
+                        self.assertLessEqual(right(p), width - round((T.PAD + T.CARD_PAD) * scale))
+                card["expanded"] = True
+                expanded = self.display([card], busy=True, width=width, scale=scale)
+                output = " ".join(p["text"] for p in expanded["prims"]
+                                  if p["id"].startswith("item0.tool.output."))
+                self.assertIn("SyntaxError: invalid syntax", output)
+                self.assertIn("item0.tool.code.l0", ids(expanded, "prims"))
+                self.assertEqual(card["output"], self.OUTPUT)
+
+    def test_partial_or_unmeasured_failure_never_claims_no_scene_changes(self):
+        for output in ("RuntimeError: stopped", "RuntimeError: stopped\nScene changes (+ added, - removed):\n+ Cube",
+                       "Scene changes: none.\nRuntimeError: stopped\nScene changes (+ added, - removed):\n+ Cube"):
+            with self.subTest(output=output):
+                note = self.note(self.display([self.card(output=output)], busy=True))
+                self.assertIn("Loopcut is correcting it", note)
+                self.assertNotIn("didn't change", note)
+                if "Scene changes" in output:
+                    self.assertIn("some scene changes remain", note)
+
+    def test_checkpoint_failure_is_not_described_as_a_code_mistake(self):
+        card = self.card(output="Not run. Could not save checkpoint.")
+        display = self.display([card], busy=True)
+        self.assertEqual(self.note(display), "")
+        self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+        self.assertIn("checkpoint", prim(display, "item0.tool.reason")["text"])
+
+    def test_completed_turn_keeps_failed_steps_measured_scene_impact(self):
+        changed = "Scene changes (+ added, - removed):\n+ Cube"
+        for report, changed_scene in ((changed, True), ("Scene changes: none.", False), ("", False),
+                                      ("Scene changes: none.\n" + changed, True),
+                                      (changed + "\nScene changes: none.", False)):
+            with self.subTest(report=report):
+                failed = self.card(turn_id="one", code="bpy.ops.mesh.primitive_cube_add()\n"
+                                   "raise RuntimeError('stopped')",
+                                   output="RuntimeError: stopped\n" + report)
+                items = [failed, self.card("done", turn_id="one", code="print(len(bpy.data.objects))",
+                                          turn_outcome="completed"),
+                         state.item_changes("1 added", ["+ Cube"], "")]
+                display = self.display(items)
+                expected = ("This step changed the scene before failing; Loopcut carried on."
+                            if changed_scene else "This step had a mistake; Loopcut carried on.")
+                self.assertEqual(self.note(display), expected)
+                self.assertEqual(prim(display, "item0.tool.details.label")["text"], "Details")
+                self.assertEqual(self.note(self.display(json.loads(json.dumps(items)))), expected)
+
+    def test_unrelated_success_never_claims_recovery_for_main_or_worker_code(self):
+        for name in layout.CODE_TOOLS:
+            for worker in ('', 'helper'):
+                for busy in (False, True):
+                    with self.subTest(name=name, worker=worker, busy=busy):
+                        items = [self.card(name=name, turn_id="one", worker=worker),
+                                 state.item_user("A note folded into this turn"),
+                                 self.card("done", name=name, turn_id="one", worker=worker,
+                                           code="print(scene.frame_current)")]
+                        display = self.display(items, busy=busy, active_turn_id="one")
+                        self.assertNotIn("Recovered", self.note(display))
+                        self.assertNotEqual(prim(display, "item0.tool.glyph")["text"], "✓")
+                        self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.TEXT_MUTED)
+                        self.assertEqual(prim(display, "item0.tool.details.label")["text"], "Details")
+                        self.assertIn("correcting it" if busy else "Loopcut carried on", self.note(display))
+
+    def test_terminal_error_stays_red_even_after_a_later_success(self):
+        for ending in (state.item_error("Connection dropped"), state.item_limit("Allowance used", "week_limit", "free", "", None)):
+            for tagged in (False, True):
+                with self.subTest(ending=ending, tagged=tagged):
+                    extra = {'turn_id': 'one'} if tagged else {}
+                    items = [self.card(expanded=True, **extra), self.card("done", **extra), ending]
+                    display = self.display(items)
+                    self.assertIn("This step failed", self.note(display))
+                    self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+                    self.assertEqual(prim(display, "item0.tool.correction.l0")["color"], T.ERROR)
+                    self.assertEqual(prim(display, "item0.tool.output.l0")["color"], T.ERROR)
+        # Some provider errors use an account notice rather than a generic error card.
+        items = [self.card(turn_id="one"), self.card("done", turn_id="one", turn_outcome="error")]
+        self.assertEqual(prim(self.display(items), "item0.tool.glyph")["color"], T.ERROR)
+        # Teardown/save errors can follow the change-summary card and a folded user note.
+        items = [self.card(turn_id="one"), self.card("done", turn_id="one", turn_outcome="error"),
+                 state.item_user("A note folded into this turn"), state.item_changes("1 added", ["+ Cube"], ""),
+                 state.item_error("Could not save this conversation")]
+        self.assertEqual(prim(self.display(items), "item0.tool.glyph")["color"], T.ERROR)
+
+    def test_neutral_past_tense_and_terminal_error_survive_reload_and_restore(self):
+        for error in (False, True):
+            with self.subTest(error=error):
+                items = [self.card(turn_id="one"),
+                         self.card("done", turn_id="one", turn_outcome="error" if error else "completed")]
+                if error:
+                    items.append(state.item_error("Connection dropped"))
+                expected = self.display(items)
+                reloaded = self.display(json.loads(json.dumps(items)))
+                self.assertEqual(reloaded['prims'], expected['prims'])
+                self.assertEqual(reloaded['hits'], expected['hits'])
+                self.assertNotIn("Recovered", self.note(reloaded))
+                self.assertEqual(prim(reloaded, "item0.tool.glyph")["color"], T.ERROR if error else T.TEXT_MUTED)
+                # Restore to before the later step: the transcript now ends on this failure.
+                restored = self.display(json.loads(json.dumps(items[:1])))
+                self.assertIn("This step failed", self.note(restored))
+                self.assertEqual(prim(restored, "item0.tool.glyph")["color"], T.ERROR)
+
+    def test_read_success_is_continuation_but_rejection_or_another_turn_is_not(self):
+        for later in (self.card("done", name="capture_viewport", turn_id="one"),
+                      self.card("rejected", turn_id="one"), self.card("done", turn_id="two")):
+            with self.subTest(later=later):
+                display = self.display([self.card(turn_id="one"), later])
+                continued = later['status'] == 'done' and later['turn_id'] == 'one'
+                self.assertIn("Loopcut carried on" if continued else "This step failed", self.note(display))
+                self.assertNotIn("Recovered", self.note(display))
+
+    def test_previous_turn_status_does_not_change_during_or_after_another_turn(self):
+        for error in (False, True):
+            for tagged in (False, True):
+                with self.subTest(error=error, tagged=tagged):
+                    old = {'turn_id': 'old'} if tagged else {}
+                    items = [self.card(**old), self.card("done", **old)]
+                    if error:
+                        items.append(state.item_error("Stopped."))
+                    expected = self.note(self.display(items))
+                    items.extend([state.item_user("Next task"), self.card("done", turn_id="new")])
+                    self.assertEqual(self.note(self.display(items, busy=True, active_turn_id="new")), expected)
+                    items.append(state.item_error("New turn failed"))
+                    self.assertEqual(self.note(self.display(items)), expected)
+
+    def test_legacy_chats_use_turn_boundaries_without_claiming_recovery(self):
+        self.assertEqual(self.note(self.display([self.card(), self.card("done")])),
+                         "This step had a mistake; Loopcut carried on.")
+        self.assertIn("correcting", self.note(self.display([self.card()], busy=True, active_turn_id="driver")))
+        for boundary in (state.item_user("Next task"), state.item_error("Stopped."),
+                         state.item_changes("1 added", ["+ Cube (mesh)"], "")):
+            with self.subTest(boundary=boundary):
+                display = self.display([self.card(), boundary, self.card("done")], busy=True)
+                self.assertIn("This step failed", self.note(display))
+
+    def test_stale_recovery_field_cannot_claim_a_repair(self):
+        display = self.display([self.card(code_repair="recovered")])
+        self.assertIn("This step failed", self.note(display))
+        self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+
+    def test_pending_correction_keeps_run_approval_and_terminal_failure_is_red(self):
+        pending = self.card("awaiting", code="pass")
+        display = self.display([self.card(), pending], busy=True)
+        self.assertIn("correcting", self.note(display))
+        self.assertEqual(hit(display, "item1.tool.run")["action"], ("approve", 1))
+        self.assertNotIn("Recovered", self.note(display))
+        ended = self.display([self.card()])
+        self.assertIn("This step failed", self.note(ended))
+        self.assertEqual(prim(ended, "item0.tool.glyph")["color"], T.ERROR)
+
+
 class ErrorCardTest(unittest.TestCase):
     def test_a_dropped_connection_offers_try_again_while_it_is_the_newest_item(self):
         session = state.new_session()
@@ -729,7 +911,7 @@ class FooterTest(unittest.TestCase):
         display = build(session)
         texts = {p["id"]: p["text"] for p in display["prims"] if p["t"] == "text"}
         self.assertEqual(texts["input.hint"], "⏎  note   esc  stop")
-        self.assertEqual(texts["input.placeholder"], "Add a note; it goes in at the next step")
+        self.assertEqual(texts["input.placeholder"], "Add a note; Loopcut replies when it can")
 
 
 class PickerTest(unittest.TestCase):
@@ -775,14 +957,14 @@ class QueuedTest(unittest.TestCase):
         delivery = lambda display: " ".join(p["text"] for p in display["prims"]
                                             if p["id"].startswith("item1.delivery."))
         self.assertEqual(delivery(display),
-                         "Queued for the main agent; helper can read this before another request")
+                         "Loopcut will reply when the helpers report back")
         self.assertEqual(hit(display, "item1.send_now")["action"], ("send_queued_now", 1))
         self.assertEqual(texts(display)["item1.send_now.label.l0"], "Stop helper and send now")
         self.assertEqual([h["id"] for h in display["hits"] if h["id"].startswith("item1.")],
                          ["item1.send_now"])
         session["items"][0]["rows"][0]["status"] = "done"
         display = build(session)
-        self.assertEqual(delivery(display), "Queued for the main agent")
+        self.assertEqual(delivery(display), "Waiting for Loopcut to reply")
         self.assertNotIn("item1.send_now", ids(display, "hits"))
 
     def test_delivery_is_conditional_during_work_checking_and_merging(self):
@@ -798,7 +980,7 @@ class QueuedTest(unittest.TestCase):
                                         if p["id"].startswith("item1.delivery."))
                     helper = "helper" if count == 1 else "helpers"
                     self.assertEqual(delivery,
-                                     f"Queued for the main agent; {helper} can read this before another request")
+                                     "Loopcut will reply when the helpers report back")
                     self.assertEqual(texts(display)["item1.send_now.label.l0"], f"Stop {helper} and send now")
                     self.assertEqual(note, before, "the parent's card remains queued after helper delivery")
 
@@ -807,12 +989,13 @@ class QueuedTest(unittest.TestCase):
         session["items"].append(dict(state.item_user("smaller"), queued=True, sending=True))
         display = build(session)
         delivery = " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item1.delivery."))
-        self.assertEqual(delivery, "Stopping helper; queued for the main agent")
+        self.assertEqual(delivery, "Stopping helper; Loopcut will reply after they stop")
         self.assertNotIn("item1.send_now", ids(display, "hits"))
 
     def test_note_and_action_wrap_within_a_narrow_card(self):
         session = chat(wave(worker("a", "working")), busy=True)
-        note = dict(state.item_user("smaller"), queued=True)
+        note = dict(state.item_user("smaller"), queued=True, helper_deliveries=[
+            {"wave": "w1", "worker": "a", "deliverable": "the printing machine", "step": 26}])
         session["items"].append(note)
         for width, scale in ((240, 1), (420, 1.5)):
             frame = layout.Frame(width, 600, scale, measure, session=session)
@@ -824,33 +1007,90 @@ class QueuedTest(unittest.TestCase):
                     self.assertLessEqual(p["x"] + measure("ui", p["size"], p["text"]), width)
                     self.assertLessEqual(p["y"] + p["h"], height)
 
+    def test_note_shows_each_helpers_receipt_separately_from_the_pending_reply(self):
+        session = chat(wave(worker("a", "working"), worker("b", "queued")), busy=True)
+        note = dict(state.item_user("smaller"), queued=True, helper_deliveries=[
+            {"wave": "w1", "worker": "a", "deliverable": "A", "step": 26},
+            {"wave": "w1", "worker": "b", "deliverable": "B"}])
+        session["items"].append(note)
+        before = deepcopy(note)
+        display = build(session)
+        visible = " ".join(texts(display).values())
+        self.assertEqual(texts(display)["item1.queued"], "sent")
+        self.assertIn("Sent to the helper building A (it read it at step 26)", visible)
+        self.assertIn("Sent to the helper building B (not read yet)", visible)
+        self.assertIn("Loopcut will reply when the helpers report back", visible)
+        self.assertEqual(note, before)
+        note.pop("queued")  # The main agent has now taken the note, too; retain the helper evidence.
+        display = build(session)
+        self.assertNotIn("item1.queued", ids(display, "prims"))
+        self.assertNotIn("item1.send_now", ids(display, "hits"))
+        self.assertIn("it read it at step 26", " ".join(texts(display).values()))
+
 
 class DelegateDetailsTest(unittest.TestCase):
+    def test_legacy_dry_run_keeps_retry_wording_without_claiming_startup(self):
+        refused = dict(state.item_tool("delegate", "Check a helper plan", ""), status="failed",
+                       plan_repair="needed", plan_turn="turn1", plan_workers=[["a", "modeling"]])
+        retry = dict(state.item_tool("delegate", "Check a helper plan", '{"dry_run": true}'), status="done",
+                     plan_turn="turn1", plan_workers=[["a", "modeling"]], output="Plan accepted")
+        session = chat(refused)
+        session["items"].append(retry)
+        display = layout.build(session, 900, 2000, 1.0, measure)
+        self.assertEqual(texts(display)["item0.tool.summary"], "Adjusted the helper plan and retried")
+        self.assertEqual(texts(display)["item0.tool.glyph"], "✓")
+        retry["plan_started"] = True
+        self.assertEqual(texts(layout.build(session, 900, 2000, 1.0, measure))["item0.tool.summary"],
+                         "Helper started")
+
     def test_plan_diagnostics_and_budget_stay_behind_details(self):
-        for repair in ("needed", "resolved"):
+        for repair in ("needed", "adjusting", "resolved"):
             for expanded in (False, True):
                 item = state.item_tool("delegate", "Check a helper plan", '{"workers": [{"id": "chair"}]}')
                 item.update(status="failed", expanded=expanded, plan_repair="needed", plan_turn="turn1",
                             plan_workers=[["chair", "modeling"]],
                             output="workers[0].checks[0]: missing kind. Budget: $0.40")
                 session = chat(item)
+                if repair == "adjusting":
+                    session.update(busy=True, turn=types.SimpleNamespace(plan_turn="turn1"))
                 if repair == "resolved":
                     retry = state.item_tool("delegate", "Start a helper", item["code"])
-                    retry.update(status="done", plan_turn="turn1", plan_workers=[["chair", "modeling"]])
+                    retry.update(status="running", plan_turn="turn1", plan_workers=[["chair", "modeling"]],
+                                 plan_started=True)
                     session["items"].append(retry)
                 display = build(session)
                 visible = " ".join(texts(display).values())
                 self.assertNotIn("workers[0]", visible)
                 self.assertNotIn("$0.40", visible)
                 self.assertNotIn("item0.tool.reason", ids(display, "prims"))
-                expected = ("Adjusted the helper plan and retried" if repair == "resolved"
-                            else "Helper plan needs adjustment")
+                expected = {"resolved": "Helper started", "adjusting": "Adjusting the helper plan…",
+                            "needed": "Helper plan needs adjustment"}[repair]
                 # The collapsed line may ellipsize at narrow widths.
                 self.assertTrue(expected.startswith(texts(display)["item0.tool.summary"].rstrip("…")))
-                if repair == "resolved":
-                    self.assertNotEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+                self.assertEqual(prim(display, "item0.tool.glyph")["color"] == T.ERROR, repair == "needed")
                 item.update(expanded=True, details_expanded=True)
-                self.assertIn("workers[0].checks[0]", " ".join(texts(build(session)).values()))
+                display = build(session)
+                self.assertIn("workers[0].checks[0]", " ".join(texts(display).values()))
+                self.assertEqual(prim(display, "item0.tool.output.l0")["color"] == T.ERROR, repair == "needed")
+
+    def test_only_a_matching_started_retry_recovers_an_active_plan(self):
+        refused = dict(state.item_tool("delegate", "Start helpers", ""), status="failed",
+                       plan_repair="needed", plan_turn="turn1", plan_workers=[["a", "modeling"]])
+        for status in ("awaiting", "running", "failed", "rejected", "done"):
+            retry = dict(state.item_tool("delegate", "Retry helpers", ""), status=status,
+                         plan_turn="turn1", plan_workers=[["a", "modeling"]], plan_dry_run=False)
+            session = chat(refused, busy=True)
+            session["items"].append(retry)
+            session["turn"] = types.SimpleNamespace(plan_turn="turn1")
+            self.assertEqual(texts(build(session))["item0.tool.summary"], "Adjusting the helper plan…")
+            retry["plan_started"] = True
+            self.assertEqual(texts(build(session))["item0.tool.summary"], "Helper started")
+            retry["plan_workers"] = [["b", "modeling"]]
+            self.assertEqual(texts(build(session))["item0.tool.summary"], "Adjusting the helper plan…")
+        session["busy"] = False
+        self.assertEqual(prim(build(session), "item0.tool.glyph")["color"], T.ERROR)
+        session.update(busy=True, turn=types.SimpleNamespace(plan_turn="turn2"))
+        self.assertEqual(prim(build(session), "item0.tool.glyph")["color"], T.ERROR)
 
     def test_successful_helper_output_keeps_internal_budget_in_details(self):
         item = state.item_tool("delegate", "Start a helper", "Internal ceiling: $0.40")
@@ -1443,7 +1683,8 @@ class HelperPreviewTest(unittest.TestCase):
         display = build(chat(wave(row)))
         preview = prim(display, "item0.wave.row0.image")
         self.assertEqual(preview["path"], row["image_path"])
-        self.assertEqual(hit(display, "item0.wave.row0.image")["action"], ("reference_open", row["image_path"]))
+        self.assertEqual(hit(display, "item0.wave.row0.image")["action"],
+                         ("preview_open", (row["image_path"], row["deliverable"])))
         card = prim(display, "item0.wave.card")
         self.assertLessEqual(preview["y"] + preview["h"], card["y"] + card["h"])
         missing = build(chat(wave(row)), missing_paths=[row["image_path"]])
@@ -1568,16 +1809,17 @@ class SceneChangesPreviewTest(unittest.TestCase):
     def details(self, display):
         return [p for p in display["prims"] if p["id"].startswith("item0.changes.l")]
 
-    def test_collapsed_long_entry_reserves_a_row_for_show_more(self):
+    def test_collapsed_long_entry_keeps_all_details_behind_show_more(self):
         for width, scale in self.SIZES:
             with self.subTest(width=width, scale=scale):
                 item = state.item_changes("1 changed", [self.LONG_ENTRY], "cp1")
                 display = self.display(item, width, scale)
                 rows = self.details(display)
-                self.assertEqual(len(rows), layout.CHANGES_PREVIEW_LINES - 1)
+                self.assertEqual(rows, [])
                 more = prim(display, "item0.changes.more")
-                self.assertRegex(more["text"], r"^Show \d+ more$")
-                self.assertGreaterEqual(more["y"], rows[-1]["y"] + rows[-1]["h"])
+                self.assertEqual(more["text"], "Show more")
+                summary = prim(display, "item0.changes.summary.l0")
+                self.assertGreaterEqual(more["y"], summary["y"] + summary["h"])
                 self.assertEqual(hit(display, "item0.changes.more")["action"], ("toggle", 0))
 
     def test_expanded_long_entry_shows_complete_text_and_show_less(self):
@@ -1597,7 +1839,7 @@ class SceneChangesPreviewTest(unittest.TestCase):
                 self.assertEqual(prim(display, "item0.changes.more")["text"], "Show less")
                 self.assertEqual(hit(display, "item0.changes.more")["action"], ("toggle", 0))
 
-    def test_short_entries_within_budget_have_no_toggle(self):
+    def test_even_short_details_need_show_more_and_empty_changes_have_no_toggle(self):
         for count in (0, 3, layout.CHANGES_PREVIEW_LINES):
             for expanded in (False, True):
                 with self.subTest(count=count, expanded=expanded):
@@ -1606,9 +1848,31 @@ class SceneChangesPreviewTest(unittest.TestCase):
                     item["expanded"] = expanded
                     display = self.display(item)
                     self.assertEqual([p["text"] for p in self.details(display)],
-                                     [line[2:] for line in lines])
-                    self.assertNotIn("item0.changes.more", ids(display, "prims"))
-                    self.assertNotIn("item0.changes.more", ids(display, "hits"))
+                                     [line[2:] for line in lines] if expanded else [])
+                    self.assertEqual("item0.changes.more" in ids(display, "hits"), bool(count))
+
+    def test_summary_names_and_count_precede_coordinates_at_all_panel_sizes(self):
+        lines = ["+ Chest (mesh) at [-1, -1, 0]..[1, 1, 2]", "- Old lid (mesh)",
+                 "~ New lid: location (0, 0, 0) -> (0, 0, 2); bounds now [-1, -1, 0]..[1, 1, 2]",
+                 "~ scene render.resolution_x 1920 -> 1080"]
+        for width, scale in self.SIZES:
+            with self.subTest(width=width, scale=scale):
+                item = state.item_changes("1 added, 1 removed, 2 changed", lines, "cp1")
+                display = self.display(item, width, scale)
+                visible = " ".join(p.get("text", "") for p in display["prims"])
+                for text in ("1 added, 1 removed, 2 changed", "Chest", "Old lid", "New lid", "Show more"):
+                    self.assertIn(text, visible)
+                for text in ("bounds", "location", "[-1", "1920"):
+                    self.assertNotIn(text, visible)
+                for p in display["prims"]:
+                    if p["t"] == "text":
+                        self.assertLessEqual(right(p), width - round(T.CARD_PAD * scale))
+                item["expanded"] = True
+                expanded = self.display(item, width, scale)
+                for n, line in enumerate(lines):
+                    actual = " ".join(p["text"] for p in self.details(expanded)
+                                      if p["id"].startswith(f"item0.changes.l{n}."))
+                    self.assertEqual(actual, line[2:])
 
     def test_stored_changes_prefixes_and_keep_undo_are_preserved(self):
         lines = ["+ " + self.LONG_ENTRY[2:], "- Previous value", "~ Updated value"]

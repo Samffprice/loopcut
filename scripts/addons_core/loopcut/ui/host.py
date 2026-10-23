@@ -441,6 +441,21 @@ def _do_action(session: dict, action) -> None:
     kind, index = action
     if kind == "reference_url":
         account.open_browser(index)
+    elif kind == "preview_open":
+        path, title = index
+        title = " ".join(title.split())[:120] or "Scene preview"
+        state.ui.pop("action_notice", None)
+        preview = {"path": path, "title": title, "conversation": session["id"]}
+        if state.ui.get("preview") == preview:
+            state.ui.pop("preview", None)
+            return
+        state.ui.pop("preview", None)
+        _refresh_missing_paths(session, force=True)
+        if not Path(path).is_file():
+            state.ui["action_notice"] = {"text": f"{title}: this preview is no longer available.",
+                                         "until": time.time() + 6.0}
+            return
+        state.ui["preview"] = preview
     elif kind in {"reference_open", "reference_folder"}:
         state.ui.pop("action_notice", None)
         error = ""
@@ -1063,6 +1078,10 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
     def _key(self, context, session, event) -> bool:
         """One key press in the input box. False means: leave the panel."""
         kind, shift = event.type, event.shift
+        preview = state.ui.get("preview")
+        if kind == "ESC" and preview and preview.get("conversation") == session["id"]:
+            state.ui.pop("preview", None)
+            return True
         command = event.oskey or event.ctrl       # Cmd on macOS, Ctrl elsewhere; both accepted.
         by_word = event.alt or (event.ctrl and sys.platform != "darwin")
         if state.ui.get("picker") is not None and _picker_key(session, event):

@@ -170,12 +170,13 @@ def _write_snapshot(store: Store, kind: str, label: str, **extra) -> dict:
     return entry
 
 
-def begin_turn(session: dict, user_item: dict) -> None:
-    """Call before the user's message is appended. Nothing is written yet."""
+def begin_turn(session: dict, user_item: dict, *, text: str | None = None) -> None:
+    """Record the request before sending; reused notes may already be in history. Nothing is written yet."""
     session["pending_checkpoint"] = {
         "item": user_item,
+        "input": user_item["text"] if text is None else text,
         "message_index": len(session["messages"]),
-        "item_index": len(session["items"]),
+        "item_index": next((i for i, item in enumerate(session["items"]) if item is user_item), len(session["items"])),
     }
 
 
@@ -186,7 +187,8 @@ def ensure_for_turn(session: dict) -> None:
     if not pending:
         return
     entry = _write_snapshot(_store(session), "turn", pending["item"]["text"],
-                            message_index=pending["message_index"], item_index=pending["item_index"])
+                            message_index=pending["message_index"], item_index=pending["item_index"],
+                            input=pending["input"])
     pending["item"]["checkpoint"] = entry["id"]
     session["pending_checkpoint"] = None
 
@@ -318,7 +320,7 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
     # 3. The conversation.
     if target["kind"] == "turn":
         removed = session["items"][cut_items:]
-        text = next((i["text"] for i in removed if i["kind"] == "user"), "")
+        text = target.get("input", next((i["text"] for i in removed if i["kind"] == "user"), ""))
         del session["messages"][cut_messages:]
         del session["items"][cut_items:]
         session["input"], session["cursor"], session["anchor"] = text, len(text), None

@@ -21,6 +21,59 @@ def frame(**ui):
     return layout.Frame(420, 700, 1.0, lambda font, size, text: len(text) * size * 0.6, ui=ui)
 
 
+class StrictObject:
+    """RNA-like attributes: reading or writing an undeclared property is an error."""
+    __slots__ = ('_fields',)
+
+    def __init__(self, **fields):
+        object.__setattr__(self, '_fields', fields)
+
+    def __getattr__(self, name):
+        if name not in self._fields:
+            raise AttributeError(name)
+        return self._fields[name]
+
+    def __setattr__(self, name, value):
+        if name not in self._fields:
+            raise AttributeError(name)
+        self._fields[name] = value
+
+
+class ImageStore:
+    __slots__ = ('images', 'loads')
+
+    def __init__(self):
+        self.images, self.loads = [], []
+
+    def load(self, path, *, check_existing):
+        assert not check_existing
+        image = StrictObject(name=Path(path).name, filepath=path, users=0, size=(800, 400), alpha_mode='STRAIGHT')
+        self.images.append(image)
+        self.loads.append(path)
+        return image
+
+    def remove(self, image):
+        self.images.remove(image)
+
+
+class ImageSpace:
+    __slots__ = ('_image', 'mode')  # Blender 5.2 has no show_region_header here.
+
+    def __init__(self):
+        self._image, self.mode = None, 'VIEW'
+
+    @property
+    def image(self):
+        return self._image
+
+    @image.setter
+    def image(self, image):
+        if self._image is not None:
+            self._image.users -= 1  # The extra user remains even after replacement.
+        image.users += 2
+        self._image = image
+
+
 class FileActionsTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -77,13 +130,50 @@ class FileActionsTest(unittest.TestCase):
         self.assertLessEqual(image['w'] + 2 * T.CARD_PAD, 400)
         self.assertLessEqual(image['h'], 220)
         self.assertLess(image['y'] + image['h'], output['y'])
+        self.assertEqual(image['w'], 400 - 2 * T.CARD_PAD)
+        self.assertIn('Open image', [p.get('text') for p in f.prims])
         self.assertIn(('reference_open', str(self.file)), [h['action'] for h in f.hits])
+        self.assertFalse(any(h['action'][0] == 'preview_open' for h in f.hits))
         for expanded, missing in ((False, set()), (True, {str(self.file)})):
             card['expanded'] = expanded
             f = frame(missing_paths=missing)
             layout._item_tool(f, 0, card, 0, 0, 400)
             self.assertFalse(any(p['t'] == 'image' for p in f.prims))
-            self.assertFalse(any(h['action'][0] == 'reference_open' for h in f.hits))
+            self.assertFalse(any(h['action'][0] in {'reference_open', 'preview_open'} for h in f.hits))
+
+    def test_capture_uses_readable_summary_instead_of_hash_filename(self):
+        card = {**state.item_tool('capture_viewport', 'Chest from the front', ''), 'status': 'done',
+                'image_path': '/images/0123456789abcdef.png'}
+        f = frame()
+        layout._item_tool(f, 0, card, 0, 0, 400)
+        previews = [h for h in f.hits if h['action'][0] == 'preview_open']
+        self.assertEqual(len(previews), 2, 'both the image and its button open the preview')
+        self.assertTrue(all(h['action'][1] == (card['image_path'], 'Chest from the front') for h in previews))
+
+    def test_inline_previews_enlarge_at_narrow_widths_and_keep_titles_and_input(self):
+        for width, scale in ((240, 1), (420, 1), (640, 1.5)):
+            for helper in (False, True):
+                with self.subTest(width=width, scale=scale, helper=helper):
+                    session = state.new_session()
+                    path, title = '/images/0123456789abcdef.png', 'Printing machine'
+                    item = (state.item_wave('w1', 1, [{**state.wave_row('a', title, 'modeling'), 'image_path': path}])
+                            if helper else {**state.item_tool('capture_viewport', title, ''), 'image_path': path})
+                    session['items'] = [item]
+                    measure = lambda font, size, text: len(text) * size * 0.6
+                    collapsed = layout.build(session, width, 1200, scale, measure)
+                    enlarged = layout.build(session, width, 1200, scale, measure,
+                                            ui={'preview': {'path': path, 'title': title, 'conversation': session['id']}})
+                    thumb = next(p for p in collapsed['prims'] if p['t'] == 'image')
+                    image = next(p for p in enlarged['prims'] if p['t'] == 'image')
+                    self.assertGreater(image['w'], thumb['w'])
+                    self.assertGreater(image['h'], thumb['h'])
+                    self.assertLessEqual(image['x'] + image['w'], width)
+                    displayed_title = ' '.join(p['text'] for p in enlarged['prims']
+                                               if p['id'].startswith(image['id'] + '.title.'))
+                    self.assertEqual(displayed_title, title)
+                    self.assertIn('Close preview', [p.get('text') for p in enlarged['prims']])
+                    self.assertIsNotNone(enlarged['input'])
+                    self.assertFalse(any('0123456789abcdef' in p.get('text', '') for p in enlarged['prims']))
 
     def test_transient_notice_draws_above_input_and_expires(self):
         text = 'Opened a.png in your default app (outside Blender).'
@@ -126,7 +216,7 @@ class HostActionsTest(unittest.TestCase):
         self.clock = Mock(return_value=0.0)
         self.session = state.new_session()
         self.area = Mock()
-        self.windows = [SimpleNamespace(screen=SimpleNamespace(areas=[self.area]))]
+        self.windows = [SimpleNamespace(screen=SimpleNamespace(areas=[self.area]), as_pointer=lambda: 1)]
         namespace = {'__package__': 'loopcut.ui', 'Path': Path, 'sys': sys, '_runtime': {}, 'PATH_TTL': 3.0,
                      'time': SimpleNamespace(monotonic=self.clock, time=self.clock),
                      'state': SimpleNamespace(session=lambda: self.session, item_error=state.item_error, ui={}),
@@ -148,11 +238,186 @@ class HostActionsTest(unittest.TestCase):
         source = ADDONS / 'loopcut/ui/host.py'
         names = {'_do_action', '_image_paths', '_missing_paths', '_refresh_missing_paths', '_prune_images',
                  'tag_redraw_all', 'draw_area'}
-        nodes = [n for n in ast.parse(source.read_text()).body if getattr(n, 'name', None) in names]
+        tree = ast.parse(source.read_text())
+        nodes = [n for n in tree.body if getattr(n, 'name', None) in names]
+        # Inline expansion must preserve typing; Escape can close it.
+        key = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_key')
+        nodes.append(key)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), namespace)
         self.host = namespace
         self.action, self.missing, self.prune = (namespace[n] for n in ('_do_action', '_missing_paths', '_prune_images'))
         self.refresh = namespace['_refresh_missing_paths']
+
+    def preview_blender(self):
+        images = ImageStore()
+        self.area = StrictObject(type='TEXT_EDITOR', tag_redraw=Mock())
+        window = StrictObject(screen=StrictObject(areas=[self.area]), as_pointer=lambda: 1)
+        self.windows[:] = [window]
+        context = StrictObject(window_manager=StrictObject(windows=self.windows), window=window, area=self.area)
+
+        def duplicate(*args):
+            area = StrictObject(type='TEXT_EDITOR', spaces=StrictObject(active=ImageSpace()),
+                                regions=[StrictObject(type='WINDOW')], tag_redraw=Mock())
+            new = StrictObject(screen=StrictObject(areas=[area]), as_pointer=lambda: len(self.windows))
+            self.windows.append(new)
+            context.window, context.area = new, area  # area_dupli changes the active modal context.
+            return {'FINISHED'}
+
+        duplicate = Mock(side_effect=duplicate)
+        bpy = StrictObject(data=StrictObject(images=images), context=context,
+                           ops=StrictObject(screen=StrictObject(area_dupli=duplicate),
+                                            wm=StrictObject(path_open=self.open)))
+        self.host['bpy'] = bpy
+        # Use the real thumbnail cache for both collapsed and expanded display primitives.
+        source = ADDONS / 'loopcut/ui/draw.py'
+        tree = ast.parse(source.read_text())
+        names = {'_release_image', 'retain_images', '_image_texture'}
+        nodes = [n for n in tree.body if getattr(n, 'name', None) in names]
+        cache = {'bpy': bpy, 'Path': Path, '_image_cache': {}, 'IMAGES_KEPT': 24,
+                 'gpu': StrictObject(texture=StrictObject(from_image=lambda image: StrictObject(image=image)))}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), cache)
+        return images, cache, duplicate
+
+    def test_strict_preview_doubles_reproduce_rna_and_extra_user_semantics(self):
+        images, _, duplicate = self.preview_blender()
+        with self.assertRaises(AttributeError):
+            self.area.unknown_property = True
+        with self.assertRaises(AttributeError):
+            self.area.unknown_property
+        duplicate('INVOKE_DEFAULT')
+        space = self.host['bpy'].context.area.spaces.active
+        self.assertIsNot(self.host['bpy'].context.area, self.area)
+        with self.assertRaises(AttributeError):
+            space.show_region_header = True
+        first = images.load('/first.png', check_existing=False)
+        space.image = first
+        space.image = images.load('/second.png', check_existing=False)
+        self.assertEqual(first.users, 1)
+
+    def test_helper_and_capture_toggle_inline_using_cached_images_without_context_changes(self):
+        images, cache, duplicate = self.preview_blender()
+        context = self.host['bpy'].context
+        original_window, original_area = context.window, context.area
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / (name + '.png') for name in ('0123456789abcdef', 'fedcba9876543210')]
+            for path in paths:
+                path.touch()
+            capture = {**state.item_tool('capture_viewport', 'Chest from the front', ''),
+                       'status': 'done', 'image_path': str(paths[0])}
+            row = {**state.wave_row('a', 'Printing machine', 'modeling'), 'image_path': str(paths[1])}
+            self.session['items'] = [capture, state.item_wave('w1', 1, [row])]
+            self.session['input_first'] = 0
+            self.session['focused'] = True
+            before = copy.deepcopy(self.session)
+
+            def display():
+                result = layout.build(self.session, 600, 1800, 1, self.host['draw'].measure,
+                                      ui=self.host['state'].ui)
+                for prim in result['prims']:
+                    if prim['t'] == 'image':
+                        self.assertIsNotNone(cache['_image_texture'](prim['path']))
+                cache['retain_images'](self.host['_image_paths'](self.session))
+                return result
+
+            collapsed = display()
+            thumbs = {p['path']: p for p in collapsed['prims'] if p['t'] == 'image'}
+            self.assertEqual(len(images.images), 2)
+            # Open/close the same image, then A -> B -> A, repeatedly.
+            for index in (0, 0, 1, 0, 1, 1) * 4:
+                path, title = str(paths[index]), ('Chest from the front', 'Printing machine')[index]
+                action = ('preview_open', (path, title))
+                was_open = self.host['state'].ui.get('preview', {}).get('path') == path
+                self.action(self.session, action)
+                result = display()
+                image = next(p for p in result['prims'] if p['t'] == 'image' and p['path'] == path)
+                self.assertEqual(image['w'] > thumbs[path]['w'], not was_open)
+                self.assertEqual(image['h'] > thumbs[path]['h'], not was_open)
+                if not was_open:
+                    self.assertIn(title, [p.get('text') for p in result['prims'] if p['id'].endswith('.title.l0')])
+                    button = next(h for h in result['hits'] if h['id'] == image['id'] + '.open')
+                    self.assertEqual(button['action'], action)
+                self.assertIsNotNone(result['input'])
+                self.assertEqual(len(images.images), 2)
+                self.assertEqual(images.loads, [str(p) for p in paths])
+                self.assertIs(context.window, original_window)
+                self.assertIs(context.area, original_area)
+                self.assertEqual(len(self.windows), 1)
+                self.assertEqual(self.session, before)
+            duplicate.assert_not_called()
+            self.open.assert_not_called()
+            cache['retain_images'](())
+            self.assertEqual(images.images, [])
+
+    def test_helper_expands_inline_while_delivered_image_keeps_its_card_and_open_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / '0123456789abcdef.png'
+            path.touch()
+            title = 'Printing machine'
+            row = {**state.wave_row('a', title, 'modeling'), 'image_path': str(path)}
+            # The same stored image can appear as a helper preview and a delivered file.
+            delivered = {**state.item_tool('run_python', title, ''),
+                         'status': 'done', 'image_path': str(path)}
+            self.session['items'] = [delivered, state.item_wave('w1', 1, [row])]
+
+            def display():
+                return layout.build(self.session, 600, 1800, 1, self.host['draw'].measure,
+                                    ui=self.host['state'].ui)
+
+            before = display()
+            delivery_image, helper_image = [p for p in before['prims'] if p['t'] == 'image']
+            helper_action = next(h['action'] for h in before['hits'] if h['id'] == helper_image['id'])
+            self.assertEqual(helper_action, ('preview_open', (str(path), title)))
+            self.action(self.session, helper_action)
+            after = display()
+            delivery_after, helper_after = [p for p in after['prims'] if p['t'] == 'image']
+            self.assertGreater(helper_after['w'], helper_image['w'])
+            self.assertGreater(helper_after['h'], helper_image['h'])
+            self.assertIn('Close preview', [p.get('text') for p in after['prims']])
+            self.assertEqual(delivery_after, delivery_image)
+            self.assertEqual([p for p in after['prims'] if p['id'].startswith('item0.')],
+                             [p for p in before['prims'] if p['id'].startswith('item0.')])
+            self.assertIn('Open image', [p.get('text') for p in after['prims']])
+            delivery_action = next(h['action'] for h in after['hits']
+                                   if h['id'] == delivery_image['id'] + '.open')
+            self.assertEqual(delivery_action, ('reference_open', str(path)))
+            self.open.assert_not_called()
+            self.action(self.session, delivery_action)
+            self.open.assert_called_once_with(filepath=str(path))
+            self.assertIsNotNone(after['input'])
+
+    def test_preview_does_not_expand_in_another_conversation(self):
+        path, title = '/saved/a.png', 'Chest'
+        self.session['items'] = [{**state.item_tool('capture_viewport', title, ''), 'image_path': path}]
+        self.host['state'].ui['preview'] = {'path': path, 'title': title, 'conversation': 'another-chat'}
+        display = layout.build(self.session, 600, 800, 1, self.host['draw'].measure, ui=self.host['state'].ui)
+        image = next(p for p in display['prims'] if p['t'] == 'image')
+        self.assertEqual(image['w'], 220)
+        self.assertIsNotNone(display['input'])
+
+    def test_missing_preview_is_readable_and_never_opens_an_app(self):
+        images, _, duplicate = self.preview_blender()
+        self.action(self.session, ('preview_open', ('/missing/hash.png', 'Printing machine')))
+        self.assertEqual(self.notice_text(), 'Printing machine: this preview is no longer available.')
+        self.assertEqual(self.session['items'], [])
+        self.assertEqual(images.loads, [])
+        self.assertNotIn('preview', self.host['state'].ui)
+        duplicate.assert_not_called()
+        self.open.assert_not_called()
+
+    def test_inline_preview_allows_typing_and_escape_closes_without_stopping(self):
+        from loopcut.ui import textedit
+        self.host.update(textedit=textedit, _update_mentions=Mock(), agent=StrictObject(decide=Mock(), stop=Mock()))
+        self.session['first_prompt_typed'] = True
+        self.host['state'].ui['preview'] = {'path': '/a.png', 'title': 'Chest', 'conversation': self.session['id']}
+        event = StrictObject(type='A', shift=False, oskey=False, ctrl=False, alt=False, unicode='a')
+        self.assertTrue(self.host['_key'](None, None, self.session, event))
+        self.assertEqual(self.session['input'], 'a')
+        self.assertIn('preview', self.host['state'].ui)
+        event.type = 'ESC'
+        self.assertTrue(self.host['_key'](None, None, self.session, event))
+        self.assertNotIn('preview', self.host['state'].ui)
+        self.host['agent'].decide.assert_not_called()
+        self.host['agent'].stop.assert_not_called()
 
     def notice_text(self):
         display = layout.build(self.session, 420, 700, 1.0, self.host['draw'].measure,

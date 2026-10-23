@@ -104,12 +104,9 @@ def _start_readiness():
     cancel = threading.Event()
     _ready_cancel = cancel
     force, _force_ready = _force_ready, False
-    if not getattr(bpy.app, "online_access", True):
-        from . import telemetry
-        _ready.update(status="done", code="offline", model=selected, account=account, selected=selected, note="")
-        telemetry.setup_step("chatgpt", "chatgpt", False, "readiness_offline")
-        _redraw()
-        return None
+    # Not gated on bpy.app.online_access: it is off on most installs and Loopcut's chat never reads it, so the
+    # gate only skipped the check (and its model fallback) for people who then chatted fine. A real network
+    # failure still ends the check as "offline".
     actual = chatgpt_ready.effective_model(account, selected)
     if not force and chatgpt_ready.verified(account, actual):
         note = _ready["note"] if _ready["account"] == account and _ready["model"] == actual else ""

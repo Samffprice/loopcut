@@ -1,0 +1,174 @@
+{
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "items": [
+    {
+      "kind": "user",
+      "text": "Build a chest",
+      "images": []
+    },
+    {
+      "kind": "tool",
+      "name": "run_python",
+      "summary": "Build the chest",
+      "code": "invalid?",
+      "status": "failed",
+      "output": "SyntaxError: invalid syntax\n\nScene changes: none.",
+      "expanded": true
+    },
+    {
+      "kind": "tool",
+      "name": "get_scene_info",
+      "summary": "Read the scene",
+      "code": "",
+      "status": "done",
+      "output": "Cube"
+    },
+    {
+      "kind": "assistant",
+      "text": "The chest is ready for another look.",
+      "streaming": false
+    },
+    {
+      "kind": "notice",
+      "text": "Scene checkpoint saved.",
+      "action_label": "",
+      "checkpoint": "",
+      "url": ""
+    },
+    {
+      "kind": "user",
+      "text": "Adjust the lid",
+      "images": []
+    },
+    {
+      "kind": "tool",
+      "name": "run_python",
+      "summary": "Build the chest",
+      "code": "invalid?",
+      "status": "failed",
+      "output": "SyntaxError: invalid syntax\n\nScene changes: none.",
+      "expanded": true
+    },
+    {
+      "kind": "tool",
+      "name": "get_scene_info",
+      "summary": "Read the scene",
+      "code": "",
+      "status": "done",
+      "output": "Cube"
+    },
+    {
+      "kind": "error",
+      "text": "Stopped."
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Build a chest"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "False-0",
+          "type": "function",
+          "function": {
+            "name": "run_python",
+            "arguments": "{\"code\": \"invalid?\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "False-0",
+      "content": "SyntaxError: invalid syntax\n\nScene changes: none."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "False-1",
+          "type": "function",
+          "function": {
+            "name": "get_scene_info",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "False-1",
+      "content": "Cube"
+    },
+    {
+      "role": "assistant",
+      "content": "The chest is ready for another look."
+    },
+    {
+      "role": "user",
+      "content": "Adjust the lid"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "True-0",
+          "type": "function",
+          "function": {
+            "name": "run_python",
+            "arguments": "{\"code\": \"invalid?\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "True-0",
+      "content": "SyntaxError: invalid syntax\n\nScene changes: none."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "True-1",
+          "type": "function",
+          "function": {
+            "name": "get_scene_info",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "True-1",
+      "content": "Cube"
+    }
+  ],
+  "input": "",
+  "attachments": [],
+  "references": [],
+  "projects": [],
+  "title": "Legacy code failures",
+  "created": 0,
+  "usage": {
+    "input": 0,
+    "cached": 0,
+    "output": 0,
+    "context": 0
+  },
+  "mode": "",
+  "codex_thread": "",
+  "spend": {
+    "credits": 0,
+    "auto": 0,
+    "allowed": 0
+  }
+}

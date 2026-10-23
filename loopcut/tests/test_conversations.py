@@ -47,6 +47,27 @@ class ConversationsTest(unittest.TestCase):
         self.assertEqual((loaded["title"], loaded["input"], loaded["cursor"]), ("build a desk", "next idea", 9))
         self.assertEqual((loaded["focused"], loaded["busy"], loaded["scroll"], loaded["turn"]), (False, False, 0.0, None))
 
+    def test_0_2_11_code_failures_load_display_and_resave_without_new_fields(self):
+        # Generated with v0.2.11's state constructors and conversations.save, before turn metadata.
+        source = Path(__file__).with_name("fixtures") / "conversation-v0.2.11.json"
+        body = json.loads(source.read_text(encoding="utf-8"))
+        folder = cv.root() / body["id"]
+        folder.mkdir(parents=True)
+        (folder / "conversation.json").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        loaded = cv.load(body["id"])
+        self.assertEqual(loaded["items"], body["items"])
+        self.assertEqual(loaded["messages"], body["messages"])
+        self.assertEqual(layout._code_repairs(loaded["items"], False), {1: "continued"})
+        display = layout.build(loaded, 900, 4000, 1.0, lambda f, s, t: len(t) * s * 0.5)
+        prims = {p["id"]: p for p in display["prims"]}
+        self.assertEqual(prims["item1.tool.glyph"]["color"], layout.T.TEXT_MUTED)
+        self.assertEqual(prims["item6.tool.glyph"]["color"], layout.T.ERROR)
+        self.assertEqual(prims["item6.tool.output.l0"]["text"], "SyntaxError: invalid syntax")
+        self.assertIn("Stopped.", [p.get("text") for p in display["prims"]])
+        self.assertIn("Scene checkpoint saved.", [p.get("text") for p in display["prims"]])
+        cv.save(loaded)
+        self.assertEqual(cv.load(body["id"])["items"], body["items"])
+
     def test_an_empty_conversation_is_not_written(self):
         cv.save(state.new_session())
         self.assertFalse(cv.root().exists())

@@ -950,7 +950,10 @@ def _model_import(job):
         if not objects:
             raise cloud_http.CloudError("Model contained no objects", "apply_failed")
         _fresh_materials(objects, previous)
-        collection = bpy.data.collections.new(f"Loopcut {job['id']} {output['name']}")
+        label = f"Loopcut {job['id']} {output['name']}"
+        if job["provenance"]["kind"] == "gen":
+            _neutral_names(previous, label)
+        collection = bpy.data.collections.new(label)
         bpy.context.scene.collection.children.link(collection)
         root = bpy.data.objects.new(collection.name, None)
         collection.objects.link(root)
@@ -1054,6 +1057,31 @@ def _remove_created(before):
             continue
         for block in [b for b in collection if _identity(b) not in before]:
             collection.remove(block)
+
+
+# Generated models arrive with the vendor's export names (tripo_node_<uuid>, Color_<uuid>), which then show in
+# the Outliner and the change card. Assist tools keep the user's own names, so only "gen" results are renamed.
+_VENDOR_TAG = re.compile(r"(?i)(?:^|[_\- ])(?:tripo|rodin|hyper3d|meshy|trellis|hunyuan)(?=[_\- ]|$)")
+_UUID_TAG = re.compile(r"(?i)[_\- ]?[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}")
+_GENERIC_PART = {"node": "mesh", "mesh": "mesh", "geometry": "mesh", "": ""}
+
+
+def _neutral_name(name: str, label: str) -> str | None:
+    """'tripo_node_<uuid>' -> '<label> mesh', 'Color_<uuid>' -> '<label> Color'; None keeps the name."""
+    if not (_UUID_TAG.search(name) or _VENDOR_TAG.search(name)):
+        return None
+    part = re.sub(r"[_\-]+", " ", _VENDOR_TAG.sub(" ", _UUID_TAG.sub("", name))).strip()
+    part = _GENERIC_PART.get(part.lower(), part)
+    return f"{label} {part}" if part else label
+
+
+def _neutral_names(previous, label):
+    import bpy
+    for block in created_datablocks(previous, datablock_snapshot(bpy.data)):
+        name = getattr(block, "name", None)
+        renamed = _neutral_name(name, label) if isinstance(name, str) else None
+        if renamed:
+            block.name = renamed
 
 
 def _fresh_materials(objects, previous):
