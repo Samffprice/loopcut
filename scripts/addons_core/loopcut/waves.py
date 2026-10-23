@@ -431,17 +431,22 @@ class _HostRuntime:
                      "boxes": _planned_boxes(brief), "run_timeout": config.run_timeout(),
                      "reference": getattr(worker, "reference", None)}
         parent = {name: self._parent_tool(wave, name, worker.cancelled) for name in ("search_assets", "look_at_reference")}
-        parent["fetch_asset"] = lambda arguments: wave.on_main(lambda: _fetch_asset(arguments))
+        parent["fetch_asset"] = lambda arguments: wave.on_main(lambda: _fetch_asset(arguments, wave.session))
         self.tools = worker_host.WorkerRuntime(child, parent)
         self.is_cancelled = worker.cancelled
         self.warnings: list = []
 
     @staticmethod
     def _parent_tool(wave: Wave, name: str, is_cancelled=None):
+        session = getattr(wave, "session", None)
+
+        def on_main(fn):  # Search results are numbered in the wave's conversation, whichever is on screen.
+            return wave.on_main(lambda: _in_conversation(session, fn))
+
         def run(arguments_json):
-            result = wave.on_main(lambda: tools.execute(name, arguments_json))
+            result = on_main(lambda: tools.execute(name, arguments_json))
             if result.then:
-                return result.then(is_cancelled or wave.turn.cancel.is_set, wave.on_main)
+                return result.then(is_cancelled or wave.turn.cancel.is_set, on_main)
             return result
         return run
 
@@ -481,9 +486,17 @@ def _planned_boxes(brief: dict) -> list:
     return [[list(low), list(high)] for low, high in _boxes(brief.get("bounds")) or ()]
 
 
-def _fetch_asset(arguments: dict) -> dict:
+def _in_conversation(session, fn):
+    """fn() with asset pick numbers read and written in `session`: a worker's call can run after
+    lifecycle.switch_to put another conversation on screen."""
+    from . import asset_picks
+    with asset_picks.bound(session):
+        return fn()
+
+
+def _fetch_asset(arguments: dict, session: dict | None = None) -> dict:
     from . import assets
-    return assets.fetch_asset(**arguments)
+    return _in_conversation(session, lambda: assets.fetch_asset(**arguments))
 
 
 def _merge(spawn, results: list, checkpoint, keep_spawn: bool = False):

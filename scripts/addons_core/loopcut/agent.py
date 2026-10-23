@@ -588,7 +588,7 @@ def _hosted_refusal(session: dict, turn: Turn, item: dict, info: dict | None = N
                 windows[window] = dict(item_to_show)
             state.ui["allowance_notice"] = {"item": item_to_show, "conversation": session["id"], "windows": windows}
     _on_main(apply)
-    if info:
+    if info and item["reason"] != "insufficient_credits":  # Out of credits: no chat windows to warn about.
         from . import mainthread
         # Only draft restoration waits for the main thread, as in the ordinary refusal path.
         # Its percentage warning is optional and never delays turn finalisation or saving.
@@ -614,6 +614,9 @@ def _allowance_notice_matches(row: dict, name: str, key: str, reset: str | None)
 def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | None = None,
                         refused: str | None = None) -> None:
     """Main thread: warn once per server window; the ordinary conversation saves persist it."""
+    from . import chat_credits
+    if info.get("billing") == chat_credits.CREDITS or chat_credits.active():
+        return  # Credits accounts still get the window headers, but no windows apply to them.
     owner = turn
     while owner is not None and owner.chat:
         session, owner = owner.chat
@@ -1608,6 +1611,63 @@ def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
                                lambda: _on_main(lambda: contact.refresh(turn), turn.cancel.is_set))
 
 
+def _continue_announced(session: dict, turn: Turn, spec: LoopSpec, request: dict, completion, cfg: config.Config,
+                        step: int, scene_action) -> bool:
+    """A reply that announces its next step and calls no tool ("I will next import the desk.") goes on with
+    completion_guard.CONTINUE instead of ending the turn. At most MAX_CONTINUES per user turn and never twice
+    without a tool run in between, counted on the user's message so a resumed turn keeps the count. Never
+    for a worker, after a Stop, at the step limit, on a question or other request for no scene work (even
+    after a read tool ran), with a note the user sent during the reply (it goes to the model next), while
+    a card waits for the user anywhere in the turn, before the router's own nudge to delegate on a level-3
+    turn, or while workers have yet to report (the finish gate collects them and continues the turn)."""
+    if (spec.role == "worker" or turn.cancel.is_set() or turn.outcome != "running" or turn.notes
+            or (cfg.max_steps and step >= cfg.max_steps)
+            or scene_action is False or not (scene_action or turn.executed_tools)):
+        return False
+    used = request.get(completion_guard.CONTINUED, 0)
+    if (used >= completion_guard.MAX_CONTINUES
+            or turn.executed_tools <= request.get(completion_guard.CONTINUED_AT, -1)):
+        return False
+    routed = getattr(turn, "routed", None)
+    if (spec.role == "orchestrator" and not session.get("workers_unavailable") and routed is not None
+            and routed.level >= 3 and not turn.delegations and not getattr(turn, "nudged", False)):
+        return False  # router.nudge, in the finish gates, asks for the delegation first.
+    if any(item.get("status") == "awaiting" or (item.get("kind") == "offer" and not item.get("resolved"))
+           or (item.get("kind") == "limit" and item.get("status") != "done")
+           for item in _turn_items(session, request)):
+        return False
+    job = getattr(turn, "job", None)
+    if job is not None:
+        from . import waves
+        try:
+            if waves.pending(job):
+                return False
+        except Exception:  # Unknown: leave the turn to the finish gate.
+            return False
+    if not completion_guard.announces_step(completion.text):
+        return False
+    request[completion_guard.CONTINUED] = used + 1
+    request[completion_guard.CONTINUED_AT] = turn.executed_tools
+    return True
+
+
+def _turn_items(session: dict, request: dict) -> list:
+    """The chat items of the user's turn, across resumes: from its own message's item on. Notes sent during
+    the turn are user items too: those folded into the history (STEER) and those still queued are passed over."""
+    messages, items = session["messages"], session["items"]
+    start = next((i for i in range(len(messages) - 1, -1, -1) if messages[i] is request), None)
+    if start is None:
+        return items
+    notes = sum(1 for m in messages[start + 1:] if m.get(context.STEER))
+    for index in range(len(items) - 1, -1, -1):
+        if items[index].get("kind") != "user" or items[index].get("queued"):
+            continue
+        if not notes:
+            return items[index:]
+        notes -= 1
+    return items
+
+
 def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
          ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
     """The turn's loop with the spec send() chose; today's single loop when it chose none."""
@@ -1624,6 +1684,8 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             session_logs.on_turn_end(session, turn)  # Sharing off, LOOPCUT_TELEMETRY off or headless: nothing.
         except Exception as ex:
             print(f"Loopcut: conversation log not sent: {type(ex).__name__}")
+        from . import chat_credits
+        chat_credits.turn_end(session, turn)  # The credits arm's "Done · N credits"; never raises.
 
 
 def _error_code(ex) -> str:
@@ -1709,6 +1771,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                             s["function"]["name"] for s in _session_schemas(session, spec)))):
                     turn.unrun_claim = request[completion_guard.CORRECTED] = True
                     bounce = completion_guard.CORRECTION
+                # Before the finish gates: they stamp Verified records on a reply they let end the turn.
+                if not bounce and _continue_announced(session, turn, spec, request, completion, cfg, step,
+                                                      scene_action):
+                    bounce = completion_guard.CONTINUE
                 if not bounce:
                     bounce = _final_reply(session, turn, completion, spec)
                 if bounce:  # Sent back, marked so it continues the turn, and the loop goes on.
@@ -2057,6 +2123,9 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         session["items"].append(state.item_error(str(ex)))
         telemetry.first_use("result_error")
         return False
+    messages = session["messages"]
+    if messages and messages[-1].get(context.STEP_LIMIT) and messages[-1].get("content") == completion_guard.CONTINUE:
+        messages.pop()  # Left last by a Stop or an error; resume() goes on from it, a new message replaces it.
     if turn.config is not None and config.on_service(turn.config.base_url):
         turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),
                            "messages": deepcopy(session["messages"]), "references": list(session["references"]),
@@ -2103,6 +2172,8 @@ def _launch(session: dict, turn: Turn) -> None:
     turn.started, turn.first_item = time.monotonic(), len(session["items"])
     turn.telemetry = telemetry.turn_start(turn.config)  # Main thread: which kind of model runs this turn.
     turn.conversation_log = session_logs.turn_start(session, turn.config)  # {} when it is not uploaded.
+    from . import chat_credits
+    chat_credits.turn_start(session, turn)  # The balance it starts from, in the credits arm; never raises.
     session["scroll"], session["confirm_restore"] = 0.0, None
     session["busy"], session["turn"] = True, turn
     session["turn_outcome"] = "running"

@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO / "scripts" / "addons_core"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 from loopcut import asset_common, asset_libraries as libraries, asset_report, asset_search, assets  # noqa: E402
-from loopcut import cloud, cloud_http, cloud_jobs, indexed_assets, polyhaven, tools  # noqa: E402
+from loopcut import cloud, cloud_http, cloud_jobs, indexed_assets, polyhaven, state, tools  # noqa: E402
 from mock_service import MockTransport  # noqa: E402
 import platform_contract  # noqa: E402
 
@@ -129,6 +129,8 @@ class FixtureTest(unittest.TestCase):
         libraries._local_scans.clear()
         indexed_assets._rows.clear()
         cloud_jobs._registry.clear()
+        state.reset()  # Pick numbers start at #1 in each test's conversation.
+        self.addCleanup(state.reset)
         self.addCleanup(libraries._remote_lists.clear)
         self.addCleanup(libraries._local_scans.clear)
         self.addCleanup(indexed_assets._rows.clear)
@@ -148,11 +150,13 @@ class MergeTest(FixtureTest):
     def test_canonical_job_merges_variants_uses_own_registration_and_never_sends_library_data(self):
         result = self.search()
         self.assertTrue(result.ok, result.text)
-        lines = [line for line in result.text.splitlines() if line[:1].isdigit() and '. ' in line]
+        lines = [line for line in result.text.splitlines() if line.startswith('#')]
         self.assertEqual(len(lines), 3, result.text)  # own folder, merged foam, aluminum
+        self.assertEqual([line.split()[0] for line in lines], ['#1', '#2', '#3'])
+        self.assertEqual(self.sheet.call_args.kwargs['labels'], [1, 2, 3], "the sheet shows the same numbers")
         self.assertEqual(sum('+ ambientcg' in line for line in lines), 1)
         merged = next(line for line in lines if '+ ambientcg' in line)
-        self.assertIn('source="library"', merged)
+        self.assertIn('; id My registered foam::', merged, "imported through the user's registration")
         self.assertIn('My registered foam::', merged)
         self.assertIn('CC0-1.0', merged)
         self.assertIn('keyword matching only', result.text)
@@ -188,12 +192,14 @@ class MergeTest(FixtureTest):
         self.entry.name = self.rows[0]['remote_library']['entries'][0]['name']
         self.entry.tags = ['foam']
         result = self.search('foam')
-        self.assertEqual(sum('source="library"' in line for line in result.text.splitlines()), 2)
+        self.assertEqual(sum('::' in line.rsplit('; id ', 1)[-1] for line in result.text.splitlines()
+                             if line.startswith('#')), 2, 'two library refs')
 
     def test_polyhaven_credit_once_and_native_import_route(self):
         result = assets.search_assets(query='chair', type='model').then(lambda: False, lambda fn: fn())
         self.assertEqual(result.text.count('Powered by Poly Haven'), 1)
-        self.assertIn('source="polyhaven", id="ArmChair_01"', result.text)
+        self.assertIn('\n#1 Arm Chair 01 (polyhaven); ', result.text)
+        self.assertIn('; id ArmChair_01\n', result.text)
         with patch.object(polyhaven, 'import_polyhaven', autospec=True, return_value=tools.ToolResult('ok')) as imported:
             assets.import_asset(source='polyhaven', id='ArmChair_01', resolution='2k')
         imported.assert_called_once_with(asset_id='ArmChair_01', resolution='2k')
@@ -266,7 +272,7 @@ class MergeTest(FixtureTest):
         self.patch(self.transport.state, 'asset_search_report', side_effect=report)
         result = self.search()
         self.assertIn('Dropped 1 invalid index result', result.text)
-        self.assertNotIn('source="physicallybased"', result.text)
+        self.assertNotIn('(physicallybased)', result.text)
         with patch.object(self.transport.state, 'asset_search_report', return_value={'schema': 'no'}):
             result = self.search()
         self.assertIn(self.entry.name, result.text)
@@ -367,8 +373,8 @@ class MergeTest(FixtureTest):
     def test_semantic_index_match_still_uses_owned_remote_registration(self):
         result = self.search('sponge')  # Server tag matches; the local listing has no such keyword.
         self.assertIn('My registered foam + ambientcg', result.text)
-        self.assertIn('source="library"', result.text)
-        self.assertNotIn('source="ambientcg"', result.text)
+        self.assertIn('; id My registered foam::', result.text)
+        self.assertNotIn('; id AcousticFoam001', result.text)
 
     def test_corrupt_downloaded_report_keeps_local_results(self):
         def corrupt(call):
@@ -563,7 +569,8 @@ class ImportTest(FixtureTest):
         self.transport.state.asset_catalog[row['id']] = row
         indexed_assets._rows.clear()
         result = assets.search_assets(query='aluminum').then(lambda: False, lambda fn: fn())
-        self.assertIn('source="physicallybased", id="Aluminum"', result.text)
+        self.assertIn('\n#2 Aluminum (physicallybased); ', result.text)
+        self.assertIn('; id Aluminum\n', result.text)
         self.assertEqual(len(self.asset_jobs()), 1)
         self.assertEqual(self.asset_jobs()[0]['input']['kind'], 'any')
         with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)), \
@@ -831,6 +838,10 @@ class RawToolTest(FixtureTest):
 class RowsTest(unittest.TestCase):
     """What a combined-search row says an asset is, beside its thumbnail."""
 
+    def setUp(self):
+        state.reset()
+        self.addCleanup(state.reset)
+
     def server_row(self, **fields):
         row = copy.deepcopy(fixture('remote-libraries.json')['results'][0])
         row.update(fields)
@@ -844,21 +855,29 @@ class RowsTest(unittest.TestCase):
         self.assertNotIn('\n', line)
         self.assertNotIn('\x07', line)
         self.assertIn('; kind: model; 0.50x0.40x0.90 m; 1234 polys; 4k maps; Worn oak stool, hand-made x', line)
-        self.assertIn('…; tags: stool, oak, rustic farm; import_asset(', line)
+        self.assertIn('…; tags: stool, oak, rustic farm; CC0-1.0; id AcousticFoam001', line)
+        self.assertTrue(line.startswith('#2 Acoustic Foam 001 (ambientcg); '), line)
         flat = asset_search._line(1, {'entry': None, 'server': self.server_row(dimensions_m=[2, 2], polycount=None,
                                                                               max_resolution=512, description=None,
                                                                               tags=None)})
-        self.assertIn('2.00x2.00 m tile; import_asset(', flat)
+        self.assertIn('2.00x2.00 m tile; CC0-1.0; id ', flat)
         odd = asset_search._line(1, {'entry': None, 'server': self.server_row(tags='stone', description=['x'])})
         self.assertNotIn('tags:', odd, "a tag string is not a list of letters")
         self.assertNotIn('maps', flat)
+
+    def test_the_id_comes_last_and_never_in_call_syntax(self):
+        # Review of 8e5bdcc53f2: merged rows still printed source="…", id="<uuid>", inviting a copy.
+        line = asset_search._line(4, {'entry': None, 'server': self.server_row()})
+        self.assertTrue(line.endswith('; id AcousticFoam001'), line)
+        self.assertNotIn('source=', line)
+        self.assertNotIn('id="', line)
 
     def test_a_local_entry_brings_its_description_and_tags(self):
         entry = libraries.Entry(library='Mine', file='props.blend', id_type='OBJECT', name='Stool',
                                 tags=['wood', 'stool'], description='My stool')
         line = asset_search._line(1, {'entry': entry, 'server': None}, 'kit: props (rows 1, 3)')
-        self.assertIn('Stool (Mine); kind: model; My stool; tags: wood, stool; kit: props (rows 1, 3); import_asset(',
-                      line)
+        self.assertEqual('#1 Stool (Mine); kind: model; My stool; tags: wood, stool; kit: props (rows 1, 3); '
+                         'license unstated; id Mine::props.blend::OBJECT::Stool', line)
 
     def test_kit_notes_name_rows_from_one_local_file_only(self):
         def entry(name, file, remote=False):
@@ -873,8 +892,8 @@ class RowsTest(unittest.TestCase):
         with patch.object(asset_common, 'sheet', return_value=None), patch.object(indexed_assets, 'remember'):
             text = asset_search._present('cafe', rows, [None] * len(rows), [], []).text
         lines = text.splitlines()[1:7]
-        self.assertIn('kit: cafe (rows 1, 3)', lines[0])
-        self.assertIn('kit: cafe (rows 1, 3)', lines[2])
+        self.assertIn('kit: cafe (#1, #3)', lines[0], "named by their pick numbers")
+        self.assertIn('kit: cafe (#1, #3)', lines[2])
         for i in (1, 3, 4, 5):
             self.assertNotIn('kit:', lines[i], "one file of its own, an index row, or a remote file's variants")
         self.assertEqual(asset_common.kit_notes([None, ('A', 'x.blend'), ('B', 'x.blend')]), {},

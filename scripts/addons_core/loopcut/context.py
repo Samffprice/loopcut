@@ -70,11 +70,12 @@ RECORD_LOOK = 300     # Characters of what a dropped capture showed.
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 8200     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 8260     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
                         # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures;
-                        # 8,194 on 2026-10-17 with the captures' labels switch).
+                        # 8,194 on 2026-10-17 with the captures' labels switch; 8,198 in 0.2.13; 8,199 on
+                        # 2026-10-23 with asset pick numbers, the cap raised from 8,200 to 8,260 for headroom).
 WORKSPACE_FIXED_TOKENS = 4080  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09,
                                # 4,012 on 2026-10-10 with the asset libraries note; 4,044 on 2026-10-15 with
                                # shell's summary; 4,067 on 2026-10-17 with capture_viewport's labels.

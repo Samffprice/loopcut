@@ -29,9 +29,9 @@ def check():
             code = 0
             return
         found = tools.execute("search_assets", json.dumps({"source": "polypizza", "query": "tree", "licence": "CC0", "limit": 4}))
-        assert found.ok and "1. " in found.text and found.image_path, found.text
+        assert found.ok and "\n#" in found.text and found.image_path, found.text
         print(found.text)
-        model_id = found.text.splitlines()[1].split(" ", 1)[1].split(":")[0]
+        model_id = found.text.splitlines()[1].rsplit("; id ", 1)[1]
         got = tools.execute("import_asset", json.dumps({"source": "polypizza", "id": model_id, "target_size": 2.0}))
         assert got.ok and "Scaled by" in got.text and "CC0" in got.text, got.text
         roots = [o for o in bpy.data.objects if o.get("polypizza_id") == model_id]

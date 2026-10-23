@@ -2,6 +2,7 @@
 
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -61,6 +62,32 @@ class MarkdownTest(unittest.TestCase):
         self.assertEqual(md.clean_prose('`unfinished **bold** | b'), '`unfinished **bold** | b')
         multiline = 'before\na | b\n--- | ---\n**bold** | c\nafter'
         self.assertEqual(md.clean_prose('``' + multiline + '``'), multiline)
+
+    def test_headings_quotes_breaks_and_single_emphasis_are_readable(self):
+        self.assertEqual(md.clean_prose('## What I built\n\nA *small* chest.\n\n---\n> Tip: press play\n### Next ##'),
+                         'What I built\n\nA small chest.\n\nTip: press play\nNext')
+        self.assertEqual(md.clean_prose('#\n# \n> > nested\n> # Quoted heading\n> ---\n*Note:* done'),
+                         'nested\nQuoted heading\nNote: done')
+        self.assertEqual(md.clean_prose('# Title ##\r\n---\r\nC# and #'), 'Title\nC# and #')
+
+    def test_line_markers_and_asterisks_that_are_not_markdown_stay_literal(self):
+        for source in ('#hashtag', '#5 is next', '####### seven', 'a * b * c', 'x*y*z', '*.py and *.blend',
+                       'scripts/*.py and tests/*.py', 'rm build/*.o dist/*.whl', '*.png,*.jpg',
+                       '(a+b)*(c+d)*(e)', '/*comment*/', 'func(*args, **kwargs)', '- item', '* item',
+                       '-- two dashes', 'a > b', '>= 3 verts', '>>> bpy.data', '`## code`'):
+            with self.subTest(source=source):
+                self.assertEqual(md.clean_prose(source), source.strip('`'))
+
+    def test_a_break_alone_between_fences_adds_no_empty_paragraph(self):
+        self.assertEqual(md.split_markdown('```\na\n```\n---\n```\nb\n```'), [('code', 'a'), ('code', 'b')])
+
+    def test_heading_cleanup_is_linear_on_long_whitespace(self):
+        started = time.perf_counter()
+        md.clean_prose('# a' + ' ' * 20000 + 'b\n' + '#' + ' ' * 20000 + '#')
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_line_markers_inside_multiline_code_spans_are_untouched(self):
+        self.assertEqual(md.clean_prose('``\n## not a heading\n> nor a quote\n``'), '\n## not a heading\n> nor a quote\n')
 
     def test_tables_omit_alignment_rules_and_keep_rows(self):
         self.assertEqual(md.clean_prose('| a | b |\n| :--- | ---: |\n| **c** | `d` |'),

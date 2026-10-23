@@ -21,7 +21,10 @@ ui = {"view": "chat", "history": [], "mentions": [], "picker": None, "model_menu
       "hover": None, "mouse": None,
       "account": None}  # Plan and window usage as the gateway last reported it; account.update_usage.
 hosts: set[int] = set()  # Pointers of the areas showing the panel. Same lifetime rules as the session.
-HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit"}
+# The gateway's refusals of hosted chat for want of allowance, or of credits in the credits arm (chat_credits.py):
+# the refused send goes back to the draft and one account notice shows. Only a credits account is ever sent
+# insufficient_credits on chat.
+HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit", "insufficient_credits"}
 
 
 def latest_limit(items: list) -> int | None:
@@ -88,6 +91,8 @@ def new_session() -> dict:
         # spend_vendors: own-key vendors approved in this chat; consent, so never saved (like auto_run).
         "spend": {"credits": 0, "auto": 0, "allowed": 0},
         "spend_vendors": [],
+        # Asset search results' pick numbers (asset_picks): {next, rows: [{n, source, id, name}]}; saved.
+        "asset_picks": {"next": 1, "rows": []},
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},

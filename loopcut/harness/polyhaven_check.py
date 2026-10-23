@@ -22,7 +22,7 @@ def check():
     code = 1
     try:
         found = tools.execute("search_assets", json.dumps({"source": "polyhaven", "query": "wooden table", "type": "model", "limit": 4}))
-        assert found.ok and "1. " in found.text and "wooden_table" in found.text, found.text
+        assert found.ok and "\n#" in found.text and "wooden_table" in found.text, found.text
         assert found.image_path and found.image_path.stat().st_size > 5_000, found
         print(found.text)
 

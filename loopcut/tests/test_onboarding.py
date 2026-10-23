@@ -177,6 +177,7 @@ class OnboardingTest(unittest.TestCase):
         op = self.onboarding.LOOPCUT_OT_onboarding_step()
         op.step, op.save = record[3].step, record[3].save
         op.provider = getattr(record[3], 'provider', 'CURRENT')
+        op.skip = getattr(record[3], 'skip', False)
         self.assertTrue(record[4].enabled)
         self.assertEqual(op.execute(self.context), {'FINISHED'})
 
@@ -1940,6 +1941,151 @@ class OnboardingTest(unittest.TestCase):
         self.assertTrue(cards["model"][4].enabled)
         own_key = [{**self.LIVE[1], "backend": "byok"}]
         self.assertEqual(self.onboarding.card_cost(self.onboarding.CARDS[1], own_key), (True, None))
+
+    # --- The credits arm (chat_credits.py, contract v1 2026-10-23) ---------------------------------------------
+
+    ARM_ACCOUNT = {"plan": "free", "billing": "credits", "chat_credits": {"per_step": 0.84},
+                   "credits": {"balance": 100, "monthly": 0, "resets_at": "2026-11-01T00:00:00.000Z"}}
+
+    def credits_arm(self, on=True):
+        """Patches for an account in the credits arm, signed in; returns an ExitStack."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(self.onboarding.chat_credits, "active", return_value=on))
+        stack.enter_context(patch.object(self.onboarding, "_manifest_account",
+                                         return_value=self.ARM_ACCOUNT if on else {}))
+        stack.enter_context(patch.object(self.account, "signed_in", return_value=True))
+        stack.enter_context(patch.object(self.account, "account_line", return_value="person@example.test"))
+        stack.enter_context(patch.object(self.onboarding, "_credits", return_value={"balance": 100}))
+        stack.enter_context(patch.object(self.onboarding, "_descriptors", return_value=self.LIVE))
+        stack.enter_context(patch.object(self.onboarding, "_connected", return_value=False))  # A new install.
+        return stack
+
+    def arm_screen(self, step, styled=False):
+        self.onboarding._state["step"] = step
+        splash, drawn, wm = self.draw_step(styled=styled)
+        self.assertTrue(drawn)
+        labels = [r[1] for r in splash.records if r[0] == "label"]
+        return splash, labels, [r[2] for r in splash.operators()]
+
+    def test_credits_arm_order_is_account_showcase_byo_ai_privacy_done(self):
+        on = self.onboarding
+        with self.credits_arm(), patch.object(on, "_report") as report:
+            splash, labels, texts = self.arm_screen("account")
+            self.assertIn("You have 100 credits", labels)
+            self.assertIn("For Loopcut's AI and the cloud tools.", labels)
+            self.assertIn("100 free credits come back every month.", labels)
+            self.assertFalse([line for line in labels if "5 hours" in line or "allowance" in line])
+            self.press_step(splash, "Continue")
+            self.assertEqual(on._state["step"], "showcase")  # The operator still says "how": the arm decides.
+            self.assertEqual(json.loads(self.progress.read_text())["step"], "showcase")
+            splash, labels, texts = self.arm_screen("showcase")
+            self.assertIn("● ● ○ ○ ○", labels)  # Step 2 of 5.
+            self.assertIn("Everything Loopcut does, in Blender", labels)
+            for title in ("AI agent", "Asset libraries", "Photo → 3D", "Motion", "Auto-rig", "Cloud renders",
+                          "Sound and voice", "Retopology"):
+                self.assertIn(title, labels)
+            for price in ("≈1 / step", "Free", "80", "2 / sec", "Soon", "from 5", "from 4", "5"):
+                self.assertIn(price, labels)  # Live estimates (80 a model, 10 for 5 s), the rest as priced today.
+            self.assertIn("100", labels)
+            self.assertIn("free credits every month for anything above,", labels)
+            self.assertIn("AI chat included.", labels)
+            self.assertIn("A typical first build uses about 20.", labels)
+            self.assertEqual(texts, ["Next", "← Back"])
+            self.assertTrue(all(r[4].enabled for r in splash.operators()))
+            self.assertEqual(splash.records.count(("icon", 0)), 0)  # No previews here: labels stand in.
+            self.press_step(splash, "Next")
+            self.assertEqual(on._state["step"], "connect")
+            splash, labels, texts = self.arm_screen("connect")
+            self.assertIn("Already pay for AI? Chat for 0 credits", labels)
+            for line in ("ChatGPT Plus or Pro", "Your own API key", "Use Loopcut's AI", "≈1 credit / step",
+                         "Sign in once. Chat uses your ChatGPT plan.",
+                         "Any OpenAI-compatible provider, or a local model.",
+                         "Nothing to set up. Chat comes out of your monthly credits."):
+                self.assertIn(line, labels)
+            self.assertEqual(labels.count("chat: 0 credits"), 2)
+            self.assertEqual(texts, ["Sign in", "Add key", "Use it", "← Back", "Skip for now"])
+            self.assertEqual([r[1] for r in splash.operators()][:2], ["loopcut.chatgpt_sign_in", "loopcut.onboarding_own_key"])
+            self.assertTrue(all(r[4].enabled for r in splash.operators()))
+            self.press_step(splash, "← Back")
+            self.assertEqual(on._state["step"], "showcase")
+            on._state["step"] = "connect"
+            self.prefs.provider = "OPENAI"
+            self.press_step(splash, "Use it")
+            self.assertEqual((on._state["step"], self.prefs.provider), ("privacy", "LOOPCUT"))
+            on._state["step"] = "connect"
+            self.prefs.provider = "OPENAI"
+            with patch.object(on, "_connected", return_value=False):
+                splash, _, _ = self.arm_screen("connect")
+            self.press_step(splash, "Skip for now")  # Never leaves the step without a model.
+            self.assertEqual((on._state["step"], self.prefs.provider), ("privacy", "LOOPCUT"))
+            self.prefs.provider = "CHATGPT"
+            with patch.object(on, "_connected", return_value=True):
+                splash, _, _ = self.arm_screen("connect")
+            self.press_step(splash, "Skip for now")  # A connected ChatGPT plan stays the model.
+            self.assertEqual((on._state["step"], self.prefs.provider), ("privacy", "CHATGPT"))
+            on._report_move_now("showcase", "connect", "CURRENT")  # What the buttons report with stats on.
+            on._report_move_now("connect", "privacy", "LOOPCUT")
+            on._report_move_now("connect", "privacy", "LOOPCUT", skip=True)
+        steps = [(c.args[0], c.kwargs.get("code") or (c.args[3] if len(c.args) > 3 else None) or
+                  (c.args[1] if len(c.args) > 1 else None)) for c in report.call_args_list]
+        self.assertIn(("showcase", "shown"), steps)
+        self.assertIn(("showcase", "next"), steps)
+        self.assertIn(("byo_ai", "shown"), steps)
+        self.assertIn(("byo_ai", "loopcut"), steps)
+        self.assertIn(("byo_ai", "skip"), steps)  # "Skip for now" is told apart from "Use it".
+        self.assertNotIn("chatgpt", [step for step, _ in steps])
+        from importlib import import_module
+        telemetry = import_module(NAME + ".telemetry")
+        for step in ("showcase", "byo_ai"):  # Steps the events contract accepts from 0.2.14.
+            self.assertEqual(telemetry.setup_step_props(step, None, True, "shown")["step"], step)
+
+    def test_credits_arm_styled_tags_and_the_model_card_price(self):
+        with self.credits_arm():
+            splash, _, _ = self.arm_screen("connect", styled=True)
+            tags = [r for r in splash.records if r[0] == "label" and r[1] == "chat: 0 credits"]
+            self.assertEqual([r[2] for r in tags], [tuple(self.onboarding.SUCCESS)] * 2)
+            self.prefs.provider = "LOOPCUT"
+            with patch.object(self.onboarding, "_connected", return_value=True):
+                splash, labels, _ = self.arm_screen("done")
+            self.assertIn("≈1 credit / step", labels)  # The modelling card runs on Loopcut's AI: not "Free".
+            self.assertNotIn("Free", labels)
+            self.assertIn("You have 100 credits. Loopcut's AI uses ≈1 credit / step.", labels)
+
+    def test_the_arms_second_step_follows_the_account_when_resumed_or_learned_late(self):
+        on = self.onboarding
+        on.save_progress("showcase")
+        self.assertEqual(on.load_progress()["step"], "showcase")
+        with self.credits_arm():
+            self.assertEqual(on._resume_step("showcase"), "showcase")
+            self.assertEqual(on._resume_step("how"), "showcase")
+            splash, labels, _ = self.arm_screen("how")  # Saved before the manifest said: drawn as the arm's.
+            self.assertIn("Everything Loopcut does, in Blender", labels)
+            self.assertEqual(on._state["step"], "showcase")
+        with self.credits_arm(False):
+            self.assertEqual(on._resume_step("showcase"), "how")
+            splash, labels, _ = self.arm_screen("showcase")  # Left the arm: How Loopcut works, as 0.2.13.
+            self.assertIn("How Loopcut works", labels)
+            self.assertIn("● ● ○ ○ ○", labels)
+            splash, labels, texts = self.arm_screen("connect")
+            self.assertIn("Choose the model for your chat", labels)
+            self.assertIn("Sign in with ChatGPT", texts)
+
+    def test_the_arms_steps_fail_open_and_never_draw_modal_without_their_operators(self):
+        on = self.onboarding
+        for step, painter in (("showcase", "_draw_showcase"), ("connect", "_draw_byo_rest")):
+            with self.subTest(step=step), self.credits_arm():
+                on._state.update(step=step, finished=False)
+                with patch.object(on, painter, side_effect=KeyError("boom")), redirect_stderr(io.StringIO()):
+                    splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+                self.assertTrue(drawn)
+                self.assertFalse(wm.splash_modal)
+                self.assertIn(("operator", "wm.splash_close"), [r[:2] for r in splash.operators()])
+                on._state.update(step=step, finished=False)
+                with patch.object(on, "missing_operators", return_value=["onboarding_step"]):
+                    splash, drawn, wm = self.draw_step(wm=types.SimpleNamespace(splash_modal=True))
+                self.assertFalse(wm.splash_modal)
+                self.assertIn(("operator", "wm.splash_close"), [r[:2] for r in splash.operators()])
+                on._state["starting_since"] = 0.0
 
     def finish_with(self, card_id, signed_in=True, connected=True):
         self.onboarding._state["step"] = "done"

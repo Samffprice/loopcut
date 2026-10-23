@@ -189,9 +189,12 @@ def chatgpt_card(code: str) -> dict | None:
             "chat goes through Loopcut's server.",
             keep_going + [_action("Manage ChatGPT usage ↗", "manage_chatgpt")])
     if code == "subscription_sharing_user_not_eligible":
+        from . import chat_credits
+        fast = ("Loopcut's AI can carry on from your credits." if chat_credits.active()
+                else "Loopcut's Fast model is free with an account.")
         return state.item_offer(
             "chatgpt", "This ChatGPT account can't share its plan",
-            "OpenAI decides that by plan, workspace and country. Loopcut's Fast model is free with an account.",
+            f"OpenAI decides that by plan, workspace and country. {fast}",
             keep_going + [_action("Use my own key", "own_key")])
     return None
 
@@ -216,15 +219,16 @@ def trial_card(amount, live: list[str]) -> dict:
                             chips + [_action("What credits buy ↗", "web", config.pricing_url("trial"))])
 
 
-def low_credits_card(balance, monthly, renews: str) -> dict:
-    """M5."""
+def low_credits_card(balance, monthly, renews: str, top_ups: bool = True) -> dict:
+    """M5. top_ups: False for a free account in the credits arm, where buying credits needs a paid plan."""
     if monthly:
         text = f"Your monthly credits renew {renews}." if renews else "Your monthly credits renew each month."
     else:
         text = "The Pro plan adds 2,200 credits every month: $22 of tools for $20."
+    actions = [_action("Add credits ↗", "web", config.credits_url("low_credits"))] if top_ups else []
     return state.item_offer("low_credits", f"{balance:,g} credits left ({dollars(balance)})", text,
-                            [_action("Add credits ↗", "web", config.credits_url("low_credits")),
-                             _action("See plans ↗", "web", config.pricing_url("low_credits", "pro")), _not_now()])
+                            actions + [_action("See plans ↗", "web", config.pricing_url("low_credits", "pro")),
+                                       _not_now()])
 
 
 def observe(manifest: dict, signed_in: bool, live: list[str]) -> None:
@@ -243,7 +247,9 @@ def observe(manifest: dict, signed_in: bool, live: list[str]) -> None:
     low = balance < monthly * LOW_SHARE if monthly else 0 < balance < LOW_FLOOR
     if low:
         renews = str(credits.get("resets_at") or "")[:10]
-        _queue(low_credits_card(balance, monthly, renews), "low_credits", f"{renews or 'balance'}:{monthly}")
+        account = manifest.get("account") or {}
+        top_ups = not (account.get("billing") == "credits" and account.get("plan") not in ("pro", "max"))
+        _queue(low_credits_card(balance, monthly, renews, top_ups), "low_credits", f"{renews or 'balance'}:{monthly}")
 
 
 def _queue(card: dict, kind: str, key: str) -> None:

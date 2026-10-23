@@ -96,7 +96,7 @@ class ListingTest(unittest.TestCase):
     def test_description_and_remote_dirname(self):
         entry = Entry("Ess", "m/oak.blend", "MATERIAL", "Oak", tags=["wood", "floor"], description="Worn planks", license="CC0")
         line = asset_libraries.describe_entry(3, entry)
-        self.assertTrue(line.startswith("3. Ess::m/oak.blend::MATERIAL::Oak; Worn planks; wood, floor; CC0"), line)
+        self.assertEqual(line, "#3 Oak (library: Ess); Worn planks; wood, floor; CC0; id Ess::m/oak.blend::MATERIAL::Oak")
         # Matches what Blender 5.2 made for this URL in a live session.
         self.assertEqual(asset_libraries.remote_cache_dirname("https://blender.ambientcg.com/"), "6f18014bec4cad69")
 

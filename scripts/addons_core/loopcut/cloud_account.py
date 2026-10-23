@@ -579,6 +579,9 @@ def error_details(error):
         except (ValueError, TypeError):
             url = ""
         hint = " Add credits or use your own vendor key." if config.billing_open() else ""
+        from . import chat_credits
+        if hint and chat_credits.active() and chat_credits.plan_of(chat_credits._account()[0]) not in ("pro", "max"):
+            hint = " Use your own vendor key, or tell the user."  # Free credits accounts cannot buy credits.
         price = f"{needed:g} ({dollars(needed)})" if needed != "?" else "more"
         return {"text": f"insufficient_credits: balance {balance}, needed {needed}." + hint,
                 "message": f"Not enough credits: this needs {price}, you have {balance}.", "upgrade": url}
@@ -719,6 +722,14 @@ def panel_data(runtime):
         credit_balance = balance(runtime.manifest)
         if credit_balance is not None:
             data["credit_balance"] = credit_balance if runtime.signed_in else None
+        from . import chat_credits
+        try:
+            credits_arm = chat_credits.panel_data(runtime.manifest, runtime.signed_in)
+        except Exception as ex:  # Display only: a malformed account object must not stop the panel drawing.
+            print(f"Loopcut: could not read the account's billing: {ex!r}")
+            credits_arm = {"billing": ""}
+        if credits_arm["billing"]:  # Servers before the credits contract send no account.billing: nothing added.
+            data["chat_credits"] = credits_arm
         return data
 
 

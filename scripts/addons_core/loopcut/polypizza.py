@@ -3,9 +3,10 @@
 Where Poly Haven is scanned realism, Poly Pizza is the rescued Google Poly archive plus new
 uploads: light single-GLB props for game, stylised and social work. It needs a free API key
 (poly.pizza > account > API), kept in Loopcut's credentials file like the model key, or given as
-LOOPCUT_POLYPIZZA_KEY. About two thirds of the catalogue is CC-BY, which requires crediting the
-creator: the attribution string is stored on every imported root object and returned to the model
-so the user hears it.
+LOOPCUT_POLYPIZZA_KEY. Most users have none, so a search without it answers from BlenderKit (else
+Poly Haven), which need no key, and says so. About two thirds of the catalogue is CC-BY, which
+requires crediting the creator: the attribution string is stored on every imported root object and
+returned to the model so the user hears it.
 
 The model files come from static.poly.pizza behind Cloudflare, which challenges datacenter and VPN
 addresses with an HTML page instead of the GLB; that case gets its own message.
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, credentials
+from . import asset_common, asset_picks, blenderkit, credentials, polyhaven
 from .asset_common import NotFound, download, get_json, sheet, valid_slug
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -32,8 +33,9 @@ CATEGORIES = {"Food & Drink": 0, "Clutter": 1, "Weapons": 2, "Transport": 3, "Fu
               "Objects": 5, "Nature": 6, "Animals": 7, "Buildings": 8, "People & Characters": 9,
               "Scenes & Levels": 10, "Other": 11}
 LICENCES = {"CC-BY": 0, "CC0": 1}
-NO_KEY = ("Poly Pizza needs a free API key: ask the user to paste one from poly.pizza (account > API) into "
-          "Loopcut's preferences under Asset libraries. Sources polyhaven and library need no key.")
+# Told to ask the user for a key, hosted Fast did and ended the turn (2026-10-23): it steers to keyless sources.
+NO_KEY = "Poly Pizza isn't set up (it needs an API key). Search blenderkit or polyhaven instead; they need no key."
+KEYLESS = "Poly Pizza isn't set up (no API key), so these are from {} instead."
 
 # ------------------------------------------------------------------ pure helpers (unit tested)
 
@@ -58,9 +60,10 @@ def search_params(category: str = "", licence: str = "", animated: bool = False,
     return params
 
 
-def describe_model(index: int, model: dict) -> str:
+def describe_model(number: int, model: dict) -> str:
+    """One result row: its pick number (asset_picks) and title first, the id last."""
     creator = model.get("Creator") or {}
-    parts = [f"{index}. {model.get('ID')}: {model.get('Title', '')}"]
+    parts = [f"#{number} {asset_common.clean(model.get('Title'), 80) or model.get('ID')} (polypizza)"]
     if model.get("Tri Count"):
         parts.append(f"{model['Tri Count']} tris")
     parts.append(str(model.get("Licence") or "?"))
@@ -70,6 +73,7 @@ def describe_model(index: int, model: dict) -> str:
         parts.append(str(model["Category"]))
     if model.get("Animated"):
         parts.append("animated")
+    parts.append(f"id {model.get('ID')}")
     return "; ".join(parts)
 
 
@@ -112,6 +116,8 @@ def search_polypizza(query: str, category: str = "", licence: str = "", animated
                      limit: int = DEFAULT_LIMIT) -> ToolResult:
     if not str(query).strip():
         raise ToolError("Give a few words to search for.")
+    if not api_key():
+        return _keyless(query, limit)
     headers = _headers()
     params = search_params(category, licence, animated, limit)
     url = f"{API}/search/{urllib.parse.quote(str(query).strip(), safe='')}?{urllib.parse.urlencode(params)}"
@@ -124,13 +130,29 @@ def search_polypizza(query: str, category: str = "", licence: str = "", animated
     results = [m for m in (data.get("results") or []) if isinstance(m, dict) and m.get("ID")]
     if not results:
         raise ToolError(f"No Poly Pizza models match {query!r}. Try fewer or more general words.")
-    lines = [describe_model(i, model) for i, model in enumerate(results, 1)]
-    image = sheet([_thumbnail(model) for model in results], "polypizza_sheet.png", fit=True)
-    text = (f"{len(results)} of {data.get('total', len(results))} Poly Pizza models for {query!r}, numbered as on "
-            f"the sheet (left to right, top to bottom):\n" + "\n".join(lines))
-    if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=polypizza, id)."
+    numbers = [asset_picks.number("polypizza", str(model["ID"]), model.get("Title")) for model in results]
+    lines = [describe_model(n, model) for n, model in zip(numbers, results)]
+    image = sheet([_thumbnail(model) for model in results], "polypizza_sheet.png", fit=True, labels=numbers)
+    text = (f"{len(results)} of {data.get('total', len(results))} Poly Pizza models for {query!r}:\n"
+            + "\n".join(lines) + "\n\n" + asset_picks.footer(image))
     return ToolResult(_clip(text), image_path=image)
+
+
+def _keyless(query: str, limit) -> ToolResult:
+    """search_polypizza without the user's key: the same words on BlenderKit's free models, else
+    Poly Haven's, numbered as picks like any search, under a line naming the library they came from."""
+    misses = []
+    for name, search, kind in (("BlenderKit", blenderkit.search_blenderkit, "model"),
+                               ("Poly Haven", polyhaven.search_polyhaven, "models")):
+        try:
+            result = search(query, kind, limit)
+        except ToolError as ex:
+            misses.append(str(ex))
+            continue
+        result.text = KEYLESS.format(name) + "\n" + result.text
+        return result
+    raise ToolError("Poly Pizza isn't set up (it needs an API key), so BlenderKit and Poly Haven were searched "
+                    "instead: " + " ".join(misses) + " Sources blenderkit, polyhaven and library need no key.")
 
 
 def _thumbnail(model: dict) -> Path | None:

@@ -335,6 +335,10 @@ def _message_entries(message: dict, kind: str, names: dict, images: Path | None)
         entry["text"] = text
         if kind != "turn":
             data["kind"] = kind
+        from . import completion_guard
+        continues = message.get(completion_guard.CONTINUED)
+        if kind == "turn" and isinstance(continues, int) and continues > 0:
+            data["step_continues"] = continues  # Announced-step nudges this turn needed (agent._continue_announced).
     if message.get(context.SUMMARY):
         data["summary"] = True
     if data:

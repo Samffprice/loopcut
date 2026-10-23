@@ -200,6 +200,9 @@ def draw_area() -> None:
 
 def _image_paths(session):
     paths = {item["image_path"] for item in session["items"] if item.get("image_path")}
+    if (state.ui.get("allowance_notice") or {}).get("item"):  # A limit pop-up may be open: its pictures stay loaded.
+        from .. import chat_credits
+        paths.update(chat_credits.media_paths())
     paths.update(row["image_path"] for item in session["items"] if item.get("kind") == "wave"
                  for row in item.get("rows", []) if row.get("image_path"))
     return paths
@@ -259,7 +262,9 @@ def _cloud_panel_state(session: dict) -> dict:
             "cloud_message": message if message == saved["message"] else "",
             "cloud_message_reserved": bool(saved["message"]), "credits": service["credits"],
             "credit_balance": service.get("credit_balance"),
-            "today": service.get("today", "")}
+            "today": service.get("today", ""),
+            **({"billing": service["chat_credits"]["billing"], "chat_credits": service["chat_credits"]}
+               if service.get("chat_credits") else {})}
 
 
 VOTE_EASE_SECONDS = 0.5     # A bar's move to a new level.
@@ -439,6 +444,10 @@ def _open_settings() -> None:
 
 def _do_action(session: dict, action) -> None:
     kind, index = action
+    if kind in ("limit_upgrade", "limit_chatgpt", "own_key") or (kind == "sign_in" and index == "chatgpt"):
+        item = (state.ui.get("allowance_notice") or {}).get("item")
+        if item:  # A way on was picked: the pop-up, if one is open, steps aside for it.
+            item["popup_closed"] = True
     if kind == "reference_url":
         account.open_browser(index)
     elif kind == "preview_open":
@@ -551,6 +560,14 @@ def _do_action(session: dict, action) -> None:
         from .. import nudges
         nudges.set_tips_off(not nudges.tips_off())
         _runtime.pop("connections", None)
+    elif kind == "limit_popup_close":  # The out-of-credits or upgrade pop-up closes to its slim card.
+        item = (state.ui.get("allowance_notice") or {}).get("item")
+        if item:
+            item["popup_closed"] = True
+    elif kind == "limit_popup_open":  # The slim card's button: the account's current refusal opens again.
+        item = (state.ui.get("allowance_notice") or {}).get("item")
+        if item:
+            item["popup_closed"] = False
     elif kind == "limit_chatgpt":
         prefs = settings.preferences()  # The user's own pick: their ChatGPT plan carries the turn on (M7).
         if prefs is not None and not session["busy"]:

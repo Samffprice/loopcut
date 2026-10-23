@@ -36,7 +36,7 @@ _ROLES = {"user", "assistant", "tool"}
 # missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
 _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
-              "mode", "codex_thread", "spend")
+              "mode", "codex_thread", "spend", "asset_picks")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 # Conversations kept somewhere other than root(): a worker's transcript and captures live in its
 # job folder (waves.py). Keyed by conversation id; set before the first save.
@@ -81,10 +81,11 @@ def save(session: dict) -> None:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
         body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED
-                if key != "spend"}
-        from . import spending
+                if key not in ("spend", "asset_picks")}
+        from . import asset_picks, spending
         with spending.lock:
             body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
+        body["asset_picks"] = asset_picks.snapshot(session)  # Search results' numbers still import after a reload.
         body["items"] = items
         meta = {"id": session["id"], "projects": session["projects"], "title": session["title"],
                 "created": session["created"], "updated": time.time(),
@@ -194,9 +195,11 @@ def _validate(body) -> dict:
     usage = body.get("usage", {})
     if not isinstance(usage, dict) or any(not isinstance(usage.get(k, 0), int) for k in _USAGE):
         raise ConversationError("malformed usage")
-    from . import spending
+    from . import asset_picks, spending
     if "spend" in body and not spending.valid_ledger(body["spend"]):
         body.pop("spend")  # A damaged ledger starts over rather than losing the conversation.
+    if "asset_picks" in body and not asset_picks.valid(body["asset_picks"]):
+        body.pop("asset_picks")  # Likewise damaged pick numbers: search again (load starts them anew).
     return body
 
 
@@ -210,6 +213,9 @@ def load(conversation_id: str) -> dict:
         raise ConversationError(f"{path} claims to be conversation {body['id']}")
     session = state.new_session()
     session.update({key: body[key] for key in _PERSISTED if key in body})
+    if "asset_picks" not in body:  # Saved before pick numbers (its results read "3. <id>"), or damaged.
+        from . import asset_picks
+        session["asset_picks"] = asset_picks.resumed(session["messages"])
     session["usage"] = {key: int(body.get("usage", {}).get(key, 0)) for key in _USAGE}
     from . import spending
     session["spend"] = {key: body.get("spend", {}).get(key, value) for key, value in spending.new_ledger().items()}

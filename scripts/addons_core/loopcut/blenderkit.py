@@ -23,7 +23,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, credentials
+from . import asset_common, asset_picks, credentials
 from .asset_common import NotFound, download, get_json, sheet, valid_slug
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -90,8 +90,9 @@ def dimensions(asset: dict) -> list | None:
     return dims if all(0 < d < 1e6 for d in dims) else None
 
 
-def describe_asset(index: int, asset: dict) -> str:
-    parts = [f"{index}. {asset.get('id')}: {asset.get('name', '')}"]
+def describe_asset(number: int, asset: dict) -> str:
+    """One result row: its pick number (asset_picks) and name first, the id last."""
+    parts = [f"#{number} {asset_common.clean(asset.get('name'), 80) or asset.get('id')} (blenderkit)"]
     size = asset_common.size_text(dimensions(asset))
     if size:
         parts.append(size)
@@ -111,6 +112,7 @@ def describe_asset(index: int, asset: dict) -> str:
     author = (asset.get("author") or {}).get("fullName")
     if author:
         parts.append(f"by {author}")
+    parts.append(f"id {asset.get('id')}")
     return "; ".join(parts)
 
 
@@ -210,13 +212,12 @@ def search_blenderkit(query: str, type: str, limit: int = DEFAULT_LIMIT) -> Tool
     results = [a for a in (data.get("results") or []) if isinstance(a, dict) and a.get("id")]
     if not results:
         raise ToolError(f"No BlenderKit {type}s match {query!r}. Try fewer or more general words.")
-    lines = [describe_asset(i, asset) for i, asset in enumerate(results, 1)]
-    image = sheet([_thumbnail(asset) for asset in results], "blenderkit_sheet.png", fit=True)
+    numbers = [asset_picks.number("blenderkit", str(asset["id"]), asset.get("name")) for asset in results]
+    lines = [describe_asset(n, asset) for n, asset in zip(numbers, results)]
+    image = sheet([_thumbnail(asset) for asset in results], "blenderkit_sheet.png", fit=True, labels=numbers)
     scope = "free assets" if not headers else "free and plan assets"
-    text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {query!r} ({scope}), "
-            f"numbered as on the sheet (left to right, top to bottom):\n" + "\n".join(lines))
-    if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=blenderkit, id)."
+    text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {query!r} ({scope}):\n"
+            + "\n".join(lines) + "\n\n" + asset_picks.footer(image))
     if any(not a.get("canDownload", True) for a in results):
         text += f"\nFull-plan assets need the user's BlenderKit key ({PLANS})."
     return ToolResult(_clip(text), image_path=image)

@@ -10,7 +10,13 @@ _INLINE = re.compile(
     r"(?P<code>(?<!`)(?P<ticks>`+)(?!`)(?P<body>.*?)(?<!`)(?P=ticks)(?!`))|"
     + LINK.pattern + r"|(?P<literal>!?\[[^\n]*|`+[^\n]*)", re.DOTALL)
 _EMPHASIS = re.compile(r"(?<![\w*\\])\*\*(?![\s*])([^*\n]+?)(?<!\s)\*\*(?![\w*])|"
-                       r"(?<![\w\\])__(?![\s_])([^_\n]+?)(?<!\s)__(?!\w)")
+                       r"(?<![\w\\])__(?![\s_])([^_\n]+?)(?<!\s)__(?!\w)|"
+                       r"(?<![\w*\\/])\*(?=\w)([^*\n]+?)(?<![\s*])\*(?![\w*/])")
+# Line markers the panel can't style: a quote marker and an ATX heading keep their text, a thematic break goes.
+# A quote marker needs a space or the line end after it, so ">= 3" and ">>> bpy" stay literal.
+_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]+(.*))?")
+_QUOTE = re.compile(r"(?: {0,3}>(?:[ \t]|$))+")
+_BREAK = re.compile(r" {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})")
 _SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 _QUOTED = re.compile(r'`+([^`\n]+)`+|"([^"\n]+)"|\'([^\'\n]+)\'')
 _PATH = re.compile(r"(?<![\w/])(?:[a-zA-Z]:[\\/]|~?/|\.{1,2}/|[\w.-]+/|[\w-]+\.[a-zA-Z0-9]{1,10}\b)[^\s<>\[\]`\"|]*")
@@ -59,7 +65,7 @@ def _blocks(text):
 def _clean_inline(text):
     parts, last = [], 0
     for match in _INLINE.finditer(text):
-        parts.append(_EMPHASIS.sub(lambda m: m[1] or m[2], text[last:match.start()]))
+        parts.append(_EMPHASIS.sub(_emphasis_text, text[last:match.start()]))
         if match.group("code") is not None:
             parts.append(match.group("body"))
         elif match.group("target") is not None:
@@ -67,8 +73,29 @@ def _clean_inline(text):
         else:
             parts.append(match[0])  # Incomplete or unsupported Markdown stays literal while streaming.
         last = match.end()
-    parts.append(_EMPHASIS.sub(lambda m: m[1] or m[2], text[last:]))
+    parts.append(_EMPHASIS.sub(_emphasis_text, text[last:]))
     return "".join(parts)
+
+
+def _emphasis_text(match):
+    return match[1] or match[2] or match[3]
+
+
+def _clean_line(line):
+    """The line's display text, or None to drop it (a thematic break or an empty heading)."""
+    line = line.rstrip("\r")
+    quote = _QUOTE.match(line)
+    rest = line[quote.end():] if quote else line
+    if _BREAK.fullmatch(rest):
+        return None
+    heading = _HEADING.fullmatch(rest)
+    if not heading:
+        return rest
+    text = (heading[1] or "").rstrip(" \t")
+    closing = text.rstrip("#")
+    if closing != text and (not closing or closing[-1] in " \t"):  # An optional closing run of #.
+        text = closing.rstrip(" \t")
+    return text or None
 
 
 def _pipe_cells(line):
@@ -106,7 +133,9 @@ def _clean_prose(text):
                 output.append("    ".join(cells))
                 index += 1
         else:
-            output.append(lines[index])
+            line = lines[index] if index in multiline else _clean_line(lines[index])
+            if line is not None:
+                output.append(line)
             index += 1
     # Clean contiguous prose together so code spans may contain line breaks.
     return _clean_inline("\n".join(output))
@@ -117,8 +146,9 @@ def clean_prose(text: str) -> str:
 
 
 def split_markdown(text: str) -> list[tuple[str, str]]:
-    return [(kind, body if kind == "code" else _clean_prose(body.strip("\n")))
-            for kind, _, body in _blocks(text) if kind == "code" or body.strip("\n")]
+    # Cleaned first: prose that was only a thematic break would otherwise be an empty paragraph.
+    parts = [(kind, body if kind == "code" else _clean_prose(body.strip("\n"))) for kind, _, body in _blocks(text)]
+    return [(kind, body) for kind, body in parts if kind == "code" or body.strip("\n")]
 
 
 def _path_intent(raw, *, link=False):

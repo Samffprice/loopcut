@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 
 import bpy
 
-from . import asset_common, asset_libraries, asset_report, cloud, cloud_http, cloud_jobs, config, indexed_assets
+from . import (asset_common, asset_libraries, asset_picks, asset_report, cloud, cloud_http, cloud_jobs, config,
+               indexed_assets)
 from .tools import ToolError, ToolResult
 
 SEARCH_SECONDS = 30
@@ -180,31 +181,36 @@ def _about(entry, server):
     return parts
 
 
-def _line(number, row, kit=""):
+def _import(row):
+    """(source, id, name) import_asset takes for a fused row: the user's own entry when they have one."""
     entry, server = row["entry"], row["server"]
     if entry is not None:
-        label = entry.name
-        origin = entry.library + (f" + {server['source']}" if server else "")
-        source, asset_id = "library", entry.ref
-    else:
-        label, origin = server["title"], server["source"]
-        source, asset_id = server["import"]["source"], server["import"]["id"]
+        return "library", entry.ref, entry.name
+    return server["import"]["source"], server["import"]["id"], server["title"]
+
+
+def _line(number, row, kit=""):
+    """One result row: its pick number (asset_picks), name and origin first, the id last as the
+    per-library rows have it, never as call syntax to copy (import_asset finds an id's source itself)."""
+    entry, server = row["entry"], row["server"]
+    _, asset_id, label = _import(row)
+    origin = entry.library + (f" + {server['source']}" if server else "") if entry is not None else server["source"]
     kind = server["kind"] if server else INDEX_TYPES.get(entry.id_type, entry.id_type)
     license_name = server["license"]["id"] if server else entry.license or "license unstated"
     about = "".join(f"{part}; " for part in [*_about(entry, server), kit] if part)
-    line = (f"{number}. {label} ({origin}); kind: {kind}; {about}"
-            f"import_asset(source={json.dumps(source)}, id={json.dumps(asset_id)}); "
-            + license_name)
+    line = f"#{number} {label} ({origin}); kind: {kind}; {about}{license_name}"
     if server and server["attribution"]["required"]:
         line += "; " + server["attribution"]["text"]
-    return line
+    return f"{line}; id {asset_id}"
 
 
 def _present(query, rows, paths, sources, notes):
+    numbers = [asset_picks.number(*_import(row)) for row in rows]
     # Local files only: a remote library's file can hold one material's variants, which is no kit.
     kits = asset_common.kit_notes([(row["entry"].library, row["entry"].file)
-                                   if row["entry"] is not None and not row["entry"].files else None for row in rows])
-    lines = [_line(i, row, kits.get(i - 1, "")) for i, row in enumerate(rows, 1)]
+                                   if row["entry"] is not None and not row["entry"].files else None for row in rows],
+                                  numbers)
+    lines = [_line(n, row, kits.get(i, "")) for i, (n, row) in enumerate(zip(numbers, rows))]
     for row in rows:
         if row["server"]:
             indexed_assets.remember(row["server"])
@@ -212,11 +218,11 @@ def _present(query, rows, paths, sources, notes):
     if any(row["server"] and row["server"]["source"] == "polyhaven" for row in rows):
         if "Powered by Poly Haven" not in credits:
             credits.append("Powered by Poly Haven")
-    image = asset_common.sheet(paths, "assets_sheet.png", fit=True) if rows else None
-    text = f"{len(rows)} asset(s) for {query!r}, numbered as on the sheet (left to right, top to bottom):\n"
+    image = asset_common.sheet(paths, "assets_sheet.png", fit=True, labels=numbers) if rows else None
+    text = f"{len(rows)} asset(s) for {query!r}:\n"
     text += "\n".join([*lines, *credits, *dict.fromkeys(notes)])
-    if image:
-        text += "\nImage attached: thumbnails in that order (blank: no preview)."
+    if rows:
+        text += "\n" + asset_picks.footer(image, blank=True)
     # Do not _clip: that could remove an import ID, required attribution, or provider credit.
     return ToolResult(text, image_path=image)
 

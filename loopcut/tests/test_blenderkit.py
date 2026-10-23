@@ -45,7 +45,8 @@ class BlenderKitTest(unittest.TestCase):
         self.assertNotIn("is_free", blenderkit.search_url("x", "hdr", 3, free_only=False))
 
     def test_rows_credit_and_file_choice(self):
-        self.assertEqual(blenderkit.describe_asset(1, ASSET), "1. 8c2e3c07: Dining chair; 1.20x0.50x0.90 m; 20384 faces; free; by dleon3D")
+        self.assertEqual(blenderkit.describe_asset(1, ASSET),
+                         "#1 Dining chair (blenderkit); 1.20x0.50x0.90 m; 20384 faces; free; by dleon3D; id 8c2e3c07")
         paid = blenderkit.describe_asset(2, {**ASSET, "isFree": False, "canDownload": False})
         self.assertIn("Full plan; needs a BlenderKit key", paid)
         self.assertEqual(blenderkit.credit_line(ASSET),
@@ -68,8 +69,9 @@ class BlenderKitTest(unittest.TestCase):
                 "dictParameters": {"dimensionX": 0.5082, "dimensionY": 0.5558, "dimensionZ": 0.9366,
                                    "faceCount": 72794, "modelStyle": "realistic"}}
         row = blenderkit.describe_asset(3, live)
-        self.assertTrue(row.startswith("3. v1: Vintage Wooden Chair; 0.51x0.56x0.94 m; 72794 faces; realistic style; "
-                                       "A classic vintage wooden chair"), row)
+        self.assertTrue(row.startswith("#3 Vintage Wooden Chair (blenderkit); 0.51x0.56x0.94 m; 72794 faces; "
+                                       "realistic style; A classic vintage wooden chair"), row)
+        self.assertTrue(row.endswith("; id v1"), row)
         self.assertIn("…; free; by Ann", row)
         self.assertNotIn("\n", row)
         self.assertLessEqual(len(row.split("; ")[5]), 90)

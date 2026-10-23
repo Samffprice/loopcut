@@ -740,7 +740,15 @@ LOOPCUT_PLAN_NOTE = ("Sign in with your Loopcut account. Fast is free with a dai
                      "5-hour session and per week.")
 
 
+CREDITS_PLAN_NOTE = ("Sign in with your Loopcut account. Loopcut's AI and the cloud tools both use your credits, "
+                     "about 1 a step for chat; your plan's credits come back every month.")
+
+
 def provider_note(provider: str) -> str:
+    if provider == "LOOPCUT":
+        from . import chat_credits
+        if chat_credits.active():
+            return CREDITS_PLAN_NOTE  # The credits arm: no session or week windows.
     if provider == "LOOPCUT" and config.billing_open():
         return LOOPCUT_PLAN_NOTE  # Plan words only while the server sells plans.
     return _BY_ID[provider][4]

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common
+from . import asset_common, asset_picks
 from .asset_common import download, get_json, rank, sheet
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -129,8 +129,9 @@ def index_metadata(index: dict) -> dict[tuple[str, str], dict]:
     return found
 
 
-def describe_entry(index: int, entry: Entry, kit: str = "") -> str:
-    parts = [f"{index}. {entry.ref}"]
+def describe_entry(number: int, entry: Entry, kit: str = "") -> str:
+    """One result row: its pick number (asset_picks), name and library first, the ref (its id) last."""
+    parts = [f"#{number} {entry.name} (library: {entry.library})"]
     if entry.description:
         parts.append(asset_common.clean(entry.description, 80))
     if entry.tags:
@@ -139,6 +140,7 @@ def describe_entry(index: int, entry: Entry, kit: str = "") -> str:
         parts.append(kit)
     if entry.license:
         parts.append(entry.license)
+    parts.append(f"id {entry.ref}")
     return "; ".join(parts)
 
 
@@ -298,13 +300,13 @@ def search_assets(query: str, type: str = "", limit: int = DEFAULT_LIMIT) -> Too
     if not found:
         where = ", ".join(f"{lib.name} ({'remote' if lib.remote else 'on disk'})" for lib in registered)
         raise ToolError(f"No asset matches {query!r} in {where}." + (" " + " ".join(notes) if notes else ""))
-    kits = asset_common.kit_notes([(entry.library, entry.file) if not entry.files else None for entry in found])
-    lines = [describe_entry(i, entry, kits.get(i - 1, "")) for i, entry in enumerate(found, 1)]
-    image = sheet([_thumbnail(entry) for entry in found], "assets_sheet.png", fit=True)
-    text = (f"{len(found)} asset(s) for {query!r}, numbered as on the sheet (left to right, top to bottom); "
-            f"pass the ref as import_asset's id:\n" + "\n".join(lines))
-    if image:
-        text += "\n\nImage attached: thumbnails in that order (blank: the library has no preview)."
+    numbers = [asset_picks.number("library", entry.ref, entry.name) for entry in found]
+    kits = asset_common.kit_notes([(entry.library, entry.file) if not entry.files else None for entry in found],
+                                  numbers)
+    lines = [describe_entry(n, entry, kits.get(i, "")) for i, (n, entry) in enumerate(zip(numbers, found))]
+    image = sheet([_thumbnail(entry) for entry in found], "assets_sheet.png", fit=True, labels=numbers)
+    text = (f"{len(found)} asset(s) for {query!r}:\n" + "\n".join(lines)
+            + "\n\n" + asset_picks.footer(image, blank=True))
     if notes:
         text += "\n" + " ".join(notes)
     return ToolResult(_clip(text), image_path=image)

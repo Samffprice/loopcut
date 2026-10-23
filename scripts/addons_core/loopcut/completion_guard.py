@@ -1,13 +1,19 @@
-"""Recognize imitations of Loopcut records, never ordinary claims about work."""
+"""Recognize imitations of Loopcut records, never ordinary claims about work; and a reply that
+announces its next step but stops before taking it."""
 
 import re
 
 
 CORRECTION = "No tool ran this turn; nothing was created. Use the tools, or say plainly that nothing was done."
 NOTICE = "This reply describes work, but no step ran, so nothing in your scene changed."
+# Sent back after a reply that announced a step and called no tool (announces_step); never shown in the panel.
+CONTINUE = "[Loopcut] Go ahead: do that now with your tools, or say plainly that you are stopping and why."
+MAX_CONTINUES = 2  # Per user turn, and never two without a tool run in between.
 # Private scalar markers on the original user message: saved, restored and never sent to the model.
 EXECUTED = "loopcut_executed_tools"
 CORRECTED = "loopcut_unrun_corrected"
+CONTINUED = "loopcut_step_continues"        # How many CONTINUE nudges this user turn has had.
+CONTINUED_AT = "loopcut_step_continued_at"  # EXECUTED when the last one was sent.
 
 _ACTIONS = (r"create|make|build|add|model|move|rotate|scale|resize|delete|remove|duplicate|rename|"
             r"parent|bevel|extrude|assign|apply|change|edit|fix|repair|replace|position|align|"
@@ -109,3 +115,68 @@ def imitates_records(text: str, tool_names) -> bool:
         if json_name.match(line) and payload.search("\n".join([line, *lines[index + 1:index + 4]])):
             return True
     return False
+
+
+# --- Announced steps -------------------------------------------------------------------------------------
+# "I will next import ...", "I'll now search ...", "Let's try ...": first person, about to act, with a verb
+# for something the tools do. English only, and narrow on purpose: a missed nudge costs the user one
+# "go on"; a false one makes Loopcut talk over a question it asked.
+_STEP_VERBS = (r"import|search|look|browse|find|fetch|download|grab|bring|load|add|create|make|build|model|place|"
+               r"put|position|move|rotate|scale|resize|arrange|align|set|adjust|apply|assign|tweak|refine|fix|"
+               r"repair|replace|swap|remove|delete|duplicate|generate|render|capture|check|inspect|verify|test|try|"
+               r"retry|attempt|start|begin|continue|proceed|work|focus|populate|furnish|decorate|light|texture|"
+               r"sculpt|animate|rig|run|organi[sz]e|parent|join|combine|assemble|scatter|configure|update|change|"
+               r"edit|improve|conduct|perform|measure")
+_LEAD = (r"(?:(?:now|next|then|first|also|just|quickly|immediately|again|instead|finally|go\s+ahead\s+and|"
+         r"go\s+on\s+to|move\s+on\s+to|proceed\s+to|need\s+to|have\s+to|try\s+to|start\s+by|begin\s+by|"
+         r"continue\s+by)[\s,]+){0,3}")
+_INTENT = re.compile(r"\b(?:i\s+will|i'll|i\s+shall|i(?:'m|\s+am)\s+(?:now\s+)?(?:going|about)\s+to|let\s+me|"
+                     r"let's|let\s+us)\s+" + _LEAD + r"(?:" + _STEP_VERBS + r")\b", re.I)
+# The step waits on the user, a condition or a later turn: not something to do now. Any "you" in the
+# sentence ("the one you pick"), any condition ("If this looks good, I'll..."), and a step that follows
+# something else ("Say the word and I'll...", "Sign in..., then I'll...") all count as waiting.
+_DEFERRED = re.compile(
+    r"\byou(?:r|'re|'d)?\b|\b(?:if|once|assuming|provided|whichever)\b|\b(?:and|then),?\s+(?:i'll|i\s+will)\b|"
+    r"\b(?:later|next\s+time|another\s+time|tomorrow)\b|"
+    r"\bin\s+(?:the|a)\s+(?:next|future|later|follow-?up)\s+(?:turn|message|reply|response|session|conversation|request)\b",
+    re.I)
+# Anywhere in the reply: a question or choice for the user, a hand-off, or a report that the work is done.
+_HANDOFF = re.compile(
+    r"\?|"
+    r"\b(?:let\s+me\s+know|feel\s+free|would\s+you\s+(?:like|prefer|rather)|do\s+you\s+want|want\s+me\s+to|"
+    r"shall\s+i|should\s+i|your\s+call|up\s+to\s+you|"
+    r"if\s+you(?:'d|\s+would)?\s+(?:like|want|prefer|rather)|"
+    r"you\s+(?:can|could|might|may)\s+(?:now|also|then|want|wish|choose|pick|tell|let)|"
+    r"your\s+(?:approval|confirmation|go-?ahead|ok|okay|input|feedback|preference|choice)|"
+    r"i(?:'m|\s+am)\s+(?:stopping|done|finished)|i(?:'ll|\s+will)\s+(?:stop|pause|wait|end\s+here|leave\s+it)|"
+    r"stopping\s+here|(?:that|this)(?:'s|\s+is)\s+(?:all|it)|all\s+(?:done|set)|"
+    r"(?:is|are)\s+(?:now\s+)?(?:done|complete|completed|finished|ready))\b|"
+    r"(?:^|[.!:]\s+)(?:please\s+)?(?:done|finished|choose|pick|select|confirm|tell\s+me|reply)\b",
+    re.I | re.M)
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def announces_step(text: str) -> bool:
+    """Whether a reply with no tool calls ends by announcing work it is about to do now ("I will next import
+    the desk.", "Let's try a broader search."), so the turn should go on instead of ending.
+
+    Only the last two sentences of the last paragraph count, and only a first-person step with a tool-shaped
+    verb, in a sentence with no "you", no condition ("if", "once"...), no "and/then I'll" after something the
+    user does, and no later turn; nor one that introduces something (ends in ":").
+    Never when the reply asks anything ("?" anywhere), offers a choice, hands off ("let me know if..."),
+    or says the work is done or stopping; nor when it ends on a list (a plan laid out, not a step begun).
+    """
+    if not isinstance(text, str):
+        return False
+    prose = re.sub(r"(?:```|~~~).*?(?:```|~~~|\Z)", "\n\n", text.replace("’", "'"), flags=re.S)
+    if _HANDOFF.search(prose):
+        return False
+    paragraphs = [p for p in re.split(r"\n\s*\n", prose) if p.strip()]
+    if not paragraphs:
+        return False
+    lines = [line for line in paragraphs[-1].splitlines() if line.strip()]
+    if _LIST_ITEM.match(lines[-1]):
+        return False
+    sentences = [s.strip() for line in lines for s in re.split(r"(?<=[.!])\s+", _plain(line)) if s.strip()]
+    return any(_INTENT.search(s) and not _DEFERRED.search(s) and not s.rstrip(" .!*_").endswith(":")
+               for s in sentences[-2:])

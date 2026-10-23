@@ -1,8 +1,8 @@
 """What the asset-library tools share: HTTP with readable errors, verified downloads into a cache,
 keyword ranking, and a sheet of thumbnails the model picks from.
 
-The sheet is one image a capture's width (four tiles across), numbered by position to match the
-text rows: the model chooses by look, which is the point of a library.
+The sheet is one image a capture's width (four tiles across), each tile labelled with its row's pick
+number (asset_picks): the model chooses by look, which is the point of a library.
 """
 
 import hashlib
@@ -167,9 +167,10 @@ def measured(objects, listed=None) -> str:
     return measured_line([_world_bounds(obj) for obj in objects], listed)
 
 
-def kit_notes(kits: list) -> dict:
+def kit_notes(kits: list, numbers: list | None = None) -> dict:
     """{row index: 'kit: <file> (rows 1, 4)'} for results that share a kit, here the same .blend file in
-    the same library: assets made to go together. `kits` holds one (library, file) or None per row."""
+    the same library: assets made to go together. `kits` holds one (library, file) or None per row;
+    with `numbers`, each row's pick number (asset_picks), the note names those: 'kit: <file> (#9, #12)'."""
     rows = {}
     for index, kit in enumerate(kits):
         if kit:
@@ -177,8 +178,9 @@ def kit_notes(kits: list) -> dict:
     notes = {}
     for (_, file), members in rows.items():
         if len(members) > 1:
-            note = f"kit: {Path(file).stem} (rows {', '.join(str(m + 1) for m in members)})"
-            notes.update(dict.fromkeys(members, note))
+            listed = (", ".join(f"#{numbers[m]}" for m in members) if numbers
+                      else "rows " + ", ".join(str(m + 1) for m in members))
+            notes.update(dict.fromkeys(members, f"kit: {Path(file).stem} ({listed})"))
     return notes
 
 
@@ -204,14 +206,16 @@ def _fitted(path, cell):
 
 
 def sheet(paths: list, name: str = "sheet.png", cell: tuple = (TILE, TILE), columns: int = SHEET_COLUMNS,
-          folder: Path | None = None, fit: bool = False) -> Path | None:
+          folder: Path | None = None, fit: bool = False, labels: list | None = None) -> Path | None:
     """Images as one, in rows of `columns` cells of cell (width, height) px, each scaled to the cell's
     height and cut to its width; None entries are blank cells. Search thumbnails (numbered by
     position in the text beside them) and a wave's contact sheet (waves.contact_sheet). Written to
     folder, else the scratch folder. Main thread.
     fit (the search sheets): each image whole and centred in its cell instead, on the sheet's grey. Cut to
     the cell's width, a 2:1 HDRI showed half its sky and a wide Poly Pizza or Poly Haven preview lost the
-    model's right side (offline picking check, 2026-10-10)."""
+    model's right side (offline picking check, 2026-10-10).
+    labels (the search sheets): each tile's pick number (asset_picks) in its top-left corner, so the
+    thumbnail the model likes is the number it imports, not a position to count."""
     import numpy as np
     width_of, height_of = cell
     tiles = []
@@ -237,10 +241,36 @@ def sheet(paths: list, name: str = "sheet.png", cell: tuple = (TILE, TILE), colu
         y0 = height - (row + 1) * height_of - row * SHEET_GAP + dy  # Pixel rows run bottom-up in Blender images.
         x0 = column * (width_of + SHEET_GAP) + dx
         canvas[y0:y0 + tile.shape[0], x0:x0 + tile.shape[1]] = tile
+    for index, label in enumerate(labels or ()):
+        row, column = divmod(index, columns)
+        stamp(canvas, str(label), column * (width_of + SHEET_GAP), height - row * (height_of + SHEET_GAP))
     out = (Path(folder) if folder else scratch.folder()) / name
     out.parent.mkdir(parents=True, exist_ok=True)
     _save_pixels(canvas, out)
     return out
+
+
+# Digits 3x5, top row first: the search sheets' pick numbers, drawn with numpy alone (no font, no GPU here).
+DIGITS = ("111101101101111", "010110010010111", "111001111100111", "111001111001111", "101101111001001",
+          "111100111001111", "111100111101111", "111001001001001", "111101111101111", "111101111001111")
+DIGIT_SCALE = 4  # A digit 12x20 px on a 160 px tile.
+
+
+def stamp(canvas, text: str, left: int, top: int) -> None:
+    """Digits in white on a black box whose top-left corner is column `left`, just under row `top` of
+    canvas (rows run bottom-up, as Blender keeps them). Anything but digits draws nothing."""
+    scale = pad = DIGIT_SCALE
+    width, height = len(text) * 4 * scale - scale + 2 * pad, 5 * scale + 2 * pad
+    if not text.isdigit() or not text.isascii() or top < height:
+        return
+    canvas[top - height:top, left:left + width, :3] = 0.0
+    for place, digit in enumerate(text):
+        for bit, on in enumerate(DIGITS[int(digit)]):
+            if on == "1":
+                row, column = divmod(bit, 3)
+                y = top - pad - (row + 1) * scale
+                x = left + pad + (place * 4 + column) * scale
+                canvas[y:y + scale, x:x + scale, :3] = 1.0
 
 
 def hdri_world(name: str, path: Path):

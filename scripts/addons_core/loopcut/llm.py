@@ -142,7 +142,15 @@ def account_from_headers(headers) -> dict | None:
             result["used_with_reservations"] = reserved
         return result
 
-    return {"plan": str(plan), "session": window("session"), "week": window("week")}
+    info = {"plan": str(plan), "session": window("session"), "week": window("week")}
+    # The credits arm (chat_credits.py): chat comes out of the balance, which each reply reports as it was before
+    # the request's charge. Only added when sent, so other accounts' info is exactly what it was.
+    if headers.get("x-loopcut-billing") in ("credits", "allowance"):
+        info["billing"] = headers["x-loopcut-billing"]
+    balance = headers.get("x-loopcut-credits-balance")
+    if isinstance(balance, str) and balance.strip().isdecimal() and balance.strip().isascii():
+        info["credits_balance"] = int(balance.strip())
+    return info
 
 
 def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:

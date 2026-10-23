@@ -34,7 +34,8 @@ import time
 from collections import deque
 
 EVENTS = ("app_start", "setup_step", "turn")
-STEPS = ("welcome", "chatgpt", "loopcut_account", "own_key", "done")
+# showcase and byo_ai: the credits arm's two setup steps (chat_credits.py, contract v1 2026-10-23).
+STEPS = ("welcome", "chatgpt", "loopcut_account", "own_key", "done", "showcase", "byo_ai")
 CHOICES = ("chatgpt", "loopcut", "own_key", "skip", None)
 PROVIDERS = ("chatgpt", "loopcut", "own_key")
 OUTCOMES = ("ok", "error", "cancelled", "empty")

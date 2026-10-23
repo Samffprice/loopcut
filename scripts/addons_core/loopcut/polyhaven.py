@@ -19,7 +19,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common
+from . import asset_common, asset_picks
 from .asset_common import NotFound, download, get_json, rank, sheet, valid_slug  # noqa: F401  (re-exported for tests)
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -52,9 +52,10 @@ def match_assets(query: str, assets: dict, limit: int = DEFAULT_LIMIT) -> list[t
                 weight_of=lambda it: it[1].get("download_count", 0), limit=limit)
 
 
-def describe_asset(index: int, slug: str, record: dict) -> str:
+def describe_asset(number: int, slug: str, record: dict) -> str:
+    """One result row: its pick number (asset_picks) and name first, the id last."""
     kind = TYPE_CODES.get(record.get("type"), "?")
-    parts = [f"{index}. {slug}: {record.get('name', slug)}"]
+    parts = [f"#{number} {record.get('name', slug)} (polyhaven)"]
     dims = record.get("dimensions")
     if dims and kind == "models":
         parts.append("%.2fx%.2fx%.2f m" % tuple(d / 1000 for d in dims[:3]))
@@ -67,6 +68,7 @@ def describe_asset(index: int, slug: str, record: dict) -> str:
     categories = ", ".join(record.get("categories", [])[:4])
     if categories:
         parts.append(categories)
+    parts.append(f"id {slug}")
     return "; ".join(parts)
 
 
@@ -164,13 +166,11 @@ def search_polyhaven(query: str, type: str, limit: int = DEFAULT_LIMIT) -> ToolR
     found = match_assets(str(query), assets(type), limit)
     if not found:
         raise ToolError(f"No Poly Haven {type} match {query!r}. Try fewer or more general words.")
-    lines = [describe_asset(i, slug, record) for i, (slug, record) in enumerate(found, 1)]
-    image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png", fit=True)
-    text = f"{len(found)} Poly Haven {type} for {query!r}, numbered as on the sheet (left to right, top to bottom):\n" \
-           + "\n".join(lines)
-    text += "\nPowered by Poly Haven"
-    if image:
-        text += "\n\nImage attached: thumbnails in that order. Import with import_asset(source=polyhaven, id)."
+    numbers = [asset_picks.number("polyhaven", slug, record.get("name") or slug) for slug, record in found]
+    lines = [describe_asset(n, slug, record) for n, (slug, record) in zip(numbers, found)]
+    image = sheet([_thumbnail(slug, record) for slug, record in found], "polyhaven_sheet.png", fit=True, labels=numbers)
+    text = f"{len(found)} Poly Haven {type} for {query!r}:\n" + "\n".join(lines)
+    text += "\nPowered by Poly Haven\n\n" + asset_picks.footer(image)
     return ToolResult(_clip(text), image_path=image)
 
 

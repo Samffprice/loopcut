@@ -20,14 +20,14 @@ from loopcut import blenderkit, tools  # noqa: E402
 
 
 def first_id(text: str) -> str:
-    return next(line.split(" ", 1)[1].split(":")[0] for line in text.splitlines() if line.startswith("1. "))
+    return next(line.rsplit("; id ", 1)[1] for line in text.splitlines() if line.startswith("#"))
 
 
 def check():
     code = 1
     try:
         found = tools.execute("search_assets", json.dumps({"source": "blenderkit", "query": "chair", "type": "model", "limit": 4}))
-        assert found.ok and "1. " in found.text and "free" in found.text and found.image_path, found.text
+        assert found.ok and "\n#" in found.text and "free" in found.text and found.image_path, found.text
         print(found.text)
         model_id = first_id(found.text)
         got = tools.execute("import_asset", json.dumps({"source": "blenderkit", "id": model_id}))
@@ -39,7 +39,8 @@ def check():
         found = tools.execute("search_assets", json.dumps({"source": "blenderkit", "query": "oak wood", "type": "material", "limit": 3}))
         assert found.ok, found.text
         material_id = first_id(found.text)
-        got = tools.execute("import_asset", json.dumps({"source": "blenderkit", "id": material_id, "apply_to": ["Cube"]}))
+        pick = next(line for line in found.text.splitlines() if line.startswith("#")).split()[0]  # "#4"
+        got = tools.execute("import_asset", json.dumps({"pick": int(pick[1:]), "apply_to": ["Cube"]}))  # By number.
         assert got.ok and "applied to Cube" in got.text, got.text
         material = bpy.data.objects["Cube"].active_material
         assert material.get("blenderkit_id") == material_id, (material.name, material.get("blenderkit_id"), material_id)

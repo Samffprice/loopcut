@@ -30,7 +30,7 @@ from pathlib import Path
 
 import bpy
 
-from . import account, blender_import, chatgpt_auth, config, settings
+from . import account, blender_import, chat_credits, chatgpt_auth, config, settings
 from .try_it import CARDS
 
 # left_chatgpt: "Use your own API key" moved the provider off a ChatGPT plan; "Back to model choices" puts it back.
@@ -52,6 +52,11 @@ SIGN_IN_PATIENCE = 120  # Seconds a browser sign-in may take before "Continue wi
 CREDITS_PATIENCE = 15   # Seconds to wait for the account's credits before carrying on without them.
 CLAIM_WINDOW = 2 * 24 * 3600  # Only a grant this recent is offered as "Claim": an older one may be spent.
 NUMBERED = ("account", "how", "connect", "privacy", "done")  # "Step n of 5"; Blender's settings come first.
+# The credits arm (chat_credits.py, contract v1 2026-10-23): "Everything Loopcut does" (showcase) takes the place of
+# "How Loopcut works", whose weekly limits and free Fast are not its rules, and the model step is reframed as
+# bringing your own AI (its events name it byo_ai). Every other account sees NUMBERED, exactly as in 0.2.13.
+CREDITS_NUMBERED = ("account", "showcase", "connect", "privacy", "done")
+STEPS = (*NUMBERED, "showcase")
 # Every operator a step draws. UILayout.operator() draws nothing for one that is not registered (an add-on
 # half way through re-registering), so a step is only drawn, and only modal, once all of them exist.
 OPERATORS = ("import_blender_settings", "onboarding_step", "onboarding_own_key", "onboarding_no_account",
@@ -115,7 +120,7 @@ def load_progress() -> dict | None:
         data = json.loads(_progress_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or data.get("step") not in (*NUMBERED, "import", "setup"):
+    if not isinstance(data, dict) or data.get("step") not in (*STEPS, "import", "setup"):
         return None
     return {"version": data.get("version"), "step": data["step"], "done": data.get("done") is True,
             "privacy_seen": data.get("privacy_seen") == PRIVACY_NOTICE, "existing": data.get("existing") is True}
@@ -157,7 +162,7 @@ def mark_privacy_seen() -> None:
         return
     progress = load_progress()
     if progress is None:
-        save_progress(_state["step"] if _state["step"] in NUMBERED else "account", privacy_seen=True)
+        save_progress(_state["step"] if _state["step"] in STEPS else "account", privacy_seen=True)
     else:
         save_progress(progress["step"], progress["done"], privacy_seen=True)
 
@@ -173,7 +178,7 @@ def _resume_step(saved: str) -> str:
         return "account"
     if saved in ("privacy", "done") and not _connected():
         return "connect"
-    return saved if saved in NUMBERED else "account"
+    return _arm_step(saved) if saved in STEPS else "account"
 
 
 def _start_step(first_run: bool) -> str | None:
@@ -212,12 +217,41 @@ def _after_setup() -> str | None:
     if settings.preferences() is None:
         return None  # Not enabled as an add-on: nothing to set up here.
     progress = load_progress()
-    return _resume_step(progress["step"] if progress and progress["step"] in NUMBERED else "account")
+    return _resume_step(progress["step"] if progress and progress["step"] in STEPS else "account")
 
 
 def _go(step: str) -> None:
+    step = _arm_step(step)
     _state["step"] = step
     save_progress(step)
+
+
+def _credits_arm() -> bool:
+    """Whether the signed-in account is in the credits arm (the manifest's account.billing). Never raises."""
+    try:
+        return chat_credits.active()
+    except Exception as ex:
+        print(f"Loopcut: could not read the account's billing: {ex!r}")
+        return False
+
+
+def _arm_step(step: str) -> str:
+    """The second step as this account's arm has it: "showcase" in the credits arm, else "how". Decided when the
+    step is drawn or entered, so an account whose manifest arrives late still lands on its own."""
+    if step == "how" and _credits_arm():
+        return "showcase"
+    if step == "showcase" and not _credits_arm():
+        return "how"
+    return step
+
+
+def _numbered() -> tuple:
+    return CREDITS_NUMBERED if _credits_arm() else NUMBERED
+
+
+def _model_step() -> str:
+    """The model step's name in setup events: byo_ai in the credits arm (the contract's), chatgpt otherwise."""
+    return "byo_ai" if _credits_arm() else "chatgpt"
 
 
 # --- The modal splash ---------------------------------------------------------------------------------------
@@ -286,8 +320,13 @@ def _signature() -> tuple:
         shown += (_on_chatgpt_plan(), ready["status"], ready["code"], ready.get("note", ""))
     elif step == "how":
         shown += (_account_plan(), _unit_prices(_descriptors()))
+    elif step == "showcase":
+        shown += tuple(sorted(_showcase_prices(_descriptors(), _manifest_account()).items())) + (
+            _showcase_monthly(),)
     elif step == "done":
         shown += (_connected(), tuple(card_cost(card, _descriptors()) for card in CARDS))
+    if step in ("account", "how", "showcase", "connect", "done"):
+        shown += (_credits_arm(),)
     return shown
 
 
@@ -403,10 +442,14 @@ def _draw_splash(layout, context, first_run: bool) -> bool:
             return False
         _go(step)
         _set_banner(context, False)
+    if step in ("how", "showcase") and _arm_step(step) != step:  # The account's arm became known since.
+        step = _state["step"] = _arm_step(step)
     if step == "account":
         _draw_account(layout, context)
     elif step == "how":
         _draw_how(layout, context)
+    elif step == "showcase":
+        _draw_showcase(layout, context)
     elif step == "connect":
         _draw_connect(layout, context)
     elif step == "privacy":
@@ -531,14 +574,16 @@ def _row_mark() -> dict:
 def _page(layout, step: str | None = None):
     """The screen's column, the splash's full width inside its own margins, under the compact header."""
     column = layout.column()
-    if step in NUMBERED:
+    if step in STEPS:
+        numbered = _numbered()
+        numbered = numbered if step in numbered else NUMBERED if step in NUMBERED else CREDITS_NUMBERED
         header = column.row()
         header.label(text="Set up Loopcut", **_mark())
         dots = header.row(align=True)
         dots.alignment = "RIGHT"
-        index = NUMBERED.index(step)
+        index = numbered.index(step)
         if _styled(dots):  # Done muted, current orange, the rest faint.
-            for n in range(len(NUMBERED)):
+            for n in range(len(numbered)):
                 dots.label_styled(text="●", color=ORANGE if n == index else MUTED if n < index else PENDING)
         else:
             dots.label(text=_dots(step))
@@ -547,8 +592,9 @@ def _page(layout, step: str | None = None):
 
 
 def _dots(step: str) -> str:
-    index = NUMBERED.index(step)
-    return " ".join("●" if n <= index else "○" for n in range(len(NUMBERED)))
+    numbered = NUMBERED if step in NUMBERED else CREDITS_NUMBERED
+    index = numbered.index(step)
+    return " ".join("●" if n <= index else "○" for n in range(len(numbered)))
 
 
 def _headline(column, title: str, line: str = "") -> None:
@@ -851,11 +897,18 @@ def _credit_rows(credits: dict) -> tuple[str, str]:
     """Honest copy when there is nothing to claim: (label, line)."""
     from . import nudges
     balance = credits.get("balance")
+    if _credits_arm():
+        if type(balance) in (int, float) and balance > 0:
+            return f"You have {balance:,g} credits", CREDITS_FOR
+        return "No credits on this account right now", "Asset search is free."
     if not config.billing_open():
         return "Your free account is ready", "Asset search and Loopcut Fast are free."
     if type(balance) in (int, float) and balance > 0:
         return f"You have {balance:,g} credits ({nudges.dollars(balance)})", "They pay for cloud tools."
     return "No free credits on this account right now", "Asset search and Loopcut Fast are free."
+
+
+CREDITS_FOR = "For Loopcut's AI and the cloud tools."
 
 
 def _draw_account(layout, context) -> None:
@@ -940,17 +993,22 @@ def _draw_signed_in(layout, context) -> None:
         _text(group, "This takes a moment.", MUTED, center=True)
     elif amount and not _state["claimed"]:
         _text(group, f"{amount:g} free credits", scale=1.5, bold=True, center=True)
-        _text(group, f"{nudges.dollars(amount)} for cloud tools", MUTED, center=True)
+        _text(group, CREDITS_FOR if _credits_arm() else f"{nudges.dollars(amount)} for cloud tools", MUTED,
+              center=True)
     elif amount:
         _text(_icon_row(group, _icon("done"), center=True), f"{amount:g} credits added", SUCCESS, scale=1.5,
               bold=True)
-        _text(group, f"{nudges.dollars(amount)} for cloud tools", MUTED, center=True)
+        _text(group, CREDITS_FOR if _credits_arm() else f"{nudges.dollars(amount)} for cloud tools", MUTED,
+              center=True)
     else:
         label, line = _credit_rows(credits)
         _text(group, label, scale=1.2, bold=True, center=True)
         _text(group, line, MUTED, center=True)
     prefs = settings.preferences()
-    if prefs is None or prefs.provider == "LOOPCUT":
+    if _credits_arm():
+        amount_monthly, free = _showcase_monthly()
+        _text(column, f"{amount_monthly:,} {'free ' if free else ''}credits come back every month.", MUTED, center=True)
+    elif prefs is None or prefs.provider == "LOOPCUT":
         kind = "chat" if _account_plan() in ("pro", "max") else "free"
         _text(column, "Credits pay for cloud tools; Loopcut chat has a separate\n"
                       f"{kind} allowance that refreshes every 5 hours.", MUTED, center=True)
@@ -972,8 +1030,7 @@ def _draw_signed_in(layout, context) -> None:
 
 # The plans as the plans and plan_credit_grants tables set them (loopcut.org/pricing), on 2026-10-21. The manifest
 # names the account's own plan but carries no catalogue: when a price or a monthly grant changes, change it here.
-PLANS = {"free": {"credits": 100, "price": 0}, "pro": {"credits": 2200, "price": 20},
-         "max": {"credits": 6600, "price": 60}}
+PLANS = chat_credits.PLANS
 # (what, Free, Pro, Max), only where the plans differ: True a check, False a dash, text as it is. The second
 # column is Pro, or Max for a Max account; the monthly credits are in the bars under the table.
 PLAN_ROWS = (("Loopcut Fast", "Weekly limit", "Higher weekly limit", "Highest weekly limit"),
@@ -1071,6 +1128,153 @@ def _draw_how(layout, context) -> None:
     _back(left, "account")
     if sales and not paid:  # Already on a paid plan: no upsell.
         _web_link(right, "See plans ↗", config.pricing_url("onboarding", "pro"))
+
+
+# --- Everything Loopcut does (the credits arm's second step) ---------------------------------------------------
+# Round3 #1: one agent and the tools it runs, as tiles of real outputs with their prices, then the one rule: the
+# monthly credits pay for all of it, AI chat included. It explains; the next step picks the model.
+
+# (id, title, line, square picture in media/credits). Pictures: our own renders and runs (the cabin and campsite
+# scenes, the alarm clock from a photo, the jumping mannequin, Poly Haven's CC0 Treasure Chest); the Lucide icons
+# (ISC) on the plain tiles.
+SHOWCASE = (("agent", "AI agent", "Plans and builds in your scene", "tile-agent.jpg"),
+            ("assets", "Asset libraries", "Free models and materials", "tile-assets.jpg"),
+            ("photo_3d", "Photo → 3D", "A textured model from one photo", "tile-photo3d.jpg"),
+            ("motion", "Motion", "Animate from text or a video", "tile-motion.jpg"),
+            ("rig", "Auto-rig", "Rig any character in one click", "tile-rig.jpg"),
+            ("render", "Cloud renders", "Final frames while you keep working", "tile-render.jpg"),
+            ("sound", "Sound and voice", "Effects and voice lines for your scene", "tile-sound.jpg"),
+            ("retopo", "Retopology", "Clean, game-ready meshes", "tile-retopo.jpg"))
+# A tile's price when the manifest has no estimate for its tool (loopcut.org/pricing, 2026-10-23).
+SHOWCASE_PRICES = {"photo_3d": "80", "motion": "2 / sec", "rig": "Soon", "render": "from 5", "sound": "from 4",
+                   "retopo": "5"}
+RIG_TOOLS = ("auto_rig", "autorig", "rig_character")  # Whichever name the service gives auto-rig when it opens.
+TILE_GAP = 6        # Pixels at UI scale 1 between tiles (the row's own spacing included).
+TILE_PADDING = 5    # Inside a tile's box: the picture nearly reaches its edges, as in the mockup.
+TILE_LINES = 2      # A tile's description wraps to at most this many lines.
+
+
+def _manifest_account() -> dict:
+    """The signed-in account's manifest object ({} until one arrives)."""
+    from . import cloud
+    runtime = cloud._runtime
+    if runtime is None or not runtime.signed_in:
+        return {}
+    with runtime.lock:
+        value = runtime.manifest.get("account")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _estimate(descriptors: list[dict], name: str) -> int | None:
+    descriptor = next((d for d in descriptors if d.get("name") == name), None)
+    if descriptor is None or descriptor.get("backend") != "managed":
+        return None
+    value = (descriptor.get("cost") or {}).get("credits_estimate")
+    return value if type(value) is int and value > 0 else None
+
+
+def _showcase_prices(descriptors: list[dict], account_info: dict) -> dict:
+    """Each tile's price as its badge reads: live estimates where the manifest has them."""
+    prices = dict(SHOWCASE_PRICES, agent=chat_credits.step_label(account_info, short=True), assets="Free")
+    model, motion = _estimate(descriptors, "image_to_3d"), _estimate(descriptors, "motion_from_text")
+    if model:
+        prices["photo_3d"] = f"{model:,}"
+    if motion:
+        prices["motion"] = f"{motion / MOTION_DEFAULT_SECONDS:g} / sec"
+    rig = next((value for value in (_estimate(descriptors, name) for name in RIG_TOOLS) if value), None)
+    if rig:
+        prices["rig"] = f"{rig:,}"
+    render = _estimate(descriptors, "render")
+    if render:
+        prices["render"] = f"from {render:,}"
+    sound = [value for value in (_estimate(descriptors, "sfx"), _estimate(descriptors, "voice_line")) if value]
+    if sound:
+        prices["sound"] = f"from {min(sound):,}"
+    retopo = _estimate(descriptors, "retopology")
+    if retopo:
+        prices["retopo"] = f"{retopo:,}"
+    return prices
+
+
+def _showcase_monthly() -> tuple[int, bool]:
+    """(the monthly credits the banner names, whether they are the free plan's)."""
+    account_info = _manifest_account()
+    return chat_credits.monthly(account_info), chat_credits.plan_of(account_info) in ("", "free")
+
+
+def _wrap_caption(text: str, width: float, scale: float = CAPTION, lines: int = TILE_LINES) -> str:
+    """Text broken into at most `lines` lines that fit `width` pixels at UI scale 1, as label_styled draws it at
+    `scale`; the last line ends with "…" if the text is longer."""
+    try:
+        import blf
+        points = bpy.context.preferences.ui_styles[0].widget.points
+        blf.size(0, points * scale)
+
+        def measure(value):
+            return blf.dimensions(0, value)[0]
+    except (ImportError, AttributeError, IndexError, TypeError):
+        def measure(value):
+            return len(value) * 11 * scale * 0.55
+    out, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if line and measure(trial) > width:
+            out.append(line)
+            line = word
+        else:
+            line = trial
+    out.append(line)
+    if len(out) > lines:
+        last = " ".join(out[lines - 1:])
+        while last and measure(last + "…") > width:
+            last = last[:-1]
+        out = out[:lines - 1] + [last.rstrip() + "…"]
+    return "\n".join(out)
+
+
+def _draw_showcase(layout, context) -> None:
+    account_info = _manifest_account()
+    column = _page(layout, "showcase")
+    _report_once("showcase", None, "shown")
+    _headline(column, "Everything Loopcut does, in Blender", "One agent runs all of these for you. Ask in plain words.")
+    prices = _showcase_prices(_descriptors(), account_info)
+    tile = (_content_px() - 3 * TILE_GAP) / 4
+    inner = tile - 2 * TILE_PADDING
+    for first in (0, 4):
+        row = column.row(align=True)
+        row.alignment = "LEFT"
+        for n, (key, title, line, picture) in enumerate(SHOWCASE[first:first + 4]):
+            if n:
+                row.separator(factor=TILE_GAP / 6)  # A separator is 6 px per factor at UI scale 1.
+            cell = row.column()
+            cell.ui_units_x = tile / 20
+            box = _group(cell, TILE_PADDING)
+            icon = _thumbnail("credits/" + picture)
+            if icon:
+                box.template_icon(icon_value=icon, scale=(inner - 2 * PREVIEW_INSET) / 20)
+            else:
+                box.label()
+            text = box.column(align=True)
+            _text(text, title, bold=True)
+            price = prices[key]
+            _text(text, price, SUCCESS if price == "Free" else MUTED if price == "Soon" else FOREGROUND, scale=CAPTION,
+                  tight=True)
+            _text(text, _wrap_caption(line, inner - 12), MUTED, scale=CAPTION, tight=True)  # The label's own margins.
+        column.separator(factor=0.4)
+    amount, free = _showcase_monthly()
+    banner = _group(column).row(align=True)
+    banner.alignment = "LEFT"
+    big = banner.column()
+    big.ui_units_x = 3.4 if amount >= 1000 else 2.6
+    big.separator(factor=0.9)
+    _text(big, f"{amount:,}", scale=2.0, bold=True)
+    words = banner.column(align=True)
+    _text(words, f"{'free ' if free else ''}credits every month for anything above,\nAI chat included.")
+    _text(words, f"A typical first build uses about {chat_credits.TYPICAL_BUILD}.", MUTED, tight=True)
+    props = _primary(column, "loopcut.onboarding_step", "Next")
+    props.step, props.save = "connect", False
+    left, _ = _footer(column)
+    _back(left, "account")
 
 
 def _parts(column, sales: bool) -> None:
@@ -1194,7 +1398,8 @@ def _plan_cell(layout, value) -> None:
         _icon_row(layout, _icon("yes" if value else "no"))
 
 
-def _option(column, name: str, line: str, icon: dict, tag: str = "", line_icon: str = "", line_color=MUTED):
+def _option(column, name: str, line: str, icon: dict, tag: str = "", line_icon: str = "", line_color=MUTED,
+            tag_color=ORANGE):
     """A model choice in its box: the name (and tag) with its action beside it, then one line across the box.
     Returns the action's column: every action at the same x and width, and as tall as the try-it Starts."""
     box = _group(column)
@@ -1206,7 +1411,7 @@ def _option(column, name: str, line: str, icon: dict, tag: str = "", line_icon: 
     _text(_icon_row(title, icon), name)
     if tag:
         if _styled(title):
-            title.label_styled(text=tag, color=ORANGE)
+            title.label_styled(text=tag, color=tag_color)
         else:
             title.label(text=tag)
     right = top.column()
@@ -1229,25 +1434,31 @@ def _draw_sign_in(layout, context) -> None:
         return
     chatgpt = chatgpt_ui.status()
     column = _page(layout, "connect")
-    _headline(column, "Choose the model for your chat", "You can change it later in Preferences.")
+    credits = _credits_arm()
+    # The credits arm (round3 #2): your own AI chats for 0 credits; Loopcut's AI is the one that uses them.
+    name, tag, tag_color = ("ChatGPT Plus or Pro", ZERO_TAG, SUCCESS) if credits else ("ChatGPT", "Recommended", ORANGE)
+    if credits:
+        _headline(column, "Already pay for AI? Chat for 0 credits", BYO_LINE)
+    else:
+        _headline(column, "Choose the model for your chat", "You can change it later in Preferences.")
     if chatgpt["status"] == "waiting":
         _watch_popup(context)
-        right = _option(column, "ChatGPT", "Waiting for your browser…", _icon("person"), "Recommended", "wait")
+        right = _option(column, name, "Waiting for your browser…", _icon("person"), tag, "wait", tag_color=tag_color)
         row = right.row(align=False)
         row.operator("loopcut.chatgpt_copy_link", text="Copy link")
         cancel = row.row()
         cancel.alignment = "RIGHT"
         _link(cancel, "loopcut.chatgpt_cancel", "Cancel")
     elif chatgpt["status"] == "error" and chatgpt["error"]:
-        right = _option(column, "ChatGPT", _sentence(chatgpt["error"]), _icon("person"), "Recommended", "error",
-                        DANGER)
+        right = _option(column, name, _sentence(chatgpt["error"]), _icon("person"), tag, "error",
+                        DANGER, tag_color=tag_color)
         row = right.split(factor=0.45)  # A plain row gave the link the width and cut the button to "Try ag…".
         row.operator("loopcut.chatgpt_sign_in", text="Try again", depress=True)  # Keeps an issued client id.
         another = row.row()
         another.alignment = "RIGHT"
         _link(another, "loopcut.chatgpt_sign_in", "Another account").new_account = True
     elif _on_chatgpt_plan():
-        right = _option(column, "ChatGPT", chatgpt_ui.account_line(), _icon("done"), "Recommended")
+        right = _option(column, name, chatgpt_ui.account_line(), _icon("done"), tag, tag_color=tag_color)
         if settings.preferences().provider != "CHATGPT":
             right.operator("loopcut.chatgpt_check", text="Use ChatGPT", depress=True)
         else:
@@ -1259,11 +1470,14 @@ def _draw_sign_in(layout, context) -> None:
             props = proceed.operator("loopcut.onboarding_step", text="Continue", depress=True)
             props.step, props.save, props.provider = "privacy", True, "CHATGPT"
     else:
-        _report_once("chatgpt", None, "shown")
-        right = _option(column, "ChatGPT", CONNECT_LINE if config.billing_open() else CONNECT_LINE_NO_SALES,
-                        _icon("person"), "Recommended")
-        right.operator("loopcut.chatgpt_sign_in", text="Sign in with ChatGPT", depress=True)
+        _report_once(_model_step(), None, "shown")
+        line = BYO_CHATGPT if credits else CONNECT_LINE if config.billing_open() else CONNECT_LINE_NO_SALES
+        right = _option(column, name, line, _icon("person"), tag, tag_color=tag_color)
+        right.operator("loopcut.chatgpt_sign_in", text="Sign in" if credits else "Sign in with ChatGPT", depress=True)
     column.separator(factor=CARD_GAP)
+    if credits and account.signed_in():
+        _draw_byo_rest(column)
+        return
     if account.signed_in():
         right = _option(column, "Loopcut models", "Loopcut Fast is free. Loopcut Pro comes with the Pro plan."
                         if config.billing_open() else "Loopcut Fast and Loopcut Pro run on your account.",
@@ -1283,6 +1497,31 @@ def _draw_sign_in(layout, context) -> None:
         _step_link(right, "Skip for now", "privacy")
 
 
+ZERO_TAG = "chat: 0 credits"
+BYO_LINE = "Connect it and the agent's thinking runs on your plan.\nYour credits go further on the tools."
+BYO_CHATGPT = "Sign in once. Chat uses your ChatGPT plan."
+BYO_KEY = "Any OpenAI-compatible provider, or a local model."
+BYO_LOOPCUT = "Nothing to set up. Chat comes out of your monthly credits."
+
+
+def _draw_byo_rest(column) -> None:
+    """The credits arm's other two choices (round3 #2): your own key, then Loopcut's AI at its price per step.
+    "Skip for now" keeps a model that is already connected and takes Loopcut's AI otherwise, so nobody leaves this
+    step without one."""
+    right = _option(column, "Your own API key", BYO_KEY, _icon("key"), ZERO_TAG, tag_color=SUCCESS)
+    right.operator("loopcut.onboarding_own_key", text="Add key").enable = True
+    column.separator(factor=CARD_GAP)
+    right = _option(column, "Use Loopcut's AI", BYO_LOOPCUT, _row_mark(),
+                    chat_credits.step_label(_manifest_account()), tag_color=MUTED)
+    props = right.operator("loopcut.onboarding_step", text="Use it")
+    props.step, props.save, props.provider = "privacy", True, "LOOPCUT"
+    left, right = _footer(column)
+    _back(left, "how")  # The showcase, in this arm (_arm_step).
+    props = _link(right, "loopcut.onboarding_step", "Skip for now")
+    props.step, props.save, props.provider = "privacy", True, "CURRENT" if _connected() else "LOOPCUT"
+    props.skip = True
+
+
 def _connected_route(prefs) -> tuple[dict, str, str]:
     """(icon, name, detail) of the model already connected, as the model step's choices name it."""
     from . import chatgpt_ui
@@ -1299,7 +1538,7 @@ def _draw_connected(layout) -> None:
     """The model step for an install from before the setup: the model it already has, kept with Continue."""
     prefs = settings.preferences()
     column = _page(layout, "connect")
-    _report_once("chatgpt", _choice(), "existing_shown")
+    _report_once(_model_step(), _choice(), "existing_shown")
     _headline(column, "Your model is connected", "Loopcut keeps using it.")
     icon, name, detail = _connected_route(prefs)
     box = _group(column)
@@ -1416,12 +1655,13 @@ def _descriptors() -> list[dict]:
         return []
 
 
-def _price(credits: int | None) -> str:
+def _price(credits: int | None, chat: str = "") -> str:
+    """chat: the credits arm's "≈1 credit / step" when Loopcut's AI runs the card, which then is not free."""
     from . import nudges
     if credits is None:
         return "Your own key"
     if credits == 0:
-        return "Free"
+        return chat or "Free"
     return f"{credits:g} credits · {nudges.dollars(credits)}"
 
 
@@ -1448,6 +1688,11 @@ def _try_line(signed_in: bool, credits: dict | None) -> str:
     balance = (credits or {}).get("balance")
     if not signed_in:
         return "Sign in to Loopcut for the cloud projects."
+    if _credits_arm() and getattr(settings.preferences(), "provider", "") == "LOOPCUT":
+        step = chat_credits.step_label(_manifest_account())  # Loopcut's AI is not free in this arm.
+        if type(balance) in (int, float) and balance > 0:
+            return f"You have {balance:,g} credits. Loopcut's AI uses {step}."
+        return f"No credits right now. Loopcut's AI uses {step}."
     if not config.billing_open():
         return "Pick one to start."
     if type(balance) in (int, float) and balance > 0:
@@ -1510,7 +1755,9 @@ def _draw_try(layout, context) -> None:
             line.separator(factor=0.5)
             _text(line, "0 credits")
         else:
-            _text(price, _price(credits_needed))
+            chat = chat_credits.step_label(_manifest_account()) if (
+                _credits_arm() and getattr(settings.preferences(), "provider", "") == "LOOPCUT") else ""
+            _text(price, _price(credits_needed, chat))
         start = foot.column()
         start.enabled = runnable and connected
         start.scale_y = OPTION_SCALE
@@ -1574,31 +1821,35 @@ def _report_once(step: str, choice: str | None, code: str) -> None:
         _report(step, choice, code=code)
 
 
-def _report_move(current: str | None, target: str, provider: str) -> None:
+def _report_move(current: str | None, target: str, provider: str, skip: bool = False) -> None:
     """What a step button means for the setup's usage events: a pick, a skip, or the last screen. A sign-in that
     worked or failed reports itself (account._setup_event, chatgpt_ui._run_sign_in). Never raises."""
     from . import telemetry
     try:
         if telemetry.enabled():
-            _report_move_now(current, target, provider)
+            _report_move_now(current, target, provider, skip)
     except Exception as ex:
         print(f"Loopcut: setup event not recorded: {type(ex).__name__}")
 
 
-def _report_move_now(current: str | None, target: str, provider: str) -> None:
+def _report_move_now(current: str | None, target: str, provider: str, skip: bool = False) -> None:
     if current == "connect" and target == "privacy" and _state["existing"] and not _state["change_model"] \
             and not _state["own_key"]:
-        _report("chatgpt", _choice(), code="existing_kept")  # An install from before kept its model.
+        _report(_model_step(), _choice(), code="existing_kept")  # An install from before kept its model.
         return
     if current == "how" and target == "connect":
         _report("chatgpt", None, code="how_continue")  # The explainer before the model step, read.
+    if current == "showcase" and target == "connect":
+        _report("showcase", None, code="next")  # The credits arm's tour of the tools, read.
     if current == "connect" and target == "privacy":
         if _state["own_key"]:
             _report("own_key", "own_key", _connected(), None if _connected() else "not_connected")
+        elif skip:
+            _report(_model_step(), "skip")  # The credits arm's "Skip for now" (Loopcut's AI when nothing is connected).
         elif provider == "LOOPCUT":
-            _report("chatgpt", "loopcut")
+            _report(_model_step(), "loopcut")
         elif provider != "CHATGPT" and not _on_chatgpt_plan():
-            _report("chatgpt", "skip")  # Only offered without an account.
+            _report(_model_step(), "skip")  # Only offered without an account.
     if target == "done":
         _report("done", _choice(), _connected(), None if _connected() else "not_connected")
 
@@ -1718,7 +1969,7 @@ class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
             account.cancel_sign_in()
             chatgpt_ui.cancel_sign_in()
         if self.enable and not _state["own_key"]:
-            _report("chatgpt", "own_key")
+            _report(_model_step(), "own_key")
         _state["own_key"] = self.enable
         prefs = settings.preferences()
         if prefs is not None:
@@ -1741,10 +1992,11 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
     bl_label = "Continue"
     bl_options = {"INTERNAL"}
 
-    step: bpy.props.EnumProperty(items=[(s, s, "") for s in ("setup", *NUMBERED)])
+    step: bpy.props.EnumProperty(items=[(s, s, "") for s in ("setup", *STEPS)])
     save: bpy.props.BoolProperty()
     provider: bpy.props.EnumProperty(items=[(s, s, "") for s in ("CURRENT", "LOOPCUT", "CHATGPT")],
                                      default="CURRENT", options={"HIDDEN", "SKIP_SAVE"})
+    skip: bpy.props.BoolProperty(options={"HIDDEN", "SKIP_SAVE"})  # A "Skip for now", told apart in setup events.
 
     def execute(self, context):
         if _state["step"] == "account":
@@ -1755,7 +2007,7 @@ class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
         prefs = settings.preferences()
         if self.provider != "CURRENT" and prefs is not None and prefs.provider != self.provider:
             prefs.provider = self.provider
-        _report_move(_state["step"], self.step, self.provider)
+        _report_move(_state["step"], self.step, self.provider, getattr(self, "skip", False))
         if _state["step"] == "privacy" and self.step == "done":
             mark_privacy_seen()  # What conversation logs share was on screen: they may start.
         if self.step == "account":
@@ -1793,7 +2045,7 @@ class LOOPCUT_OT_onboarding_change_model(bpy.types.Operator):
 
     def execute(self, context):
         _state["change_model"] = True
-        _report("chatgpt", _choice(), code="existing_change")
+        _report(_model_step(), _choice(), code="existing_change")
         if context.region_popup is not None:
             context.region_popup.tag_refresh_ui()
         return {"FINISHED"}

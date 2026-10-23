@@ -289,6 +289,16 @@ class TranscriptTest(unittest.TestCase):
         self.assertIn({"role": "event", "text": "input_audio omitted"}, entries)
         self.assertIn("Like this [image data omitted]", [e.get("text") for e in entries])
 
+    def test_announced_step_nudges_are_counted_on_their_turn(self):
+        from loopcut import completion_guard
+        messages = [{"role": "user", "content": "Build a room", completion_guard.CONTINUED: 2,
+                     completion_guard.CONTINUED_AT: 3},
+                    {"role": "assistant", "content": "I'll now import a desk."},
+                    {"role": "user", context.STEP_LIMIT: True, "content": completion_guard.CONTINUE}]
+        entries = session_logs.build_transcript(messages, [{"kind": "user", "text": "Build a room"}])
+        self.assertEqual(entries[0], {"role": "user", "text": "Build a room", "data": {"step_continues": 2}})
+        self.assertEqual(entries[2]["data"], {"kind": "continuation"})
+
     def test_image_size_reads_png_and_jpeg_headers(self):
         path = Path(self.directory.name) / "j.png"
         path.write_bytes(jpeg_header(1280, 720))

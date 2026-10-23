@@ -11,7 +11,7 @@ import math
 import re
 from pathlib import Path
 
-from .. import allowance, config, spending, state
+from .. import allowance, chat_credits, config, spending, state
 from . import textedit
 from . import theme as T
 from .markdown import REFERENCE_LIMIT, split_markdown
@@ -260,6 +260,13 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
                               f.px(T.FONT_SIZE_SMALL), T.TEXT_MUTED)
     if not item.get("streaming"):
         cursor += _reference_rows(f, n, item.get("file_references", []), x, cursor, width)
+        line = chat_credits.turn_line(item)
+        if line:  # Only the credits arm's turns carry one (chat_credits.record).
+            small = f.px(T.FONT_SIZE_SMALL)
+            cursor += f.px(4)
+            f.text(f"item{n}.credits.check", x, cursor, "✓", small, T.TEXT_MUTED if item.get("turn_stopped") else T.OK)
+            f.text(f"item{n}.credits", x + f.px(16), cursor, line, small, T.TEXT_MUTED)
+            cursor += f.line_height(small)
     return cursor - y
 
 
@@ -697,6 +704,12 @@ def _limit_buttons(f: Frame, n: int | str | None, item: dict, id: str) -> list:
 def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     """Out of allowance: what ran out, what the next plan offers, and the button that gets it.
     The buttons show on the newest unresolved limit; older ones are history."""
+    kind = _offer_card(f, item)
+    if kind:  # Out of credits, or variant B: the slim card; its button opens the pop-up again.
+        newest = n == state.latest_limit(f.session["items"])
+        live = (f.ui.get("allowance_notice") or {}).get("item") is item  # A reloaded card is history.
+        return _slim_card(f, f"item{n}.limit", n, item, kind, x, y, width,
+                          buttons=newest and live and not _limit_over(f, item))
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
@@ -725,7 +738,8 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
             elif item["reason"] != "free_daily_limit":  # The server's free_daily_limit text already says it.
                 body += "\nHave ChatGPT Plus or Pro? It can run Loopcut now."
         balance = f.ui.get("credit_balance")
-        if item["reason"] in HOSTED_LIMITS and isinstance(balance, (int, float)) and balance > 0:
+        if (item["reason"] in HOSTED_LIMITS and isinstance(balance, (int, float)) and balance > 0
+                and not _credits_arm(f)):
             body += "\nYour credits pay for cloud tools and do not add chat time."
     f.text(f"item{n}.limit.title", inner_x, cursor, title, size, color)
     cursor += f.line_height(size) + f.px(4)
@@ -739,6 +753,326 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.limit.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
     return height
+
+
+# --- The credits contract's cards (chat_credits.py) -------------------------------------------------------------
+# Only with a server that sends account.billing (any arm): the credits arm's out-of-credits pop-up (round3 #3) and,
+# in every arm, the out-of-allowance pop-up of round2 variant B. Each closes to one slim card (round2 D). Without
+# account.billing the cards above draw exactly as in 0.2.13.
+
+SHEET_BG = T._hex("#1c1c1c")
+SHEET_BORDER = T._hex("#3a3a3a")
+DIM = (0.0, 0.0, 0.0, 0.62)
+SLIM_BG = T._hex("#211e17")
+SLIM_BORDER = T._hex("#4a3d22")
+FREE_BG = T._hex("#1b2a20")
+FREE_BORDER = T._hex("#2c4a36")
+BAND = T._hex("#2a2b55")
+TILE_BG = T._hex("#262626")
+LOCK = T._hex("#dddddd")
+
+
+def _billing(f: Frame) -> str:
+    """The account's billing as the manifest (ui "billing") or the gateway's replies say it; "" from older servers."""
+    value = f.ui.get("billing") or (f.ui.get("account") or {}).get("billing") or ""
+    return value if value in (chat_credits.CREDITS, chat_credits.ALLOWANCE) else ""
+
+
+def _credits_arm(f: Frame) -> bool:
+    return _billing(f) == chat_credits.CREDITS
+
+
+def _offer_card(f: Frame, item: dict) -> str:
+    """Which new card a limit item gets: "credits" (out of credits), "offer" (variant B), or "" (0.2.13's card)."""
+    if item.get("reason") == chat_credits.CODE:
+        return "credits"
+    upgrade = item.get("upgrade")
+    # A server with the credits contract says account.billing, or sends upgrade.times with the refusal (it does so
+    # for every arm; servers before it never do), so other accounts get variant B too and older servers never.
+    if (item.get("reason") in allowance.LIMIT_WINDOWS and config.billing_open() and isinstance(upgrade, dict)
+            and upgrade.get("url") and (_billing(f) or "times" in upgrade)):
+        return "offer"
+    return ""
+
+
+def _limit_over(f: Frame, item: dict) -> bool:
+    """A new card's refusal that no longer applies: past its reset (or, for an allowance, a refreshed window)."""
+    if item.get("resolved"):
+        return True
+    if item.get("reason") == chat_credits.CODE:
+        plan = (f.ui.get("chat_credits") or {}).get("plan")
+        if item.get("plan") and plan and plan != item["plan"]:
+            return True  # Upgraded on the site, from a card or an email: the plan's credits are there now.
+        return chat_credits.expired(item.get("resets_at"), f.ui.get("now"))
+    notice = f.ui.get("allowance_notice") or {}
+    if notice.get("item") is item:
+        return allowance.refused_window(f.ui.get("account"), notice, f.ui.get("now")) is None
+    return False
+
+
+def _notice_index(f: Frame, item: dict):
+    """The limit actions' index: the card's place in this chat, else this chat's id (as the input notice's)."""
+    n = next((n for n, row in enumerate(f.session.get("items", [])) if row is item), None)
+    notice = f.ui.get("allowance_notice") or {}
+    if n is None and notice.get("conversation") == f.session.get("id"):
+        n = f.session.get("id")
+    return n
+
+
+def _slim_text(f: Frame, item: dict, kind: str) -> tuple[str, str, tuple]:
+    status = item.get("status", "") if config.billing_open() else ""
+    if status == "done":
+        return "Upgraded", item.get("text", ""), T.OK
+    if status == "waiting":
+        return "Waiting for your upgrade", "Finish in the browser.", T.WARN
+    if kind == "credits":
+        return "You're out of credits", chat_credits.come_back(f.ui.get("chat_credits") or {}, item.get("resets_at", ""),
+                                                               f.ui.get("now"), short=True), T.WARN
+    when = chat_credits.short_reset(item.get("resets_at"), f.ui.get("now"))
+    return chat_credits.used_title(item), f"Refills {when}" if when else "Refills soon", T.WARN
+
+
+def _slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, buttons: bool = True) -> int:
+    """Round2 D: what stays once the pop-up is closed. A ring, what happened, when it comes back, and one button
+    that opens the pop-up again ("See Pro" when there is a plan to get)."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    title, line, color = _slim_text(f, item, kind)
+    mark = len(f.prims)
+    ring = f.px(20)
+    actions = []
+    status = item.get("status", "") if config.billing_open() else ""
+    if buttons and status in ("", "waiting") and not f.session.get("busy"):
+        plan = str((item.get("upgrade") or {}).get("plan") or "pro").capitalize()
+        upgrade = status == "" and config.billing_open() and (item.get("upgrade") or {}).get("url")
+        # While an upgrade waits, the free ways on stay one click away (an abandoned checkout never resets it).
+        actions.append((id + ".open", f"See {plan}" if upgrade else "Options", T.BUTTON if upgrade else T.BUTTON_GHOST,
+                        T.BUTTON_TEXT if upgrade else T.TEXT, ("limit_popup_open", n)))
+        if kind == "offer" and isinstance(n, int) and state.can_resume(f.session):
+            actions.append((id + ".retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
+    widths = [round(f.measure("ui", small, label)) + f.px(20) for _, label, *_ in actions]
+    side = sum(widths) + f.px(8) * max(0, len(actions) - 1)
+    text_x = x + pad + ring + f.px(10)
+    beside = bool(side) and width - (text_x - x) - pad - side - f.px(8) >= f.px(120)  # Else under the text.
+    text_w = width - (text_x - x) - pad - (side + f.px(8) if beside else 0)
+    cursor = y + pad
+    cursor += f.paragraph(id + ".title", text_x, cursor, text_w, title, size, T.TEXT)
+    cursor += f.paragraph(id + ".text", text_x, cursor, text_w, line, small, T.TEXT_MUTED)
+    if actions and not beside:
+        cursor += f.px(8) + _button_row(f, text_x, cursor + f.px(8), width - (text_x - x) - pad, actions)
+    height = max(cursor - y, ring) + pad
+    f.ring(id + ".ring", x + pad, y + pad + (min(height - 2 * pad, ring + f.px(8)) - ring) // 2, ring, 1.0,
+           f.px(3.5), color)
+    bx = x + width - pad - side
+    for (bid, label, fill, text_color, action), w in zip(actions if beside else [], widths):
+        f.button(bid, bx, y + (height - f.px(24)) // 2, label, fill, text_color, action)
+        bx += w + f.px(8)
+    f.prims.insert(mark, {"t": "rect", "id": id + ".card", "x": x, "y": y, "w": width, "h": height,
+                          "color": SLIM_BG, "radius": f.px(T.RADIUS), "border": 1, "border_color": SLIM_BORDER})
+    return height
+
+
+def _popup_item(f: Frame) -> tuple[dict | None, str]:
+    """The account's refusal whose pop-up is open now, and its kind; (None, "") when none is."""
+    notice = f.ui.get("allowance_notice") or {}
+    item = notice.get("item")
+    if (not item or f.ui.get("view", "chat") != "chat" or f.session.get("busy") or item.get("popup_closed")
+            or item.get("status", "") not in ("", "waiting")):
+        return None, ""
+    kind = _offer_card(f, item)
+    if not kind or _limit_over(f, item):
+        return None, ""
+    return item, kind
+
+
+def _wide_button(f: Frame, id: str, x, y, width, height, label: str, action, short: str = "") -> None:
+    """A full-width primary button; `short` replaces a label too long for a narrow panel."""
+    size = f.px(T.FONT_SIZE)
+    if short and f.measure("ui", size, label) > width - f.px(16):
+        label = short
+    label = _ellipsize(f, label, size, width - f.px(16))
+    f.rect(id, x, y, width, height, T.BUTTON, f.px(T.RADIUS_SMALL))
+    f.text(id + ".label", x + (width - round(f.measure("ui", size, label))) // 2,
+           y + (height - f.line_height(size)) // 2, label, size, T.BUTTON_TEXT)
+    f.hit(id, x, y, width, height, action)
+
+
+def _centered(f: Frame, id: str, x, y, width, text: str, size: int, color) -> int:
+    """Centred lines, wrapped to the width; returns their height."""
+    lines = [line.rstrip() for _, line in wrap(text, "ui", size, width, f.measure)]
+    for k, line in enumerate(lines):
+        f.text(f"{id}.l{k}" if k else id, x + (width - round(f.measure("ui", size, line))) // 2,
+               y + k * f.line_height(size), line, size, color)
+    return f.line_height(size) * len(lines)
+
+
+def _close(f: Frame, id: str, right: int, y: int, color=T.TEXT_MUTED) -> None:
+    size, box = f.px(T.FONT_SIZE_TITLE), f.px(22)
+    f.text(id + ".label", right - box + (box - round(f.measure("ui", size, "×"))) // 2,
+           y + (box - f.line_height(size)) // 2, "×", size, color)
+    f.hit(id, right - box, y, box, box, ("limit_popup_close", None), tip="Close")
+
+
+def _lock(f: Frame, id: str, x, y) -> None:
+    """A small padlock: a ring for the shackle, half hidden by the body."""
+    body_w, body_h, shackle = f.px(8), f.px(6), f.px(6)
+    f.ring(id + ".shackle", x + (body_w - shackle) // 2, y, shackle, 1.0, max(1, f.px(1.4)), LOCK, LOCK)
+    f.rect(id + ".body", x, y + shackle // 2 + f.px(1), body_w, body_h, LOCK, f.px(1.5))
+
+
+def _keep_chatting(f: Frame, id: str, n, x, y, width) -> int:
+    """The free way on: the user's own ChatGPT plan or API key."""
+    pad, size, small = f.px(10), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    cursor = y + f.px(8)
+    cursor += f.paragraph(id + ".title", x + pad, cursor, width - 2 * pad, "Keep chatting for free", size, T.TEXT)
+    cursor += f.paragraph(id + ".text", x + pad, cursor, width - 2 * pad, "Connect ChatGPT Plus/Pro or an API key",
+                          small, T.TEXT_MUTED)
+    chatgpt = ("limit_chatgpt", n) if f.ui.get("chatgpt_plan") else ("sign_in", "chatgpt")
+    cursor += f.px(8) + _button_row(f, x + pad, cursor + f.px(8), width - 2 * pad, [
+        (id + ".chatgpt", "Use ChatGPT Plus/Pro", T.BUTTON_GHOST, T.TEXT, chatgpt),
+        (id + ".key", "Add an API key", T.BUTTON_GHOST, T.TEXT, ("own_key", None))])
+    height = cursor + f.px(8) - y
+    f.prims.insert(mark, {"t": "rect", "id": id + ".card", "x": x, "y": y, "w": width, "h": height,
+                          "color": FREE_BG, "radius": f.px(T.RADIUS_SMALL), "border": 1, "border_color": FREE_BORDER})
+    return height
+
+
+def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) -> int:
+    """Round3 #3: out of credits. What stops (the same tools, locked), Pro first, then the free way on."""
+    pad, small, title = f.px(14), f.px(T.FONT_SIZE_SMALL), f.px(T.FONT_SIZE_TITLE)
+    inner_x, inner_w = x + pad, width - 2 * pad
+    cursor = y + pad
+    ring = f.px(26)
+    f.ring("popup.ring", inner_x, cursor + f.px(2), ring, 1.0, f.px(4), T.WARN)
+    text_x = inner_x + ring + f.px(10)
+    text_w = inner_w - ring - f.px(10) - f.px(22)
+    top = cursor
+    cursor += f.paragraph("popup.title", text_x, cursor, text_w, "You're out of credits", title, T.BUTTON_TEXT)
+    cursor += f.paragraph("popup.text", text_x, cursor, text_w,
+                          chat_credits.come_back(f.ui.get("chat_credits") or {}, item.get("resets_at", ""),
+                                                 f.ui.get("now")), small, T.TEXT_MUTED)
+    _close(f, "popup.close", x + width - f.px(6), y + f.px(6))
+    cursor = max(cursor, top + ring + f.px(4)) + f.px(10)
+    if compact:
+        return _credits_actions(f, item, n, inner_x, cursor, inner_w) + pad - y
+    f.text("popup.pause", inner_x, cursor, "These pause until then:", small, T.TEXT_MUTED)
+    cursor += f.line_height(small) + f.px(4)
+    columns, gap = (3 if inner_w >= f.px(240) else 2), f.px(5)
+    tile_w = (inner_w - gap * (columns - 1)) // columns
+    tile_h = round(tile_w * 9 / 16)
+    label_size = f.px(10)
+    for k, (label, picture) in enumerate(chat_credits.LOCKED_TILES):
+        tx = inner_x + (k % columns) * (tile_w + gap)
+        ty = cursor + (k // columns) * (tile_h + gap)
+        f.rect(f"popup.tile{k}.bg", tx, ty, tile_w, tile_h, TILE_BG, f.px(4))
+        if picture:
+            f.prims.append({"t": "image", "id": f"popup.tile{k}.image", "path": str(chat_credits.MEDIA / picture),
+                            "x": tx, "y": ty, "w": tile_w, "h": tile_h})
+        f.rect(f"popup.tile{k}.border", tx, ty, tile_w, tile_h, T.NONE, f.px(4), 1, T.CARD_BORDER)
+        f.text(f"popup.tile{k}.label", tx + f.px(5), ty + tile_h - f.line_height(label_size) - f.px(3),
+               _ellipsize(f, label, label_size, tile_w - f.px(10)), label_size, T.TEXT)
+        _lock(f, f"popup.tile{k}.lock", tx + tile_w - f.px(13), ty + f.px(5))
+    rows = -(-len(chat_credits.LOCKED_TILES) // columns)
+    cursor += rows * tile_h + (rows - 1) * gap + f.px(12)
+    return _credits_actions(f, item, n, inner_x, cursor, inner_w) + pad - y
+
+
+def _credits_actions(f: Frame, item: dict, n, inner_x, cursor, inner_w) -> int:
+    """The out-of-credits sheet's ways on: Pro, its fine print, then the user's own AI. Returns the bottom."""
+    small = f.px(T.FONT_SIZE_SMALL)
+    upgrade = item.get("upgrade") or {}
+    if config.billing_open() and upgrade.get("url"):
+        _wide_button(f, "popup.upgrade", inner_x, cursor, inner_w, f.px(34), chat_credits.upgrade_button(upgrade),
+                     ("limit_upgrade", n), chat_credits.upgrade_button(upgrade, short=True))
+        cursor += f.px(34) + f.px(8)
+        cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Cancel anytime · Asset search stays free",
+                            small, T.TEXT_MUTED)
+    else:
+        cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Asset search stays free", small,
+                            T.TEXT_MUTED)
+    cursor += f.px(10)
+    return cursor + _keep_chatting(f, "popup.free", n, inner_x, cursor, inner_w)
+
+
+def _offer_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) -> int:
+    """Round2 variant B: the next plan's band, what ran out, four rows of what the plan adds, one button, then
+    the user's own ChatGPT plan or key."""
+    pad, size, small, title = f.px(14), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL), f.px(T.FONT_SIZE_TITLE)
+    inner_x, inner_w = x + pad, width - 2 * pad
+    band = f.px(44)
+    name, price = chat_credits.offer_plan(item)
+    f.rect("popup.band", x + 1, y + 1, width - 2, band, BAND, f.px(T.RADIUS))
+    f.rect("popup.band.square", x + 1, y + band - f.px(T.RADIUS), width - 2, f.px(T.RADIUS), BAND)
+    mark_size = f.px(16)
+    f.prims.append({"t": "mark", "id": "popup.band.mark", "x": inner_x, "y": y + (band - mark_size) // 2,
+                    "w": mark_size, "h": mark_size})
+    f.text("popup.band.name", inner_x + mark_size + f.px(8), y + (band - f.line_height(title)) // 2, name, title,
+           T.BUTTON_TEXT)
+    right = x + width - f.px(6)
+    _close(f, "popup.close", right, y + (band - f.px(22)) // 2, T.TEXT)
+    name_right = inner_x + mark_size + f.px(8) + round(f.measure("ui", title, name))
+    pill_w = round(f.measure("ui", small, price)) + f.px(16) if price else 0
+    if price and right - f.px(28) - pill_w > name_right + f.px(8):  # The price only where it fits beside the name.
+        pill_h = f.px(20)
+        px_ = right - f.px(22) - f.px(6) - pill_w
+        f.rect("popup.band.price", px_, y + (band - pill_h) // 2, pill_w, pill_h, (1.0, 1.0, 1.0, 0.12),
+               pill_h // 2)
+        f.text("popup.band.price.label", px_ + f.px(8), y + (band - f.line_height(small)) // 2, price, small,
+               T.BUTTON_TEXT)
+    cursor = y + band + pad
+    cursor += f.paragraph("popup.used", inner_x, cursor, inner_w, chat_credits.offer_used(item), size, T.BUTTON_TEXT)
+    cursor += f.paragraph("popup.get", inner_x, cursor, inner_w, "Upgrade and you get:", small, T.TEXT_MUTED)
+    cursor += f.px(8)
+    circle, icon = f.px(26), f.px(14)
+    for k, (key, line) in enumerate(chat_credits.offer_rows(item)[:1 if compact else None]):
+        picture, tint = chat_credits.OFFER_ICONS[key]
+        f.rect(f"popup.row{k}.circle", inner_x, cursor, circle, circle, tint, circle // 2)
+        f.prims.append({"t": "image", "id": f"popup.row{k}.icon",
+                        "path": str(chat_credits.MEDIA / "icons" / (picture + ".png")),
+                        "x": inner_x + (circle - icon) // 2, "y": cursor + (circle - icon) // 2, "w": icon, "h": icon})
+        f.text(f"popup.row{k}.text", inner_x + circle + f.px(12), cursor + (circle - f.line_height(size)) // 2,
+               _ellipsize(f, line, size, inner_w - circle - f.px(12)), size, T.TEXT)
+        cursor += circle + f.px(10)
+    cursor += f.px(4)
+    plan = str((item.get("upgrade") or {}).get("plan") or "pro").capitalize()
+    _wide_button(f, "popup.upgrade", inner_x, cursor, inner_w, f.px(32), f"Upgrade to {plan}", ("limit_upgrade", n))
+    cursor += f.px(32) + f.px(8)
+    when = chat_credits.short_reset(item.get("resets_at"), f.ui.get("now"))
+    fine = "Cancel anytime" + (f" · {'Free chat' if (item.get('plan') or 'free') == 'free' else 'Chat'} refills {when}"
+                               if when else "")
+    cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, fine, small, T.TEXT_MUTED) + f.px(8)
+    chatgpt = ("limit_chatgpt", n) if f.ui.get("chatgpt_plan") else ("sign_in", "chatgpt")
+    cursor += _button_row(f, inner_x, cursor, inner_w, [
+        ("popup.chatgpt", "Use ChatGPT Plus/Pro", T.BUTTON_GHOST, T.TEXT, chatgpt),
+        ("popup.key", "Add an API key", T.BUTTON_GHOST, T.TEXT, ("own_key", None))])
+    return cursor + pad - y
+
+
+def _popup(f: Frame, top: int) -> None:
+    """The open pop-up over the dimmed panel; a click outside it closes it to its slim card."""
+    item, kind = _popup_item(f)
+    if item is None:
+        return
+    f.rect("popup.dim", 0, 0, f.width, f.height, DIM)
+    f.hit("popup.dim", 0, 0, f.width, f.height, ("limit_popup_close", None))
+    gutter = f.px(T.PAD)
+    x, width = gutter, f.width - 2 * gutter
+    first_prim, first_hit = len(f.prims), len(f.hits)
+    f.hit("popup.sheet", x, 0, width, 0, ("noop", None))  # Its height is known once drawn.
+    n = _notice_index(f, item)
+    sheet = _credits_sheet if kind == "credits" else _offer_sheet
+    height = sheet(f, item, n, x, 0, width)
+    if height > f.height - top - 2 * gutter:  # A short panel: drawn again without the pictures or rows.
+        del f.prims[first_prim:], f.hits[first_hit + 1:]
+        height = sheet(f, item, n, x, 0, width, compact=True)
+    f.hits[first_hit]["h"] = height
+    f.prims.insert(first_prim, {"t": "rect", "id": "popup.sheet", "x": x, "y": 0, "w": width, "h": height,
+                                "color": SHEET_BG, "radius": f.px(T.RADIUS), "border": 1, "border_color": SHEET_BORDER})
+    shift = max(top + gutter, min(top + f.px(48), f.height - height - gutter))
+    for prim in f.prims[first_prim:]:
+        prim["y"] += shift
+    for hit in f.hits[first_hit:]:
+        hit["y"] += shift
 
 
 _CHANGE_COLORS = {"+": T.OK, "-": T.ERROR, "~": T.TEXT_MUTED}
@@ -1408,15 +1742,23 @@ def _input_notice(f: Frame, y: int) -> int:
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
     width = f.width - 2 * pad
     usage = ""
-    if f.ui.get("provider", "LOOPCUT") == "LOOPCUT":
+    notice = f.ui.get("allowance_notice")
+    item = notice.get("item") if notice else None
+    kind = _offer_card(f, item) if item else ""
+    # No windows apply to credits; a refusal's own card (variant B's) already says what ran out.
+    if f.ui.get("provider", "LOOPCUT") == "LOOPCUT" and not _credits_arm(f) and not (kind and not _limit_over(f, item)):
         usage, _ = usage_note(f.ui.get("account"), f.ui.get("allowance_notice"), f.ui.get("now"))
     height = 0
     if usage:
         usage += " · AI use includes helpers, not time; credits buy cloud tools, not more chat."
         height = f.paragraph("input.usage", pad, y, width, usage, small, T.TEXT_MUTED) + f.px(6)
         y += height
-    notice = f.ui.get("allowance_notice")
-    item = notice.get("item") if notice else None
+    if kind:
+        n = _notice_index(f, item)
+        # The chat's own card shows a refusal that came mid-turn; the open pop-up covers this one.
+        if not (f.session.get("busy") or _limit_over(f, item) or isinstance(n, int) or _popup_item(f)[0] is item):
+            return height + _slim_card(f, "input.limit", n, item, kind, pad, y, width) + f.px(6)
+        item = None
     if item and item.get("reason") in allowance.LIMIT_WINDOWS \
             and allowance.refused_window(f.ui.get("account"), notice, f.ui.get("now")) is None:
         item = None
@@ -1454,6 +1796,13 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
     """The credits block above the input footer (C47): the balance, then this chat's spend and today's (server
     account.spend), on one line when they fit and one each when the panel is narrow."""
     small = f.px(T.FONT_SIZE_SMALL)
+    balance = f.ui.get("credit_balance")
+    if _credits_arm(f) and isinstance(balance, (int, float)):
+        total = chat_credits.chat_total(f.session)
+        line = f"{math.floor(balance):,} credits" + (f" · chat {chat_credits.credits_text(total).split()[0]}"
+                                                     if total else "")
+        # No "Today: N credits": it counts cloud jobs only (the daily cloud limit's counter), never chat.
+        return [line]
     spend = f.session.get("spend")
     chat = spending.chat_label(spend) if f.ui.get("credits") or (
         spending.valid_ledger(spend) and spend.get("credits")) else ""
@@ -1462,6 +1811,17 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
     if extras and f.measure("ui", small, " · ".join(extras)) <= width:
         return lines + [" · ".join(extras)]
     return lines + extras
+
+
+def _chat_tip(f: Frame) -> str:
+    """The credits arm's footer tooltip: what this chat used, AI chat and tools apart."""
+    spend = f.session.get("spend")
+    tools = spend.get("credits", 0) if spending.valid_ledger(spend) else 0
+    total = chat_credits.chat_total(f.session)
+    if not total:
+        return "Loopcut's AI and the cloud tools use credits. Open your account."
+    return (f"This chat: {chat_credits.credits_text(total)} (AI {chat_credits.credits_text(total - tools)}, "
+            f"tools {chat_credits.credits_text(tools)}). Open your account.")
 
 
 def _credit_height(f: Frame, lines: list[str]) -> int:
@@ -1830,7 +2190,7 @@ def _rings(f: Frame, session: dict, right: int, y: int, height: int) -> None:
     diameter, thickness, gap = f.px(14), f.px(3), f.px(6)
     usage, budget, account = session.get("usage") or {}, int(f.ui.get("context_budget") or 0), f.ui.get("account")
     notice, now = f.ui.get("allowance_notice"), f.ui.get("now")
-    if f.ui.get("provider", "LOOPCUT") != "LOOPCUT":
+    if f.ui.get("provider", "LOOPCUT") != "LOOPCUT" or _credits_arm(f):
         account, notice = None, None
     rings = ring_shares(usage, budget, account, notice, now)
     total = len(rings) * diameter + (len(rings) - 1) * gap
@@ -1924,10 +2284,10 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
             f.text("input.credits" + (str(k) if k else ""), inner_x, credit_y + f.line_height(small) * k,
                    _ellipsize(f, line, small, inner_w), small, T.TEXT_MUTED)
         # The balance alone opens the account; neither the spend rows nor blank space are links.
-        if f.ui.get("credits"):
+        if f.ui.get("credits") or _credits_arm(f):
             balance = _ellipsize(f, credit_lines[0], small, inner_w)
             f.hit("input.credits", inner_x, credit_y, round(f.measure("ui", small, balance)),
-                  f.line_height(small), ("open_account", None))
+                  f.line_height(small), ("open_account", None), tip=_chat_tip(f) if _credits_arm(f) else "")
 
     if f.ui.get("picker") is not None:
         _picker(f, x, card_y, width)
@@ -2192,6 +2552,7 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
         _vote_footer(f, input_top)
     else:
         _input(f, session, input_top, model)
+        _popup(f, header_bottom)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
             "prims": f.prims, "hits": f.hits, "input": f.input}

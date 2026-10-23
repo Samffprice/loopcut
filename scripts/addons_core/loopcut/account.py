@@ -440,7 +440,14 @@ def update_usage(info: dict) -> None:
     """Fold what a gateway reply's headers said (plan, session and week usage) into the account,
     so the panel stays current without a request to /v1/me."""
     previous = (_state["account"] or {}).get("plan")
-    _set_account({**(_state["account"] or {}), **info})
+    merged = {**(_state["account"] or {}), **info}
+    for key in ("billing", "credits_balance"):  # The credits arm's headers: gone when replies stop sending them.
+        if key not in info:
+            merged.pop(key, None)
+    _set_account(merged)
+    if "credits_balance" in info:
+        from . import chat_credits
+        chat_credits.note_balance(info)  # The credits arm: the balance this turn started from.
     if info.get("plan") and info["plan"] != previous:
         _state["usage_refresh_at"] = time.monotonic()
         refresh_account()  # Model availability is account-specific too.
@@ -565,6 +572,9 @@ def usage_lines() -> list[str]:
     account = _state["account"]
     if not account:
         return []
+    from . import chat_credits
+    if chat_credits.active():
+        return []  # Chat comes out of the credit balance: no session or week windows apply.
     lines = []
     refused = allowance.refused_windows(account, state.ui.get("allowance_notice"))
     for key, label in (("session", "Session"), ("week", "Week")):

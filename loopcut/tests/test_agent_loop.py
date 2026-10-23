@@ -241,6 +241,19 @@ class AgentLoopTest(unittest.TestCase):
         # The line is read on the main thread at the start of each turn, not stored with the conversation.
         self.assertNotIn("addons_line", conversations._PERSISTED)
 
+    def test_a_new_message_replaces_a_nudge_left_last_by_a_stop(self):
+        nudge = {"role": "user", context.STEP_LIMIT: True, "content": agent.completion_guard.CONTINUE}
+        self.session["messages"] = [{"role": "user", "content": "Build a room"},
+                                    {"role": "assistant", "content": "I'll now import a desk."}, dict(nudge)]
+        SCRIPT.replies.append(text_reply("Done."))
+        with mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>"):
+            self.assertTrue(agent.send("Make it red"))
+            self.session["turn"].thread.join(5)
+        self.assertNotIn(nudge, self.session["messages"])
+        sent = [m.get("content") for m in SCRIPT.requests[0]["messages"]]
+        self.assertNotIn(agent.completion_guard.CONTINUE, sent)
+        self.assertEqual(self.session["messages"][1]["content"], "I'll now import a desk.")
+
     def test_a_setup_card_request_sent_unedited_marks_its_turn_and_an_edited_one_does_not(self):
         scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
         scene.start()
@@ -2621,11 +2634,39 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(self.session["references"], [])
                     history = [i for i in self.session["items"] if i["kind"] != "notice"]
                     self.assertEqual((history, self.session["messages"], self.session["turn_number"]), before)
-                    self.assertEqual(len(self.session["items"]), len(history) + (reason != "session_limit"),
+                    # Out of credits (the credits arm) has no chat windows to warn about.
+                    self.assertEqual(len(self.session["items"]),
+                                     len(history) + (reason not in ("session_limit", "insufficient_credits")),
                                      "only an unrefused window adds a percentage warning")
                     self.assertFalse(state.can_resume(self.session))
                     self.assertEqual(state.ui["allowance_notice"]["item"]["reason"], reason)
                 self.assertEqual(state.ui["account"]["session"]["used"], 0.82)
+
+    def test_out_of_credits_keeps_the_servers_reset_and_upgrade_and_warns_about_no_window(self):
+        """The credits arm's 402 (the live server's body, 2026-10-23): the send returns to the draft, the notice
+        carries the reset and upgrade for the pop-up, the turn event's code is insufficient_credits, and the
+        meaningless window headers never become a percentage warning, then or on a later success."""
+        reset = "2026-11-01T00:00:00.000Z"
+        upgrade = {"url": "https://loopcut.org/pricing?from=app&reason=insufficient_credits&plan=pro", "plan": "pro",
+                   "label": "Get Pro", "note": "Pro: 2,200 credits a month, $20."}
+        info = {"plan": "free", "billing": "credits", "credits_balance": 0,
+                "session": {"used": 0.95, "resets_at": "2099-10-21T18:00:00Z"}, "week": {"used": 0.9}}
+        details = {"message": "Out of credits. 100 free credits come back in 8 days.", "code": "insufficient_credits",
+                   "plan": "free", "balance": 0, "needed": 1, "resets_at": reset, "upgrade": upgrade}
+        refusal = llm.LLMError("HTTP 402", 402, "insufficient_credits", details, account=info)
+        turn = self.send("make more details")
+        spec = agent.LoopSpec(role="single", system=lambda _: "", schemas=lambda: [], save=mock.Mock(), reference_card=False)
+        with mock.patch.object(agent, "_request", side_effect=refusal), mock.patch.object(agent, "_changes_item"), \
+                mock.patch.object(config, "billing_open", return_value=True):
+            agent.run_loop(self.session, turn, spec)
+        item = state.ui["allowance_notice"]["item"]
+        self.assertEqual((item["reason"], item["resets_at"], item["upgrade"]), ("insufficient_credits", reset, upgrade))
+        self.assertEqual(item["text"], details["message"])
+        self.assertEqual(turn.error_code, "insufficient_credits")
+        self.assertEqual(self.session["input"], "make more details")
+        self.assertFalse([i for i in self.session["items"] if i["kind"] == "notice"])
+        agent._warn_low_allowance(self.session, self.session["items"], info)
+        self.assertFalse([i for i in self.session["items"] if i["kind"] == "notice"])
 
     def test_refusal_overrides_only_its_window_until_next_success_with_or_without_headers(self):
         for window in ("session", "week"):
@@ -3443,6 +3484,8 @@ class UnrunCompletionTest(unittest.TestCase):
 
         def reply(*args):
             completion = next(pending)
+            if callable(completion):  # (turn) -> the reply: a Stop or a card arriving while it streams.
+                completion = completion(turn)
             if isinstance(completion, Exception):
                 raise completion
             item = state.item_assistant()
@@ -3726,6 +3769,170 @@ class UnrunCompletionTest(unittest.TestCase):
                          (1, True))
         wired = conversations.wire_messages(session["id"], session["messages"])
         self.assertEqual(wired[0], {"role": "user", "content": "Build a prop"})
+
+
+# Final replies seen 2026-10-23 on hosted Fast: each ended its turn with the job barely started.
+ANNOUNCED = (
+    "I have successfully imported the Modern Wooden Floor TV Console. To start building out the VTuber room, I "
+    "will next import the Gaming Desk with Shelves (pick #2) to provide a place for a monitor and setup.",
+    "I have imported the drawing tablet and the penholder. These look like a good start for the desk area of the "
+    "VTuber's setup. Since these items are small, I'll now search for larger environmental assets like \"room\" or "
+    "\"study\" setups to build the actual room. I'll use the BlenderKit library again for variety.",
+    "I apologize, it seems like I'm having persistent trouble ... Let's try a broader approach. ... I will try "
+    "searching BlenderKit for a vintage desk.")
+
+
+class AnnouncedStepTest(unittest.TestCase):
+    """A reply that announces its next step and calls no tool continues the turn (completion_guard.CONTINUE):
+    the real loop with scripted completions; no Blender or local sockets."""
+
+    run_replies = UnrunCompletionTest.run_replies
+    call = staticmethod(UnrunCompletionTest.call)
+    saved_session = UnrunCompletionTest.saved_session
+    guard = agent.completion_guard
+
+    def nudges(self, session):
+        return [m for m in session["messages"] if m.get("content") == self.guard.CONTINUE]
+
+    def test_announced_step_continues_once_then_the_turn_ends_normally(self):
+        for announced in ANNOUNCED:
+            with self.subTest(announced=announced[:40]):
+                gate = mock.Mock(return_value=None)
+                session, turn, requests, ran = self.run_replies(
+                    [self.call(), llm.Completion(text=announced), self.call(), llm.Completion(text="Done.")],
+                    "Build a VTuber room", on_final=gate)
+                self.assertEqual((requests, ran, turn.outcome), (4, 2, "completed"))
+                [nudge] = self.nudges(session)
+                self.assertTrue(nudge[context.STEP_LIMIT], "it continues the turn rather than starting one")
+                self.assertEqual(nudge["role"], "user")
+                self.assertEqual(gate.call_count, 1, "the finish gates see only the reply that ends the turn")
+                # Not in the panel: the announcement stays as the agent's reply and the next step follows it.
+                shown = [i["kind"] for i in session["items"] if i["kind"] != "assistant" or i["text"].strip()]
+                self.assertEqual(shown, ["user", "tool", "assistant", "tool", "assistant"])
+                self.assertFalse(any(self.guard.CONTINUE in str(i.get("text", "")) for i in session["items"]))
+                request = session["messages"][0]
+                self.assertEqual((request[self.guard.CONTINUED], request[self.guard.CONTINUED_AT]), (1, 1))
+                wired = conversations.wire_messages(session["id"], session["messages"])
+                self.assertEqual(wired[0], {"role": "user", "content": "Build a VTuber room"})
+
+    def test_at_most_two_per_user_turn_and_never_two_without_a_tool_run_between(self):
+        announced = llm.Completion(text=ANNOUNCED[0])
+        session, turn, requests, ran = self.run_replies(
+            [self.call(), announced, self.call(), announced, self.call(), announced])
+        self.assertEqual((requests, ran, len(self.nudges(session)), turn.outcome), (6, 3, 2, "completed"))
+        for replies in ([self.call(), announced, announced], [announced, announced]):
+            with self.subTest(tools_first=len(replies) == 3):
+                session, turn, requests, _ = self.run_replies(replies)
+                self.assertEqual((requests, len(self.nudges(session)), turn.outcome), (len(replies), 1, "completed"))
+        # A new user message gets its own two.
+        session, _, requests, _ = self.run_replies(
+            [self.call(), announced, self.call(), announced, llm.Completion(text="Done.")], session=session)
+        self.assertEqual((requests, len(self.nudges(session))), (5, 3))
+
+    def test_questions_finished_replies_and_hand_offs_end_the_turn(self):
+        for final in ("I imported the desk. Would you like me to add a chair next? I'll import it then.",
+                      "I imported the console and the desk. Let me know if you want changes.",
+                      "Done. I'll leave the lighting to you.", "The room is complete.",
+                      "I'll add the lamp once you pick a style.", "I'm stopping here: BlenderKit is not responding."):
+            with self.subTest(final=final):
+                session, turn, requests, _ = self.run_replies([self.call(), llm.Completion(text=final)])
+                self.assertEqual((requests, turn.outcome), (2, "completed"))
+                self.assertFalse(self.nudges(session))
+
+    def test_no_nudge_after_stop_for_workers_or_without_scene_work(self):
+        def stopped(turn):
+            turn.cancel.set()  # Stop pressed while the announcement streamed.
+            return llm.Completion(text=ANNOUNCED[0])
+        session, turn, requests, _ = self.run_replies([self.call(), stopped])
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (2, "cancelled", 0))
+        session, turn, requests, _ = self.run_replies([self.call(), llm.Completion(text=ANNOUNCED[0])], role="worker")
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (2, "completed", 0))
+        session, turn, requests, _ = self.run_replies([llm.Completion(text="Let me check the scene.")],
+                                                      "How do I build a prop?")
+        self.assertEqual((requests, len(self.nudges(session))), (1, 0))
+
+    def test_no_nudge_while_a_card_waits_for_the_user(self):
+        cards = (state.item_offer("locked_tool", "BlenderKit needs a free Loopcut account", "", []),
+                 dict(state.item_tool("run_python", "Install a package", ""), status="awaiting"),
+                 state.item_limit("This week's allowance is used.", "week_limit", "free", "", None))
+        for card in cards:
+            with self.subTest(kind=card["kind"]):
+                session = state.new_session()
+                def shown(turn, card=card):
+                    session["items"].append(card)
+                    return llm.Completion(text=ANNOUNCED[0])
+                session, turn, requests, _ = self.run_replies([self.call(), shown], session=session)
+                self.assertEqual((requests, len(self.nudges(session))), (2, 0))
+
+    def test_step_cap_is_never_extended(self):
+        session, turn, requests, _ = self.run_replies([self.call(), llm.Completion(text=ANNOUNCED[0])], max_steps=2)
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (2, "completed", 0))
+        # The step after a nudge is one of the turn's steps.
+        session, turn, requests, ran = self.run_replies(
+            [llm.Completion(text=ANNOUNCED[0]), self.call(), llm.Completion(text="The desk is in.")], max_steps=2)
+        self.assertEqual((requests, ran, turn.outcome, len(self.nudges(session))), (3, 1, "step_limit", 1))
+
+    def test_resumed_turn_keeps_the_count_even_after_save_load(self):
+        announced = llm.Completion(text=ANNOUNCED[1])
+        for reload in (False, True):
+            with self.subTest(reload=reload):
+                session, _, _, _ = self.run_replies([self.call(), announced, llm.LLMError("Connection lost")])
+                self.assertEqual(len(self.nudges(session)), 1)
+                session = self.saved_session(session) if reload else session
+                session, turn, requests, _ = self.run_replies([announced], session=session, resume=True)
+                self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (1, "completed", 1))
+        session, _, _, _ = self.run_replies([self.call(), announced, llm.LLMError("Connection lost")])
+        session, turn, requests, _ = self.run_replies(
+            [self.call(), announced, self.call(), announced], session=self.saved_session(session), resume=True)
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (4, "completed", 2))
+
+    def test_question_turn_is_not_nudged_after_a_read_tool_ran(self):
+        # Review of f7094fe5bc6: the nudge would have changed the scene on a question.
+        session, turn, requests, ran = self.run_replies(
+            [self.call(), llm.Completion(text="The sun lamp is at 10 W, which is why. I'll set it to 1000 W.")],
+            "Why is my render so dark?")
+        self.assertEqual((requests, ran, turn.outcome, len(self.nudges(session))), (2, 1, "completed", 0))
+
+    def test_the_routers_delegate_nudge_comes_first_on_a_level_3_turn(self):
+        from loopcut import router
+        routed = types.SimpleNamespace(level=3, deliverables=[("room", "")])
+        session, turn, requests, _ = self.run_replies(
+            [self.call(), llm.Completion(text=ANNOUNCED[0]), llm.Completion(text=ANNOUNCED[1]), self.call(),
+             llm.Completion(text="Done.")], role="orchestrator", routed=routed, on_final=agent._orchestrator_final)
+        bounces = [m["content"] for m in session["messages"] if m.get(context.STEP_LIMIT)]
+        self.assertEqual(bounces, [router.NUDGE.format(what="room"), self.guard.CONTINUE])
+        self.assertEqual((requests, turn.outcome), (5, "completed"))
+
+    def test_a_note_typed_during_the_reply_goes_to_the_model_without_a_nudge_before_it(self):
+        session = state.new_session()
+        def noted(turn):
+            item = dict(state.item_user("Make it blue"), queued=True)
+            session["items"].append(item)
+            turn.notes.append(("Make it blue", item))
+            return llm.Completion(text=ANNOUNCED[0])
+        with mock.patch.object(agent, "_resend_on_main") as resend:
+            session, turn, requests, _ = self.run_replies([self.call(), noted], session=session)
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (2, "completed", 0))
+        self.assertEqual(resend.call_args.args[0], "Make it blue", "sent as the next message")
+
+    def test_a_card_from_before_a_resume_still_waits(self):
+        session = state.new_session()
+        def failed(turn):
+            session["items"].append(state.item_offer("locked_tool", "BlenderKit needs a free Loopcut account", "", []))
+            raise llm.LLMError("Connection lost")
+        session, _, _, _ = self.run_replies([self.call(), failed], session=session)
+        session, turn, requests, _ = self.run_replies([llm.Completion(text=ANNOUNCED[0])], session=session, resume=True)
+        self.assertEqual((requests, turn.outcome, len(self.nudges(session))), (1, "completed", 0))
+
+    def test_record_correction_comes_first_and_each_guard_fires_once(self):
+        forged = "run_python: done\nNext, I'll add a chair."
+        session, turn, requests, ran = self.run_replies(
+            [llm.Completion(text=forged), llm.Completion(text=ANNOUNCED[0]), llm.Completion(text="Nothing was done.")])
+        self.assertEqual((requests, ran), (3, 0))
+        corrections = [m for m in session["messages"] if m.get("content") == self.guard.CORRECTION]
+        self.assertEqual((len(corrections), len(self.nudges(session))), (1, 1))
+        self.assertLess(session["messages"].index(corrections[0]), session["messages"].index(self.nudges(session)[0]))
+        self.assertEqual(session["items"][-1], state.item_notice(self.guard.NOTICE))
 
 
 class TurnEndTest(unittest.TestCase):

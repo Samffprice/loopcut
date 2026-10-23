@@ -5,7 +5,8 @@
 
 Writes <state>.png, <state>.panel.png and <state>.json (plus .splash.png for onboarding),
 using shot.py's settle/double-draw and screenshot/crop sequence. Widths are logical pixels (scaled for Blender's UI scale).
-Use --state narrow_job for one fixture, or --keep-open to inspect the last state by hand.
+Use --state narrow_job for one fixture (or a comma list, panel states before onboarding ones), or --keep-open to
+inspect the last state by hand. The credits_* and allowance_* states put a canned manifest in place (FixtureRuntime).
 Run in a throwaway window: the script replaces panel service functions with fixtures.
 """
 
@@ -20,7 +21,45 @@ from pathlib import Path
 STATES = ("signed_out", "first_run", "hints_dismissed", "coming_soon", "coming_soon_clicked",
           "coming_soon_collapsed", "coming_soon_signed_out", "cloud_message", "narrow_job",
           "chatgpt_waiting", "loopcut_waiting", "sign_in_error", "running_extras",
-          "onboarding_account", "onboarding_account_failed", "onboarding_connect", "onboarding_connect_chatgpt_error")
+          "onboarding_account", "onboarding_account_failed", "onboarding_connect", "onboarding_connect_chatgpt_error",
+          # The credits package (chat_credits.py): a credits-arm account's screens, then variant B for any arm.
+          "credits_turn", "credits_popup", "credits_slim", "allowance_offer", "allowance_slim",
+          "credits_account", "credits_showcase", "credits_byo_ai")
+CREDITS_RESET = "2026-11-01T00:00:00.000Z"
+CREDITS_ACCOUNT = {"plan": "free", "billing": "credits", "chat_credits": {"per_step": 0.84},
+                   "credits": {"balance": 94, "monthly": 0, "resets_at": CREDITS_RESET}}
+CREDITS_UPGRADE = {"url": "https://loopcut.org/pricing?from=app&reason=insufficient_credits&plan=pro", "plan": "pro",
+                   "label": "Get Pro", "note": "Pro: 2,200 credits a month, $20."}
+LIVE_TOOLS = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
+              {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
+
+
+class FixtureRuntime:
+    """A cloud runtime with a canned manifest: no HTTP, no credentials."""
+
+    def __init__(self, account):
+        import threading
+        self.manifest = {"account": account, "flags": {"billing": True, "services": True, "premium_skills": False},
+                         "tools": [], "skills": []}
+        self.signed_in, self.refreshed_at, self.lock = True, 1.0, threading.RLock()
+        self.account_saving, self.account_message, self.supported, self.live = False, "", True, False
+        self.vote_notice, self.quotes, self.keys_set, self.policy, self.preferred = "", {}, {}, {}, {}
+        self.skills, self.account_pending, self.prompts_stale, self.model_source = [], {}, False, ""
+
+    def descriptors(self, on_the_house=None):
+        return [dict(tool) for tool in LIVE_TOOLS]
+
+    def refresh(self, *, wait=False):
+        return True
+
+    def refresh_async(self):
+        pass
+
+    def no_generation(self):
+        return False
+
+    def private_mode(self):
+        return False
 
 
 def fixtures(state):
@@ -61,6 +100,32 @@ def fixtures(state):
     assistant["text"] = "I'm checking the lights and camera before making changes."
     result["running_extras"].update(busy=True, items=[state.item_user("Add soft studio lighting."), assistant])
     result["running_extras"]["ui"].update(coming_soon=extras, cloud_jobs=[job])
+    # The credits package. "manifest_account" puts a canned runtime in place; "notice" a refusal (its card).
+    turn = [state.item_user("Model a typewriter"), dict(assistant, text="Built a typewriter: body, 44 keys, carriage "
+                                                                         "and platen.", turn_credits=14, chat_credits=14),
+            state.item_user("make more details on the typewriter please"),
+            dict(assistant, text="Added brass key caps, ribbon spool and paper guide.", turn_credits=6, chat_credits=4)]
+    for item in turn:
+        item.pop("streaming", None)
+    for name in ("credits_turn", "credits_popup", "credits_slim"):
+        result[name].update(items=[dict(item) for item in turn], spend={"credits": 2, "auto": 2, "allowed": 0})
+        result[name]["ui"]["manifest_account"] = CREDITS_ACCOUNT
+    for name in ("credits_popup", "credits_slim"):
+        card = state.item_limit("Out of credits. 100 free credits come back in 8 days.", "insufficient_credits", "free",
+                                CREDITS_RESET, None)
+        card["upgrade"] = dict(CREDITS_UPGRADE)
+        card["popup_closed"] = name == "credits_slim"
+        result[name]["ui"].update(notice=card, manifest_account={**CREDITS_ACCOUNT, "credits": {
+            **CREDITS_ACCOUNT["credits"], "balance": 0}})
+    for name in ("allowance_offer", "allowance_slim"):
+        card = state.item_limit("Chat allowance used.", "week_limit", "free", "2026-10-26T18:00:00Z", None)
+        card["upgrade"] = {**CREDITS_UPGRADE, "label": "Upgrade to Pro", "times": 17}
+        card["popup_closed"] = name == "allowance_slim"
+        result[name].update(items=[dict(item) for item in turn[:2]])
+        result[name]["ui"].update(notice=card, manifest_account={"plan": "free", "billing": "allowance",
+                                                                 "credits": {"balance": 100, "monthly": 0}})
+    for name, step in (("credits_account", "account"), ("credits_showcase", "showcase"), ("credits_byo_ai", "connect")):
+        result[name]["ui"].update(onboarding_step=step, manifest_account=CREDITS_ACCOUNT, signed_in=True)
     return result
 
 
@@ -69,7 +134,7 @@ def main():
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state", choices=("all", *STATES), default="all")
+    parser.add_argument("--state", default="all", help="all, one state, or several separated by commas")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--width", type=int, default=420)
     parser.add_argument("--narrow-width", type=int, default=240)
@@ -91,16 +156,19 @@ def main():
     from loopcut.ui import host
 
     canned = fixtures(state)
-    names = list(STATES) if args.state == "all" else [args.state]
+    names = list(STATES) if args.state == "all" else args.state.split(",")
+    if any(name not in STATES for name in names):
+        parser.error(f"unknown state in {args.state}; choose from {', '.join(STATES)}")
     current = {"index": 0, "ui": {}}
     window = bpy.context.window_manager.windows[0]
     base_ui = dict(state.ui)
 
-    cloud.register = cloud.panel_seen = lambda: None
+    cloud.register = cloud.panel_seen = cloud.refresh_async = lambda: None
     cloud.coming_soon = lambda: current["ui"].get("coming_soon", [])
     cloud.ui_message = lambda: current["ui"].get("cloud_message", "")
     cloud_jobs.ui_rows = lambda: current["ui"].get("cloud_jobs", [])
-    account.signed_in = lambda: False
+    account.signed_in = lambda: current["ui"].get("signed_in", False)
+    account.account_line = lambda: "tester@example.test"
     chatgpt_auth.status = lambda: {"signed_in": False}
     account.status = lambda: current["ui"].get("sign_in", {}).get("loopcut", {"status": "idle", "error": ""})
     chatgpt_ui.status = lambda: current["ui"].get("sign_in", {}).get("chatgpt", {"status": "idle", "error": ""})
@@ -161,16 +229,24 @@ def main():
         session.update({k: v for k, v in fixture.items() if k != "ui"})
         state.ui.clear()
         state.ui.update({**base_ui, **fixture["ui"], "view": "chat", "hover": None})
+        manifest_account = current["ui"].get("manifest_account")
+        cloud._runtime = FixtureRuntime(manifest_account) if manifest_account else None
+        if current["ui"].get("notice"):
+            state.ui["allowance_notice"] = {"item": current["ui"]["notice"], "conversation": session["id"]}
         host._runtime.pop("cloud_panel", None)
         panel = current["panel"]
         scale = bpy.context.preferences.system.ui_scale
         width = round((args.narrow_width if name == "narrow_job" else args.width) * scale)
         delta = panel.width - width
         if abs(delta) > 4 and not current["ui"].get("onboarding_step"):  # The splash's width is its own.
-            with bpy.context.temp_override(window=window, area=panel):
-                result = bpy.ops.screen.area_move(x=panel.x - 1, y=panel.y + panel.height // 2, delta=delta)
+            try:
+                with bpy.context.temp_override(window=window, area=panel):
+                    result = bpy.ops.screen.area_move(x=panel.x - 1, y=panel.y + panel.height // 2, delta=delta)
+            except RuntimeError as ex:  # Some window states refuse the move (poll); the split's own width will do.
+                result = {"CANCELLED"}
+                print(f"C11: kept the panel's width ({ex})")
             if result != {"FINISHED"}:
-                raise RuntimeError("Could not resize the panel edge; run with the panel docked on the right")
+                print(f"C11: could not resize the panel to {width} px; it is {panel.width} px")
         step = current["ui"].get("onboarding_step")
         if step:
             onboarding._state.update(step=step, own_key=False)

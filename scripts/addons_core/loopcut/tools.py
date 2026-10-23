@@ -280,8 +280,10 @@ def changes_over_time(name: str, arguments: dict) -> bool:
 
 
 def current_call(name: str, arguments: dict) -> tuple[str, dict]:
-    """A call as the current tools spell it: an old name becomes its merged tool (see RENAMED)."""
-    if name not in RENAMED or {"source", "action"} & set(arguments):
+    """A call as the current tools spell it: an old name becomes its merged tool (see RENAMED). Only
+    current calls name a source, an action, an id or a pick: import_asset(pick=9) is not the old
+    library import_asset(ref)."""
+    if name not in RENAMED or {"source", "action", "pick", "id"} & set(arguments):
         return name, arguments
     current, implied, id_name = RENAMED[name]
     arguments = dict(arguments)

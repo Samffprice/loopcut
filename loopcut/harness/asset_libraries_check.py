@@ -71,7 +71,7 @@ def check():
             print("essentials skipped:", ex)
         if found is not None and found.ok:
             assert asset_libraries.ESSENTIALS_NAME + "::" in found.text and found.image_path, found.text
-            ref = next(line.split(" ", 1)[1].split(";")[0] for line in found.text.splitlines() if line.startswith("1. "))
+            ref = next(line.rsplit("; id ", 1)[1] for line in found.text.splitlines() if line.startswith("#"))
             got = tools.execute("import_asset", json.dumps({"source": "library", "id": ref}))
             assert got.ok and "is now the scene world" in got.text, got.text
             assert bpy.context.scene.world.name.lower().startswith("city") or "city" in got.text.lower(), got.text
