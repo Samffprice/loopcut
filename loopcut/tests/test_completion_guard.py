@@ -122,5 +122,61 @@ class AnnouncesStepTest(unittest.TestCase):
             self.assertTrue(marker.startswith("loopcut_"), "private: never sent to the model")
 
 
+class SharedNudgeTest(unittest.TestCase):
+    """What the announced-step nudge and the record correction share: one budget a turn and one honest exit.
+    The loop side is in test_agent_loop.UnmadeCallsTest."""
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def test_the_record_correction_spends_from_the_announced_steps_budget(self):
+        g = completion_guard
+        for request, left in (({}, 2), ({g.CONTINUED: 1}, 1), ({g.CORRECTED: True}, 1),
+                              ({g.CONTINUED: 1, g.CORRECTED: True}, 0), ({g.CONTINUED: 2}, 0)):
+            with self.subTest(request=request):
+                self.assertEqual(g.nudges_left(request), left)
+
+    def test_a_plain_stop_or_nothing_ran_is_the_honest_exit_for_both(self):
+        for text in ("Nothing ran: I only described the steps.", "Nothing has run yet.", "Nothing was run.",
+                     "No tool ran, so the scene is as it was.", "No tools were run this turn.",
+                     "I'm stopping here because the search failed.", "Stopping here: the search failed.",
+                     "I’ll stop here; BlenderKit keeps timing out.", "I will stop now."):
+            with self.subTest(text=text[:40]):
+                self.assertTrue(completion_guard.stops_honestly(text))
+        # Work claims are not an exit, though they say "nothing was ..." or "I'll stop ..." (reviews of the port:
+        # each kept a written-out reply from its correction), nor is a wait: ar-artist-2's reply after rc's
+        # correction among them, and p6c's, whose "Nothing was done this turn" goes on to report work.
+        for text in ("I fixed the left shoulder and restored the pose. Nothing was changed on the legs.",
+                     "Updated the material to aged brass; nothing was created, only edited.",
+                     "Done: the shovel blade is now iron. Nothing was made from scratch.",
+                     "The walk cycle is applied. I'll stop the animation at frame 120 so it loops.",
+                     "The walk cycle is applied. I will stop the animation at frame 120.",
+                     "I'm stopping the render at 64 samples.", "The import worked; nothing ran into the chest.",
+                     "Nothing was done.", "I'll wait for the render to finish.", "All done.", "I'm done.", "Done.",
+                     "Nothing looks wrong at the shoulders.", "The steps ran.", None,
+                     (self.FIXTURES / "ar-artist-2-after-correction.txt").read_text(),
+                     (self.FIXTURES / "p6c-more-details-after-correction.txt").read_text()):
+            with self.subTest(text=str(text)[:40]):
+                self.assertFalse(completion_guard.stops_honestly(text))
+
+    def test_announces_step_reads_as_at_the_base(self):
+        # The honest exit is the loop's (agent.run_loop), not announces_step's: a failed step followed by the next
+        # one is still nudged (review of the port), and so is "Nothing ran yet. I'll now ...", until the loop
+        # sees the exit (test_agent_loop.UnmadeCallsTest).
+        for text in ("The desk import failed, nothing was made. Let me try a broader search.",
+                     "Nothing ran yet. I'll now import the desk.", "The desk is in. I'll now import the chair."):
+            with self.subTest(text=text):
+                self.assertTrue(completion_guard.announces_step(text))
+
+    def test_only_explicit_examples_and_earlier_steps_introduce_a_block(self):
+        for line in ("Example:", "In the previous step:", "In the previous steps:", "Earlier steps:",
+                     "- **For example**, a record reads:"):
+            with self.subTest(line=line):
+                self.assertTrue(completion_guard.introduces_example(line))
+        # Not an introduction for copied records, though imitates_records reads these as one (_ILLUSTRATION).
+        for line in ("What did it print?", "- **Here is the code** I ran:",
+                     "I'll redo the shoulder region with a proper geometric rule:",
+                     *(self.FIXTURES / "ar-artist-2-written-out.txt").read_text().split("\n")):
+            with self.subTest(line=line[:40]):
+                self.assertFalse(completion_guard.introduces_example(line))
+
 if __name__ == "__main__":
     unittest.main()

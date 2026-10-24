@@ -1,0 +1,15 @@
+The machine reads as a plain box — it needs real silhouette break-up (angled paper-feed tray, ribbed drum, top guard rails, chutes, casters). And it's only 71 mm from the chest, needs to be farther. Sending this back to the original modeling worker that built it.
+- delegate({"wave":{"shared":{"keep":{"names":["TreasureChest","TreasureChest_Wood","TreasureChest_Gold","Light","Fil): Wave 3 started: Moscow8M.
+    Budget: $0.400 of $0.40 left for this turn's workers; 1800 s per worker run.
+    Schedule: moscow8m start now.
+    Status comes from each brief's checks, run in the worker's copy.
+    Wave 3 (3-1-w3) finished in 477 s.
+    [moscow8m] Moscow8M · modeling · done · 20 steps · checks 8/8
+      outcome: completed and merged. Breaks the plain-box silhouette: angled paper-feed tray with platen roller at left-rear, slanted ink duct and guard rails on top, ribbed drum with axle hubs and brass collars, framed front control panel with 3 brass gauges/knobs, rotary handwheel with spokes and brass hub, lever arm with knob, paper delivery chute with a stack of sheets at right, side service door with hinges and handle, louver banks, corner caster feet, seam lines and rivet rows. Moved away from the chest to x=1.85 — now 345 mm clear (was 71 mm).
+    [moscow8m] Moscow8M · no local fixes needed, all checks pass in the worker's copy (details).
+    Moscow8M · models · /workspace/waves/w3/treasurechest_3d.blend (details)
+- looked: the contact sheet of these deliverables, each as it finished, in the scene's own light (a studio light if it has none), labelled moscow8m (after the step above).
+- checks({}): Ran every check on the live scene now: 11 of 12 pass.
+    Pass: o1, o2, o3, moscow8m c1, moscow8m c2, moscow8m c3, moscow8m c4, moscow8m c5, moscow8m c6, moscow8m c7, moscow8m c8
+    Unavailable: moscow8m keep — item 2 (TreasureChest, TreasureChest_Wood, TreasureChest_Gold, Light, Fill) (unchanged): no object named "TreasureChest, TreasureChest_Wood, TreasureChest_Gold, Light, Fill" in this scene.
+    Requirements (the user's words): 2 of 2 covered.

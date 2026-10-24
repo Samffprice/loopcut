@@ -166,13 +166,16 @@ _KEEP_LIST_SHAPE = "_keep_list_shape"  # Internal marker: shared.keep arrived as
 
 
 def _keep_list_names(value: list) -> list:
-    """Names read from shared.keep given as a list: of plain names, or of {"name": ...} objects."""
+    """Names read from shared.keep given as a list: of plain names, of {"name": ...} objects, or of
+    {"names": [...]} objects."""
     names = []
     for item in value:
         if isinstance(item, str):
             names.append(item)
         elif isinstance(item, dict) and isinstance(item.get("name"), str):
             names.append(item["name"])
+        elif isinstance(item, dict):
+            names += _names(item.get("names"))
     return names
 
 
@@ -180,12 +183,15 @@ def normalise_wave(wave: dict) -> dict:
     """The wave with every optional field present and each worker's checks numbered c1, c2... in
     brief order. Malformed values are kept as they are, for validate_wave to name. shared.keep given
     as a list (live_facts and validate_wave need it as {names, quote}) is reshaped here, marked
-    _KEEP_LIST_SHAPE so repair_wave can still see and note the mistake."""
+    _KEEP_LIST_SHAPE so repair_wave can still see and note the mistake. A list holding one
+    {names, quote} object is read as that object, its quote included (autorig_dog 20261023-180603)."""
     wave = json.loads(json.dumps(wave))  # A copy the caller's arguments do not share.
     shared = wave.get("shared") if isinstance(wave.get("shared"), dict) else {}
     keep = shared.get("keep")
-    if isinstance(keep, list):
-        shared_keep = {"names": _keep_list_names(keep), "quote": "", _KEEP_LIST_SHAPE: True}
+    if isinstance(keep, list) and len(keep) == 1 and isinstance(keep[0], dict) and "names" in keep[0]:
+        shared_keep = {"names": keep[0]["names"], "quote": keep[0].get("quote", ""), _KEEP_LIST_SHAPE: "object"}
+    elif isinstance(keep, list):
+        shared_keep = {"names": _keep_list_names(keep), "quote": "", _KEEP_LIST_SHAPE: "names"}
     else:
         keep = keep if isinstance(keep, dict) else {}
         shared_keep = {"names": keep.get("names", []), "quote": keep.get("quote", "")}
@@ -634,7 +640,7 @@ def repair_wave(wave: dict, words: str, live: dict) -> tuple[dict, list[str]]:
     its field, "Repairs: ..." in the delegate result). Never invents scope or ownership: a repair only
     drops what has no quote or still fails validation once aliased, aliases a field name, maps or
     defaults a role, reshapes shared.keep given as a list or bounds given flat, sanitises a prefix,
-    measures a rests_on support the brief forgot to declare, keeps a name over owning it, or drops a
+    measures a rests_on support the brief forgot to declare, or drops a
     name that plainly isn't in the scene. wave: normalise_wave's. words: user_words. live: live_facts'."""
     wave = json.loads(json.dumps(wave))
     shared, workers = wave["shared"], wave["workers"]
@@ -643,7 +649,10 @@ def repair_wave(wave: dict, words: str, live: dict) -> tuple[dict, list[str]]:
     notes = []
 
     keep = shared["keep"]
-    if keep.pop(_KEEP_LIST_SHAPE, False):
+    shape = keep.pop(_KEEP_LIST_SHAPE, "")
+    if shape == "object":
+        notes.append("shared.keep: a list holding one {names, quote} given; read as that object")
+    elif shape:
         notes.append(f"shared.keep: a list given instead of {{names, quote}}; read as names "
                      f"({', '.join(keep['names']) or 'none'})")
     if _names(keep.get("names")) and _quote_error(keep.get("quote"), words):
@@ -701,14 +710,6 @@ def repair_wave(wave: dict, words: str, live: dict) -> tuple[dict, list[str]]:
                 notes.append(f"{label}.aspects: dropped {', '.join(map(str, invalid))} (only "
                              f"{', '.join(ASPECTS)})")
                 worker["aspects"] = [a for a in aspects if a in ASPECTS]
-
-        owns = worker.get("owns")
-        if isinstance(owns, list):
-            conflict = [n for n in owns if isinstance(n, str) and n in kept_names]
-            if conflict:
-                notes.append(f"{label}.owns: {', '.join(conflict)} also listed in shared.keep; keeping wins, "
-                             f"removed from owns (stays kept, nobody owns it)")
-                worker["owns"] = [n for n in owns if n not in conflict]
 
         style = worker.get("style")
         if isinstance(style, list) and all(isinstance(part, str) for part in style):
@@ -901,7 +902,11 @@ def validate_wave(wave: dict, words: str, live: dict) -> list[str]:
             if name is None:
                 errors.append(f"{label}.owns: a list of names")
             elif name in kept:
-                errors.append(f"{label}.owns: {name!r} is kept (shared.keep); nobody may own it")
+                # Refused, not repaired: neither side can be read off the words. autorig_dog
+                # 20261023-180603: dropping it from owns emptied the rig worker's job; a keep that
+                # quotes "rig my dog so he can run" is the user asking to change it, not to keep it.
+                errors.append(f"{label}.owns: {name!r} is also in shared.keep. If this worker changes it, remove it "
+                              f"from shared.keep; if the user asked to keep it unchanged, remove it from owns")
             elif name not in objects and name not in names:
                 errors.append(f"{label}.owns: {name!r} is not in the scene; a worker creates what is new")
             elif name in owners:
@@ -1396,18 +1401,61 @@ WAIT_SCHEMA = {"type": "function", "function": {
                    "required": ["wait"], "additionalProperties": False}}}
 
 
+def _decoded(value):
+    """A value sent as a JSON string of an object, read as that object; anything else as it is."""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return value
+        return decoded if isinstance(decoded, dict) else value
+    return value
+
+
+def wave_argument(wave, shared=None) -> tuple:
+    """(wave, repairs, refusal): delegate's wave as the object it means. A wave or shared sent as a
+    JSON string is read as the object it encodes, and shared sent next to wave instead of inside it
+    is moved in (GLM, autorig_dog 20261023-180603: refused as "wave must be an object" and as "Bad
+    arguments", nothing started). Two different shared objects are refused, not one picked."""
+    repairs = []
+    if isinstance(wave, str) and isinstance(_decoded(wave), dict):
+        repairs.append("wave: a JSON string given; read as the object it encodes")
+        wave = _decoded(wave)
+    if isinstance(wave, dict) and isinstance(wave.get("shared"), str) and isinstance(_decoded(wave["shared"]), dict):
+        repairs.append("wave.shared: a JSON string given; read as the object it encodes")  # Else read as {}.
+        wave = {**wave, "shared": _decoded(wave["shared"])}
+    if shared is None or not isinstance(wave, dict):
+        return wave, repairs, ""
+    if isinstance(shared, str) and isinstance(_decoded(shared), dict):
+        repairs.append("shared: a JSON string given; read as the object it encodes")
+        shared = _decoded(shared)
+    if not isinstance(shared, dict):
+        return wave, repairs, ("delegate refused; nothing started: shared, given next to wave, is not an object. "
+                               "Send shared inside wave as {keep, palette, supports, units, notes}.")
+    inner = wave.get("shared")
+    if inner in (None, {}):
+        repairs.append("shared: given next to wave instead of inside it; moved into wave.shared")
+        return {**wave, "shared": shared}, repairs, ""
+    if inner == shared:
+        repairs.append("shared: given both inside wave and next to it, the same; read once")
+        return wave, repairs, ""
+    return wave, repairs, ("delegate refused; nothing started: shared was given both inside wave and next to it, "
+                           "and the two differ. Send shared once, inside wave.")
+
+
 def waits(name: str, arguments: dict) -> bool:
     """delegate wait with no briefs: the running workers' next results. It starts nothing, so it is not
-    asked about (the delegate that started them was)."""
-    wave = arguments.get("wave")
+    asked about (the delegate that started them was). A wave sent as a JSON string counts as its briefs."""
+    wave = _decoded(arguments.get("wave"))
     return (name == "delegate" and str(arguments.get("wait")).lower() == "true"
             and not (isinstance(wave, dict) and wave.get("workers")))
 
 
-def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False):
+def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False, shared: dict | None = None):
     """Main thread. Validate, dry-run the layout, save the workers' copy, then hand the wave to the
     agent thread (waves.run_wave), which returns once one of the turn's workers has finished and
-    merged. wait with no briefs: the next results of the workers still running (waves.collect)."""
+    merged. wait with no briefs: the next results of the workers still running (waves.collect).
+    shared is not in the schema: a model that sends it next to wave gets it moved in (wave_argument)."""
     from . import tools, waves
     session = state.session()
     turn = session.get("turn")
@@ -1421,6 +1469,9 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         return tools.ToolResult("Workers are off in this conversation; do the work yourself.", ok=False)
     if session.get("workers_unavailable"):
         return tools.ToolResult(waves.unavailable_note(session), ok=False)
+    wave, argument_repairs, refusal = wave_argument(wave, shared)
+    if refusal:
+        return tools.ToolResult(refusal, ok=False, plan_refused=True)
     if not isinstance(wave, dict):
         return tools.ToolResult("delegate refused: wave must be an object {shared, workers}; or wait true, with no "
                                 "wave, for the running workers' next results.", ok=False, plan_refused=True)
@@ -1433,6 +1484,7 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
     live["busy"] = waves.busy(job)
     live["references"] = [r["name"] for r in session.get("references") or ()]  # What the user attached.
     plan, repairs = repair_wave(plan, words, live)  # Small mistakes fixed before validation ever sees them.
+    repairs = argument_repairs + repairs
     errors = snapshot_errors + validate_wave(plan, words, live)
     if errors and dry_run:
         return tools.ToolResult(dry_run_report(errors, repairs, [], [], layout_checked=False),
@@ -1689,7 +1741,8 @@ def describe(name: str, arguments: dict):
         return None
     if waits(name, arguments):
         return "Wait for the helpers' next results", ""
-    wave = arguments.get("wave") if isinstance(arguments.get("wave"), dict) else {}
+    wave = wave_argument(arguments.get("wave"), arguments.get("shared"))[0]  # As delegate will read it.
+    wave = wave if isinstance(wave, dict) else {}
     workers = wave.get("workers")
     if not isinstance(workers, list) or not workers or not all(isinstance(w, dict) for w in workers):
         return "Helper plan is empty or invalid", json.dumps(arguments, indent=2)

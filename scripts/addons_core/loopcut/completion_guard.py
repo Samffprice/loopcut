@@ -1,5 +1,6 @@
 """Recognize imitations of Loopcut records, never ordinary claims about work; and a reply that
-announces its next step but stops before taking it."""
+announces its next step but stops before taking it. Both are sent back from one budget a turn
+(nudges_left), and neither when the reply says plainly that it stops or that nothing ran."""
 
 import re
 
@@ -8,7 +9,9 @@ CORRECTION = "No tool ran this turn; nothing was created. Use the tools, or say 
 NOTICE = "This reply describes work, but no step ran, so nothing in your scene changed."
 # Sent back after a reply that announced a step and called no tool (announces_step); never shown in the panel.
 CONTINUE = "[Loopcut] Go ahead: do that now with your tools, or say plainly that you are stopping and why."
-MAX_CONTINUES = 2  # Per user turn, and never two without a tool run in between.
+# Per user turn, and never two without a tool run in between. The turn's one record correction (CORRECTED:
+# CORRECTION, or agent's copied-records retry) spends from the same budget (nudges_left).
+MAX_CONTINUES = 2
 # Private scalar markers on the original user message: saved, restored and never sent to the model.
 EXECUTED = "loopcut_executed_tools"
 CORRECTED = "loopcut_unrun_corrected"
@@ -32,6 +35,10 @@ _ILLUSTRATION = re.compile(
     r"\b(?:example|sample|previous (?:step|turn)|earlier (?:step|turn|output|result|record))\b|"
     r"^plan\b|^(?:I'll|I will)\b.*:$|\b(?:here|following)\b.*\b(?:code|script)\b", re.I)
 _RESULT = r"(?:ok|done|success(?:ful)?|failed|printed|output|result)\b"
+# _ILLUSTRATION's explicit part, plurals included. Not in _ILLUSTRATION itself: RECORD_HEAD begins "Earlier steps.",
+# and the 0.2.13 correction must still see the forged records after a copied head (rel015-app).
+_EXAMPLE_INTRO = re.compile(r"\b(?:example|sample|previous (?:steps?|turns?)|"
+                            r"earlier (?:steps?|turns?|outputs?|results?|records?))\b", re.I)
 
 
 def scene_request(message: dict) -> bool | None:
@@ -58,6 +65,13 @@ def scene_request(message: dict) -> bool | None:
 
 def _plain(line: str) -> str:
     return re.sub(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", "", line.strip()).replace("**", "").replace("`", "")
+
+
+def introduces_example(line: str) -> bool:
+    """A line that introduces an example or an account of earlier steps ("Example:", "In the previous steps:"),
+    after which context.copied_records leaves record-shaped text alone. Narrower than imitates_records' reading
+    (_ILLUSTRATION): an "I'll ...:" or a question before forged records does not make them an example."""
+    return bool(_EXAMPLE_INTRO.search(_plain(line.replace("’", "'"))))
 
 
 def imitates_records(text: str, tool_names) -> bool:
@@ -154,6 +168,29 @@ _HANDOFF = re.compile(
     r"(?:^|[.!:]\s+)(?:please\s+)?(?:done|finished|choose|pick|select|confirm|tell\s+me|reply)\b",
     re.I | re.M)
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def nudges_left(request: dict) -> int:
+    """What is left of the user turn's MAX_CONTINUES: the announced-step nudges sent (CONTINUED) and the one
+    record correction (CORRECTED), counted on the user's message so a resumed turn keeps the count."""
+    return MAX_CONTINUES - request.get(CONTINUED, 0) - bool(request.get(CORRECTED))
+
+
+# The whole reply stopping, or nothing having run: "I'm stopping here.", "I'll stop now, since...", "Nothing ran.",
+# "No tools were run this turn." Each ends there, at a clause: "I'll stop the animation at frame 120" and "nothing
+# ran into the chest" are work, and "nothing was changed on the legs" is part of a claim. This exit turns the
+# corrections off, so a false yes leaves a false account standing.
+_WHEN = r"(?:\s+(?:here|now|there|yet|at\s+all|for\s+now|this\s+turn|in\s+this\s+(?:reply|turn)))?"
+_END = r"(?=\s*(?:[.!;:,\u2014\u2013-]|$)|\s+(?:because|since|as|until|and|but|so)\b)"
+_STOPPING = re.compile(r"\b(?:i(?:'m|\s+am)\s+stopping|i(?:'ll|\s+will)\s+stop|stopping\s+here|"
+                       r"nothing\s+(?:ran|has\s+run|was\s+run)|no\s+(?:tools?|steps?|calls?)\s+(?:ran|were\s+run))"
+                       + _WHEN + _END, re.I | re.M)
+
+
+def stops_honestly(text) -> bool:
+    """A reply that says plainly it is stopping or that nothing ran: the answer every nudge offers, so
+    agent.run_loop sends it back for neither an announced step nor a record correction."""
+    return isinstance(text, str) and bool(_STOPPING.search(text.replace("’", "'")))
 
 
 def announces_step(text: str) -> bool:

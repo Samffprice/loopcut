@@ -8,10 +8,20 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
+class FakeImage(SimpleNamespace):
+    """bpy.types.Image as _image_texture uses it: attributes and ID properties."""
+
+    def __setitem__(self, key, value):
+        self.__dict__.setdefault('props', {})[key] = value
+
+    def get(self, key, default=None):
+        return self.__dict__.get('props', {}).get(key, default)
+
+
 class ImageDrawTest(unittest.TestCase):
     def setUp(self):
         self.images = mock.Mock()
-        self.images.load.return_value = SimpleNamespace(size=(800, 400), alpha_mode='STRAIGHT')
+        self.images.load.return_value = FakeImage(size=(800, 400), alpha_mode='STRAIGHT')
         self.gpu = mock.Mock()
         self.blit = mock.Mock()
         presets = ModuleType('gpu_extras.presets')
@@ -96,7 +106,7 @@ class ImageDrawTest(unittest.TestCase):
     def test_only_the_most_recently_drawn_pictures_stay_loaded_and_they_are_hidden(self):
         loads = []
         self.images.load.side_effect = lambda path, check_existing: loads.append(
-            SimpleNamespace(size=(64, 64), alpha_mode='STRAIGHT', path=path)) or loads[-1]
+            FakeImage(size=(64, 64), alpha_mode='STRAIGHT', path=path)) or loads[-1]
         kept = self.draw.IMAGES_KEPT
         for n in range(kept + 2):
             self.draw._draw_image(dict(self.prim, path=f'/stored/images/{n}.png'), 600)
@@ -104,6 +114,8 @@ class ImageDrawTest(unittest.TestCase):
         self.assertNotIn('/stored/images/0.png', self.draw._image_cache)
         self.assertEqual([c.args[0] for c in self.images.remove.call_args_list], loads[:2])
         self.assertTrue(all(image.name.startswith('.') for image in loads))
+        self.assertEqual(self.draw.TEMP, 'lc_temp', 'ownership.TEMP, which scene_diff._images skips')
+        self.assertTrue(all(image.get('lc_temp') for image in loads), 'tagged temporary: no scene change')
         self.draw._draw_image(dict(self.prim, path='/stored/images/0.png'), 600)  # Drawn again: reloaded.
         self.assertIn('/stored/images/0.png', self.draw._image_cache)
 

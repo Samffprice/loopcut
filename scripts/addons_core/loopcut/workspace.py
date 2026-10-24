@@ -131,7 +131,8 @@ finish, say briefly what you did and anything the user must decide."""
 
 # The live-scene tools the workspace agent keeps (agent._tool_schemas' names): the rest are the cheaper
 # single agent's ways to do what the shell, run_blender and view_image do here.
-LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "search_assets", "import_asset")
+LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "search_assets", "import_asset",
+              "character_rig")
 
 SCHEMAS = [  # Sent with every workspace request: every word here is paid for on every step.
     {"type": "function", "function": {
@@ -393,6 +394,20 @@ def live_side(data: dict, snapshot: dict | None) -> tuple[dict, dict | None, dic
     pointers = live["pointers"]["value"] if live["pointers"] and live["pointers"]["snapshots"] >= count else None
     settings = live["settings"]["value"] if live["settings"] and live["settings"]["snapshots"] >= count else None
     return tokens, pointers, settings
+
+
+def outdated(data: dict, snapshot: dict | None) -> str:
+    """What of the record a build from this snapshot is measured against holds tokens from an earlier
+    Loopcut ("" when none): compared with today's, an untouched rigged object read as a dropped edit
+    and a real owned edit as a conflict (review of 56f650edc0d), so apply_build refuses instead."""
+    from . import ownership
+    if snapshot is not None and snapshot.get("token_version") != ownership.TOKEN_VERSION:
+        return f"snapshot {snapshot['number']} was taken"
+    count = snapshot["number"] if snapshot else 0
+    if any(len(value) < 3 or value[2] != ownership.TOKEN_VERSION
+           for value in data["live"]["tokens"].values() if value[1] >= count):
+        return "the last apply"
+    return ""
 
 
 def recreated_keys(data: dict, snapshot: dict | None) -> list[str]:
@@ -719,6 +734,7 @@ def _save_snapshot(session: dict, ws: Path) -> dict:
     ids, tokens = ownership.spawn_state()
     scene = bpy.context.scene
     entry = {"number": number, "file": SOURCE, "taken": round(time.time(), 3), "scene": scene.name, "tokens": tokens,
+             "token_version": ownership.TOKEN_VERSION,
              "pointers": {attr: ownership.key_of(getattr(scene, attr)) if getattr(scene, attr) is not None else None
                           for attr in ("camera", "world")},
              "settings": scene_settings(scene), "stamped": False}
@@ -1069,6 +1085,13 @@ def _merge(session: dict, ws: Path, prepared: dict, number: int, result_name: st
     from . import merge, ownership, scene_diff
     data = load_state(ws)
     snapshot = snapshot_for(data, prepared.get("snapshot"))
+    old = outdated(data, snapshot)
+    if old:
+        return ToolResult(f"Nothing applied: Loopcut was updated since {old}, and it now measures the scene "
+                          f"differently, so this build would read as false conflicts and dropped edits. Take a new "
+                          f"snapshot (snapshot_scene), then build from it and apply. Earlier applies are already in "
+                          f"the new snapshot, so make the build replace those objects instead of adding them.",
+                          ok=False)
     live_tokens, live_pointers, live_settings = live_side(data, snapshot)
     names = {key: data["live"]["names"].get(key, key.split(":", 1)[1]) for key in live_tokens}
     keys = set((snapshot or {}).get("tokens") or ()) | set(live_tokens)
@@ -1113,7 +1136,7 @@ def _merge(session: dict, ws: Path, prepared: dict, number: int, result_name: st
         if idb is None:
             data["live"]["tokens"].pop(key, None)
             continue
-        data["live"]["tokens"][key] = [ownership.token(idb, uid2spawn), count]
+        data["live"]["tokens"][key] = [ownership.token(idb, uid2spawn), count, ownership.TOKEN_VERSION]
         data["live"]["names"][key] = idb.name
     uid2key = {uid: key for key, uid in ids.items()}
     data["live"]["pointers"] = {"snapshots": count, "value": {

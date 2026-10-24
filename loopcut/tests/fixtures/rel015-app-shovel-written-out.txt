@@ -1,0 +1,20 @@
+Earlier steps. Their code and full results are no longer shown; what you said at each step and what it changed are. The scene is the source of truth: read it again for exact values.
+
+Good — the machine detail landed. Now a medieval shovel. It's a small prop (wooden shaft, iron blade, T-grip), so I'll build it myself in one pass and place it clear of the other two.
+- run_python "Build a medieval shovel (wood shaft, T-grip, iron blade) and place it clear of chest and machine": ok, printed:
+    shovel verts 854
+    [4.2, -0.5, 0.0]
+    bounds [0.4684, 0.276, 1.5136]
+    ~ scene: +MedievalShovel (MedievalShovel_Wood, MedievalShovel_Iron, MedievalShovel_Leather)
+
+- check_contact({"pairs":[{"a":"MedievalShovel","relation":"clear_of","b":"TreasureChest","gap":0.15},{"a":"MedievalShovel",): Contact: 2 pass, 0 fail, 0 unavailable (tolerance 2.0 mm; moves are world-space, nothing was moved).
+    pass: MedievalShovel clear_of TreasureChest: clear by 3.155 m.
+    pass: MedievalShovel clear_of Moscow8M: clear by 763.1 mm.
+
+The shovel is built and clear of both props. Framing it into the shot.
+- frame_camera({"objects":["MedievalShovel","Moscow8M","TreasureChest"],"direction":"three_quarter","margin":0.1}): Camera "Camera" framed from three_quarter with margin 0.1, fitted to the height (bottom and top margins bind): at [7.232, -6.635, 4.250], rotation [62.0, 0.0, 38.0] deg (world XYZ), lens 50.0 mm, 8.846 m from the subject's centre; 1920x1080, sensor fit AUTO, horizontal.
+    In frame coordinates (0..1, x left to right, y bottom to top); a negative margin is past that edge:
+    - Moscow8M: x 0.120..0.355 y 0.314..0.721, 100% inside, margins L 0.120 R 0.645 B 0.314 T 0.279, offset -0.263 +0.018
+    - MedievalShovel: x 0.318..0.584 y 0.100..0.900, 100% inside, margins L 0.318 R 0.416 B 0.100 T 0.100, offset -0.049 +0.000
+    - TreasureChest: x 0.005..0.118 y 0.523..0.721, 100% inside, margins L 0.005 R 0.882 B 0.523 T 0.279, offset -0.439 +0.122
+- looked: three_quarter view of TreasureChest, Moscow8M, MedievalShovel; studio lighting, not the scene's lights or world. Drawn: the viewport, Material Preview, AgX view, 640x533 px (after the step above).

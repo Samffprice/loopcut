@@ -42,6 +42,8 @@ ROLLBACK_NOTE = ("Rolled back: this call changed {names}, which your brief doesn
 UNDONE_NOTE = ("This call changed {names}, which your brief doesn't own, and it could not be rolled back here. The "
                "merge will drop those edits; leave {them} alone.")
 SURVIVED_NOTE = "Undo could not put back {names}; the merge will drop those edits, so leave {them} alone."
+WEIGHTS_NOTE = ("Weights changed on {names}, which your brief doesn't own, and they could not be rolled back here. "
+                "The merge will drop those edits; leave {them} alone.")
 MATERIAL_NOTE = ("{name} is a palette material, everyone's. To change how your own parts look, copy it: "
                  "m = bpy.data.materials['{name}'].copy(); m.name = '{prefix}_{base}'; edit m and assign it only to "
                  "objects you created or own.")
@@ -113,6 +115,19 @@ def _undo_op(name: str, **arguments) -> bool:
     except RuntimeError as ex:
         print(f"worker: {name} failed: {ex}")
         return False
+
+
+def flush_edit_mode() -> list[str]:
+    """Each object in Edit Mode, its edits written back to its data, the mode left as it is: until the
+    object leaves Edit Mode they live in the edit mesh, and write_result's libraries.write saves the
+    data, so a weight or geometry edit left in Edit Mode at finish merged as nothing (review of
+    56f650edc0d). Returns their names."""
+    flushed = []
+    for ob in bpy.data.objects:
+        if ob.library is None and ob.mode == "EDIT":
+            ob.update_from_editmode()
+            flushed.append(ob.name)
+    return flushed
 
 
 def _names(keys) -> str:
@@ -256,6 +271,8 @@ class Worker:
 
     def finish(self, payload: dict) -> dict:
         from loopcut import ownership
+        flush_edit_mode()  # Facts, the look and the result all read object data.
+        self.not_undone.update(self._unowned_weight_edits())  # The manifest's not_undone says them too.
         # Before write_result, which may leave the scene as it saved it.
         facts, missing, look = self._facts(), self._missing(), self._cell()
         path = self.folder / "result.blend"
@@ -279,8 +296,37 @@ class Worker:
 
     def _missing(self) -> list[str]:
         """The deliverable, when no object of that name is in the scene at report time: a worker can
-        report a prop it never built (a continued brief whose earlier work did not merge)."""
-        return [self.deliverable] if self.deliverable and bpy.context.scene.objects.get(self.deliverable) is None else []
+        report a prop it never built (a continued brief whose earlier work did not merge). Not when the
+        worker owns objects, changed some and created none: an edit-only brief has no root of its own
+        (autorig_dog 20261023-180603: told the root was its name, a weights-only rig worker made an empty
+        DogRig). Known limit: a mixed brief (owns a table, must build a Lamp) that only edits the table
+        reads as done here too; a check on the Lamp, when the brief has one, still fails."""
+        if not self.deliverable or bpy.context.scene.objects.get(self.deliverable) is not None:
+            return []
+        from loopcut import ownership
+        if self.owned and not any(idb.id_type == "OBJECT" for idb in ownership.created_ids()) and self._edited_owned():
+            return []
+        return [self.deliverable]
+
+    def _unowned_weight_edits(self) -> list[str]:
+        """Unowned objects with vertex groups whose weights changed since spawn, with full tokens:
+        the per-call check leaves weights out (_changed), so the worker would never learn of them
+        (an auto-rig brief whose owns missed the body mesh wasted the run). At check_brief and at
+        finish only: 1.6 s per 1M weighted vertices each time, not per call."""
+        from loopcut import ownership
+        present = {ownership.key_of(idb): idb for idb in ownership.all_ids() if idb.get(ownership.STAMP)}
+        keys = [k for k, call in ownership.CALL_TOKENS.items()  # Only objects with weights differ from full.
+                if k not in self.owned and k in present and call != self.spawn_tokens.get(k)]
+        with ownership.one_pass():
+            return sorted(k for k in keys if ownership.token(present[k]) != self.spawn_tokens[k])
+
+    def _edited_owned(self) -> bool:
+        """Whether something the worker owns changed or went since spawn (full tokens, once)."""
+        from loopcut import ownership
+        present = {ownership.key_of(idb): idb for idb in ownership.all_ids() if idb.get(ownership.STAMP)}
+        with ownership.one_pass():
+            return any(key not in present or ownership.token(present[key]) != self.spawn_tokens[key]
+                       for key in self.owned if key in self.spawn_tokens)
 
     def _repair(self) -> list[str]:
         """worker_capture.repair_meshes on the worker's own objects."""
@@ -351,6 +397,9 @@ class Worker:
         results = _run_checks(self.checks, self._scope())
         advice = _run_checks(self.advisory, self._scope(), advisory=True)
         result = tools.ToolResult(_checks_text(results) + _advice_text(advice) + _paint_text())
+        edited = self._unowned_weight_edits()
+        if edited:
+            result.text += "\n\n" + WEIGHTS_NOTE.format(names=_names(edited), them="them" if len(edited) > 1 else "it")
         if self.craft_look or any(r.get("status") not in ("pass", "deferred") for r in results):
             return result
         self.craft_look = True
@@ -392,8 +441,16 @@ class Worker:
         return False
 
     def _changed(self) -> list[str]:
+        """After every call: what changed that the worker does not own, for the rollback. Weight-free
+        tokens: hashing the deform weights of every unowned rigged mesh after each call cost 1.6 s per
+        1M vertices. So an unowned weight edit is not rolled back right after the call; the live
+        scene never gets it all the same: a copy the result carries (something the worker's own work
+        refers to) is swapped back for the live one and reported as a dropped edit by the merge, and
+        one nothing refers to never leaves this Blender: write_result lists it (changed_not_owned, full
+        tokens) and the merge reports that as a dropped edit too. check_brief tells the worker
+        (_unowned_weight_edits)."""
         from loopcut import ownership
-        changed = ownership.changed_keys(self.spawn_tokens, self.owned, self.prefix)
+        changed = ownership.changed_per_call(self.owned, self.prefix)
         return [k for k in changed if k not in self.not_undone]
 
     def _after_call(self, saved: bool) -> tuple:

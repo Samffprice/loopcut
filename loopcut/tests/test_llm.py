@@ -215,6 +215,12 @@ class LLMTest(unittest.TestCase):
     def test_correlation_headers_builds_both_headers_for_a_role(self):
         self.assertEqual(llm.correlation_headers("abc123", "router"),
                          {"x-loopcut-conversation": "abc123", "x-loopcut-role": "router"})
+        self.assertEqual(llm.correlation_headers("abc123", "router", ""),
+                         {"x-loopcut-conversation": "abc123", "x-loopcut-role": "router"}, "no card, no header")
+
+    def test_correlation_headers_name_a_try_it_cards_turn(self):
+        self.assertEqual(llm.correlation_headers("abc123", "worker", "motion"),
+                         {"x-loopcut-conversation": "abc123", "x-loopcut-role": "worker", "x-loopcut-try-it": "motion"})
 
     def test_retry_after_is_respected_and_capped(self):
         llm.RETRY_DELAYS, saved_delays = (0.01, 0.01, 0.01), llm.RETRY_DELAYS

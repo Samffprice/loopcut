@@ -304,6 +304,12 @@ def charge_reporter():
     return report
 
 
+def progress_reporter():
+    """Bind progress to the initiating card, including a delegated tool's visible parent card."""
+    callback = getattr(_approval, 'callback', None)
+    return (lambda progress: callback({'progress': progress})) if getattr(callback, 'rig', False) is True else None
+
+
 def confirm(details):
     callback = getattr(_approval, "callback", None)
     if callback is not None:
@@ -319,13 +325,14 @@ def _check_cancel(cancel):
         raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
 
 
-def _quote(module, descriptor, arguments, files, project, cancel, runtime, client):
+def _quote(module, descriptor, arguments, files, project, cancel, runtime, client, on_progress=None):
     _check_cancel(cancel)
     clean = {k: v for k, v in arguments.items() if k not in ("quote_id", "idempotency_key")}
     try:
         # Quotes pass the same server limits as jobs (C47); an approved refusal's token also admits the job.
         _confirmed(lambda token: module.run(descriptor, clean, files, project=project, cancel=cancel, client=client,
-                                            quote=True, **({"confirm_token": token} if token else {})),
+                                            quote=True, **({'on_progress': on_progress} if on_progress else {}),
+                                            **({"confirm_token": token} if token else {})),
                    descriptor, arguments, cancel)
     except cloud_http.CloudError as ex:
         if ex.code != "quote_required":
@@ -337,7 +344,8 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
     raise cloud_http.CloudError("The service did not provide a credit quote", "invalid_response")
 
 
-def authorize(module, descriptor, arguments, files, *, project, cancel, runtime, client):
+def authorize(module, descriptor, arguments, files, *, project, cancel, runtime, client, notice='', notice_first=False,
+              on_progress=None):
     """Worker: resolve a runtime quote before consent, then forward its ID."""
     _check_cancel(cancel)
     arguments = _Authorized(arguments)
@@ -362,12 +370,16 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
             if pending:
                 quote = pending['quote']
         if quote is None:
-            quote = _quote(module, descriptor, arguments, files, project, cancel, runtime, client)
+            quote = _quote(module, descriptor, arguments, files, project, cancel, runtime, client, on_progress)
         arguments["quote_id"] = quote["quote_id"]
         with runtime.lock:
             runtime.quotes[quote['quote_id']] = quote
             runtime.quote_requests[quote['quote_id']] = arguments.fingerprint
     details = approval_details(descriptor, quote)
+    if descriptor.get('name') == 'auto_rig':
+        details['rig_notice'] = notice
+    elif notice:
+        details['text'] = notice + '\n' + details['text'] if notice_first else details['text'] + '\n' + notice
     if isinstance(getattr(runtime, "manifest", None), dict):
         with runtime.lock:
             details["balance"] = balance(runtime.manifest)  # The card's "Balance 1,840 → 1,760".
@@ -514,7 +526,12 @@ def submit(module, descriptor, arguments, files, *, project, on_progress, cancel
         # 4xx rejections and terminal jobs are definitive. Transport/5xx errors are ambiguous.
         definitive = ('job' not in ex.extra and ex.status is not None and 400 <= ex.status < 500) or (
             ex.extra.get('job', {}).get('status') in {'failed', 'canceled'})
-        if definitive:
+        # A verified delivered rig can fail its local artifact checks. Its
+        # refund retries use the durable job handle, not an ambiguous submission.
+        delivered_rig = (ex.extra.get('apply_failure') is True
+                         and ex.extra.get('job', {}).get('tool') == 'auto_rig'
+                         and ex.extra.get('job', {}).get('status') == 'succeeded')
+        if definitive or delivered_rig:
             complete(runtime, arguments, _key_spent(ex))
         if ex.code != "quote_expired" or ex.status != 409 or quote is None:
             raise
@@ -522,7 +539,8 @@ def submit(module, descriptor, arguments, files, *, project, on_progress, cancel
         if result.get('status') in {'succeeded', 'failed', 'canceled'}:
             complete(runtime, arguments, result['status'] != 'succeeded')
         return result
-    replacement = _quote(module, descriptor, arguments, files, project, cancel, runtime, client)
+    replacement = _quote(module, descriptor, arguments, files, project, cancel, runtime, client,
+                         on_progress if descriptor.get('apply') == 'apply_rig' else None)
     if replacement["credits"] > quote["credits"]:
         raise cloud_http.CloudError(f"The new quote is {replacement['credits']:g} credits; approve a new call to continue.",
                                     "quote_changed", extra=replacement)

@@ -782,6 +782,17 @@ class StreamTest(Base):
         self.assertEqual(request["body"]["prompt_cache_key"], "loopcut-conv-local-single")
         self.assertFalse([name for name in request["headers"] if name.lower().startswith("x-loopcut-")])
 
+    def test_stream_chat_never_sends_a_try_it_cards_header_to_the_chatgpt_plan(self):
+        FakeResponses.script = [(200, reply("Done."))]
+        llm.stream_chat(
+            base_url=config.CHATGPT_PLAN_BASE_URL, api_key="unused", model="gpt-6.1-sol",
+            messages=conversation(), tools=TOOLS, reasoning_effort="high", on_text=lambda _: None,
+            is_cancelled=lambda: False, headers=llm.correlation_headers("conv-local", "single", "motion"),
+            prompt_id="single")
+        request = FakeResponses.requests[-1]
+        self.assertEqual(request["body"]["prompt_cache_key"], "loopcut-conv-local-single", "same cache key as any turn")
+        self.assertFalse([name for name in request["headers"] if name.lower().startswith("x-loopcut-")])
+
     def test_reasoning_and_phase_are_replayed_next_step(self):
         FakeResponses.script = [(200, reply("Step one.", calls=[("call_5", "run_python", "{}", "loopcut")], reasoning="ENC-A")),
                                 (200, reply("Finished.", reasoning="ENC-B"))]

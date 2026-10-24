@@ -5,6 +5,8 @@ import uuid
 
 # tool: the first call the agent makes; arguments: its fixed input, except the attached photo's name.
 # free: try_samples supplies the shipped result. seconds: scales the manifest's displayed motion price.
+# arm_free: no tool, but the credits arm's gateway serves the card's tagged requests on the house (x-loopcut-try-it,
+# server TRY_IT_CARDS), so in that arm it is tagged and priced "Free" too (0.2.15).
 # thumbnail: in media/, our studio renders of the jumping mannequin and Poly Haven's CC0 Treasure Chest,
 # alongside the card photo (our dwarf warrior concept). The setup continues to expose these definitions as
 # onboarding.CARDS.
@@ -17,7 +19,7 @@ CARDS = (
      "thumbnail": "dwarf-warrior.jpg", "line": "Turns this photo into a textured 3D model.",
      "prompt": "Turn the attached photo into a textured 3D model and put it in the scene in place of the default "
                "cube."},
-    {"id": "model", "title": "Model a treasure chest", "tool": None,
+    {"id": "model", "title": "Model a treasure chest", "tool": None, "arm_free": True,
      "thumbnail": "card_chest.jpg", "line": "Built step by step with Blender's own tools.",
      "prompt": "Model a stylized treasure chest with gold trim"},  # A starter checked to finish on the free tier.
 )

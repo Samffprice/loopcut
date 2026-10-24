@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 from . import bl_info, config, credentials
 
-CONTRACT = "0.7"
+CONTRACT = "0.9"
 MAX_RESPONSE = 4 * 1024 * 1024
 
 

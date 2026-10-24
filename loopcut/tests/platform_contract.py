@@ -4,7 +4,9 @@ The contract belongs to the private platform repository, so the open repository 
 not have it, and nothing from it is copied here. LOOPCUT_CONTRACT_DIR names its contract/ folder
 (a missing or empty value hides it). Otherwise a loopcut-web-platform checkout beside this
 repository, or beside any folder above it, is used. A test that needs it calls require(), which
-skips the test with REASON when it is not there.
+skips the test with REASON when it is not there. An explicitly configured path,
+missing fixture in an available checkout, or LOOPCUT_REQUIRE_CONTRACT=1 instead
+fails: private CI must not quietly turn a missing contract into a passing skip.
 """
 
 import os
@@ -27,9 +29,11 @@ def contract_dir():
 
 
 def require(*parts):
-    """The contract folder joined with parts. Skips the calling test when it is missing."""
+    """Find a fixture; only unconfigured public checkouts may skip this test."""
     root = contract_dir()
     path = root.joinpath(*parts) if root else None
     if path is None or not path.exists():
+        if root or os.environ.get(ENV) or os.environ.get('LOOPCUT_REQUIRE_CONTRACT') == '1':
+            raise FileNotFoundError(REASON + (f" ({'/'.join(parts)})" if parts else ""))
         raise unittest.SkipTest(REASON + (f" ({'/'.join(parts)})" if parts else ""))
     return path

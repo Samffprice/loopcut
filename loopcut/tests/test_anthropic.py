@@ -433,10 +433,11 @@ class StreamTest(Base):
         completion = llm.stream_chat(base_url=BASE, api_key=KEY, model="claude-sonnet-5-5", messages=conversation(),
                                      tools=TOOLS, reasoning_effort="low", on_text=lambda _: None,
                                      is_cancelled=lambda: False, max_tokens=4000, prompt_id="single",
-                                     headers=llm.correlation_headers("c1", "single"))
+                                     headers=llm.correlation_headers("c1", "single", "motion"))
         self.assertEqual(completion.text, "hi")
         self.assertEqual((self.body()["max_tokens"], self.body()["output_config"]), (4000, {"effort": "low"}))
-        self.assertNotIn("x-loopcut-prompt", Fake.requests[-1]["headers"])
+        self.assertFalse([h for h in Fake.requests[-1]["headers"] if h.lower().startswith("x-loopcut")],
+                         "no gateway header, a Try it card's included")
         self.assertEqual(am.list_models(BASE, KEY), ["claude-opus-5-5", "claude-haiku-5-5"])
         self.assertEqual(Fake.requests[-1]["path"], "/v1/models?limit=1000")
         self.assertEqual(Fake.requests[-1]["headers"]["x-api-key"], KEY)

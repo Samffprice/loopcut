@@ -95,6 +95,8 @@ class Completion:
     # servers, delta.reasoning on OpenRouter). Never shown or sent back; it tells a reasoning-only reply, which
     # has nothing to show, from an empty one in the log.
     reasoning_chars: int = 0
+    # Calls the reply wrote out as text instead of making them; set by agent._drop_copied_records.
+    unmade: list[str] = field(default_factory=list)
 
     def as_message(self) -> dict:
         message = {"role": "assistant", "content": self.text or None}
@@ -283,11 +285,21 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
     return completion
 
 
-def correlation_headers(conversation_id: str, role: str) -> dict:
+TRY_IT_HEADER = "x-loopcut-try-it"
+
+
+def correlation_headers(conversation_id: str, role: str, try_it: str = "") -> dict:
     """x-loopcut-conversation / x-loopcut-role for Loopcut's own gateway: which of a turn's
     simultaneous streams (orchestrator, worker, router, summary, single) a request is, for its
-    usage row. These headers go only to the gateway (see stream_chat)."""
-    return {"x-loopcut-conversation": conversation_id, "x-loopcut-role": role}
+    usage row. These headers go only to the gateway (see stream_chat).
+
+    try_it: the setup Try it card whose unedited request started this turn (agent.try_it_card), sent as
+    x-loopcut-try-it so the gateway can leave the request uncharged (credits arm, capped server-side). "" on
+    every other turn, which sends no such header."""
+    headers = {"x-loopcut-conversation": conversation_id, "x-loopcut-role": role}
+    if try_it:
+        headers[TRY_IT_HEADER] = try_it
+    return headers
 
 
 def _is_loopback(base_url: str) -> bool:
@@ -326,7 +338,7 @@ def stream_chat(
     """`headers` adds to (never replaces) Authorization/Content-Type/Accept -- for Loopcut's own
     gateway, the caller passes correlation_headers()'s x-loopcut-conversation / x-loopcut-role so a
     usage row can be told apart from another conversation's on the same account (see the web repo's
-    gateway/correlation.ts). All x-loopcut-* headers go only to the gateway. prompt_id selects
+    gateway/correlation.ts), and x-loopcut-try-it on a setup Try it card's turn. All x-loopcut-* headers go only to the gateway. prompt_id selects
     its single, orchestrator, worker or router prompt; absent means pass-through.
 
     max_tokens caps the reply the way every OpenAI-compatible provider expects, in the request body

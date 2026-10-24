@@ -263,7 +263,8 @@ class ValidateTest(unittest.TestCase):
         """M0: the spec moved objects the brief said to keep."""
         wave = reference_wave()
         wave["workers"][1]["owns"] = ["Bottle"]
-        self.assertIn("workers[1] (table).owns: 'Bottle' is kept (shared.keep); nobody may own it", refusals(wave))
+        self.assertIn("workers[1] (table).owns: 'Bottle' is also in shared.keep. If this worker changes it, remove it "
+                      "from shared.keep; if the user asked to keep it unchanged, remove it from owns", refusals(wave))
 
     def test_a_missing_palette_material_or_support_is_refused(self):
         wave = reference_wave()
@@ -628,13 +629,58 @@ class RepairWaveTest(unittest.TestCase):
         self.assertTrue(any("checks[0]: dropped (dims Armchair)" in r for r in repairs), repairs)
         self.assertEqual(orchestrator.validate_wave(plan, USER, LIVE), [])
 
-    def test_owning_a_kept_name_keeps_it_kept_not_owned(self):
+    def test_owning_a_kept_name_is_refused_with_both_ways_out(self):
         wave = reference_wave()
         wave["workers"][0]["owns"] = ["Bottle"]  # Bottle is already in shared.keep
         plan, repairs = self.repair(wave)
-        self.assertEqual(plan["workers"][0]["owns"], [])
-        self.assertTrue(any("owns" in r and "keeping wins" in r for r in repairs), repairs)
+        self.assertEqual(plan["workers"][0]["owns"], ["Bottle"], "not repaired: neither side follows from the words")
+        self.assertFalse(any("owns" in r for r in repairs), repairs)
+        self.assertEqual(orchestrator.validate_wave(plan, USER, LIVE), [
+            "workers[0] (armchair).owns: 'Bottle' is also in shared.keep. If this worker changes it, remove it from "
+            "shared.keep; if the user asked to keep it unchanged, remove it from owns"])
+
+    def test_the_transcripts_owned_and_kept_rig_is_refused_not_resolved(self):
+        """autorig_dog 20261023-180603, both calls: the rig and its mesh in a worker's owns and in
+        shared.keep. Keeping won and emptied the job (the weights never merged); with the keep's quote
+        read from [{names, quote}] it was "rig my dog so he can run", the user asking to change it."""
+        words = "can u rig my dog so he can run"
+        live = {"objects": {"Cube.001": {"type": "MESH", "box": None}, "Character Rig": {"type": "ARMATURE", "box": None}},
+                "materials": [], "names": ["Cube.001", "Character Rig"]}
+        rig = {"shared": {"keep": ["Cube.001", "Character Rig"], "names": ["Cube.001", "Character Rig"]},
+               "workers": [{"deliverable": "DogRig", "id": "dogrig", "owns": ["Character Rig", "Cube.001"],
+                            "prefix": "DogRig", "role": "animation",
+                            "requirements": [{"do": "fix the weights", "quote": "rig my dog so he can run"}]}]}
+        run = {"shared": {"keep": [{"names": ["Cube.001", "Character Rig"], "quote": "rig my dog so he can run"}],
+                          "names": ["Cube.001", "Character Rig"]},
+               "workers": [{"deliverable": "RunCycle", "id": "runcycle", "owns": ["Character Rig"], "prefix": "RunCycle",
+                            "role": "animation", "requirements": [{"do": "keyframe a gallop", "quote": "so he can run"}]}]}
+        for wave, owns in ((rig, ["Character Rig", "Cube.001"]), (run, ["Character Rig"])):
+            with self.subTest(worker=wave["workers"][0]["id"]):
+                plan, repairs = self.repair(wave, words, live)
+                self.assertEqual(plan["workers"][0]["owns"], owns)
+                errors = orchestrator.validate_wave(plan, words, live)
+                label = f"workers[0] ({wave['workers'][0]['id']}).owns"
+                self.assertEqual(errors, [f"{label}: {name!r} is also in shared.keep. If this worker changes it, remove "
+                                          f"it from shared.keep; if the user asked to keep it unchanged, remove it "
+                                          f"from owns" for name in owns])
+                self.assertFalse(any("owning wins" in r or "keeping wins" in r for r in repairs), repairs)
+        plan, repairs = self.repair(run, words, live)
+        self.assertEqual(plan["shared"]["keep"]["quote"], "rig my dog so he can run", "[{names, quote}] still read")
+        self.assertIn("shared.keep: a list holding one {names, quote} given; read as that object", repairs)
+
+    def test_keep_given_as_a_list_holding_one_names_quote_object_is_read_as_it(self):
+        wave = reference_wave()
+        wave["shared"]["keep"] = [{"names": ["Bottle", "Box"], "quote": "Keep the bottle and the box unchanged"}]
+        plan, repairs = self.repair(wave)
+        self.assertEqual(plan["shared"]["keep"], {"names": ["Bottle", "Box"],
+                                                  "quote": "Keep the bottle and the box unchanged"})
+        self.assertIn("shared.keep: a list holding one {names, quote} given; read as that object", repairs)
+        self.assertFalse(any("shared.keep.quote" in r for r in repairs), "the user's quote is kept: " + str(repairs))
         self.assertEqual(orchestrator.validate_wave(plan, USER, LIVE), [])
+        wave["shared"]["keep"] = [{"names": ["Bottle"]}, {"names": ["Box"], "quote": "the box"}]
+        plan, _ = self.repair(wave)
+        self.assertEqual(plan["shared"]["keep"], {"names": ["Bottle", "Box"], "quote": ""},
+                         "several objects: their names, no single quote")
 
     def test_a_flat_six_number_bounds_is_reshaped_to_the_real_shape(self):
         wave = reference_wave()
@@ -1195,6 +1241,76 @@ class ScatteredBoundsTest(unittest.TestCase):
                       orchestrator.dry_run_report(["workers[0].id: ..."], [], [], [], layout_checked=False))
 
 
+class DelegateArgumentsTest(unittest.TestCase):
+    """autorig_dog 20261023-180603: a wave sent as a JSON string, and shared next to wave instead of
+    inside it, were refused with nothing started; both are read as meant now, and said so."""
+
+    def dry_run(self, **arguments):
+        from loopcut import tools
+        session = state.reset()
+        self.addCleanup(state.reset)
+        turn = agent.Turn()
+        turn.roles = types.SimpleNamespace(orchestrate=True, job_max_usd=0.4, worker_max_seconds=1800, max_workers=3)
+        session["turn"] = turn
+        session["items"].append(state.item_user(USER))
+        with mock.patch.object(orchestrator, "live_facts", lambda plan: json.loads(json.dumps(LIVE))), \
+                mock.patch.object(orchestrator, "layout", lambda plan, live, project: ([], [], [], [])):
+            return tools.execute("delegate", json.dumps({**arguments, "dry_run": True}))
+
+    def test_a_wave_sent_as_a_json_string_is_read_as_its_object(self):
+        result = self.dry_run(wave=json.dumps(reference_wave()))
+        self.assertTrue(result.ok, result.text)
+        self.assertIn("a real delegate would start", result.text)
+        self.assertIn("Repairs: wave: a JSON string given; read as the object it encodes", result.text)
+        refused = self.dry_run(wave="[1, 2]")
+        self.assertFalse(refused.ok)
+        self.assertIn("wave must be an object", refused.text, "a string of no object is still refused")
+
+    def test_shared_next_to_wave_is_moved_in_when_the_wave_has_none(self):
+        wave = reference_wave()
+        shared = wave.pop("shared")
+        result = self.dry_run(wave=wave, shared=shared)
+        self.assertTrue(result.ok, result.text)
+        self.assertNotIn("Bad arguments", result.text)
+        self.assertIn("shared: given next to wave instead of inside it; moved into wave.shared", result.text)
+        self.assertEqual(orchestrator.wave_argument(wave, shared)[0]["shared"], shared)
+        same = self.dry_run(wave=reference_wave(), shared=shared)
+        self.assertTrue(same.ok, same.text)
+        self.assertIn("shared: given both inside wave and next to it, the same; read once", same.text)
+
+    def test_wave_shared_sent_as_a_json_string_is_decoded_with_or_without_shared_beside_it(self):
+        wave = reference_wave()
+        shared = wave["shared"]
+        wave["shared"] = json.dumps(shared)
+        for beside in (None, shared):
+            with self.subTest(beside=beside is not None):
+                decoded, repairs, refusal = orchestrator.wave_argument(wave, beside)
+                self.assertEqual((decoded["shared"], refusal), (shared, ""), "the keep is not lost to {}")
+                self.assertIn("wave.shared: a JSON string given; read as the object it encodes", repairs)
+                result = self.dry_run(wave=wave, **({"shared": beside} if beside else {}))
+                self.assertTrue(result.ok, result.text)
+                self.assertIn("wave.shared: a JSON string given", result.text)
+        refused = self.dry_run(wave=wave, shared={"keep": {"names": ["Rug"], "quote": "the rug"}})
+        self.assertIn("the two differ", refused.text)
+
+    def test_two_different_shared_objects_are_refused_not_guessed(self):
+        result = self.dry_run(wave=reference_wave(), shared={"keep": {"names": ["Rug"], "quote": "the rug"}})
+        self.assertFalse(result.ok)
+        self.assertTrue(result.plan_refused)
+        self.assertEqual(result.text, "delegate refused; nothing started: shared was given both inside wave and "
+                                      "next to it, and the two differ. Send shared once, inside wave.")
+        self.assertIn("is not an object", self.dry_run(wave=reference_wave(), shared=["Rug"]).text)
+
+    def test_the_schema_the_model_sees_is_unchanged_and_a_string_wave_still_asks_first(self):
+        properties = orchestrator.SCHEMAS[0]["function"]["parameters"]["properties"]
+        self.assertEqual(sorted(properties), ["dry_run", "wait", "wave"])
+        wave = json.dumps(reference_wave())
+        self.assertFalse(orchestrator.waits("delegate", {"wait": True, "wave": wave}), "briefs start workers")
+        self.assertEqual(agent._approval("delegate", json.dumps({"wait": True, "wave": wave}), ()), "gate")
+        title, _ = orchestrator.describe("delegate", {"wave": wave})
+        self.assertTrue(title.startswith("Start 2 helpers for Armchair, SideTable"), title)
+
+
 class RoleTypesTest(unittest.TestCase):
     """What a worker may create: its role's types, empties for every role, and its aspects' types."""
 
@@ -1439,7 +1555,9 @@ class PromptTest(unittest.TestCase):
         plan = orchestrator.normalise_wave(reference_wave())
         brief = {**plan["workers"][0], "steps": 20}
         text = workers.opening(brief, plan["shared"], [plan["workers"][1]], "<scene_context>\nx\n</scene_context>")
-        for line in ("keep (the user's; never change): Bottle, Box (user: \"Keep the bottle and the box unchanged\")",
+        for line in ("deliverable: Armchair (the name of the root object of what you create; a brief that only edits "
+                     "what you own creates no root)",
+                     "keep (the user's; never change): Bottle, Box (user: \"Keep the bottle and the box unchanged\")",
                      "support: Rug, top_z 0.015",
                      "prefix: Armchair: for materials and other internal/helper datablocks (Armchair_Name); "
                      "name parts for what they are",

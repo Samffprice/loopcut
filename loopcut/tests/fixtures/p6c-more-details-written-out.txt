@@ -1,0 +1,94 @@
+Earlier steps. Their code and full results are no longer shown; what you said at each step and what it changed are. The scene is the source of truth: read it again for exact values.
+
+- run_python "Add bolt heads across frame joints, gear teeth and a wear/wear-grime material pass": ok, printed:
+    bolts: 36, gear teeth: 18
+    Scene changes: added 36 bolt heads on frame joints and 18 gear teeth on the three drive gears; roughened and dirtied the enamel, cast iron, steel and rubber materials for an aged Soviet look
+    + Moscow8M_Bolt_Leg_FL_T (mesh) at [-0.6885, -0.3885, 0.785]..[-0.6515, -0.3515, 0.815]
+    + Moscow8M_Bolt_Leg_FL_M (mesh) at [-0.6885, -0.3885, 0.545]..[-0.6515, -0.3515, 0.575]
+    + Moscow8M_Bolt_Leg_FL_B (mesh) at [-0.6885, -0.3885, 0.33]..[-0.6515, -0.3515, 0.36]
+    + Moscow8M_Bolt_Leg_FR_T (mesh) at [0.6515, -0.3885, 0.785]..[0.6885, -0.3515, 0.815]
+    + Moscow8M_Bolt_Leg_FR_M (mesh) at [0.6515, -0.3885, 0.545]..[0.6885, -0.3515, 0.575]
+    + Moscow8M_Bolt_Leg_FR_B (mesh) at [0.6515, -0.3885, 0.33]..[0.6885, -0.3515, 0.36]
+    + Moscow8M_Bolt_Leg_BL_T (mesh) at [-0.6885, 0.3515, 0.785]..[-0.6515, 0.3885, 0.815]
+    + Moscow8M_Bolt_Leg_BL_M (mesh) at [-0.6885, 0.3515, 0.545]..[-0.6515, 0.3885, 0.575]
+    + Moscow8M_Bolt_Leg_BL_B (mesh) at [-0.6885, 0.3515, 0.33]..[-0.6515, 0.3885, 0.36]
+    + Moscow8M_Bolt_Leg_BR_T (mesh) at [0.6515, 0.3515, 0.785]..[0.6885, 0.3885, 0.815]
+    + Moscow8M_Bolt_Leg_BR_M (mesh) at [0.6515, 0.3515, 0.545]..[0.6885, 0.3885, 0.575]
+    + Moscow8M_Bolt_Leg_BR_B (mesh) at [0.6515, 0.3515, 0.33]..[0.6885, 0.3885, 0.36]
+    + Moscow8M_Bolt_Rail_LF (mesh) at [1.3155, -0.3435, 1.245]..[1.3525, -0.3065, 1.275]
+    + Moscow8M_Bolt_Rail_LB (mesh) at [1.3155, -0.2935, 1.245]..[1.3525, -0.2565, 1.275]
+    + Moscow8M_Bolt_Rail_RF (mesh) at [2.6475, -0.3435, 1.245]..[2.6845, -0.3065, 1.275]
+    ... and 4 more: Moscow8M_Bolt_Rail_RB, Moscow8M_GearTooth_Big, Moscow8M_GearTooth_Mid, collection Moscow8M
+
+- run_python "Add hex bolt heads, washers and gear teeth in the right places": ok, printed:
+    bolts: 23, washers: 9
+    + Moscow8M_HexBolt_Cheek_L1 (mesh) at [1.272, -0.1525, 1.4425]..[1.302, -0.0475, 1.5275]
+    + Moscow8M_HexBolt_Cheek_L2 (mesh) at [1.272, 0.0225, 1.4425]..[1.302, 0.1275, 1.5275]
+    + Moscow8M_HexBolt_Cheek_R1 (mesh) at [2.698, -0.1525, 1.4425]..[2.728, -0.0475, 1.5275]
+    + Moscow8M_HexBolt_Cheek_R2 (mesh) at [2.698, 0.0225, 1.4425]..[2.728, 0.1275, 1.5275]
+    + Moscow8M_HexBolt_Apron_L (mesh) at [1.272, -0.1525, 0.7925]..[1.302, -0.0475, 0.8775]
+    + Moscow8M_HexBolt_Apron_R (mesh) at [2.698, -0.1525, 0.7925]..[2.728, -0.0475, 0.8775]
+    + Moscow8M_HexBolt_Tie (mesh) at [1.341, 0.322, 0.6725]..[1.387, 0.338, 0.7575]
+    + Moscow8M_HexBolt_Tie_R (mesh) at [2.613, 0.322, 0.6725]..[2.659, 0.338, 0.7575]
+    + Moscow8M_HexBolt_EndPlate_L (mesh) at [1.272, -0.1955, 1.4025]..[1.302, -0.1225, 1.4875]
+    + Moscow8M_HexBolt_EndPlate_R (mesh) at [2.698, -0.1955, 1.4025]..[2.728, -0.1225, 1.4875]
+    + Moscow8M_Washer_Axle_L (mesh) at [1.272, -0.0825, 1.1925]..[1.302, -0.0175, 1.2875]
+    + Moscow8M_Washer_Axle_R (mesh) at [2.698, -0.0825, 1.1925]..[2.728, -0.0175, 1.2875]
+    + Moscow8M_Washer_FeedAxle_L (mesh) at [1.372, -0.4075, 1.0225]..[1.402, -0.3425, 1.0875]
+    + Moscow8M_Washer_FeedAxle_R (mesh) at [2.598, -0.4075, 1.0225]..[2.628, -0.3425, 1.0875]
+    + Moscow8M_Washer_Forme_L (mesh) at [1.372, -0.1275, 1.0025]..[1.402, -0.0625, 1.0675]
+    ... and 9 more: Moscow8M_Washer_Forme_R, Moscow8M_GearTeeth_Big, Moscow8M_GearTeeth_Mid, Moscow8M_GearTeeth_Small, material Moscow8M_BoltSteel, collection Moscow8M
+- looked: three_quarter view of Moscow8M_GearTeeth_Big, Moscow8M_GearTeeth_Mid, Moscow8M_GearTeeth_Small, Moscow8M_HexBolt_Cheek_L1, Moscow8M_HexBolt_Cheek_L2, Moscow8M_HexBolt_Cheek_R1, Moscow8M_HexBolt_Cheek_R2, Moscow8M_HexBolt_Apron_L, Moscow8M_HexBolt_Apron_R, Moscow8M_HexBolt_Tie, Moscow8M_HexBolt_Tie_R, Moscow8M_HexBolt_EndPlate_L; studio lighting, not the scene's lights or world. Drawn: the viewport, Material Preview, AgX view …
+
+- run_python "Seat gear teeth in the gear rims": ok, printed:
+    teeth x now: big 2.702 2.783; mid 2.702 2.783; small 2.702 2.783
+    ~ Moscow8M_GearTeeth_Big: location (2.751, -0.02, 1.24) -> (2.7425, -0.02, 1.24); scale (0.02, 0.02, 0.13) -> (0.041, 0.02, 0.13); bounds now [2.702, -0.04, 1.11]..[2.783, 0.0, 1.37]
+    ~ Moscow8M_GearTeeth_Mid: location (2.751, 0.2, 1.09) -> (2.7425, 0.2, 1.09); scale (0.02, 0.02, 0.09) -> (0.041, 0.02, 0.09); bounds now [2.702, 0.18, 1.0]..[2.783, 0.22, 1.18]
+    ~ Moscow8M_GearTeeth_Small: location (2.751, -0.02, 0.96) -> (2.7425, -0.02, 0.96); scale (0.02, 0.02, 0.07) -> (0.041, 0.02, 0.07); bounds now [2.702, -0.04, 0.89]..[2.783, 0.0, 1.03]
+- looked: three_quarter view of Moscow8M_GearTeeth_Big, Moscow8M_GearTeeth_Mid, Moscow8M_GearTeeth_Small, Moscow8M_GearBig, Moscow8M_GearMid, Moscow8M_GearSmall, Moscow8M_Bolt_Leg_FL_T, Moscow8M_Bolt_Leg_FL_M, Moscow8M_Bolt_Leg_FL_B, Moscow8M_Bolt_Leg_FR_T, Moscow8M_Bolt_Leg_FR_M, Moscow8M_Bolt_Leg_FR_B; studio lighting, not the scene's lights or world. Drawn: the viewport, Material Preview, AgX vi …
+
+- run_python "Age the enamel: greener grey, blotchy wear and roughness variation": ok, printed:
+    on Moscow8M_Enamel: nodes=13 links=7 base=(0.29,0.34,0.31) rough=(0.58,0.8)
+    on Moscow8M_CastIron: nodes=13 links=8 base=(0.13,0.14,0.14) rough=(0.58,0.75)
+    on Moscow8M_Steel: nodes=13 links=7 base=(0.45,0.46,0.47) rough=(0.35,0.65)
+    on Moscow8M_Rubber: nodes=13 links=8 base=(0.07,0.07,0.07) rough=(0.68,0.88)
+    Scene changes: aged the enamel, cast iron, steel and rubber materials with blotchy colour, grime and roughness variation
+    ~ material Moscow8M_CastIron: +2 nodes, +1 links
+    ~ material Moscow8M_Enamel: +1 nodes, +1 links
+    ~ material Moscow8M_Rubber: +2 nodes, +1 links
+    ~ material Moscow8M_Steel: +1 nodes, +1 links
+
+- capture_viewport({"angle":"camera","focus":["Moscow8M_Bed","Moscow8M_Cheek_R","Moscow8M_GearBig"],"style":"rendered"}): Image attached: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px. Nearest to the viewpoint first: Moscow8M_ButtonRed 4.8 m, Moscow8M_ButtonBlack 4.8 m …
+- looked: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px (after the step above).
+
+- run_python "Add scratched streaks and edge highlights to aged paint": ok, printed:
+    added wear to: Moscow8M_Enamel, Moscow8M_CastIron, Moscow8M_Chrome, Moscow8M_Steel
+    ~ material Moscow8M_CastIron: +2 nodes, +2 links
+    ~ material Moscow8M_Chrome: +1 nodes, +1 links
+    ~ material Moscow8M_Enamel: +2 nodes, +2 links
+    ~ material Moscow8M_Steel: +2 nodes, +2 links
+
+- capture_viewport({"angle":"camera","focus":["Moscow8M_Bed","Moscow8M_Cheek_R","Moscow8M_GearBig"],"style":"rendered"}): Image attached: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px. Nearest to the viewpoint first: Moscow8M_ButtonRed 4.8 m, Moscow8M_ButtonBlack 4.8 m …
+- looked: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px (after the step above).
+
+- run_python "Lower key/rim intensity for aged studio look": ok, printed:
+    Scene changes: dimmed Moscow8M_Key and Moscow8M_Rim for a softer, aged studio look
+    ~ Moscow8M_Key: energy 900.0 -> 500.0
+    ~ Moscow8M_Rim: energy 520.0 -> 300.0
+
+- capture_viewport({"angle":"camera","focus":["Moscow8M_Bed","Moscow8M_Cheek_R","Moscow8M_GearBig"],"style":"rendered"}): Image attached: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px. Nearest to the viewpoint first: Moscow8M_ButtonRed 4.8 m, Moscow8M_ButtonBlack 4.8 m …
+- looked: the view through Camera; the image edges are the camera frame; EEVEE, the scene's own lights and world, no exposure or colour adjustments applied. Drawn: the viewport, Rendered, AgX view, 640x360 px (after the step above).
+
+- checks({"add":[{"kind":"exists","name":"Moscow8M_HexBolt_Cheek_L1","type":"MESH","quote":"more ditails on the machine, bolts,"}): Added o1, o2, o3, o4, o5, o6, o7, o8: 8 of 8 pass on the live scene now; they run again before your reply ends.
+    - o1 exists Moscow8M_HexBolt_Cheek_L1: pass, Moscow8M_HexBolt_Cheek_L1 (mesh) is in the scene
+    - o2 count Moscow8M_HexBolt_: pass, 23 mesh objects named Moscow8M_HexBolt_ or starting with Moscow8M_HexBolt_ (Moscow8M_HexBolt_Apron_L, Moscow8M_HexBolt_Apron_R, Moscow8M_HexBolt_Cheek_L1, Moscow8M_HexBolt_Cheek_L2, Moscow8M_HexBolt_Cheek_R1 and 18 more); want at least 12
+    - o3 exists Moscow8M_GearTeeth_Big: pass, Moscow8M_GearTeeth_Big (mesh) is in the scene
+    - o4 exists Moscow8M_GearTeeth_Mid: pass, Moscow8M_GearTeeth_Mid (mesh) is in the scene
+    - o5 exists Moscow8M_GearTeeth_Small: pass, Moscow8M_GearTeeth_Small (mesh) is in the scene
+    - o6 material_on Moscow8M_HexBolt_Cheek_L1: Moscow8M_BoltSteel: pass, Moscow8M_HexBolt_Cheek_L1 has material Moscow8M_BoltSteel
+    - o7 material_on Moscow8M_GearTeeth_Big: Moscow8M_Steel: pass, Moscow8M_GearTeeth_Big has material Moscow8M_Steel
+    - o8 material_on Moscow8M_Bed: Moscow8M_Enamel: pass, Moscow8M_Bed has material Moscow8M_Enamel
+
+- checks({}): Ran every check on the live scene now: 8 of 8 pass.
+    Pass: o1, o2, o3, o4, o5, o6, o7, o8
+    Requirements (the user's words): 1 of 1 covered.

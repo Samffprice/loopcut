@@ -282,6 +282,17 @@ class RetryReviewTest(unittest.TestCase):
                 self.call()
         self.assertEqual(self.posts[0]['idempotency_key'], self.posts[1]['idempotency_key'])
 
+    def test_delivered_rig_verification_failure_releases_pending_submission(self):
+        self.descriptor.update(name='auto_rig', apply='apply_rig')
+        delivered = job()
+        delivered.update(tool='auto_rig')
+        self.module.run = Mock(side_effect=cloud_http.CloudError('Corrupt rig', 'hash_mismatch',
+            extra={'job': delivered, 'apply_failure': True}))
+        with self.assertRaises(cloud_http.CloudError):
+            self.call()
+        self.assertEqual(json.loads((self.runtime.cache_dir / 'pending.json').read_text()), {})
+        self.assertEqual(self.module.run.call_count, 1)
+
     def test_retry_after_a_failed_job_gets_a_new_key_even_when_the_model_resends_it(self):
         # A key names one job (SPEC §3.4): resent, it replays the failure or is refused for other inputs.
         failed = cloud_http.CloudError('Vendor failed', 'vendor_failed', None, {'refunded': True, 'job': job('failed')})

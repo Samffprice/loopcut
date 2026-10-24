@@ -151,6 +151,18 @@ class CardsTest(DataDir):
         nudges.flush(session)
         self.assertEqual(len([i for i in session["items"] if i["kind"] == "offer"]), 1, "one a day")
 
+    def test_the_credits_arm_never_gets_the_trial_card(self):
+        """0.2.15: the arm's setup says the free credits; the card would arrive after a first paid turn."""
+        credits = {"balance": 60, "trial": {"amount": 100, "granted_at": "2026-10-23T10:00:00Z"}}
+        with patch.object(config, "billing_open", lambda: True):
+            nudges.observe({"account": {"billing": "credits", "credits": credits}}, True, ["sfx"])
+            self.assertEqual(nudges._pending, [])
+            for billing in ("allowance", None):  # Every other account keeps it.
+                nudges.observe({"account": {"billing": billing, "credits": credits}}, True, ["sfx"])
+                self.assertEqual([k for _, k, _ in nudges._pending], ["trial"])
+                with nudges._lock:
+                    nudges._pending.clear()
+
     def test_low_credit_thresholds(self):
         with patch.object(config, "billing_open", lambda: True):
             for credits, low in (({"balance": 441, "monthly": 2200}, False), ({"balance": 439, "monthly": 2200}, True),

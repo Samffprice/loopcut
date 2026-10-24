@@ -102,6 +102,45 @@ class ParsingTest(unittest.TestCase):
         self.assertTrue(chat_credits.expired(RESET, datetime(2026, 11, 1, 0, 0, 1, tzinfo=timezone.utc).timestamp()))
         self.assertFalse(chat_credits.expired("", NOW))
 
+    def test_the_weekly_top_up_is_named_when_it_comes_before_the_monthly_grant(self):
+        refill = {"credits": 25, "at": "2026-10-30T09:12:00Z"}
+        self.assertEqual(chat_credits.refill_of(refill), refill)
+        for bad in (None, [], {"credits": 0, "at": refill["at"]}, {"credits": "25", "at": refill["at"]},
+                    {"credits": 25}, {"credits": 25, "at": "soon"}, {"credits": float("nan"), "at": refill["at"]}):
+            self.assertIsNone(chat_credits.refill_of(bad), bad)
+        manifest = {"account": {"plan": "free", "billing": "credits", "chat_credits": {"per_step": 0.84,
+                                                                                      "refill": refill}}}
+        self.assertEqual(chat_credits.panel_data(manifest, True)["refill"], refill)
+        self.assertNotIn("refill", chat_credits.panel_data({"account": {"billing": "credits"}}, True))
+        item = {"resets_at": RESET, "refill": refill}
+        self.assertEqual(chat_credits.next_refill(item, ARM, NOW), refill)
+        self.assertEqual(chat_credits.next_refill({"resets_at": RESET}, {**ARM, "refill": refill}, NOW), refill)
+        self.assertIsNone(chat_credits.next_refill({"resets_at": "2026-10-29T00:00:00Z", "refill": refill}, ARM, NOW))
+        self.assertIsNone(chat_credits.next_refill(item, ARM, datetime(2026, 10, 31, tzinfo=timezone.utc).timestamp()))
+        self.assertIsNone(chat_credits.next_refill({"resets_at": RESET}, ARM, NOW))
+        self.assertEqual(chat_credits.come_back(ARM, RESET, NOW, refill=refill), "25 free credits come back Fri 30 Oct")
+        soon = {"credits": 25, "at": "2026-10-23T23:00:00Z"}
+        self.assertEqual(chat_credits.come_back(ARM, RESET, NOW, refill=soon), "25 free credits come back in about 3 h")
+        self.assertEqual(chat_credits.come_back(ARM, RESET, NOW, short=True, refill=soon),
+                         "Free credits come back in about 3 h")
+        self.assertFalse(chat_credits.refused_until_passed(item, NOW))
+        self.assertTrue(chat_credits.refused_until_passed(item, datetime(2026, 10, 30, 10, tzinfo=timezone.utc)
+                                                          .timestamp()))
+        self.assertFalse(chat_credits.refused_until_passed({"resets_at": RESET}, datetime(2026, 10, 30, 10,
+                                                           tzinfo=timezone.utc).timestamp()))
+
+    def test_a_402_keeps_its_refill_only_for_insufficient_credits(self):
+        from loopcut import agent
+        refill = {"credits": 25, "at": "2026-10-30T09:12:00Z"}
+        error = llm.LLMError("Out of credits.", 402, "insufficient_credits",
+                             {"message": "Out of credits.", "plan": "free", "resets_at": RESET, "upgrade": UPGRADE,
+                              "refill": refill})
+        self.assertEqual(agent._limit_item(error)["refill"], refill)
+        error.details.pop("refill")
+        self.assertNotIn("refill", agent._limit_item(error))
+        week = llm.LLMError("Used.", 402, "week_limit", {"message": "Used.", "refill": refill})
+        self.assertNotIn("refill", agent._limit_item(week))
+
     def test_the_upgrade_button_and_variant_b_rows_follow_the_plan_and_times(self):
         self.assertEqual(chat_credits.upgrade_button(UPGRADE), "Get Pro · 2,200 credits a month · $20")
         self.assertEqual(chat_credits.upgrade_button({**UPGRADE, "plan": "max"}), "Get Max · 6,600 credits a month · $60")
@@ -109,7 +148,7 @@ class ParsingTest(unittest.TestCase):
         item = {"reason": "week_limit", "plan": "free", "upgrade": {**UPGRADE, "times": 17}}
         self.assertEqual(chat_credits.offer_rows(item), [
             ("chat", "17× more chat every month"), ("model", "Loopcut Pro, the stronger model"),
-            ("credits", "2,200 cloud credits a month"), ("render", "Cycles renders and top-ups")])
+            ("credits", "2,200 cloud credits a month ($22)"), ("render", "Cycles renders and top-ups")])
         self.assertEqual(chat_credits.offer_rows({"upgrade": UPGRADE})[0][1], "Much more chat every month")
         self.assertNotIn("model", [key for key, _ in chat_credits.offer_rows({"upgrade": {**UPGRADE, "plan": "max"}})])
         self.assertEqual(chat_credits.offer_used(item), "You've used this week's free chat.")
@@ -275,7 +314,9 @@ class PanelTest(unittest.TestCase):
         self.assertFalse(any(p["id"].startswith("input.usage") for p in display["prims"]))
         self.assertEqual([p["id"] for p in display["prims"] if p["t"] == "ring"], ["input.ring.context"])
         self.assertNotIn("allowance", hit(display, "input.rings")["tip"])
-        self.assertEqual(texts(display, "input.credits"), ["94 credits · chat 6"])
+        self.assertEqual(texts(display, "input.credits"), ["94 credits ($0.94) · This chat: 6 credits"])
+        narrow = self.build(240, credit_balance=94.6)  # Too long for one line: one each.
+        self.assertEqual(texts(narrow, "input.credits"), ["94 credits ($0.94)", "This chat: 6 credits"])
         self.assertEqual(hit(display, "input.credits")["action"], ("open_account", None))
         self.assertIn("AI 4 credits, tools 2 credits", hit(display, "input.credits")["tip"])
         self.assertEqual(texts(display, "item1.credits"), ["✓", "Done · 6 credits"])
@@ -295,12 +336,13 @@ class PanelTest(unittest.TestCase):
                 display = self.build(width, height, allowance_notice=self.notice())
                 words = texts(display, "popup.")
                 for line in ("You're out of credits", "100 free credits come back Sun 1 Nov",
-                             "These pause until then:", "Keep chatting for free"):
+                             "These pause until then:", "Have ChatGPT Plus or Pro? Chat on it at no cost.",
+                             "Pro: 2,200 credits a month ($22)"):
                     self.assertIn(line, " ".join(words))
+                self.assertNotIn("Keep chatting for free", " ".join(words))  # False to anyone without Plus.
                 self.assertEqual(hit(display, "popup.upgrade")["action"], ("limit_upgrade", self.session["id"]))
                 label = " ".join(texts(display, "popup.upgrade"))
-                self.assertEqual(label, "Get Pro · 2,200 credits a month · $20" if width == 420 else
-                                 "Get Pro · $20 a month")
+                self.assertEqual(label, "Get Pro · $20 a month")  # The line above it says the credits.
                 self.assertEqual(hit(display, "popup.free.chatgpt")["action"], ("sign_in", "chatgpt"))
                 self.assertEqual(hit(display, "popup.free.key")["action"], ("own_key", None))
                 self.assertEqual(hit(display, "popup.close")["action"], ("limit_popup_close", None))
@@ -397,6 +439,24 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(texts(display, "item1.limit.title"), ["You're out of credits"])
         self.assertFalse(any(h["id"].startswith("item1.limit.") for h in display["hits"]))
 
+    def test_the_pop_up_and_its_slim_card_name_the_sooner_weekly_top_up(self):
+        refill = {"credits": 25, "at": "2026-10-30T09:12:00Z"}
+        self.card["refill"] = refill
+        display = self.build(allowance_notice=self.notice())
+        self.assertIn("25 free credits come back Fri 30 Oct", " ".join(texts(display, "popup.text")))
+        self.assertNotIn("100 free credits", " ".join(texts(display, "popup.")))
+        self.card["popup_closed"] = True
+        display = self.build(allowance_notice=self.notice())
+        self.assertEqual(" ".join(texts(display, "input.limit.text")), "Free credits come back Fri 30 Oct")
+        after = datetime(2026, 10, 30, 9, 13, tzinfo=timezone.utc).timestamp()  # Topped up: the card is over.
+        display = self.build(allowance_notice=self.notice(), now=after)
+        self.assertFalse(any(p["id"].startswith(("popup.", "input.limit")) for p in display["prims"]))
+        # No refill on the refusal: the manifest's (account.chat_credits.refill) names it.
+        self.card.pop("refill")
+        self.card["popup_closed"] = False
+        display = self.build(allowance_notice=self.notice(), chat_credits={**ARM, "refill": refill})
+        self.assertIn("25 free credits come back Fri 30 Oct", " ".join(texts(display, "popup.text")))
+
     def test_variant_b_replaces_the_allowance_card_with_a_new_server_only(self):
         card = state.item_limit("Chat allowance used.", "week_limit", "free", "2026-10-25T18:00:00Z",
                                 {**UPGRADE, "label": "Upgrade to Pro", "times": 17})
@@ -445,6 +505,241 @@ class PanelTest(unittest.TestCase):
         display = self.build(billing="allowance", chat_credits=None, allowance_notice=notice)
         self.assertFalse(any(p["id"].startswith("popup.") for p in display["prims"]))
 
+
+    # --- 0.2.15 (persona tests 2026-10-23/24, owner-approved backlog items 1-7) --------------------------------
+
+    def offer_card(self, **upgrade):
+        card = state.item_limit("Chat allowance used.", "week_limit", "free", "2026-10-25T18:00:00Z",
+                                {**UPGRADE, "label": "Upgrade to Pro", "times": 17, **upgrade})
+        return card, {"item": card, "conversation": self.session["id"]}
+
+    def test_concrete_units_replace_n_times_on_both_pop_ups(self):
+        self.card["upgrade"] = {**UPGRADE, "builds": 110}
+        words = " ".join(texts(self.build(allowance_notice=self.notice()), "popup."))
+        self.assertIn("Pro: 2,200 credits a month ($22), about 110 builds", words)
+        card, notice = self.offer_card(builds=110)
+        words = " ".join(texts(self.build(billing="", chat_credits=None, allowance_notice=notice), "popup."))
+        self.assertIn("About 110 builds a month", words)
+        self.assertIn("2,200 cloud credits a month ($22)", words)
+        self.assertNotIn("× more", words)
+        card["upgrade"].pop("builds")  # A refusal without builds keeps the times line.
+        words = " ".join(texts(self.build(billing="", chat_credits=None, allowance_notice=notice), "popup."))
+        self.assertIn("17× more chat every month", words)
+        for bad in (0, -3, "110", 1.5, None):
+            self.assertNotIn("builds", chat_credits.offer_line({**UPGRADE, "builds": bad}))
+
+    def test_variant_b_has_the_green_box_and_no_balance_while_it_stands(self):
+        card, notice = self.offer_card(builds=110)
+        ui = dict(billing="", chat_credits=None, allowance_notice=notice, credits="100 credits ($1.00)",
+                  credit_balance=100)
+        display = self.build(**ui)
+        self.assertEqual(" ".join(texts(display, "popup.free.title")), "Have ChatGPT Plus or Pro? Chat on it at no cost.")
+        self.assertEqual(hit(display, "popup.free.chatgpt")["action"], ("sign_in", "chatgpt"))
+        self.assertEqual(hit(display, "popup.free.key")["action"], ("own_key", None))
+        self.assertEqual(hit(display, "popup.close")["action"], ("limit_popup_close", None))
+        self.assertNotIn("100 credits ($1.00)", " ".join(texts(display)))
+        self.assertFalse(any(h["id"] == "input.credits" for h in display["hits"]))
+        sheet = next(p for p in display["prims"] if p["id"] == "popup.sheet")
+        for p in display["prims"][display["prims"].index(sheet):]:
+            if p.get("text"):
+                self.assertLessEqual(p["x"] + measure("ui", p["size"], p["text"]), 420, p["id"])
+        card["popup_closed"] = True  # Its slim card still stands: no balance yet.
+        self.assertNotIn("100 credits ($1.00)", " ".join(texts(self.build(**ui))))
+        later = datetime(2026, 10, 25, 18, 1, tzinfo=timezone.utc).timestamp()  # Refilled: the balance is back.
+        ui["account"] = {"plan": "free", "week": {"used": 0.0, "resets_at": "2026-11-01T18:00:00Z"}}
+        self.assertEqual(texts(self.build(now=later, **ui), "input.credits")[0], "100 credits ($1.00)")
+        for height in (420, 520):  # Short panels keep every button of the taller sheet in view.
+            card["popup_closed"] = False
+            display = self.build(420, height, **{**ui, "account": {"plan": "free", "week": {"used": 1.0}}})
+            for id in ("popup.upgrade", "popup.free.chatgpt", "popup.free.key", "popup.close"):
+                box = hit(display, id)
+                self.assertLessEqual(box["y"] + box["h"], height, (height, id))
+
+    def test_the_pop_up_says_what_became_of_the_request_only_where_true(self):
+        self.session["input"] = "make the keys brass"  # A new message refused before anything ran: back in the box.
+        words = " ".join(texts(self.build(allowance_notice=self.notice()), "popup."))
+        self.assertIn("Your message is saved in the box below.", words)
+        self.session["input"] = ""
+        words = " ".join(texts(self.build(allowance_notice=self.notice()), "popup."))
+        self.assertNotIn("saved", words)
+        # Stopped mid-turn: the turn is kept, and its slim card's Continue (or an upgrade) goes on with it.
+        self.session["items"] = [state.item_user("details"), self.card]
+        self.session["messages"] = [{"role": "user", "content": "details"}, {"role": "tool", "content": "Done."}]
+        words = " ".join(texts(self.build(allowance_notice=self.notice()), "popup."))
+        self.assertIn("Your request is saved; it picks up when you continue.", words)
+        self.card["popup_closed"] = True
+        display = self.build(allowance_notice=self.notice())
+        self.assertEqual(hit(display, "item1.limit.retry")["action"], ("limit_retry", 1))
+        self.assertEqual(texts(display, "item1.limit.retry"), ["Continue"])
+        self.session["messages"].append({"role": "assistant", "content": "Finished."})  # Nothing left to resume.
+        self.card["popup_closed"] = False
+        self.assertNotIn("saved", " ".join(texts(self.build(allowance_notice=self.notice()), "popup.")))
+        self.assertFalse(any(h["id"] == "item1.limit.retry" for h in self.build(allowance_notice=self.notice())["hits"]))
+
+    def test_once_the_credits_are_back_a_stopped_turn_keeps_its_continue(self):
+        self.card.update(refill={"credits": 25, "at": "2026-10-30T09:12:00Z"}, popup_closed=True)
+        self.session["items"] = [state.item_user("details"), self.card]
+        self.session["messages"] = [{"role": "user", "content": "details"}, {"role": "tool", "content": "Done."}]
+        after = datetime(2026, 10, 30, 9, 13, tzinfo=timezone.utc).timestamp()
+        display = self.build(allowance_notice=self.notice(), now=after)
+        self.assertEqual(texts(display, "item1.limit.title"), ["Credits are back"])
+        self.assertEqual(texts(display, "item1.limit.text"), ["Continue where it stopped."])
+        self.assertEqual([h["action"] for h in display["hits"] if h["id"].startswith("item1.limit.")],
+                         [("limit_retry", 1)])
+        self.session["messages"].append({"role": "assistant", "content": "Finished."})  # Nothing to go on with.
+        display = self.build(allowance_notice=self.notice(), now=after)
+        self.assertEqual(texts(display, "item1.limit.text"), ["Free credits came back."])
+        self.assertFalse(any(h["id"].startswith("item1.limit.") for h in display["hits"]))
+
+    def test_the_locked_grid_shows_released_tools_only(self):
+        words = texts(self.build(allowance_notice=self.notice()), "popup.tile")
+        self.assertNotIn("Auto-rig", words)
+        self.assertEqual(words, ["AI agent", "Photo → 3D", "Motion", "Renders", "Sound and voice", "Retopology"])
+
+    def test_own_ai_users_see_tool_credits_and_no_padlock_on_the_agent(self):
+        self.card["upgrade"] = {**UPGRADE, "builds": 110}
+        for provider in ("CHATGPT", "OPENAI"):
+            with self.subTest(provider=provider):
+                display = self.build(allowance_notice=self.notice(), provider=provider, chatgpt_plan=True)
+                words = " ".join(texts(display, "popup."))
+                self.assertIn("Pro: 2,200 credits a month ($22) for renders, motion and 3D models", words)
+                self.assertNotIn("builds", words)
+                self.assertNotIn("Have ChatGPT Plus", words)  # Already on their own AI.
+                locks = [p["id"] for p in display["prims"] if p["id"].endswith(".lock.body")]
+                self.assertEqual(len(locks), 5)
+                self.assertNotIn("popup.tile0.lock.body", locks)  # Tile 0 is the AI agent.
+                self.assertEqual(hit(display, "popup.close")["action"], ("limit_popup_close", None))
+
+    def test_a_reopened_chat_draws_its_new_cards_as_history(self):
+        """Import path: a conversation saved with 0.2.15's refill and heads-up loads back and draws with no pop-up and
+        no buttons on the old refusal (only the live refusal has them)."""
+        import tempfile
+        from loopcut import conversations
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        with patch.object(conversations, "root", return_value=Path(folder.name)):
+            self.card.update(refill={"credits": 25, "at": "2026-10-30T09:12:00Z"}, popup_closed=True)
+            heads_up = state.item_notice("18 credits left ($0.18)\n25 free credits come back Fri 30 Oct",
+                                         action_label="Get Pro · $20 a month",
+                                         url="https://loopcut.org/pricing?from=app&reason=low_credits&plan=pro")
+            self.session["items"] = [state.item_user("details"), heads_up, self.card]
+            conversations.save(self.session)
+            body = conversations._validate(json.loads((Path(folder.name) / self.session["id"] / "conversation.json")
+                                                      .read_text()))  # What load() checks (it needs bpy for the rest).
+        self.session = {**state.new_session(), "id": body["id"], "items": body["items"]}
+        display = self.build(allowance_notice=None)
+        self.assertFalse(any(p["id"].startswith("popup.") for p in display["prims"]))
+        self.assertEqual(texts(display, "item2.limit.title"), ["You're out of credits"])
+        self.assertFalse(any(h["id"].startswith("item2.limit.") for h in display["hits"]))
+        self.assertEqual(hit(display, "item1.notice.action")["action"], ("open_url", 1))
+
+    def test_a_pop_up_that_cannot_draw_closes_and_the_chat_stays_usable(self):
+        with patch.object(layout, "_credits_sheet", side_effect=RuntimeError("bad data")):
+            display = self.build(allowance_notice=self.notice())
+        self.assertFalse(any(p["id"].startswith("popup.") for p in display["prims"]))
+        self.assertTrue(self.card["popup_closed"])
+        self.assertTrue(any(h["id"] == "input.text" or h["id"].startswith("input") for h in display["hits"]))
+        with patch.object(layout, "_draw_slim_card", side_effect=KeyError("plan")):
+            display = self.build(allowance_notice=self.notice())
+        self.assertFalse(any(p["id"].startswith("input.limit") for p in display["prims"]))
+        self.assertTrue(any(h["id"].startswith("input") for h in display["hits"]))
+
+
+class LowCreditsTest(unittest.TestCase):
+    """0.2.15 item 5: one quiet heads-up at about 20 credits, from the replies' balance, once a refill period."""
+
+    def setUp(self):
+        from loopcut import agent, cloud, nudges
+        self.agent, self.nudges = agent, nudges
+        self.account = {"plan": "free", "billing": "credits", "chat_credits": {
+            "per_step": 0.84, "refill": {"credits": 25, "at": "2026-10-30T09:12:00Z"}},
+            "credits": {"balance": 18, "monthly": 0, "resets_at": RESET}}
+        self.seen = []
+        for target, name, value in ((cloud, "_runtime", Runtime(self.account)),
+                                    (nudges, "first_time", lambda kind, key: (kind, key) not in self.seen
+                                     and not self.seen.append((kind, key)))):
+            p = patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def warn(self, items, balance, billing="credits"):
+        info = {"plan": "free", "billing": billing, "credits_balance": balance}
+        with patch.object(self.agent.config, "billing_open", return_value=True), \
+                patch.object(chat_credits.time, "time", return_value=NOW):
+            self.agent._warn_low_credits(items, info, None)
+
+    def test_once_per_refill_period_with_the_offer(self):
+        items = []
+        self.warn(items, 21)
+        self.assertEqual(items, [])
+        self.warn(items, 18)
+        self.assertEqual(len(items), 1)
+        notice = items[0]
+        self.assertEqual(notice["kind"], "notice")
+        self.assertEqual(notice["text"], "18 credits left ($0.18)\n25 free credits come back Fri 30 Oct")
+        self.assertEqual(notice["action_label"], "Get Pro · $20 a month")
+        self.assertIn("plan=pro", notice["url"])
+        self.assertEqual(self.seen, [("low_chat_credits", "2026-10-30T09:12:00Z")])
+        self.warn(items, 9)
+        self.assertEqual(len(items), 1)  # Once in this refill period.
+        self.account["chat_credits"]["refill"]["at"] = "2026-11-06T09:12:00Z"  # The next week.
+        self.warn(items, 12)
+        self.assertEqual(len(items), 2)
+        self.assertFalse(any(v in " ".join(i["text"] for i in items) for v in VENDORS))
+
+    def test_a_reply_in_the_live_chat_brings_it_and_no_window_warning(self):
+        session = state.reset()
+        info = {"plan": "free", "billing": "credits", "credits_balance": 18,
+                "session": {"used": 0.95, "resets_at": "2026-10-24T01:00:00Z"}, "week": {"used": 0.97}}
+        with patch.object(self.agent.config, "billing_open", return_value=True), \
+                patch.object(chat_credits.time, "time", return_value=NOW):
+            self.agent._warn_low_allowance(session, session["items"], info)
+            self.agent._warn_low_allowance(session, session["items"], {**info, "credits_balance": None})
+        self.assertEqual([i["text"] for i in session["items"]],
+                         ["18 credits left ($0.18)\n25 free credits come back Fri 30 Oct"])
+
+    def test_never_outside_the_arm_or_at_zero(self):
+        items = []
+        self.warn(items, 0)
+        self.warn(items, 15, billing="allowance")
+        self.warn(items, None)
+        self.assertEqual(items, [])
+
+    def test_the_arm_skips_the_older_low_credit_card_and_allowance_accounts_keep_it(self):
+        nudges = self.nudges
+        with patch.object(nudges.config, "billing_open", return_value=True):
+            for billing, kinds in (("credits", []), ("allowance", ["low_credits"]), (None, ["low_credits"])):
+                with nudges._lock:
+                    nudges._pending.clear()
+                nudges.observe({"account": {"billing": billing, "credits": {"balance": 15, "monthly": 100}}}, True, [])
+                with nudges._lock:
+                    self.assertEqual([k for _, k, _ in nudges._pending], kinds, billing)
+                    nudges._pending.clear()
+
+    def test_turns_on_a_users_own_ai_carry_no_credits_line(self):
+        from loopcut import config
+        turn = types.SimpleNamespace(config=types.SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex"))
+        chat_credits.turn_start(state.new_session(), turn)
+        self.assertFalse(hasattr(turn, "credits"))
+        hosted = types.SimpleNamespace(config=types.SimpleNamespace(base_url=config.SERVICE_URL + "/v1"))
+        with patch.object(config, "on_service", return_value=True):
+            chat_credits.turn_start(state.new_session(), hosted)
+        self.assertEqual(hosted.credits["before"], 18)
+
+
+class FlagOff0214Test(unittest.TestCase):
+    def test_flag_off_matches_0_2_14(self):
+        """fixtures/flag_off_0.2.14.json is flag_off_0_2_14's snapshot taken from the 0.2.14 add-on's credits package
+        (75f6845c1ca): with no account.billing, chat_credits, refill, upgrade.times or builds, the panel, the setup,
+        the chat footers, the conversion cards and the refusal cards are exactly 0.2.14's."""
+        import flag_off_0_2_14
+        expected = json.loads(flag_off_0_2_14.FIXTURE.read_text())
+        now = json.loads(json.dumps(flag_off_0_2_14.snapshot(), sort_keys=True))
+        self.assertEqual(sorted(now), sorted(expected))
+        for part in expected:
+            for name in expected[part]:
+                with self.subTest(part=part, scene=name):
+                    self.assertEqual(now[part][name], expected[part][name])
 
 if __name__ == "__main__":
     unittest.main()

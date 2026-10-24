@@ -662,6 +662,9 @@ class VideoInputTest(unittest.TestCase):
 
 
 class FakeArmature:
+    def get(self, key, default=None):
+        return getattr(self, '_properties', {}).get(key, default)
+
     def __init__(self, name, kind="ARMATURE"):
         self.name, self.type, self.modifiers, self.parent = name, kind, [], None
 

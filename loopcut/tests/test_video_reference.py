@@ -523,7 +523,8 @@ class ModelInputTest(Folder):
             self.assertIn(name, offered)
         for name in ("compare_with_reference", "look_at_reference"):
             self.assertIn("frame", offered[name]["parameters"]["properties"])
-        self.assertLessEqual(set(workspace.LIVE_TOOLS) | set(workspace.TOOLS), set(offered))
+        # character_rig only with auto-rig access (test_tool_surface).
+        self.assertLessEqual((set(workspace.LIVE_TOOLS) - {"character_rig"}) | set(workspace.TOOLS), set(offered))
 
     def test_send_describes_the_clip_keeps_its_record_and_waits_while_preparing(self):
         folder = worker_output(self.clip_folder(), {"asked": False})

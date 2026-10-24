@@ -24,12 +24,17 @@ STATES = ("signed_out", "first_run", "hints_dismissed", "coming_soon", "coming_s
           "onboarding_account", "onboarding_account_failed", "onboarding_connect", "onboarding_connect_chatgpt_error",
           # The credits package (chat_credits.py): a credits-arm account's screens, then variant B for any arm.
           "credits_turn", "credits_popup", "credits_slim", "allowance_offer", "allowance_slim",
-          "credits_account", "credits_showcase", "credits_byo_ai")
+          "credits_account", "credits_showcase", "credits_byo_ai",
+          # 0.2.15: the weekly top-up, plain units, the request line, own-AI users, the heads-up, variant B's box.
+          "v15_credits_popup", "v15_credits_slim", "v15_credits_back", "v15_credits_popup_chatgpt", "v15_credits_turn",
+          "v15_allowance_offer", "v15_credits_account", "v15_credits_showcase", "v15_credits_try")
 CREDITS_RESET = "2026-11-01T00:00:00.000Z"
 CREDITS_ACCOUNT = {"plan": "free", "billing": "credits", "chat_credits": {"per_step": 0.84},
                    "credits": {"balance": 94, "monthly": 0, "resets_at": CREDITS_RESET}}
 CREDITS_UPGRADE = {"url": "https://loopcut.org/pricing?from=app&reason=insufficient_credits&plan=pro", "plan": "pro",
                    "label": "Get Pro", "note": "Pro: 2,200 credits a month, $20."}
+V15_REFILL = {"credits": 25, "at": "2026-10-30T09:12:00Z"}  # Ahead of any run before then: "Fri 30 Oct".
+V15_ACCOUNT = {**CREDITS_ACCOUNT, "chat_credits": {"per_step": 0.84, "refill": V15_REFILL}}
 LIVE_TOOLS = [{"name": "motion_from_text", "backend": "managed", "cost": {"credits_estimate": 10}},
               {"name": "image_to_3d", "backend": "managed", "cost": {"credits_estimate": 80}}]
 
@@ -126,6 +131,36 @@ def fixtures(state):
                                                                  "credits": {"balance": 100, "monthly": 0}})
     for name, step in (("credits_account", "account"), ("credits_showcase", "showcase"), ("credits_byo_ai", "connect")):
         result[name]["ui"].update(onboarding_step=step, manifest_account=CREDITS_ACCOUNT, signed_in=True)
+    # 0.2.15. A refusal mid-turn (the turn's messages end in a tool result) keeps the turn: "Your request is saved".
+    stopped = [{"role": "user", "content": "make more details"}, {"role": "tool", "content": "Added the keys."}]
+    for name in ("v15_credits_popup", "v15_credits_slim", "v15_credits_back", "v15_credits_popup_chatgpt"):
+        card = state.item_limit("Out of credits. 25 free credits come back Fri 30 Oct.", "insufficient_credits", "free",
+                                CREDITS_RESET, None)
+        card.update(upgrade={**CREDITS_UPGRADE, "builds": 110}, refill=dict(V15_REFILL),
+                    popup_closed=name == "v15_credits_slim")
+        result[name].update(items=[dict(item) for item in turn] + [card], messages=stopped,
+                            spend={"credits": 2, "auto": 2, "allowed": 0})
+        result[name]["ui"].update(notice=card, manifest_account={**V15_ACCOUNT, "credits": {
+            **CREDITS_ACCOUNT["credits"], "balance": 0}})
+    result["v15_credits_popup_chatgpt"]["ui"]["provider"] = "CHATGPT"
+    result["v15_credits_back"]["ui"]["notice"].update(refill={"credits": 25, "at": "2026-10-20T09:12:00Z"},
+                                                      popup_closed=True)  # The top-up has come: Continue.
+    result["v15_credits_back"]["items"][-1] = result["v15_credits_back"]["ui"]["notice"]
+    heads_up = state.item_notice("18 credits left ($0.18)\n25 free credits come back Fri 30 Oct",
+                                 action_label="Get Pro · $20 a month",
+                                 url="https://loopcut.org/pricing?from=app&reason=low_credits&plan=pro")
+    result["v15_credits_turn"].update(items=[dict(item) for item in turn] + [heads_up],
+                                      spend={"credits": 2, "auto": 2, "allowed": 0})
+    result["v15_credits_turn"]["ui"]["manifest_account"] = {**V15_ACCOUNT, "credits": {
+        **CREDITS_ACCOUNT["credits"], "balance": 18}}
+    card = state.item_limit("Chat allowance used.", "week_limit", "free", "2026-10-26T18:00:00Z", None)
+    card["upgrade"] = {**CREDITS_UPGRADE, "label": "Upgrade to Pro", "times": 17, "builds": 110}
+    result["v15_allowance_offer"].update(items=[dict(item) for item in turn[:2]])
+    result["v15_allowance_offer"]["ui"].update(notice=card, manifest_account={"plan": "free", "credits": {
+        "balance": 100, "monthly": 0}})  # An allowance arm account: no account.billing; its refusal says builds.
+    for name, step in (("v15_credits_account", "account"), ("v15_credits_showcase", "showcase"),
+                       ("v15_credits_try", "done")):
+        result[name]["ui"].update(onboarding_step=step, manifest_account=V15_ACCOUNT, signed_in=True)
     return result
 
 
@@ -179,6 +214,15 @@ def main():
     host._config_cached = lambda: ("fast", current["ui"].get("needs_setup", False), 24000)
     host._checkpoint_statuses = lambda session: {}
     settings.model_label = lambda model: "Fast"
+    build = host.layout.build
+
+    def build_with_provider(session, width, height, scale, measure, model="", checkpoints=None, ui=None):
+        # A fixture's "provider" stands for the add-on preference (unset here: the checkout is not an enabled add-on).
+        if ui is not None and current["ui"].get("provider"):
+            ui = {**ui, "provider": current["ui"]["provider"]}
+        return build(session, width, height, scale, measure, model, checkpoints, ui)
+
+    host.layout.build = build_with_provider
 
     # Onboarding fixtures are last so one splash can repaint between them without synthetic input.
     def draw_splash(menu, context):

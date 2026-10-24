@@ -223,6 +223,26 @@ class ChildCommand(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ipc.ProtocolError):
                 ipc.read_token(io.BytesIO(invalid))
 
+    def test_an_edit_only_brief_with_no_root_is_not_missing_its_deliverable(self):
+        """autorig_dog 20261023-180603: a weights-only rig worker, told the deliverable was its root's
+        name, made an empty DogRig; with no root it would have been reported partial, "missing"."""
+        from loopcut import ownership, worker_child
+        scene = types.SimpleNamespace(objects={})
+        blender = types.SimpleNamespace(context=types.SimpleNamespace(scene=scene))
+        rig = types.SimpleNamespace(deliverable="DogRig", owned={"OBJECT:Dog", "MESH:Dog"}, _edited_owned=lambda: True)
+        idle = types.SimpleNamespace(deliverable="DogRig", owned={"OBJECT:Dog"}, _edited_owned=lambda: False)
+        cases = (([], rig, []),  # Owns the dog, changed it, created nothing: an edit-only brief.
+                 ([], idle, ["DogRig"]),  # Owns it but changed nothing: nothing was done, so it is missing.
+                 ([types.SimpleNamespace(id_type="OBJECT")], rig, ["DogRig"]),  # Made something, not named so.
+                 ([], types.SimpleNamespace(deliverable="Chair", owned=set()), ["Chair"]))  # A build that built nothing.
+        for created, worker, missing in cases:
+            with self.subTest(missing=missing, created=len(created)), mock.patch.object(worker_child, "bpy", blender), \
+                    mock.patch.object(ownership, "created_ids", return_value=created):
+                self.assertEqual(worker_child.Worker._missing(worker), missing)
+        scene.objects["DogRig"] = object()
+        with mock.patch.object(worker_child, "bpy", blender):
+            self.assertEqual(worker_child.Worker._missing(rig), [], "there: never missing")
+
     def test_addon_and_scene_loading_follow_authentication(self):
         from loopcut import worker_child
         events = []

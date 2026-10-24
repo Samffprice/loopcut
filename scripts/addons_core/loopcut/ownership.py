@@ -15,7 +15,9 @@ current frame, not edits. Images count by absolute path, so the spawn copy's rel
 the result's absolute paths read the same; their pixels through the packed data's CRC (a repaint
 counts once it is packed again; write_result packs the worker's own unsaved paint so it survives).
 A text block counts its contents. A mesh counts its UV maps' coordinates, so an unwrap alone is a
-change. A collection counts only members that existed at spawn, so creating into the user's
+change. An object counts its vertex group names and, for a mesh, the deform weights (weights_hash),
+so weight painting alone is a change (autorig_dog 20261023-180603: a rig worker's weight fixes merged
+as "0 replaced"). A collection counts only members that existed at spawn, so creating into the user's
 "Collection" does not change it.
 
 Supporting datablocks (SUPPORT: text blocks and images, which no object shows) get a line each in
@@ -28,6 +30,7 @@ Linked (library) datablocks are read-only and never stamped; their identity is (
 Temporary capture setups are tagged TEMP and left out of tokens and results.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -97,7 +100,12 @@ _SKIP_PROPS = {"rna_type", "name", "name_full", "show_expanded", "show_in_editmo
 _TRANSFORM = (("location", "loc"), ("rotation_euler", "rot"), ("rotation_quaternion", "quat"),
               ("rotation_axis_angle", "axis"), ("scale", "scale"))
 
+# What a token measures, for records kept across sessions (the workspace's state.json): 2 since 0.2.15,
+# when an object counts its vertex group names and deform weights; a record without it is 0.2.14's.
+TOKEN_VERSION = 2
 SPAWN_TOKENS: dict = {}  # The child's tokens from stamp_all, for write_result's advisory.
+CALL_TOKENS: dict = {}   # The same without deform weights (token weights=False), for the per-call check.
+SPAWN_WEIGHTS: dict = {}  # Object key -> weights_hash at stamp_all, for an object with vertex groups on a local mesh.
 SPAWN_ACTIVE: dict = {}  # The child's active collection at stamp_all: {"name": its stamp, "" for the scene's own}.
 STAMPED_UIDS: set = set()  # The child's datablocks as stamped (session_uids survive undo), to tell copies apart.
 
@@ -272,6 +280,59 @@ def coords_hash(collection, attribute: str, count: int, width: int = 3):
     return _hash(np.round(values, 4) + 0.0)  # + 0.0: -0.0 and 0.0 alike.
 
 
+_WEIGHT_CHUNK = 1 << 16  # Vertices per pass of weights_hash, so its lists stay small (a single pass: 185 MB at 1M).
+_PASS_WEIGHTS: dict | None = None  # Mesh session_uid -> weights_hash, inside one pass over the scene (one_pass).
+
+
+@contextlib.contextmanager
+def one_pass():
+    """One read of the whole scene (spawn_state, stamp_all, changed_keys): a mesh's weights are hashed
+    once however many objects use it (review: 11 objects on one 100k mesh took 2.0 s at spawn). Nothing
+    may change in between, so only around a read."""
+    global _PASS_WEIGHTS
+    outer = _PASS_WEIGHTS
+    _PASS_WEIGHTS = {} if outer is None else outer
+    try:
+        yield
+    finally:
+        _PASS_WEIGHTS = outer
+
+
+def _weights(mesh) -> str:
+    """weights_hash, once per mesh inside one_pass."""
+    memo = _PASS_WEIGHTS
+    if memo is None:
+        return weights_hash(mesh)
+    if mesh.session_uid not in memo:
+        memo[mesh.session_uid] = weights_hash(mesh)
+    return memo[mesh.session_uid]
+
+
+def weights_hash(mesh) -> str:
+    """A short hash of a mesh's deform weights: per vertex its group count, then (group index, weight
+    at 1e-4), in vertex order. MDeformVert has no foreach_get, so this is a Python pass, in chunks:
+    0.15 s for 100k vertices at three weights each and 1.6 s for 1M, 17 MB at most (Blender 5.2,
+    2026-10-24; the mesh's own token takes 0.03 s and 0.36 s). Only for a mesh whose object has vertex
+    groups: MeshVertex.groups is read for writing, so it adds an empty deform layer to a mesh that has
+    none (measured). A mesh with no groups is therefore never read; one with groups but no weight
+    assigned yet gets that layer at its first token (at spawn): it holds no weights, and neither a
+    token nor the attribute list sees it."""
+    import numpy as np
+    digest = hashlib.blake2b(digest_size=8)
+    vertices = mesh.vertices
+    for start in range(0, len(vertices), _WEIGHT_CHUNK):
+        counts, groups, weights = [], [], []
+        for vertex in vertices[start:start + _WEIGHT_CHUNK]:
+            elements = vertex.groups
+            counts.append(len(elements))
+            for element in elements:
+                groups.append(element.group)
+                weights.append(element.weight)
+        digest.update(np.array(counts, dtype=np.int32).tobytes() + np.array(groups, dtype=np.int32).tobytes()
+                      + (np.round(np.array(weights, dtype=np.float32), 4) + 0.0).tobytes())
+    return digest.hexdigest()
+
+
 def uv_maps(mesh, active_only: bool = False) -> list[tuple[str, str]]:
     """[(name, hash)] of a mesh's UV maps (the active one alone with active_only), each hash of its
     corner coordinates at 1e-4 in corner order. In Edit Mode from the edit mesh: the mesh's own UV
@@ -337,7 +398,7 @@ def _values(idb, names, moving=()) -> dict:
     return {name: "animated" if name in moving else _rnd(getattr(idb, name, None)) for name in names}
 
 
-def _object(ob, uid2spawn) -> dict:
+def _object(ob, uid2spawn, weights: bool = True) -> dict:
     moving = _moving(ob)
     d = {"type": ob.type, "mode": ob.rotation_mode, "parent": _ref(ob.parent, uid2spawn), "ptype": ob.parent_type,
          "pbone": ob.parent_bone, "pinv": _rnd([c for row in ob.matrix_parent_inverse for c in row]),
@@ -352,6 +413,19 @@ def _object(ob, uid2spawn) -> dict:
         if path.startswith("rotation") and path != rotation:
             continue
         d[short] = "driven" if path in moving else _rnd(getattr(ob, path))
+    groups = getattr(ob, "vertex_groups", None)
+    if groups is not None and len(groups):  # An object without keeps its old token.
+        d["groups"] = [g.name for g in groups]  # In index order: the weights name groups by index.
+        data = ob.data
+        if weights and ob.type == "MESH" and data is not None and data.library is None:
+            # The weights are the mesh's, counted here: only the object says whether its mesh has
+            # groups (weights_hash). Known gap: a mesh shared with an object the worker does not own
+            # is not owned (expand_owns), so a weight edit to it is dropped, and reported naming the
+            # owned object (write_result's weights_not_merged) and the unowned ones using it. Owns
+            # naming a mesh but not its object: the edit is reported on the (unowned) object, and the
+            # owned mesh, its token unchanged, stays as it was live. A lattice's groups count by name only: its
+            # weights (lattice.points[i].groups) are not hashed, a known limit.
+            d["weights"] = _weights(data)
     return d
 
 
@@ -415,14 +489,15 @@ def _image(image) -> dict:
     return d
 
 
-def token(idb, uid2spawn=None) -> str:
+def token(idb, uid2spawn=None, weights: bool = True) -> str:
     """What a datablock is, as a short hash. uid2spawn (parent side: live session_uid -> spawn name)
     makes references to renamed live datablocks read as at spawn, and marks which collection members
-    existed then; in the child, the stamps do both."""
+    existed then; in the child, the stamps do both. weights=False leaves an object's deform weights
+    out (its vertex group names stay): the worker's per-call check, compared against CALL_TOKENS."""
     t = idb.id_type
     moving = _moving(idb)
     if t == "OBJECT":
-        d = _object(idb, uid2spawn)
+        d = _object(idb, uid2spawn, weights)
     elif t == "MESH":
         d = _mesh(idb, uid2spawn)
     elif t == "MATERIAL":
@@ -455,6 +530,8 @@ def token(idb, uid2spawn=None) -> str:
                            coords_hash(fc.keyframe_points, "co", count, 2) if count else ""])
         d = {"curves": sorted(curves), "slots": sorted(s.identifier for s in getattr(idb, "slots", ()))}
     elif t == "COLLECTION":
+        # Known limit: after an undo that could not restore an owned object the worker deleted, its
+        # collection reads as changed though only an owned member did.
         d = {"objects": sorted(_ref(o, uid2spawn) for o in idb.objects if _known(o, uid2spawn) and not o.get(TEMP)),
              "children": sorted(_ref(c, uid2spawn) for c in idb.children if _known(c, uid2spawn)),
              "hide": [idb.hide_render, idb.hide_viewport], "offset": _rnd(idb.instance_offset)}
@@ -478,7 +555,10 @@ def describe(idb) -> dict:
     if idb is None:
         return {}
     if idb.id_type == "OBJECT":
-        return {"location": _rnd(idb.location), "rotation": _rnd(idb.rotation_euler), "scale": _rnd(idb.scale)}
+        shown = {"location": _rnd(idb.location), "rotation": _rnd(idb.rotation_euler), "scale": _rnd(idb.scale)}
+        if len(idb.vertex_groups) and idb.type == "MESH" and idb.data is not None and idb.data.library is None:
+            shown["weights"] = weights_hash(idb.data)  # A weights-only edit shows as different values too.
+        return shown
     if idb.id_type == "LIGHT":
         return {"energy": _rnd(idb.energy), "color": _rnd(idb.color)}
     if idb.id_type == "MESH":
@@ -497,7 +577,8 @@ def spawn_state() -> tuple[dict[str, int], dict[str, str]]:
     local datablock."""
     ids = {key_of(idb): idb.session_uid for idb in all_ids()}
     uid2spawn = {uid: key.split(":", 1)[1] for key, uid in ids.items()}
-    tokens = {key_of(idb): token(idb, uid2spawn) for idb in all_ids()}
+    with one_pass():
+        tokens = {key_of(idb): token(idb, uid2spawn) for idb in all_ids()}
     return ids, tokens
 
 
@@ -561,14 +642,21 @@ def expand_owns(owns: list[str], aspects: list[str]) -> set[str]:
 
 def stamp_all() -> dict[str, str]:
     """Child, before any model code: stamp every local datablock with its spawn name; returns the
-    spawn tokens (also kept in SPAWN_TOKENS). The active collection is kept too (SPAWN_ACTIVE)."""
+    spawn tokens (also kept in SPAWN_TOKENS, and without weights in CALL_TOKENS). The active
+    collection is kept too (SPAWN_ACTIVE)."""
     import bpy
     for idb in all_ids():
         idb[STAMP] = idb.name
     STAMPED_UIDS.clear()
     STAMPED_UIDS.update(idb.session_uid for idb in all_ids())
     SPAWN_TOKENS.clear()
-    SPAWN_TOKENS.update({key_of(idb): token(idb) for idb in all_ids()})
+    SPAWN_WEIGHTS.clear()
+    with one_pass():
+        SPAWN_TOKENS.update({key_of(idb): token(idb) for idb in all_ids()})
+        SPAWN_WEIGHTS.update({key_of(ob): _weights(ob.data) for ob in _weighted(all_ids())})  # Hashed above.
+    CALL_TOKENS.clear()  # Only an object with vertex groups differs; the rest are its full token.
+    CALL_TOKENS.update({key_of(idb): token(idb, weights=False) if idb.id_type == "OBJECT" and len(idb.vertex_groups)
+                        else SPAWN_TOKENS[key_of(idb)] for idb in all_ids()})
     layer = bpy.context.view_layer.active_layer_collection if bpy.context.view_layer else None
     active = layer.collection if layer is not None else None
     SPAWN_ACTIVE.clear()
@@ -674,19 +762,36 @@ def created_ids() -> list:
     return [idb for idb in all_ids() if not idb.get(STAMP) and idb.id_type != "COLLECTION" and _kept(idb)]
 
 
+def _weighted(idbs):
+    """The objects among these whose weights a token hashes: vertex groups on a local mesh."""
+    return [ob for ob in idbs if ob.id_type == "OBJECT" and ob.type == "MESH" and len(ob.vertex_groups)
+            and ob.data is not None and ob.data.library is None]
+
+
 def changed_keys(spawn_tokens: dict, owned: set, prefix: str = "") -> list[str]:
     """Stamped datablocks that changed, or are gone, and are not owned. Whatever it is called: the
     palette and the supports may carry the worker's prefix (Chest_Wood for the Chest worker), and are
     everyone's; everything else live under the prefix is owned (orchestrator.validate_wave)."""
+    return _changed(spawn_tokens, owned, weights=True)
+
+
+def changed_per_call(owned: set, prefix: str = "") -> list[str]:
+    """changed_keys without deform weights, against CALL_TOKENS: the worker's check after every call
+    (worker_child._changed). Its own map, so weight-free tokens are never compared with full ones."""
+    return _changed(CALL_TOKENS, owned, weights=False)
+
+
+def _changed(spawn_tokens: dict, owned: set, weights: bool) -> list[str]:
     unstamp_copies()
     present = {key_of(idb): idb for idb in all_ids() if idb.get(STAMP)}
     changed = []
-    for key, before in spawn_tokens.items():
-        if key in owned:
-            continue
-        idb = present.get(key)
-        if idb is None or token(idb) != before:
-            changed.append(key)
+    with one_pass():
+        for key, before in spawn_tokens.items():
+            if key in owned:
+                continue
+            idb = present.get(key)
+            if idb is None or token(idb, weights=weights) != before:
+                changed.append(key)
     return sorted(changed)
 
 
@@ -956,6 +1061,17 @@ def write_result(path, owned: set, prefix: str, role: str, aspects=(), brief=Non
                 owned_ids.append(idb)
     failed = _pack_paint([i for i in created + owned_ids if i.id_type == "IMAGE"])
     changed = changed_keys(SPAWN_TOKENS, owned, prefix) if SPAWN_TOKENS else []
+    # What the merge reports as kept in the worker's copy (merge._merge_worker): changed and still here,
+    # not a text or image (the support lines say those), and only in a worker's child, where the
+    # per-call check skipped weights (CALL_TOKENS). A workspace build's changed_not_owned is full of
+    # save side effects (what an owned object's deletion left unused, an old World, replaced images):
+    # 47 false dropped edits over 9 builds (review of a80b9b8a630).
+    stayed = [k for k in changed if k in present and k.split(":", 1)[0] not in SUPPORT] if CALL_TOKENS else []
+    # An owned object whose mesh is not owned (shared with an object the worker does not own): its
+    # weights are the mesh's, so painting them merges nothing; listed so the merge says so by name.
+    with one_pass():
+        unmerged = sorted(key_of(ob) for ob in _weighted(owned_ids) if key_of(ob.data) not in owned
+                          and key_of(ob) in SPAWN_WEIGHTS and _weights(ob.data) != SPAWN_WEIGHTS[key_of(ob)])
     try:  # Listing them never costs the result.
         updated = [i for i in owned_ids if i.id_type in SUPPORT and SPAWN_TOKENS.get(key_of(i)) != token(i)]
         _reload_packed([i for i in created + updated if i.id_type == "IMAGE"])
@@ -985,6 +1101,6 @@ def write_result(path, owned: set, prefix: str, role: str, aspects=(), brief=Non
         "owned_deleted": sorted(k for k in owned if k not in present), "pointers": pointers, "support": support,
         "advisory": {
             "outside_role": sorted(name(i) for i in created if not held.get(i.session_uid, (True,))[0]),
-            "changed_not_owned": changed,
+            "changed_not_owned": changed, "in_copy_only": stayed, "weights_not_merged": unmerged,
         },
     }

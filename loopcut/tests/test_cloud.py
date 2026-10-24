@@ -170,7 +170,7 @@ class RuntimeTest(RuntimeFixture):
         restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
         self.assertEqual(restarted.etag, '"v1"')
         self.assertEqual(restarted.descriptors(), runtime.descriptors())
-        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.7')
+        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.9')
 
     def test_multipart_capability_comes_from_the_latest_manifest(self):
         offered = {'blob_multipart': {'min_size': 16 * 1024 * 1024}}
@@ -1089,6 +1089,84 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual([self.calls[0][1], self.calls[-1][1]], [main, main])
         self.assertNotEqual(self.calls[1][1], main)
 
+    def test_ordinary_cloud_call_drains_apply_continuation_off_main(self):
+        self.ready()
+        from loopcut import tools
+        threads = []
+        def finish(canceled, on_main):
+            threads.append(threading.get_ident())
+            return tools.ToolResult('Confirmed refund', ok=False)
+        with patch.object(cloud, '_apply_to_scene', return_value=tools.ToolResult('Reporting', then=finish)):
+            result = self.run_step(cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'test'}))
+        self.assertEqual(result.text, 'Confirmed refund')
+        self.assertIsNone(result.then)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+    def test_download_failure_drains_refund_continuation_off_main(self):
+        self.ready()
+        from loopcut import tools
+        threads = []
+        def fail(*args, **kwargs):
+            raise cloud_http.CloudError('Corrupt file', 'hash_mismatch')
+        self.module.run = self.quoting(fail)
+        def finish(canceled, on_main):
+            threads.append(threading.get_ident())
+            return tools.ToolResult('Confirmed refund after file verification failed', ok=False)
+        with patch.object(cloud, '_rig_failure_result', return_value=tools.ToolResult('Reporting', then=finish)):
+            result = self.run_step(cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'test'}))
+        self.assertIn('Confirmed refund', result.text)
+        self.assertNotIn('apply', [row[0] for row in self.calls])
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+    def test_detached_verification_failure_uses_the_same_refund_receipt_flow(self):
+        value = {'id': 'job_test', 'credits': {'reserved': 20, 'charged': 20, 'refunded': 0}}
+        failure = cloud_http.CloudError('Corrupt rig', 'hash_mismatch',
+            extra={'job': value, 'apply_failure': True, 'apply_message': 'Verification failed safely.'})
+        returned = deepcopy(value)
+        returned['credits'].update(charged=0, refunded=20)
+        self.module.job_status = unittest.mock.Mock(side_effect=failure)
+        self.module.wait_rig_refund = unittest.mock.Mock(return_value={
+            'status': 'refunded', 'message': '20 credits returned.', 'job': returned})
+        settle = unittest.mock.Mock()
+        complete = unittest.mock.Mock()
+        cloud._jobs['job_test'] = {'module': self.module, 'result': None, 'descriptor': {'apply': 'apply_rig'},
+            'handle_error': lambda e: None, 'report_error': lambda e: None, 'charge_reporter': settle,
+            'complete': complete}
+        result = self.run_step(cloud._job_status({'job_id': 'job_test'}))
+        self.assertIn('20 credits returned', result.text)
+        self.assertEqual(settle.call_args.args[0], 0)
+        complete.assert_called_once_with(False)
+        self.assertIsNone(cloud._job_status({'job_id': 'job_test'}).then)
+        self.assertEqual(self.module.job_status.call_count, 1)
+
+    def test_failed_rig_job_status_retries_only_report_and_updates_original_charge(self):
+        value = {'id': 'job_test', 'credits': {'reserved': 20, 'charged': 20, 'refunded': 0}}
+        failure = cloud_http.CloudError('Rig failed; no refund confirmed', 'validation_failed',
+            extra={'job': value, 'apply_failure': True, 'apply_message': 'Rig failed safely.'})
+        self.module.apply_result = unittest.mock.Mock(side_effect=failure)
+        returned = deepcopy(value)
+        returned['credits'].update(charged=0, refunded=20)
+        self.module.wait_rig_refund = unittest.mock.Mock(side_effect=[
+            {'status': 'unconfirmed', 'message': 'No refund confirmed.', 'job': value},
+            {'status': 'refunded', 'message': '20 credits returned.', 'job': returned}])
+        settle = unittest.mock.Mock()
+        prepared = cloud._apply(self.module, {'apply': 'apply_rig', 'backend': 'managed'}, value, report=settle)
+        first = self.run_step(prepared)
+        self.assertFalse(first.ok)
+        self.assertIn('No refund confirmed', first.text)
+        self.assertIn('loopcut_cloud.job_status using job_id job_test', first.model_note)
+        with patch.object(cloud, '_runtime', None):
+            self.assertIn(cloud.PREFIX + 'job_status', [s['function']['name'] for s in cloud.tool_schemas()])
+        second = self.run_step(cloud._job_status({'job_id': 'job_test'}))
+        self.assertIn('20 credits returned', second.text)
+        self.assertEqual(settle.call_args.args[0], 0)
+        self.assertEqual(self.module.apply_result.call_count, 1)
+        self.assertEqual(self.module.wait_rig_refund.call_args_list,
+                         [unittest.mock.call('job_test', retry=False), unittest.mock.call('job_test', retry=True)])
+        self.assertIsNone(cloud._job_status({'job_id': 'job_test'}).then)
+
     def test_missing_or_incomplete_c3_fails_clearly(self):
         self.ready()
         with patch.object(cloud.importlib, 'import_module', side_effect=ModuleNotFoundError(name='loopcut.cloud_jobs')):
@@ -1306,7 +1384,7 @@ class LifecycleTest(RuntimeFixture):
                 patch.object(config, 'service_policy', return_value={'no_generation': True, 'private_mode': True}), \
                 patch.object(config, 'service_backends', return_value={}):
             signed_in = cloud._snapshot()
-            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.7')
+            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.9')
             signed_in.manifest = manifest(tool())
             signed_in._save()
             key.return_value = ''

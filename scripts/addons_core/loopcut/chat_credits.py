@@ -11,6 +11,11 @@ that request's charge), and an empty balance is HTTP 402 insufficient_credits wi
 the upgrade object. This module reads those, works out what each turn cost (the balance before the turn less
 the balance after it, which takes in the turn's tool credits too), and holds the copy and pictures of the
 out-of-credits pop-up and the setup's "Everything Loopcut does" step. No bpy at import: the layout tests load it.
+
+0.2.15 (contract 0.9, persona tests 2026-10-23/24): the weekly top-up (chat_credits.refill and the 402's refill) is
+named when it comes first; upgrade.builds puts offers in builds, and plan credits carry their dollars; a low-credit
+heads-up (agent._warn_low_credits) comes once a refill period. Every one of these needs a field only the experiment
+sends, so other accounts see 0.2.14 (test_chat_credits.FlagOff0214Test).
 """
 
 import math
@@ -27,6 +32,7 @@ MEDIA = Path(__file__).parent / "media"
 SETTLE_SECONDS = 1.5  # After a turn, before reading the balance: the last request's charge is booked as it ends.
 REFRESH_TRIES = 4     # A manifest refresh already running blocks ours; try again this many times, a second apart.
 TYPICAL_BUILD = 20    # Credits a typical first build uses (owner's estimate, round3 mockup).
+LOW_BALANCE = 20      # The heads-up before the hard stop (0.2.15): at about this many credits, once a refill period.
 # The plans as loopcut.org/pricing sets them (2026-10-23); onboarding.PLANS is this table. When a price or a monthly
 # grant changes, change it here. The free plan's 100 a month starts in the month after sign-up (the sign-up month
 # has its 100 sign-up credits instead, and account.credits.monthly is 0 then), so copy uses the plan's figure.
@@ -117,14 +123,35 @@ def balance(account: dict):
     return value if _amount(value) else None
 
 
+def refill_of(value) -> dict | None:
+    """The weekly top-up, {credits, at} (manifest account.chat_credits.refill or the chat 402's refill, contract
+    0.9); None when absent or malformed."""
+    if not isinstance(value, dict):
+        return None
+    credits, at = value.get("credits"), value.get("at")
+    if not (_amount(credits) and credits > 0 and isinstance(at, str) and _moment(at) is not None):
+        return None
+    return {"credits": credits, "at": at}
+
+
+def account_refill(account: dict) -> dict | None:
+    """The manifest account's next weekly top-up."""
+    data = account.get("chat_credits") if isinstance(account, dict) else None
+    return refill_of(data.get("refill")) if isinstance(data, dict) else None
+
+
 def panel_data(manifest, signed_in: bool) -> dict:
     """What the panel's layout needs, as plain values (layout.py never reads the runtime)."""
     account = (manifest or {}).get("account") if signed_in else None
     account = account if isinstance(account, dict) else {}
     credits = account.get("credits") if isinstance(account.get("credits"), dict) else {}
-    return {"billing": billing(manifest, signed_in), "plan": plan_of(account), "monthly": monthly(account),
+    data = {"billing": billing(manifest, signed_in), "plan": plan_of(account), "monthly": monthly(account),
             "resets_at": credits.get("resets_at") if isinstance(credits.get("resets_at"), str) else "",
             "step": step_label(account)}
+    refill = account_refill(account)
+    if refill:  # Only when the server names one, so every other account's data is as before.
+        data["refill"] = refill
+    return data
 
 
 def day_label(resets_at, now: float | None = None) -> str:
@@ -169,6 +196,35 @@ def expired(resets_at, now: float | None = None) -> bool:
         return False
 
 
+def _moment(value) -> float | None:
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return moment.replace(tzinfo=moment.tzinfo or timezone.utc).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def next_refill(item: dict, data: dict, now: float | None = None) -> dict | None:
+    """The weekly top-up an out-of-credits card names: the refusal's own refill, else the manifest's, when it is
+    still ahead and comes before the monthly reset. None otherwise (and always without the weekly top-up)."""
+    item, data = item if isinstance(item, dict) else {}, data if isinstance(data, dict) else {}
+    refill = refill_of(item.get("refill")) or refill_of(data.get("refill"))
+    if refill is None:
+        return None
+    now = time.time() if now is None else now
+    at = _moment(refill["at"])
+    if at is None or at <= now:
+        return None
+    reset = _moment(item.get("resets_at") or data.get("resets_at"))
+    return None if reset is not None and now < reset <= at else refill
+
+
+def refused_until_passed(item: dict, now: float | None = None) -> bool:
+    """An out-of-credits refusal is over at its monthly reset, or at the weekly top-up it named."""
+    refill = refill_of((item or {}).get("refill"))
+    return expired((item or {}).get("resets_at"), now) or (refill is not None and expired(refill["at"], now))
+
+
 # --- What each turn cost -------------------------------------------------------------------------------------
 
 def turn_start(session: dict, turn) -> None:
@@ -177,6 +233,11 @@ def turn_start(session: dict, turn) -> None:
         account, signed_in = _account()
         if billing({"account": account}, signed_in) != CREDITS:
             return
+        cfg = getattr(turn, "config", None)
+        if cfg is not None:
+            from . import config
+            if not config.on_service(cfg.base_url):
+                return  # A ChatGPT plan's or a key's turn spends no chat credits: no "Done · N credits" (0.2.15).
         from . import spending
         with spending.lock:
             tools = spending.ledger(session).get("credits", 0)
@@ -313,9 +374,13 @@ def turn_line(item: dict) -> str:
 # --- The pop-ups' copy ---------------------------------------------------------------------------------------
 
 # The out-of-credits pop-up's locked tiles (round3 #3): (label, picture in media/credits, or "" for a plain tile).
+# Released tools only (0.2.15): nothing marked Soon, such as Auto-rig.
 LOCKED_TILES = (("AI agent", "credits/mini-agent.jpg"), ("Photo → 3D", "credits/mini-photo3d.jpg"),
                 ("Motion", "credits/mini-motion.jpg"), ("Renders", "credits/mini-render.jpg"),
-                ("Auto-rig", ""), ("Sound, retopo…", ""))
+                ("Sound and voice", ""), ("Retopology", ""))
+AGENT_TILE = "AI agent"
+# The free way on, one line (persona rerun 2026-10-24: "Keep chatting for free" read as false without Plus).
+KEEP_CHATTING = "Have ChatGPT Plus or Pro? Chat on it at no cost."
 # Variant B's rows (round2): (icon in media/icons, tint of its circle).
 OFFER_ICONS = {"chat": ("message-circle-fg", (0.18, 0.27, 0.45, 1.0)), "model": ("sparkles-fg", (0.30, 0.22, 0.45, 1.0)),
                "credits": ("cloud-fg", (0.16, 0.33, 0.25, 1.0)), "render": ("aperture-fg", (0.42, 0.18, 0.20, 1.0))}
@@ -341,9 +406,45 @@ def upgrade_button(upgrade, short: bool = False) -> str:
     return str(upgrade.get("label") or "See plans")
 
 
-def come_back(data: dict, resets_at: str, now: float | None = None, short: bool = False) -> str:
+def plan_dollars(credits) -> str:
+    """"$22" for a plan's 2,200 credits (1 credit = $0.01): whole dollars beside a plan's grant."""
+    return f"${credits / 100:,.0f}" if credits % 100 == 0 else f"${credits / 100:,.2f}"
+
+
+def balance_dollars(credits) -> str:
+    """"$0.94": a balance's value, as the panel's other credit lines show it."""
+    return f"${credits / 100:,.2f}"
+
+
+def _builds(upgrade) -> int | None:
+    value = upgrade.get("builds") if isinstance(upgrade, dict) else None
+    return value if type(value) is int and value > 0 else None
+
+
+def offer_line(upgrade, tools_only: bool = False) -> str:
+    """The out-of-credits pop-up's price line: "Pro: 2,200 credits a month ($22), about 110 builds" (upgrade.builds,
+    contract 0.9); for a chat on the user's own ChatGPT plan, what the credits buy instead. "" for a plan this table
+    does not know."""
+    plan = str((upgrade or {}).get("plan") or "").lower() if isinstance(upgrade, dict) else ""
+    if plan not in PLANS or not PLANS[plan]["price"]:
+        return ""
+    credits = PLANS[plan]["credits"]
+    line = f"{plan.capitalize()}: {credits:,} credits a month ({plan_dollars(credits)})"
+    if tools_only:
+        return line + " for renders, motion and 3D models"
+    builds = _builds(upgrade)
+    return line + (f", about {builds:,} builds" if builds else "")
+
+
+def come_back(data: dict, resets_at: str, now: float | None = None, short: bool = False,
+              refill: dict | None = None) -> str:
     """"100 free credits come back Sun 1 Nov" (the free plan), "2,200 credits come back …" (a paid one); short, for
-    the slim card, without the amount."""
+    the slim card, without the amount. refill (next_refill): the sooner weekly top-up, "25 free credits come back
+    Fri 30 Oct" or "… in about 3 h"."""
+    if refill:
+        what = "Free credits" if short else f"{_n(refill['credits'])} free credits"
+        when = short_reset(refill["at"], now)
+        return f"{what} come back {when}" if when else f"{what} came back"  # Past: a card kept as history.
     amount = data.get("monthly") or PLANS["free"]["credits"]
     free = (data.get("plan") or "free") == "free"
     what = f"{'Free credits' if free else 'Credits'} come back" if short else \
@@ -357,12 +458,16 @@ def offer_rows(item: dict) -> list[tuple[str, str]]:
     upgrade's times (how many times more hosted chat) when the server sends it."""
     upgrade = item.get("upgrade") or {}
     plan = str(upgrade.get("plan") or "pro").lower()
-    times = upgrade.get("times")
-    chat = f"{times}× more chat every month" if type(times) is int and times > 1 else "Much more chat every month"
+    times, builds = upgrade.get("times"), _builds(upgrade)
+    if builds:  # Concrete units (0.2.15): personas read "17×" as "17× of what?".
+        chat = f"About {builds:,} builds a month"
+    else:
+        chat = f"{times}× more chat every month" if type(times) is int and times > 1 else "Much more chat every month"
     rows = [("chat", chat)]
     if plan == "pro":
         rows.append(("model", "Loopcut Pro, the stronger model"))
-    rows.append(("credits", f"{PLANS.get(plan, PLANS['pro'])['credits']:,} cloud credits a month"))
+    credits = PLANS.get(plan, PLANS["pro"])["credits"]
+    rows.append(("credits", f"{credits:,} cloud credits a month ({plan_dollars(credits)})"))
     if (item.get("plan") or "free") == "free":  # Pro and Max both have these already.
         rows.append(("render", "Cycles renders and top-ups"))
     return rows
@@ -381,6 +486,26 @@ def offer_used(item: dict) -> str:
     if item.get("reason") == "week_limit":
         return f"You've used this week's {'free ' if free else ''}chat."
     return f"You've used this 5-hour window's {'free ' if free else ''}chat."
+
+
+def low_key(account: dict) -> str:
+    """The refill period a low-credit heads-up belongs to: the next weekly top-up, else the monthly reset."""
+    refill = account_refill(account)
+    if refill:
+        return refill["at"]
+    credits = (account or {}).get("credits")
+    reset = credits.get("resets_at") if isinstance(credits, dict) else None
+    return reset if isinstance(reset, str) and reset else "balance"
+
+
+def low_text(balance, account: dict, now: float | None = None) -> str:
+    """The heads-up's two lines: "18 credits left ($0.18)", then "25 free credits come back Fri 30 Oct"."""
+    credits = (account or {}).get("credits")
+    reset = credits.get("resets_at") if isinstance(credits, dict) else None
+    data = {"plan": plan_of(account), "monthly": monthly(account), "resets_at": reset if isinstance(reset, str) else ""}
+    refill = next_refill({}, {**data, "refill": account_refill(account)}, now)
+    back = come_back(data, data["resets_at"], now, refill=refill)
+    return f"{_n(balance)} credit{'' if round(balance) == 1 else 's'} left ({balance_dollars(balance)})\n{back}"
 
 
 def used_title(item: dict) -> str:

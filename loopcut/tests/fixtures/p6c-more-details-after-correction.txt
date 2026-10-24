@@ -1,0 +1,12 @@
+Nothing was done this turn — the previous turn's work stands. Let me verify the current scene state to confirm the detail pass is intact, then close out with what exists.
+
+Actually, since the checks ran and passed at the end of last turn (8/8), and this turn produced no tool calls, I'll simply report the state.
+
+The detail pass from last turn is in place and verified (8/8 checks pass):
+- **23 hex bolt heads** (`Moscow8M_HexBolt_*`) on the cheeks, aprons, tie beam, end plates and rails, in `Moscow8M_BoltSteel`
+- **9 washers** on axle and shaft mounts
+- **18 gear teeth** on the big/mid/small drive gears, seated in the gear rims
+- **Aged Soviet finish** — greener-grey enamel with blotchy wear, grime and roughness variation on `Moscow8M_Enamel`, `CastIron`, `Steel`, `Rubber`, `Chrome`; scratched streaks and edge highlights added
+- **Softer lighting** — `Moscow8M_Key` dimmed to 500 W, `Moscow8M_Rim` to 300 W for a muted, aged studio look
+
+Nothing new was created or changed this turn. Say the word if you want a render of the current machine or more parts (more bolts, serial plate, cast logos).

@@ -1,0 +1,16635 @@
+{
+"extra": {
+"nudges": {
+"plenty": [],
+"trial_and_low": [
+[
+"trial",
+"2026-10-16T10:00:00Z",
+{
+"actions": [
+{
+"arg": "Make a short sound effect that fits this shot.",
+"do": "prompt",
+"label": "Sound effect",
+"when": ""
+},
+{
+"arg": "Turn a reference picture into a 3D model in this scene.",
+"do": "prompt",
+"label": "Picture to 3D",
+"when": ""
+},
+{
+"arg": "https://loopcut.org/pricing?from=app&reason=trial",
+"do": "web",
+"label": "What credits buy \u2197",
+"when": ""
+}
+],
+"kind": "offer",
+"nudge": "trial",
+"resolved": "",
+"text": "Try a cloud tool:",
+"title": "100 trial credits added ($1.00)"
+}
+],
+[
+"low_credits",
+"2099-10-21:100",
+{
+"actions": [
+{
+"arg": "https://loopcut.org/account?from=app&reason=low_credits",
+"do": "web",
+"label": "Add credits \u2197",
+"when": ""
+},
+{
+"arg": "https://loopcut.org/pricing?from=app&reason=low_credits&plan=pro",
+"do": "web",
+"label": "See plans \u2197",
+"when": ""
+},
+{
+"arg": "",
+"do": "dismiss",
+"label": "Not now",
+"when": ""
+}
+],
+"kind": "offer",
+"nudge": "low_credits",
+"resolved": "",
+"text": "Your monthly credits renew 2099-10-21.",
+"title": "15 credits left ($0.15)"
+}
+]
+],
+"trial_pack": [
+[
+"low_credits",
+"balance:0",
+{
+"actions": [
+{
+"arg": "https://loopcut.org/account?from=app&reason=low_credits",
+"do": "web",
+"label": "Add credits \u2197",
+"when": ""
+},
+{
+"arg": "https://loopcut.org/pricing?from=app&reason=low_credits&plan=pro",
+"do": "web",
+"label": "See plans \u2197",
+"when": ""
+},
+{
+"arg": "",
+"do": "dismiss",
+"label": "Not now",
+"when": ""
+}
+],
+"kind": "offer",
+"nudge": "low_credits",
+"resolved": "",
+"text": "The Pro plan adds 2,200 credits every month: $22 of tools for $20.",
+"title": "24 credits left ($0.24)"
+}
+]
+]
+},
+"panel": {
+"reply_chatgpt_240": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 204,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 178,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 152,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 126,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 100,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 216,
+"x": 12,
+"y": 622
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 632
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction",
+"w": 22,
+"x": 138,
+"y": 756
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 702
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 800,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 216,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 212,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 186,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 160,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 134,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 108,
+"y": 7
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 190,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 610
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 166,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 216,
+"x": 12,
+"y": 622
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 632
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 634
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 658
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 172,
+"y": 759
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 142,
+"y": 760
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 702
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits",
+"x": 22,
+"y": 718
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits2",
+"size": 11,
+"t": "text",
+"text": "Today: 6 credits",
+"x": 22,
+"y": 734
+}
+]
+},
+"reply_chatgpt_420": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 638
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 648
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction",
+"w": 22,
+"x": 318,
+"y": 756
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 718
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 800,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 174,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 626
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 638
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 648
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 650
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 674
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 759
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 760
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 718
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 734
+}
+]
+},
+"reply_loopcut_240": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 204,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 178,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 152,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 126,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 100,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 216,
+"x": 12,
+"y": 622
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 632
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 30% used, 70% left\nWeek chat allowance: 20% used, 80% left",
+"w": 42,
+"x": 118,
+"y": 756
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 702
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 800,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 216,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 212,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 186,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 160,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 134,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 108,
+"y": 7
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 190,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 240,
+"x": 0,
+"y": 610
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 166,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 216,
+"x": 12,
+"y": 622
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 632
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 634
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 658
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 172,
+"y": 759
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 122,
+"y": 760
+},
+{
+"color": [
+0.3373,
+0.7255,
+0.498,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.7,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 142,
+"y": 760
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 702
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits",
+"x": 22,
+"y": 718
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits2",
+"size": 11,
+"t": "text",
+"text": "Today: 6 credits",
+"x": 22,
+"y": 734
+}
+]
+},
+"reply_loopcut_420": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 638
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 648
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 30% used, 70% left\nWeek chat allowance: 20% used, 80% left",
+"w": 42,
+"x": 298,
+"y": 756
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 718
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 800,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 174,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 626
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 638
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 648
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 650
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 674
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 756
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 759
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 759
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 760
+},
+{
+"color": [
+0.3373,
+0.7255,
+0.498,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.7,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 760
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 718
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 734
+}
+]
+}
+},
+"refusals": {
+"free_daily_limit": {
+"kind": "limit",
+"plan": "free",
+"reason": "free_daily_limit",
+"resets_at": "2099-10-21",
+"status": "",
+"text": "Chat allowance used.",
+"upgrade": null
+},
+"session_limit": {
+"kind": "limit",
+"plan": "free",
+"reason": "session_limit",
+"resets_at": "2099-10-21",
+"status": "",
+"text": "This session's allowance is used. It resets 2099-10-21.",
+"upgrade": null
+},
+"week_limit": {
+"kind": "limit",
+"plan": "free",
+"reason": "week_limit",
+"resets_at": "2099-10-21",
+"status": "",
+"text": "This week's allowance is used. It resets 2099-10-21.",
+"upgrade": null
+}
+}
+},
+"panel": {
+"daily_billing_False": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 22,
+"y": 338
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "item3.limit.key",
+"tip": "",
+"w": 139,
+"x": 182,
+"y": 338
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "item3.limit.retry",
+"tip": "",
+"w": 79,
+"x": 22,
+"y": 368
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "input.limit.retry",
+"tip": "",
+"w": 79,
+"x": 319,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 170,
+"id": "item3.limit.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 232
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item3.limit.title",
+"size": 13,
+"t": "text",
+"text": "Free Fast is used up for today",
+"x": 22,
+"y": 242
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used.",
+"x": 22,
+"y": 266
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "Resets 2099-10-21.",
+"x": 22,
+"y": 282
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l2",
+"size": 11,
+"t": "text",
+"text": "Your credits pay for cloud tools and do not add chat",
+"x": 22,
+"y": 298
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l3",
+"size": 11,
+"t": "text",
+"text": "time.",
+"x": 22,
+"y": 314
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 22,
+"y": 338
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 32,
+"y": 342
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 182,
+"y": 338
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 192,
+"y": 342
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 22,
+"y": 368
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 32,
+"y": 372
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 264,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 636
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 84% used (5-hour window) \u00b7 AI use includes helpers, not",
+"x": 12,
+"y": 648
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 664
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 686
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 22,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 182,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 319,
+"y": 708
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 329,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.16,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"daily_billing_True": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"limit_upgrade",
+3
+],
+"h": 24,
+"id": "item3.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 22,
+"y": 354
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 142,
+"y": 354
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "item3.limit.key",
+"tip": "",
+"w": 139,
+"x": 22,
+"y": 384
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "item3.limit.retry",
+"tip": "",
+"w": 79,
+"x": 169,
+"y": 384
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"limit_upgrade",
+3
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "input.limit.retry",
+"tip": "",
+"w": 79,
+"x": 159,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 186,
+"id": "item3.limit.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 232
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item3.limit.title",
+"size": 13,
+"t": "text",
+"text": "Free Fast is used up for today",
+"x": 22,
+"y": 242
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used.",
+"x": 22,
+"y": 266
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "Pro: more.",
+"x": 22,
+"y": 282
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l2",
+"size": 11,
+"t": "text",
+"text": "Resets 2099-10-21.",
+"x": 22,
+"y": 298
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l3",
+"size": 11,
+"t": "text",
+"text": "Your credits pay for cloud tools and do not add chat",
+"x": 22,
+"y": 314
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l4",
+"size": 11,
+"t": "text",
+"text": "time.",
+"x": 22,
+"y": 330
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "item3.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 22,
+"y": 354
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 32,
+"y": 358
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 142,
+"y": 354
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 152,
+"y": 358
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 22,
+"y": 384
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 32,
+"y": 388
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 169,
+"y": 384
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 179,
+"y": 388
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 294,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 606
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 84% used (5-hour window) \u00b7 AI use includes helpers, not",
+"x": 12,
+"y": 618
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 634
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 656
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 22,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 142,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 22,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 159,
+"y": 708
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 169,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.16,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"idle_billing_False": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 538
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 548
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 656
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 656
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 125,
+"x": 22,
+"y": 618
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 700,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "hello",
+"x": 22,
+"y": 56
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 212,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 488
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 84% used (5-hour window) \u00b7 AI use includes helpers, not",
+"x": 12,
+"y": 500
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 516
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 538
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 548
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 550
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 574
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 656
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 659
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 659
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 659
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 660
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.16,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 660
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "100 credits ($1.00)",
+"x": 22,
+"y": 618
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 0 credits",
+"x": 22,
+"y": 634
+}
+]
+},
+"idle_billing_True": {
+"hits": [
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 538
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 548
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 656
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 656
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 125,
+"x": 22,
+"y": 618
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 700,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "hello",
+"x": 22,
+"y": 56
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 212,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 488
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 84% used (5-hour window) \u00b7 AI use includes helpers, not",
+"x": 12,
+"y": 500
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 516
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 538
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 548
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 550
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 574
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 656
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 659
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 659
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 659
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 660
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.16,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 660
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "100 credits ($1.00)",
+"x": 22,
+"y": 618
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 0 credits",
+"x": 22,
+"y": 634
+}
+]
+},
+"narrow_billing_False": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 216,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 224,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 198,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 172,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 146,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 120,
+"y": 0
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 12,
+"y": 662
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 12,
+"y": 692
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 236,
+"x": 12,
+"y": 722
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 732
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 100% used, 0% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 138,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 802
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 232,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 206,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 180,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 154,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 128,
+"y": 7
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 358,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 542
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (5-hour window) \u00b7 AI",
+"x": 12,
+"y": 554
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "use includes helpers, not time;",
+"x": 12,
+"y": 570
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l2",
+"size": 11,
+"t": "text",
+"text": "credits buy cloud tools, not more",
+"x": 12,
+"y": 586
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l3",
+"size": 11,
+"t": "text",
+"text": "chat.",
+"x": 12,
+"y": 602
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets",
+"x": 12,
+"y": 624
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "2099-10-21.",
+"x": 12,
+"y": 640
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 12,
+"y": 662
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 22,
+"y": 666
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 12,
+"y": 692
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 22,
+"y": 696
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 166,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 722
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 732
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 734
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 758
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 192,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 142,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 162,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 802
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits2",
+"size": 11,
+"t": "text",
+"text": "Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"narrow_billing_True": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 216,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 224,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 198,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 172,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 146,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 120,
+"y": 0
+},
+{
+"action": [
+"limit_upgrade",
+"ffffffffffffffffffffffffffffffff"
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 12,
+"y": 632
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 12,
+"y": 662
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 12,
+"y": 692
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 236,
+"x": 12,
+"y": 722
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 732
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 100% used, 0% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 138,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 802
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 232,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 206,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 180,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 154,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 128,
+"y": 7
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 388,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 260,
+"x": 0,
+"y": 512
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (5-hour window) \u00b7 AI",
+"x": 12,
+"y": 524
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "use includes helpers, not time;",
+"x": 12,
+"y": 540
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l2",
+"size": 11,
+"t": "text",
+"text": "credits buy cloud tools, not more",
+"x": 12,
+"y": 556
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l3",
+"size": 11,
+"t": "text",
+"text": "chat.",
+"x": 12,
+"y": 572
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets",
+"x": 12,
+"y": 594
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "2099-10-21.",
+"x": 12,
+"y": 610
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 12,
+"y": 632
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 22,
+"y": 636
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 12,
+"y": 662
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 22,
+"y": 666
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 12,
+"y": 692
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 22,
+"y": 696
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 166,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 236,
+"x": 12,
+"y": 722
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 732
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 734
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 758
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 192,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 142,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 162,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 802
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits2",
+"size": 11,
+"t": "text",
+"text": "Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"session_billing_False": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 100% used, 0% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 264,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 636
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (5-hour window) \u00b7 AI use includes helpers,",
+"x": 12,
+"y": 648
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "not time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 664
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 686
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 22,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 182,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"session_billing_True": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"limit_upgrade",
+"ffffffffffffffffffffffffffffffff"
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 100% used, 0% left\nWeek chat allowance: 40% used, 60% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 294,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 606
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (5-hour window) \u00b7 AI use includes helpers,",
+"x": 12,
+"y": 618
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "not time; credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 634
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 656
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 22,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 142,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 22,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.session",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"week_mid_turn_billing_False": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 22,
+"y": 338
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "item3.limit.key",
+"tip": "",
+"w": 139,
+"x": 182,
+"y": 338
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "item3.limit.retry",
+"tip": "",
+"w": 79,
+"x": 22,
+"y": 368
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "input.limit.retry",
+"tip": "",
+"w": 79,
+"x": 319,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 100% used, 0% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 170,
+"id": "item3.limit.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 232
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item3.limit.title",
+"size": 13,
+"t": "text",
+"text": "Weekly allowance used",
+"x": 22,
+"y": 242
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "This week's allowance is used. It resets 2099-10-21.",
+"x": 22,
+"y": 266
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "Have ChatGPT Plus or Pro? It can run Loopcut now.",
+"x": 22,
+"y": 282
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l2",
+"size": 11,
+"t": "text",
+"text": "Your credits pay for cloud tools and do not add chat",
+"x": 22,
+"y": 298
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l3",
+"size": 11,
+"t": "text",
+"text": "time.",
+"x": 22,
+"y": 314
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 22,
+"y": 338
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 32,
+"y": 342
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 182,
+"y": 338
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 192,
+"y": 342
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 22,
+"y": 368
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 32,
+"y": 372
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 264,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 636
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (week) \u00b7 AI use includes helpers, not time;",
+"x": 12,
+"y": 648
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 664
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 686
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 22,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 172,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 182,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 319,
+"y": 708
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 329,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.week",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+},
+"week_mid_turn_billing_True": {
+"hits": [
+{
+"action": [
+"toggle",
+2
+],
+"h": 20,
+"id": "item2.changes.more",
+"tip": "",
+"w": 376,
+"x": 22,
+"y": 192
+},
+{
+"action": [
+"limit_upgrade",
+3
+],
+"h": 24,
+"id": "item3.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 22,
+"y": 370
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 142,
+"y": 370
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "item3.limit.key",
+"tip": "",
+"w": 139,
+"x": 22,
+"y": 400
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "item3.limit.retry",
+"tip": "",
+"w": 79,
+"x": 169,
+"y": 400
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 34,
+"id": "header.title",
+"tip": "Loopcut <version> beta",
+"w": 55,
+"x": 38,
+"y": 0
+},
+{
+"action": [
+"close_panel",
+null
+],
+"h": 34,
+"id": "header.close",
+"tip": "Close panel",
+"w": 24,
+"x": 384,
+"y": 0
+},
+{
+"action": [
+"service_settings",
+null
+],
+"h": 34,
+"id": "header.settings",
+"tip": "Settings",
+"w": 24,
+"x": 358,
+"y": 0
+},
+{
+"action": [
+"history_open",
+null
+],
+"h": 34,
+"id": "header.history",
+"tip": "History",
+"w": 24,
+"x": 332,
+"y": 0
+},
+{
+"action": [
+"new_chat",
+null
+],
+"h": 34,
+"id": "header.new",
+"tip": "New chat",
+"w": 24,
+"x": 306,
+"y": 0
+},
+{
+"action": [
+"jobs_open",
+null
+],
+"h": 34,
+"id": "header.jobs",
+"tip": "Background jobs",
+"w": 24,
+"x": 280,
+"y": 0
+},
+{
+"action": [
+"limit_upgrade",
+3
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"tip": "",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"action": [
+"sign_in",
+"chatgpt"
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"tip": "",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"action": [
+"own_key",
+null
+],
+"h": 24,
+"id": "input.limit.key",
+"tip": "",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"action": [
+"limit_retry",
+3
+],
+"h": 24,
+"id": "input.limit.retry",
+"tip": "",
+"w": 79,
+"x": 159,
+"y": 708
+},
+{
+"action": [
+"focus",
+null
+],
+"h": 76,
+"id": "input.card",
+"tip": "",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"action": [
+"picker_open",
+null
+],
+"h": 20,
+"id": "input.add",
+"tip": "Add context: objects, materials, images, add-ons",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"action": [
+"model_menu",
+null
+],
+"h": 22,
+"id": "input.model",
+"tip": "Choose the model",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"action": [
+"noop",
+null
+],
+"h": 22,
+"id": "input.rings",
+"tip": "Context: 0 of 24.0k tokens (0%) before compaction\nSession chat allowance: 84% used, 16% left\nWeek chat allowance: 100% used, 0% left",
+"w": 42,
+"x": 298,
+"y": 856
+},
+{
+"action": [
+"open_account",
+null
+],
+"h": 16,
+"id": "input.credits",
+"tip": "",
+"w": 119,
+"x": 22,
+"y": 818
+}
+],
+"prims": [
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 900,
+"id": "bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 40,
+"id": "item0.user.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 46
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item0.user.l0",
+"size": 13,
+"t": "text",
+"text": "make more details",
+"x": 22,
+"y": 56
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item1.p0.l0",
+"size": 13,
+"t": "text",
+"text": "Added brass key caps.",
+"x": 12,
+"y": 96
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 96,
+"id": "item2.changes.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 126
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item2.changes.title",
+"size": 13,
+"t": "text",
+"text": "Scene changes",
+"x": 22,
+"y": 136
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.count.l0",
+"size": 11,
+"t": "text",
+"text": "3 objects added",
+"x": 22,
+"y": 160
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.summary.l0",
+"size": 11,
+"t": "text",
+"text": "Keys.",
+"x": 22,
+"y": 176
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item2.changes.more",
+"size": 11,
+"t": "text",
+"text": "Show more",
+"x": 36,
+"y": 194
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.1294,
+0.1294,
+0.1294,
+1.0
+],
+"h": 202,
+"id": "item3.limit.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 232
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "item3.limit.title",
+"size": 13,
+"t": "text",
+"text": "Weekly allowance used",
+"x": 22,
+"y": 242
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used.",
+"x": 22,
+"y": 266
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l1",
+"size": 11,
+"t": "text",
+"text": "Pro: more.",
+"x": 22,
+"y": 282
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l2",
+"size": 11,
+"t": "text",
+"text": "Resets 2099-10-21.",
+"x": 22,
+"y": 298
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l3",
+"size": 11,
+"t": "text",
+"text": "Have ChatGPT Plus or Pro? It can run Loopcut now.",
+"x": 22,
+"y": 314
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l4",
+"size": 11,
+"t": "text",
+"text": "Your credits pay for cloud tools and do not add chat",
+"x": 22,
+"y": 330
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.text.l5",
+"size": 11,
+"t": "text",
+"text": "time.",
+"x": 22,
+"y": 346
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "item3.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 22,
+"y": 370
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 32,
+"y": 374
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 142,
+"y": 370
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 152,
+"y": 374
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 22,
+"y": 400
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 32,
+"y": 404
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "item3.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 169,
+"y": 400
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "item3.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 179,
+"y": 404
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 34,
+"id": "header.bg",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 0
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"h": 1,
+"id": "header.rule",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 33
+},
+{
+"h": 18,
+"id": "header.mark",
+"t": "mark",
+"w": 18,
+"x": 12,
+"y": 8
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.title",
+"size": 13,
+"t": "text",
+"text": "Loopcut",
+"x": 38,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.close",
+"size": 13,
+"t": "text",
+"text": "\u00d7",
+"x": 392,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.settings",
+"size": 11,
+"t": "text",
+"text": "\u2699",
+"x": 366,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.history",
+"size": 11,
+"t": "text",
+"text": "\u21ba",
+"x": 340,
+"y": 9
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.new",
+"size": 13,
+"t": "text",
+"text": "+",
+"x": 314,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "header.jobs",
+"size": 13,
+"t": "text",
+"text": "\u25a4",
+"x": 288,
+"y": 7
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "header.version",
+"size": 11,
+"t": "text",
+"text": "<version> beta",
+"x": 101,
+"y": 9
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.0941,
+0.0941,
+0.0941,
+1.0
+],
+"h": 294,
+"id": "input.zone",
+"radius": 0,
+"t": "rect",
+"w": 420,
+"x": 0,
+"y": 606
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l0",
+"size": 11,
+"t": "text",
+"text": "Chat 100% used (week) \u00b7 AI use includes helpers, not time;",
+"x": 12,
+"y": 618
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.usage.l1",
+"size": 11,
+"t": "text",
+"text": "credits buy cloud tools, not more chat.",
+"x": 12,
+"y": 634
+},
+{
+"color": [
+0.851,
+0.6431,
+0.2549,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.text.l0",
+"size": 11,
+"t": "text",
+"text": "Chat allowance used. Resets 2099-10-21.",
+"x": 12,
+"y": 656
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1765,
+0.4353,
+0.8118,
+1.0
+],
+"h": 24,
+"id": "input.limit.upgrade",
+"radius": 5,
+"t": "rect",
+"w": 112,
+"x": 12,
+"y": 678
+},
+{
+"color": [
+1.0,
+1.0,
+1.0,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.upgrade.label",
+"size": 11,
+"t": "text",
+"text": "Upgrade to Pro",
+"x": 22,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.chatgpt",
+"radius": 5,
+"t": "rect",
+"w": 152,
+"x": 132,
+"y": 678
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.chatgpt.label",
+"size": 11,
+"t": "text",
+"text": "Sign in with ChatGPT",
+"x": 142,
+"y": 682
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.key",
+"radius": 5,
+"t": "rect",
+"w": 139,
+"x": 12,
+"y": 708
+},
+{
+"color": [
+0.8392,
+0.8392,
+0.8392,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.key.label",
+"size": 11,
+"t": "text",
+"text": "Use my own API key",
+"x": 22,
+"y": 712
+},
+{
+"border": 0,
+"border_color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"color": [
+0.1647,
+0.1647,
+0.1647,
+1.0
+],
+"h": 24,
+"id": "input.limit.retry",
+"radius": 5,
+"t": "rect",
+"w": 79,
+"x": 159,
+"y": 708
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.limit.retry.label",
+"size": 11,
+"t": "text",
+"text": "Try again",
+"x": 169,
+"y": 712
+},
+{
+"border": 1,
+"border_color": [
+0.2275,
+0.2275,
+0.2275,
+1.0
+],
+"color": [
+0.1216,
+0.1216,
+0.1216,
+1.0
+],
+"h": 150,
+"id": "input.card",
+"radius": 8,
+"t": "rect",
+"w": 396,
+"x": 12,
+"y": 738
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 20,
+"id": "input.add",
+"radius": 5,
+"t": "rect",
+"w": 20,
+"x": 22,
+"y": 748
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.add.label",
+"size": 11,
+"t": "text",
+"text": "+",
+"x": 28,
+"y": 750
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 20,
+"id": "input.placeholder",
+"size": 13,
+"t": "text",
+"text": "Plan, build, fix anything in your scene",
+"x": 22,
+"y": 774
+},
+{
+"border": 1,
+"border_color": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"color": [
+0.0,
+0.0,
+0.0,
+0.0
+],
+"h": 22,
+"id": "input.model",
+"radius": 5,
+"t": "rect",
+"w": 55,
+"x": 22,
+"y": 856
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.label",
+"size": 11,
+"t": "text",
+"text": "Fast",
+"x": 30,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.model.caret",
+"size": 11,
+"t": "text",
+"text": "\u25be",
+"x": 62,
+"y": 859
+},
+{
+"color": [
+0.3608,
+0.3608,
+0.3608,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.hint",
+"size": 11,
+"t": "text",
+"text": "\u23ce  send",
+"x": 352,
+"y": 859
+},
+{
+"color": [
+0.302,
+0.6118,
+0.9647,
+1.0
+],
+"h": 14,
+"id": "input.ring.context",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 302,
+"y": 860
+},
+{
+"color": [
+0.898,
+0.3922,
+0.4157,
+1.0
+],
+"h": 14,
+"id": "input.ring.week",
+"share": 0.0,
+"t": "ring",
+"thickness": 3,
+"track": [
+0.2,
+0.2,
+0.2,
+1.0
+],
+"w": 14,
+"x": 322,
+"y": 860
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits",
+"size": 11,
+"t": "text",
+"text": "94 credits ($0.94)",
+"x": 22,
+"y": 818
+},
+{
+"color": [
+0.5216,
+0.5216,
+0.5216,
+1.0
+],
+"font": "ui",
+"h": 16,
+"id": "input.credits1",
+"size": 11,
+"t": "text",
+"text": "This chat: 12 credits \u00b7 Today: 6 credits",
+"x": 22,
+"y": 834
+}
+]
+}
+},
+"splash": {
+"account_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cb \u25cb \u25cb \u25cb"
+],
+[
+"label",
+"You're signed in"
+],
+[
+"label",
+"tester@example.test"
+],
+[
+"label",
+"Your free account is ready"
+],
+[
+"label",
+"Asset search and Loopcut Fast are free."
+],
+[
+"label",
+"Credits pay for cloud tools; Loopcut chat has a separate"
+],
+[
+"label",
+"free allowance that refreshes every 5 hours."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+]
+],
+"account_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cb \u25cb \u25cb \u25cb"
+],
+[
+"label",
+"You're signed in"
+],
+[
+"label",
+"tester@example.test"
+],
+[
+"label",
+"You have 100 credits ($1.00)"
+],
+[
+"label",
+"They pay for cloud tools."
+],
+[
+"label",
+"Credits pay for cloud tools; Loopcut chat has a separate"
+],
+[
+"label",
+"free allowance that refreshes every 5 hours."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"See plans \u2197"
+]
+]
+]
+],
+"account_styled_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"You're signed in",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"tester@example.test",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+"Your free account is ready",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.2, 'bold': True, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"label",
+"Asset search and Loopcut Fast are free.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"label",
+"Credits pay for cloud tools; Loopcut chat has a separate\nfree allowance that refreshes every 5 hours.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+]
+],
+"account_styled_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"You're signed in",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"tester@example.test",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+"You have 100 credits ($1.00)",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.2, 'bold': True, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"label",
+"They pay for cloud tools.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"label",
+"Credits pay for cloud tools; Loopcut chat has a separate\nfree allowance that refreshes every 5 hours.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"color",
+"(0.3176470588235294, 0.6549019607843137, 0.6823529411764706)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"connect_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cb \u25cb"
+],
+[
+"label",
+"Choose the model for your chat"
+],
+[
+"label",
+"You can change it later in Preferences."
+],
+[
+"label",
+""
+],
+[
+"label",
+"ChatGPT"
+],
+[
+"label",
+"Recommended"
+],
+[
+"label",
+"Uses your ChatGPT Plus or Pro plan."
+],
+[
+"operator",
+"loopcut.chatgpt_sign_in",
+"Sign in with ChatGPT",
+[],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Sign in with ChatGPT"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models"
+],
+[
+"label",
+"Loopcut Fast and Loopcut Pro run on your account."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Use Loopcut",
+[
+[
+"provider",
+"LOOPCUT"
+],
+[
+"save",
+"True"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"text",
+"Use Loopcut"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your own API key"
+],
+[
+"label",
+"OpenAI, Anthropic, OpenRouter or a local model."
+],
+[
+"operator",
+"loopcut.onboarding_own_key",
+"Add a key",
+[
+[
+"enable",
+"True"
+]
+],
+true,
+[
+[
+"text",
+"Add a key"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+]
+],
+"connect_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cb \u25cb"
+],
+[
+"label",
+"Choose the model for your chat"
+],
+[
+"label",
+"You can change it later in Preferences."
+],
+[
+"label",
+""
+],
+[
+"label",
+"ChatGPT"
+],
+[
+"label",
+"Recommended"
+],
+[
+"label",
+"Uses your ChatGPT Plus or Pro plan. Cloud tools still use credits."
+],
+[
+"operator",
+"loopcut.chatgpt_sign_in",
+"Sign in with ChatGPT",
+[],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Sign in with ChatGPT"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models"
+],
+[
+"label",
+"Loopcut Fast is free. Loopcut Pro comes with the Pro plan."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Use Loopcut",
+[
+[
+"provider",
+"LOOPCUT"
+],
+[
+"save",
+"True"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"text",
+"Use Loopcut"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your own API key"
+],
+[
+"label",
+"OpenAI, Anthropic, OpenRouter or a local model."
+],
+[
+"operator",
+"loopcut.onboarding_own_key",
+"Add a key",
+[
+[
+"enable",
+"True"
+]
+],
+true,
+[
+[
+"text",
+"Add a key"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+]
+],
+"connect_styled_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"Choose the model for your chat",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"You can change it later in Preferences.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"ChatGPT",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Recommended",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"Uses your ChatGPT Plus or Pro plan.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.chatgpt_sign_in",
+"Sign in with ChatGPT",
+[],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Sign in with ChatGPT"
+]
+]
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Loopcut Fast and Loopcut Pro run on your account.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Use Loopcut",
+[
+[
+"provider",
+"LOOPCUT"
+],
+[
+"save",
+"True"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"text",
+"Use Loopcut"
+]
+]
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your own API key",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"OpenAI, Anthropic, OpenRouter or a local model.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_own_key",
+"Add a key",
+[
+[
+"enable",
+"True"
+]
+],
+true,
+[
+[
+"text",
+"Add a key"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"connect_styled_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"Choose the model for your chat",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"You can change it later in Preferences.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"ChatGPT",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Recommended",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"Uses your ChatGPT Plus or Pro plan. Cloud tools still use credits.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.chatgpt_sign_in",
+"Sign in with ChatGPT",
+[],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Sign in with ChatGPT"
+]
+]
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Loopcut Fast is free. Loopcut Pro comes with the Pro plan.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Use Loopcut",
+[
+[
+"provider",
+"LOOPCUT"
+],
+[
+"save",
+"True"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"text",
+"Use Loopcut"
+]
+]
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your own API key",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"OpenAI, Anthropic, OpenRouter or a local model.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_own_key",
+"Add a key",
+[
+[
+"enable",
+"True"
+]
+],
+true,
+[
+[
+"text",
+"Add a key"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"how"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"done_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cf \u25cf"
+],
+[
+"label",
+"Try your first project"
+],
+[
+"label",
+"Pick one to start."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Make it move"
+],
+[
+"label",
+"A figure jumps for joy, with text to motion."
+],
+[
+"label",
+"6 credits"
+],
+[
+"label",
+"0 credits"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"motion"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Photo to 3D model"
+],
+[
+"label",
+"Turns this photo into a textured 3D model."
+],
+[
+"label",
+"80 credits"
+],
+[
+"label",
+"0 credits"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"photo_3d"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Model a treasure chest"
+],
+[
+"label",
+"Built step by step with Blender's own tools."
+],
+[
+"label",
+"Free"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"model"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Skip for now",
+[
+[
+"card",
+""
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Skip for now"
+]
+]
+]
+],
+"done_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cf \u25cf"
+],
+[
+"label",
+"Try your first project"
+],
+[
+"label",
+"You have 100 credits ($1.00)"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Make it move"
+],
+[
+"label",
+"A figure jumps for joy, with text to motion."
+],
+[
+"label",
+"6 credits"
+],
+[
+"label",
+"0 credits"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"motion"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Photo to 3D model"
+],
+[
+"label",
+"Turns this photo into a textured 3D model."
+],
+[
+"label",
+"80 credits"
+],
+[
+"label",
+"0 credits"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"photo_3d"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Model a treasure chest"
+],
+[
+"label",
+"Built step by step with Blender's own tools."
+],
+[
+"label",
+"Free"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"model"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Pro plan: 2,200 credits a month, Loopcut Pro and top-ups"
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"See plans \u2197"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Skip for now",
+[
+[
+"card",
+""
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Skip for now"
+]
+]
+]
+],
+"done_styled_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"Try your first project",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Pick one to start.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Make it move",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"A figure jumps for joy, with text to motion.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"6 credits",
+"(0.8313725490196079, 0.3411764705882353, 0.2901960784313726)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"0 credits",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"motion"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Photo to 3D model",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Turns this photo into a textured 3D model.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"80 credits",
+"(0.8313725490196079, 0.3411764705882353, 0.2901960784313726)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"0 credits",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"photo_3d"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Model a treasure chest",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Built step by step with Blender's own tools.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Free",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"model"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Skip for now",
+[
+[
+"card",
+""
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"done_styled_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"Try your first project",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"You have 100 credits ($1.00)",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Make it move",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"A figure jumps for joy, with text to motion.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"6 credits",
+"(0.8313725490196079, 0.3411764705882353, 0.2901960784313726)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"0 credits",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"motion"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Photo to 3D model",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Turns this photo into a textured 3D model.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"80 credits",
+"(0.8313725490196079, 0.3411764705882353, 0.2901960784313726)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"0 credits",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"photo_3d"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"box",
+"9"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Model a treasure chest",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.1, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Built step by step with Blender's own tools.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Free",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Start",
+[
+[
+"card",
+"model"
+]
+],
+true,
+[
+[
+"text",
+"Start"
+]
+]
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Pro plan: 2,200 credits a month, Loopcut Pro and top-ups",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"color",
+"(0.3176470588235294, 0.6549019607843137, 0.6823529411764706)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"privacy"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_try",
+"Skip for now",
+[
+[
+"card",
+""
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"how_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cb \u25cb \u25cb"
+],
+[
+"label",
+"How Loopcut works"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your ChatGPT plan"
+],
+[
+"label",
+"The thinking"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Plan"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Build"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Check"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Fix"
+],
+[
+"label",
+"Runs on your paid ChatGPT plan"
+],
+[
+"label",
+"Writes and runs each Blender step"
+],
+[
+"label",
+"+"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your Loopcut account"
+],
+[
+"label",
+"The cloud tools"
+],
+[
+"label",
+""
+],
+[
+"label",
+"3D model"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Motion"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Voice"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Sound"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Render"
+],
+[
+"label",
+"Asset search included"
+],
+[
+"label",
+"More coming"
+],
+[
+"label",
+""
+],
+[
+"label",
+"No ChatGPT plan? Everything still works."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models do the thinking instead, or add your own API key."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"account"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+]
+],
+"how_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cb \u25cb \u25cb"
+],
+[
+"label",
+"How Loopcut works"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your ChatGPT plan"
+],
+[
+"label",
+"The thinking"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Plan"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Build"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Check"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Fix"
+],
+[
+"label",
+"Runs on your paid ChatGPT plan"
+],
+[
+"label",
+"Never uses Loopcut credits"
+],
+[
+"label",
+"+"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your Loopcut account"
+],
+[
+"label",
+"The cloud tools"
+],
+[
+"label",
+""
+],
+[
+"label",
+"3D model"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Motion"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Voice"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Sound"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Render"
+],
+[
+"label",
+"Asset search is free"
+],
+[
+"label",
+"Others use credits, price shown first"
+],
+[
+"label",
+""
+],
+[
+"label",
+"No ChatGPT plan? Everything still works."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut Fast does the thinking instead, or add your own API key."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Free"
+],
+[
+"label",
+"Your plan"
+],
+[
+"label",
+"Pro"
+],
+[
+"label",
+"$20/mo"
+],
+[
+"label",
+"Loopcut Fast"
+],
+[
+"label",
+"Weekly limit"
+],
+[
+"label",
+"Higher weekly limit"
+],
+[
+"label",
+"Loopcut Pro model"
+],
+[
+"label",
+""
+],
+[
+"label",
+""
+],
+[
+"label",
+"Credit top-ups"
+],
+[
+"label",
+""
+],
+[
+"label",
+""
+],
+[
+"label",
+"Free"
+],
+[
+"progress",
+"0.1"
+],
+[
+"label",
+"100 credits: 1 model from a photo, or 50 s of motion"
+],
+[
+"label",
+"Pro"
+],
+[
+"progress",
+"1.0"
+],
+[
+"label",
+"2,200 credits: 27 models from photos, or 18 min of motion"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"account"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"See plans \u2197"
+]
+]
+]
+],
+"how_styled_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"How Loopcut works",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your ChatGPT plan",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"The thinking",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.35, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Plan",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Build",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Check",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Fix",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+"Runs on your paid ChatGPT plan\nWrites and runs each Blender step",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+"+",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 2.2, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your Loopcut account",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"The cloud tools",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.35, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"3D model",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Motion",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Voice",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Sound",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Render",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+"Asset search included\nMore coming",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"No ChatGPT plan? Everything still works.",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models do the thinking instead, or add your own API key.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"account"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"how_styled_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"How Loopcut works",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your ChatGPT plan",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"The thinking",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.35, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Plan",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Build",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Check",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Fix",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+"Runs on your paid ChatGPT plan\nNever uses Loopcut credits",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+"+",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 2.2, 'bold': False, 'tight': False, 'center': True, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your Loopcut account",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"The cloud tools",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.35, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"3D model",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Motion",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Voice",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Sound",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Render",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': True, 'code': False}"
+],
+[
+"label",
+"Asset search is free\nOthers use credits, price shown first",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"No ChatGPT plan? Everything still works.",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut Fast does the thinking instead, or add your own API key.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Free",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Your plan",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+"Pro",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"$20/mo",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 0.85, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+"Loopcut Fast",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Weekly limit",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Higher weekly limit",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Loopcut Pro model",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+""
+],
+[
+"label",
+"Credit top-ups",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+""
+],
+[
+"label",
+"Free",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"progress",
+"0.1"
+],
+[
+"label",
+"100 credits: 1 model from a photo, or 50 s of motion",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"Pro",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"progress",
+"1.0"
+],
+[
+"label",
+"2,200 credits: 27 models from photos, or 18 min of motion",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"account"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"See plans \u2197",
+[
+[
+"url",
+"https://loopcut.org/pricing?from=app&reason=onboarding&plan=pro"
+]
+],
+true,
+[
+[
+"color",
+"(0.3176470588235294, 0.6549019607843137, 0.6823529411764706)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"privacy_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cf \u25cb"
+],
+[
+"label",
+"Your data"
+],
+[
+"label",
+"What leaves your computer"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Chats go to the model you picked"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Cloud tools send only what they need"
+],
+[
+"label",
+""
+],
+[
+"label",
+"A picture, a mesh or a prompt."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your files stay on your computer"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut never uploads your .blend."
+],
+[
+"prop",
+"auto_run"
+],
+[
+"operator",
+"wm.context_toggle",
+"Run code without asking",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.auto_run"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Run code without asking"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Every step can be undone."
+],
+[
+"prop",
+"share_conversations"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share conversations",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_conversations"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Share conversations"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Text only, kept 90 days. Never used for training."
+],
+[
+"prop",
+"share_usage_stats"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share anonymous usage stats",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_usage_stats"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Share anonymous usage stats"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Versions, steps and timings."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"True"
+],
+[
+"step",
+"done"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"Privacy policy \u2197",
+[
+[
+"url",
+"https://loopcut.org/privacy"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Privacy policy \u2197"
+]
+]
+]
+],
+"privacy_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf \u25cf \u25cf \u25cf \u25cb"
+],
+[
+"label",
+"Your data"
+],
+[
+"label",
+"What leaves your computer"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Chats go to the model you picked"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Cloud tools send only what they need"
+],
+[
+"label",
+""
+],
+[
+"label",
+"A picture, a mesh or a prompt."
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your files stay on your computer"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut never uploads your .blend."
+],
+[
+"prop",
+"auto_run"
+],
+[
+"operator",
+"wm.context_toggle",
+"Run code without asking",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.auto_run"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Run code without asking"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Every step can be undone."
+],
+[
+"prop",
+"share_conversations"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share conversations",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_conversations"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Share conversations"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Text only, kept 90 days. Never used for training."
+],
+[
+"prop",
+"share_usage_stats"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share anonymous usage stats",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_usage_stats"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Share anonymous usage stats"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Versions, steps and timings."
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"True"
+],
+[
+"step",
+"done"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"\u2190 Back"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"Privacy policy \u2197",
+[
+[
+"url",
+"https://loopcut.org/privacy"
+]
+],
+true,
+[
+[
+"emboss",
+"False"
+],
+[
+"text",
+"Privacy policy \u2197"
+]
+]
+]
+],
+"privacy_styled_billing_False": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"Your data",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"What leaves your computer",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Chats go to the model you picked",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Cloud tools send only what they need",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"A picture, a mesh or a prompt.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your files stay on your computer",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut never uploads your .blend.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"prop",
+"auto_run"
+],
+[
+"operator",
+"wm.context_toggle",
+"Run code without asking",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.auto_run"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Every step can be undone.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"prop",
+"share_conversations"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share conversations",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_conversations"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Text only, kept 90 days. Never used for training.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"prop",
+"share_usage_stats"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share anonymous usage stats",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_usage_stats"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Versions, steps and timings.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"True"
+],
+[
+"step",
+"done"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"Privacy policy \u2197",
+[
+[
+"url",
+"https://loopcut.org/privacy"
+]
+],
+true,
+[
+[
+"color",
+"(0.3176470588235294, 0.6549019607843137, 0.6823529411764706)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+],
+"privacy_styled_billing_True": [
+[
+"label",
+"Set up Loopcut"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.8745098039215686, 0.5450980392156862, 0.21568627450980393)",
+"{}"
+],
+[
+"label",
+"\u25cf",
+"(0.2196078431372549, 0.2196078431372549, 0.22745098039215686)",
+"{}"
+],
+[
+"label",
+"Your data",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.7, 'bold': True, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+"What leaves your computer",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Chats go to the model you picked",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut models",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Cloud tools send only what they need",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"A picture, a mesh or a prompt.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Your files stay on your computer",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)",
+"{'scale': 1.0, 'bold': False, 'tight': False, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"Loopcut never uploads your .blend.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"box",
+"12"
+],
+[
+"prop",
+"auto_run"
+],
+[
+"operator",
+"wm.context_toggle",
+"Run code without asking",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.auto_run"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Every step can be undone.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"prop",
+"share_conversations"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share conversations",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_conversations"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Text only, kept 90 days. Never used for training.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"prop",
+"share_usage_stats"
+],
+[
+"operator",
+"wm.context_toggle",
+"Share anonymous usage stats",
+[
+[
+"data_path",
+"preferences.addons[\"_flag_off_splash\"].preferences.share_usage_stats"
+]
+],
+true,
+[
+[
+"color",
+"(0.9490196078431372, 0.9372549019607843, 0.9137254901960784)"
+],
+[
+"hover",
+"False"
+]
+]
+],
+[
+"label",
+""
+],
+[
+"label",
+"Versions, steps and timings.",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"Continue",
+[
+[
+"save",
+"True"
+],
+[
+"step",
+"done"
+]
+],
+true,
+[
+[
+"depress",
+"True"
+],
+[
+"text",
+"Continue"
+]
+]
+],
+[
+"operator",
+"loopcut.onboarding_step",
+"\u2190 Back",
+[
+[
+"save",
+"False"
+],
+[
+"step",
+"connect"
+]
+],
+true,
+[
+[
+"color",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)"
+],
+[
+"hover",
+"True"
+]
+]
+],
+[
+"operator",
+"wm.url_open",
+"Privacy policy \u2197",
+[
+[
+"url",
+"https://loopcut.org/privacy"
+]
+],
+true,
+[
+[
+"color",
+"(0.3176470588235294, 0.6549019607843137, 0.6823529411764706)"
+],
+[
+"hover",
+"True"
+]
+]
+]
+]
+}
+}

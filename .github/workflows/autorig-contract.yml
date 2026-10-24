@@ -1,0 +1,53 @@
+name: Auto-rig platform contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev/feat/autorig-client]
+  pull_request:
+    paths:
+      - '.github/workflows/autorig-contract.yml'
+      - 'scripts/addons_core/loopcut/**'
+      - 'loopcut/harness/autorig*.py'
+      - 'loopcut/tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    # The contract is private and must never be copied to public release CI.
+    if: github.repository == 'loopcut-ai/loopcut-dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      LOOPCUT_CONTRACT_DIR: ${{ github.workspace }}/platform/contract
+      LOOPCUT_REQUIRE_CONTRACT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+          persist-credentials: false
+      - name: Require read-only platform access
+        env:
+          PLATFORM_CONTRACT_TOKEN: ${{ secrets.PLATFORM_CONTRACT_TOKEN }}
+        run: |
+          if [ -z "$PLATFORM_CONTRACT_TOKEN" ]; then
+            echo '::error::Configure PLATFORM_CONTRACT_TOKEN with read-only contents access to Samffprice/loopcut-web. Private contract tests cannot be skipped.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: Samffprice/loopcut-web
+          ref: 733b070aa4b428cea25b989540c415c73d73d04f
+          path: platform
+          token: ${{ secrets.PLATFORM_CONTRACT_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: contract
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Show the platform revision under test
+        run: git -C platform rev-parse HEAD
+      - name: Test auto-rig against the platform fixtures
+        run: python3 -m unittest discover -s loopcut/tests -p 'test_autorig*.py'

@@ -69,8 +69,9 @@ class Models:
         self.arrivals: list[tuple[str, float]] = []
         self.delays: dict[tuple[str, int], float] = {}  # (worker, request number) -> seconds before replying
         self.bodies: list[tuple[str, dict]] = []  # (who, request body) in arrival order
+        self.headers: list[tuple[str, dict]] = []  # (who, request headers, names lowercased) in arrival order
 
-    def reply_for(self, body: dict) -> bytes:
+    def reply_for(self, body: dict, headers: dict | None = None) -> bytes:
         first = next(m["content"] for m in body["messages"] if m["role"] == "user")
         if isinstance(first, list):  # A brief with the user's images (references): its text part.
             first = "".join(p.get("text", "") for p in first if p.get("type") == "text")
@@ -78,6 +79,7 @@ class Models:
         worker = "router" if body.get("model") == "router" else found.group(1).lower() if found else "orchestrator"
         with self.lock:
             self.bodies.append((worker, body))
+            self.headers.append((worker, headers or {}))
         with self.lock:
             number = sum(1 for w, _ in self.arrivals if w == worker)
             self.arrivals.append((worker, time.monotonic()))
@@ -93,7 +95,7 @@ MODELS = Models()
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        reply = MODELS.reply_for(body)
+        reply = MODELS.reply_for(body, {name.lower(): value for name, value in self.headers.items()})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -1367,6 +1369,7 @@ class WaveTest(unittest.TestCase):
         MODELS.arrivals.clear()
         MODELS.delays.clear()
         MODELS.bodies.clear()
+        MODELS.headers.clear()
         wave_checkpoint = mock.patch.object(checkpoints, "ensure_for_wave", create=True,  # W2's; merge calls it.
                                             side_effect=lambda session, label, message_index, item_index: "cp")
         wave_checkpoint.start()
@@ -1524,6 +1527,22 @@ class WaveTest(unittest.TestCase):
             self.assertEqual(text["item1.wave.row1.summary.l0"], "Table built.")
         self.assertEqual(drawn["item2.merge.l2.l0"], "LIGHT:A_Test /a (kept aside)")
         self.assertIn("item2.merge.accept", {h["id"] for h in display["hits"]})
+
+    def test_workers_of_a_try_it_cards_turn_name_the_card_on_every_request_and_others_never(self):
+        """Their model calls are made here, in the parent, as their own sessions (waves.py): the card comes from the
+        user's turn they work for (agent.try_it_card), never from the worker's own turn."""
+        for card in ("model", ""):
+            with self.subTest(card=card):
+                MODELS.headers.clear()
+                MODELS.scripts.update(a=[build(), finish("Chair built.")], b=[build(), finish("Table built.")])
+                wave = self.wave(["a", "b"])
+                self.turn.try_it = card
+                self.run_wave(wave)
+                sent = [(who, h.get("x-loopcut-role"), h.get("x-loopcut-try-it")) for who, h in MODELS.headers]
+                self.assertEqual(sorted(sent), [(w, "worker", card or None) for w in ("a", "a", "b", "b")])
+                worker_sessions = {h.get("x-loopcut-conversation") for _, h in MODELS.headers}
+                self.assertNotIn(self.session["id"], worker_sessions, "each worker is its own conversation, as before")
+                self.assertTrue(all(w.turn.try_it == "" for w in wave.crew), "a worker's turn never runs the card")
 
     # ---------------------------------------------------------------- results as workers finish
 

@@ -39,6 +39,21 @@ class StrictObject:
         self._fields[name] = value
 
 
+class ImageID(StrictObject):
+    """An image datablock: RNA-like attributes and ID properties (image["lc_temp"] = True)."""
+    __slots__ = ('_props',)
+
+    def __init__(self, **fields):
+        super().__init__(**fields)
+        object.__setattr__(self, '_props', {})
+
+    def __setitem__(self, key, value):
+        self._props[key] = value
+
+    def get(self, key, default=None):
+        return self._props.get(key, default)
+
+
 class ImageStore:
     __slots__ = ('images', 'loads')
 
@@ -47,7 +62,7 @@ class ImageStore:
 
     def load(self, path, *, check_existing):
         assert not check_existing
-        image = StrictObject(name=Path(path).name, filepath=path, users=0, size=(800, 400), alpha_mode='STRAIGHT')
+        image = ImageID(name=Path(path).name, filepath=path, users=0, size=(800, 400), alpha_mode='STRAIGHT')
         self.images.append(image)
         self.loads.append(path)
         return image
@@ -273,7 +288,7 @@ class HostActionsTest(unittest.TestCase):
         tree = ast.parse(source.read_text())
         names = {'_release_image', 'retain_images', '_image_texture'}
         nodes = [n for n in tree.body if getattr(n, 'name', None) in names]
-        cache = {'bpy': bpy, 'Path': Path, '_image_cache': {}, 'IMAGES_KEPT': 24,
+        cache = {'bpy': bpy, 'Path': Path, '_image_cache': {}, 'IMAGES_KEPT': 24, 'TEMP': 'lc_temp',
                  'gpu': StrictObject(texture=StrictObject(from_image=lambda image: StrictObject(image=image)))}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), cache)
         return images, cache, duplicate
@@ -322,6 +337,7 @@ class HostActionsTest(unittest.TestCase):
             collapsed = display()
             thumbs = {p['path']: p for p in collapsed['prims'] if p['t'] == 'image'}
             self.assertEqual(len(images.images), 2)
+            self.assertTrue(all(image.get('lc_temp') for image in images.images), 'previews are no scene change')
             # Open/close the same image, then A -> B -> A, repeatedly.
             for index in (0, 0, 1, 0, 1, 1) * 4:
                 path, title = str(paths[index]), ('Chest from the front', 'Printing machine')[index]

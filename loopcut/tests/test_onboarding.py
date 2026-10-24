@@ -1188,6 +1188,32 @@ class OnboardingTest(unittest.TestCase):
                     watch.call_args.args[1]({"plan": "pro"})
                     self.assertEqual(resume.call_count, int(change == "none"))
 
+    def test_out_of_credits_mid_turn_picks_up_on_continue_or_an_upgrade(self):
+        """0.2.15's pop-up line "Your request is saved; it picks up when you continue": the slim card's Continue
+        (limit_retry) and a finished upgrade both resume the stopped turn, and nothing else is added to the chat."""
+        upgrade = {"url": "https://loopcut.org/pricing?from=app&reason=insufficient_credits&plan=pro", "plan": "pro",
+                   "label": "Get Pro"}
+        for way in ("continue", "upgrade"):
+            with self.subTest(way=way), patch.object(self.host.config, "billing_open", return_value=True):
+                session = self.state.reset()
+                card = self.state.item_limit("Out of credits.", "insufficient_credits", "free",
+                                             "2026-11-01T00:00:00Z", upgrade)
+                card["refill"] = {"credits": 25, "at": "2026-10-30T09:12:00Z"}
+                session["items"] = [self.state.item_user("details"), card]
+                session["messages"] = [{"role": "user", "content": "details"}, {"role": "tool", "content": "Done."}]
+                with patch.object(self.host.agent, "resume") as resume, \
+                        patch.object(self.account, "refresh_account") as refresh, \
+                        patch.object(self.account, "watch_plan") as watch, \
+                        patch.object(self.account, "open_browser"), patch.object(self.host.conversations, "save"):
+                    if way == "continue":
+                        self.host._do_action(session, ("limit_retry", 1))
+                        refresh.call_args.args[0]()
+                    else:
+                        self.host._do_action(session, ("limit_upgrade", 1))
+                        watch.call_args.args[1]({"plan": "pro"})
+                    resume.assert_called_once()
+                self.assertEqual(len(session["items"]), 2)
+
     def test_locked_model_upgrade_dispatch_starts_the_same_watch_without_resuming_a_turn(self):
         with patch.object(self.host.config, "billing_open", return_value=True), patch.object(self.settings, "_changed"), \
                 patch.object(self.account, "models", return_value=[{"id": "pro", "label": "Pro", "available": False,
@@ -2047,9 +2073,36 @@ class OnboardingTest(unittest.TestCase):
             self.prefs.provider = "LOOPCUT"
             with patch.object(self.onboarding, "_connected", return_value=True):
                 splash, labels, _ = self.arm_screen("done")
-            self.assertIn("≈1 credit / step", labels)  # The modelling card runs on Loopcut's AI: not "Free".
-            self.assertNotIn("Free", labels)
+            # The modelling card runs on Loopcut's AI, which the arm serves on the house for a tagged Try it card
+            # (server TRY_IT_CARDS, 0.2.15): "Free", like the other cards' "0 credits".
+            self.assertEqual(labels[-1], "Free")
+            self.assertNotIn("≈1 credit / step", labels)
             self.assertIn("You have 100 credits. Loopcut's AI uses ≈1 credit / step.", labels)
+
+    def test_the_weekly_top_up_names_25_a_week_on_the_account_step_and_the_showcase(self):
+        """0.2.15: account.chat_credits.refill (the weekly top-up to 25) replaces the monthly line; without it the
+        steps keep 0.2.14's words (test_credits_arm_order_is_account_showcase_byo_ai_privacy_done)."""
+        weekly = {**self.ARM_ACCOUNT, "chat_credits": {"per_step": 0.84,
+                                                       "refill": {"credits": 25, "at": "2026-10-30T09:12:00Z"}}}
+        with self.credits_arm(), patch.object(self.onboarding, "_manifest_account", return_value=weekly):
+            _, labels, _ = self.arm_screen("account")
+            self.assertIn("25 free credits come back every week.", labels)
+            self.assertFalse([line for line in labels if "every month" in line])
+            _, labels, texts = self.arm_screen("showcase")
+            self.assertIn("25", labels)
+            self.assertIn("free credits every week, AI chat included.", labels)
+            self.assertNotIn("100", labels)
+            self.assertFalse([line for line in labels if "every month" in line])
+            self.assertEqual(texts, ["Next", "← Back"])
+            for bad in ({"credits": 0, "at": "2026-10-30T09:12:00Z"}, {"credits": 25, "at": "soon"}, [25], None):
+                broken = {**weekly, "chat_credits": {"per_step": 0.84, "refill": bad}}
+                with patch.object(self.onboarding, "_manifest_account", return_value=broken):
+                    _, labels, _ = self.arm_screen("showcase")
+                self.assertIn("free credits every month for anything above,", labels)
+            pro = {**weekly, "plan": "pro", "credits": {"balance": 2000, "monthly": 2200}}
+            with patch.object(self.onboarding, "_manifest_account", return_value=pro):
+                _, labels, _ = self.arm_screen("showcase")
+            self.assertIn("2,200", labels)  # A paid plan's monthly grant is the bigger news.
 
     def test_the_arms_second_step_follows_the_account_when_resumed_or_learned_late(self):
         on = self.onboarding
@@ -2117,6 +2170,21 @@ class OnboardingTest(unittest.TestCase):
         self.assertEqual(start.call_args.args[2], (str(self.onboarding.SAMPLE_PHOTO),))
         self.assertEqual(start.call_args.kwargs, {"try_it": "photo_3d"})  # Its cloud call is on the house.
         self.assertTrue(self.onboarding.SAMPLE_PHOTO.is_file())
+
+    def test_the_model_card_is_tagged_only_in_the_credits_arm(self):
+        """0.2.15: the treasure chest card sends x-loopcut-try-it (start_request's try_it) in the credits arm, whose
+        gateway serves it free; every other account starts it as 0.2.14 did."""
+        for arm, expected in ((True, {"try_it": "model"}), (False, {"try_it": ""})):
+            with self.subTest(arm=arm), patch.object(self.onboarding.chat_credits, "active", return_value=arm):
+                self.fresh_session()
+                _, later = self.finish_with("model")
+                window = object()
+                wm = types.SimpleNamespace(splash_modal=True, windows=[window])
+                with patch.object(self.fake, "context", types.SimpleNamespace(
+                            window_manager=wm, temp_override=Mock(return_value=contextlib.nullcontext())), create=True), \
+                        patch.object(self.host, "start_request") as start:
+                    later()
+                self.assertEqual(start.call_args.kwargs, expected)
 
     def test_finishing_without_an_account_brings_the_setup_back_next_start(self):
         report, _ = self.finish_with("", signed_in=False)

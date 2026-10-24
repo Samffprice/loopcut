@@ -46,6 +46,7 @@ void main()
 _cache: dict = {}
 _image_cache: dict = {}  # path -> (owned Blender image, GPU texture), or None after a failed load; last drawn last.
 IMAGES_KEPT = 16  # Pictures kept loaded at once: a long conversation's captures would otherwise all stay in memory.
+TEMP = "lc_temp"  # ownership.TEMP: our own datablock, never a user change (scene_diff) or a worker's (tokens).
 _measure_cache: dict = {}
 _MEASURE_CACHE_LIMIT = 20000
 
@@ -143,6 +144,7 @@ def _image_texture(path):
         try:
             loaded = bpy.data.images.load(path, check_existing=False)
             loaded.name = "." + Path(path).name  # A leading dot keeps it out of the user's image lists.
+            loaded[TEMP] = True  # The scene-changes card listed it as "+ image .05cb008bb..." otherwise.
             texture = gpu.texture.from_image(loaded)
             if min(loaded.size) <= 0:
                 raise ValueError("empty image")

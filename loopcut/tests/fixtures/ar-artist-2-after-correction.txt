@@ -1,0 +1,7 @@
+I'm sorry about the mess before. Here is exactly what I did last turn and what it left the scene as, since you asked me to be honest about what I see:
+
+**Restored state:** I stepped back 3 undo steps and stopped the moment the upper-arm joint head returned to its original rest position (z 0.528 instead of my raised 0.578). That restored **both the original joint position and the original weights exactly** — the pre-fix state. I then re-applied only the 90° wrist twist on top, so your stress pose is complete again.
+
+**Verification:** the deformation check now reports **no spikes and no torn skin at any joint**, and shoulder volume is back at ~97% — that matches the first, pre-fix check. I also captured a look, and I see the character in the stress pose with intact shoulders — no shards anywhere.
+
+**What I see honestly:** in my capture the armpits, collarbone, neck and upper arms all look intact. Since you were looking at the mesh at the moment of your report, that jagged state existed *after* my second smoothing — and it's precisely what the undo removed. If you're still seeing shards in your viewport right now, tell me where exactly, because the check and the current state say the mesh is healed; a stale viewport or a different evaluated state is my other suspect. Undo once or tell me to reset to rest and I'll set the stress pose fresh so we're both looking at the same thing.

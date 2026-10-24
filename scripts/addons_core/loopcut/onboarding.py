@@ -322,11 +322,11 @@ def _signature() -> tuple:
         shown += (_account_plan(), _unit_prices(_descriptors()))
     elif step == "showcase":
         shown += tuple(sorted(_showcase_prices(_descriptors(), _manifest_account()).items())) + (
-            _showcase_monthly(),)
+            _showcase_monthly(), _showcase_weekly())
     elif step == "done":
         shown += (_connected(), tuple(card_cost(card, _descriptors()) for card in CARDS))
     if step in ("account", "how", "showcase", "connect", "done"):
-        shown += (_credits_arm(),)
+        shown += (_credits_arm(), _showcase_weekly())
     return shown
 
 
@@ -1007,7 +1007,9 @@ def _draw_signed_in(layout, context) -> None:
     prefs = settings.preferences()
     if _credits_arm():
         amount_monthly, free = _showcase_monthly()
-        _text(column, f"{amount_monthly:,} {'free ' if free else ''}credits come back every month.", MUTED, center=True)
+        weekly = _showcase_weekly() if free else None
+        _text(column, f"{weekly:,} free credits come back every week." if weekly else
+              f"{amount_monthly:,} {'free ' if free else ''}credits come back every month.", MUTED, center=True)
     elif prefs is None or prefs.provider == "LOOPCUT":
         kind = "chat" if _account_plan() in ("pro", "max") else "free"
         _text(column, "Credits pay for cloud tools; Loopcut chat has a separate\n"
@@ -1202,6 +1204,12 @@ def _showcase_monthly() -> tuple[int, bool]:
     return chat_credits.monthly(account_info), chat_credits.plan_of(account_info) in ("", "free")
 
 
+def _showcase_weekly() -> int | None:
+    """The weekly top-up's credits when the server names one (account.chat_credits.refill, 0.2.15), else None."""
+    refill = chat_credits.account_refill(_manifest_account())
+    return round(refill["credits"]) if refill else None
+
+
 def _wrap_caption(text: str, width: float, scale: float = CAPTION, lines: int = TILE_LINES) -> str:
     """Text broken into at most `lines` lines that fit `width` pixels at UI scale 1, as label_styled draws it at
     `scale`; the last line ends with "…" if the text is longer."""
@@ -1259,17 +1267,21 @@ def _draw_showcase(layout, context) -> None:
             price = prices[key]
             _text(text, price, SUCCESS if price == "Free" else MUTED if price == "Soon" else FOREGROUND, scale=CAPTION,
                   tight=True)
-            _text(text, _wrap_caption(line, inner - 12), MUTED, scale=CAPTION, tight=True)  # The label's own margins.
+            _text(text, _wrap_caption(line, inner - 4), MUTED, scale=CAPTION, tight=True)
         column.separator(factor=0.4)
     amount, free = _showcase_monthly()
+    weekly = _showcase_weekly() if free else None
     banner = _group(column).row(align=True)
     banner.alignment = "LEFT"
     big = banner.column()
-    big.ui_units_x = 3.4 if amount >= 1000 else 2.6
+    big.ui_units_x = 3.4 if (weekly or amount) >= 1000 else 2.6
     big.separator(factor=0.9)
-    _text(big, f"{amount:,}", scale=2.0, bold=True)
+    _text(big, f"{weekly or amount:,}", scale=2.0, bold=True)
     words = banner.column(align=True)
-    _text(words, f"{'free ' if free else ''}credits every month for anything above,\nAI chat included.")
+    if weekly:  # The weekly top-up (0.2.15): the sooner, smaller refill is the one people come back for.
+        _text(words, "free credits every week, AI chat included.")
+    else:
+        _text(words, f"{'free ' if free else ''}credits every month for anything above,\nAI chat included.")
     _text(words, f"A typical first build uses about {chat_credits.TYPICAL_BUILD}.", MUTED, tight=True)
     props = _primary(column, "loopcut.onboarding_step", "Next")
     props.step, props.save = "connect", False
@@ -1756,7 +1768,8 @@ def _draw_try(layout, context) -> None:
             _text(line, "0 credits")
         else:
             chat = chat_credits.step_label(_manifest_account()) if (
-                _credits_arm() and getattr(settings.preferences(), "provider", "") == "LOOPCUT") else ""
+                _credits_arm() and getattr(settings.preferences(), "provider", "") == "LOOPCUT"
+                and not card.get("arm_free")) else ""  # The arm serves that card on the house: "Free".
             _text(price, _price(credits_needed, chat))
         start = foot.column()
         start.enabled = runnable and connected
@@ -2116,7 +2129,7 @@ def _close_and_start(card: dict | None):
             return None
     from .ui import host
     host.start_request(window, card["prompt"], (str(SAMPLE_PHOTO),) if card.get("photo") else (),
-                       try_it=card["id"] if card.get("free") else "")
+                       try_it=card["id"] if card.get("free") or (card.get("arm_free") and _credits_arm()) else "")
     return None
 
 

@@ -1,6 +1,7 @@
 """The agent loop: stream a reply, run the tools it asks for, feed results back, repeat."""
 
 import dataclasses
+import functools
 import json
 import threading
 import time
@@ -135,6 +136,15 @@ EMPTY_REPLY_MESSAGE = ("The model sent back an empty reply twice, so nothing hap
                        "another model in the model menu below.")
 FILTERED_REPLY_MESSAGE = ("The model provider's content filter stopped this reply before it said anything. Rephrase "
                           "the request, or pick another model in the model menu below.")
+# A reply that wrote its calls out as text and called nothing (_unmade): what goes back as the turn's record
+# correction, what the panel says when it cannot go back, and what the stored reply then says.
+UNMADE_PROMPT = ("[Loopcut] Your last reply wrote {calls} out as text instead of calling {them}, so nothing ran and "
+                 "nothing it reported was seen or measured; the scene is as it was before that reply. Call the "
+                 "tools now, or tell the user plainly that nothing ran.")
+UNMADE_FINAL = ("Stopped: the assistant again wrote out its steps instead of running them, so none of the work "
+                "it described was done or checked.")
+UNMADE_STORED = ("The steps in this reply did not run: I wrote them out instead of calling the tools, so none of that "
+                 "work was done or checked.")
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -206,6 +216,7 @@ class Turn:
         # also counts rejected/skipped calls, so it cannot establish that anything ran.
         self.executed_tools = 0
         self.unrun_claim = False  # One record correction per user turn, including resume.
+        self.unmade_final = ""  # Loopcut's last line after a reply that only wrote its calls out (_unmade).
         self.contact_checks: list = []  # Measurements and evaluated geometry fingerprints, only this turn.
         self.contact_bounced = False   # At most one correction for a pass invalidated by later edits.
         # The turn's usage event (telemetry.py): when it started, what ran it, the first chat item it added,
@@ -615,7 +626,8 @@ def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | 
                         refused: str | None = None) -> None:
     """Main thread: warn once per server window; the ordinary conversation saves persist it."""
     from . import chat_credits
-    if info.get("billing") == chat_credits.CREDITS or chat_credits.active():
+    credits = info.get("billing") == chat_credits.CREDITS or chat_credits.active()
+    if credits and type(info.get("credits_balance")) is not int:
         return  # Credits accounts still get the window headers, but no windows apply to them.
     owner = turn
     while owner is not None and owner.chat:
@@ -632,6 +644,9 @@ def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | 
     # Resolve reopened conversations by id, and unsaved/id-less sessions by object identity.
     # Never append to a captured conversation or save from this callback.
     session, items = live, live["items"]
+    if credits:
+        _warn_low_credits(items, info, owner)
+        return
     refused_windows = allowance.refused_windows(info, state.ui.get("allowance_notice"))
     for name in ("session", "week"):
         if name == refused or name in refused_windows:
@@ -661,6 +676,30 @@ def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | 
             owner.allowance_notices.append((items, item))
 
 
+def _warn_low_credits(items: list, info: dict, owner: Turn | None) -> None:
+    """Main thread, credits arm (0.2.15): one quiet heads-up per refill period once a reply's balance is down to
+    about 20 credits, with the offer, before the out-of-credits stop. Never raises."""
+    from . import chat_credits, nudges
+    balance = info.get("credits_balance")
+    if (info.get("billing") != chat_credits.CREDITS or type(balance) is not int
+            or not 0 < balance <= chat_credits.LOW_BALANCE):
+        return
+    try:
+        account, _ = chat_credits._account()
+        if not nudges.first_time("low_chat_credits", chat_credits.low_key(account)):
+            return
+        item = state.item_notice(chat_credits.low_text(balance, account))
+        if config.billing_open():  # Paid plans top up; the free plan's way to more is Pro.
+            paid = chat_credits.plan_of(account) in ("pro", "max")
+            item.update(action_label="Add credits" if paid else chat_credits.upgrade_button({"plan": "pro"}, True),
+                        url=config.credits_url("low_credits") if paid else config.pricing_url("low_credits", "pro"))
+        items.append(item)
+        if owner is not None:
+            owner.allowance_notices.append((items, item))
+    except Exception as ex:
+        print(f"Loopcut: could not show the low-credit notice: {ex!r}")
+
+
 def _limit_item(ex: llm.LLMError) -> dict:
     """The card for a 402: Loopcut's gateway says which window ran out, when it resets and what
     the next plan offers; any other provider's 402 shows its message with no button."""
@@ -668,9 +707,14 @@ def _limit_item(ex: llm.LLMError) -> dict:
     upgrade = details.get("upgrade") if isinstance(details.get("upgrade"), dict) else None
     info = ex.account or {}
     window = info.get({"session_limit": "session", "week_limit": "week"}.get(ex.code, "")) or {}
-    return state.item_limit(str(details.get("message") or ex), ex.code or "limit",
+    item = state.item_limit(str(details.get("message") or ex), ex.code or "limit",
                             str(details.get("plan") or info.get("plan") or ""),
                             str(details.get("resets_at") or window.get("resets_at") or ""), upgrade)
+    from . import chat_credits
+    refill = chat_credits.refill_of(details.get("refill")) if ex.code == chat_credits.CODE else None
+    if refill:  # The credits arm's sooner weekly top-up (contract 0.9); absent, the card is 0.2.14's.
+        item["refill"] = refill
+    return item
 
 
 def _alike_on_main(a, b) -> bool:
@@ -698,10 +742,13 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import assets, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools, video_attach
+    from . import assets, autorig, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools, video_attach
+    remote = cloud.tool_schemas()
+    # character_rig only beside the account's cloud auto_rig: without auto-rig access the model has no rig tools.
+    rig = autorig.SCHEMAS if any(cloud.tool_name(s["function"]["name"]) == "auto_rig" for s in remote) else []
     return video_attach.with_clip_tools(
         tools.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
-        + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + cloud.tool_schemas())
+        + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + rig + remote)
 
 
 def _tool_title(name: str, schemas: Callable | None = None) -> str:
@@ -730,9 +777,9 @@ def _describe(call: llm.ToolCall, schemas: Callable | None = None) -> tuple[str,
     name = call.name
     if tools.RENAMED.get(name, (name,))[0] != name:  # A saved call to a tool since merged.
         name, arguments = tools.current_call(name, arguments)
-    from . import orchestrator, paint_tools, texture_tools, uv_tools, workspace
+    from . import autorig, orchestrator, paint_tools, texture_tools, uv_tools, workspace
     for module in (job_tools, files, assets, contact, camera, orchestrator, uv_tools, texture_tools, paint_tools,
-                   workspace, cloud):
+                   workspace, autorig, cloud):
         described = module.describe(name, arguments)
         if described:
             return described
@@ -882,8 +929,10 @@ class _Consent:
         self.session, self.turn, self.card = session, turn, card
         self.asks, self.files_allowed = asks, files_allowed
         self.hold = None       # (credits held, ran without asking) once the call may run.
+        self.settled = None    # A rig's last net charge and original auto flag; its refund can reduce it later.
         self.limit_approved = False  # The user approved past a server limit, seeing this call's cost: no second ask.
         self.shown = [card]    # The cards that show its cost: its own, and a worker's ask in the user's panel.
+        self.rig = card.get('name') in ('loopcut_cloud__auto_rig', 'loopcut_cloud.auto_rig')
 
     def chat(self):
         if getattr(self.turn, "chat", None):
@@ -891,6 +940,20 @@ class _Consent:
         return (self.session if self.session is not None else state.session()), self.turn
 
     def __call__(self, details):
+        if 'progress' in details:  # Only a rig reports here (cloud_account.progress_reporter).
+            from . import cloud
+            if self.card.get('status') != 'running':
+                return True  # A queued redraw must not replace an approval or completed result.
+            if self.rig and getattr(self.turn, 'chat', None) and len(self.shown) == 1:
+                chat, _ = self.chat()
+                card = state.item_tool(self.card['name'], f'{self.turn.worker}: Rig your character', '')
+                card.update(status='running')
+                self.shown.append(card)
+                chat['items'].append(card)
+            for card in self.shown:
+                if card.get('status') == 'running':
+                    cloud._card_progress(card, details['progress'])
+            return True
         if "error" in details:
             for card in self.shown:
                 card["cloud_error"] = details["error"]
@@ -900,7 +963,16 @@ class _Consent:
         if "charged" in details:
             self._settle(details["charged"], details.get("text") or "")
             return True
+        previous_cost = self.card.get('cost', '')
         self.card["cost"] = details["text"]
+        if self.rig:
+            from . import rig_text
+            if details.get('credits') is not None:
+                self.card.update(rig_credits=details['credits'], rig_balance=details.get('balance'),
+                                 rig_notice=details.get('rig_notice', rig_text.QUOTE))
+                self.card['cost'] = rig_text.price(details['credits'], details.get('balance'))
+            else:
+                self.card['cost'] = previous_cost or rig_text.price(0)
         if details.get("file_access"):
             if not details["required"] or self.files_allowed:
                 return True
@@ -941,6 +1013,9 @@ class _Consent:
             chat_turn.paid_calls += 1
             held = spending.start(spending.ledger(chat_session), details, not explicit)
         self.hold = (held, not explicit) if held else None
+        if self.rig:
+            for card in self.shown:
+                card.update(cost=self.card['cost'])
         _redraw()
         return True
 
@@ -956,17 +1031,24 @@ class _Consent:
         with spending.lock:
             lines = spending.ask_lines(kind, details, spending.ledger(chat_session), settings,
                                        calls=chat_turn.paid_calls, balance=details.get("balance"), worker=worker)
+        if self.rig:
+            from . import rig_text
+            lines = [rig_text.approval(kind, self.card.get('rig_notice'))]
         fields = {"ask": kind, "ask_lines": lines, "ask_label": spending.approve_label(kind, settings),
                   "paid_approval": True, "heavy": False, "install": False}
         if details.get("url"):
             fields["ask_link"] = details["url"]
+        if self.rig:
+            fields['rig_stage'] = 'Waiting for approval.'
         if worker:
-            card = state.item_tool(self.card.get("name", ""), f"{worker}: {self.card.get('summary') or ''}".rstrip(": "), "")
-            card.update(cost=details["text"], worker=worker, **fields)
+            card = (self.shown[-1] if self.rig and len(self.shown) > 1 else  # Its mirrored progress card.
+                    state.item_tool(self.card.get("name", ""), f"{worker}: {self.card.get('summary') or ''}".rstrip(": "), ""))
+            card.update(cost=self.card["cost"], worker=worker, **fields)
             card["status"] = "awaiting"
             if card not in self.shown:
                 self.shown.append(card)
-            chat_session["items"].append(card)
+            if card not in chat_session["items"]:
+                chat_session["items"].append(card)
             _redraw()
             try:
                 approved = _wait_for_card(card, (chat_turn, self.turn))
@@ -981,15 +1063,30 @@ class _Consent:
             approved = _wait_for_approval(self.turn)
         for key in ("ask", "ask_lines", "ask_label", "ask_link"):
             card.pop(key, None)
-        card["status"] = ("done" if worker else "running") if approved else "rejected"
+        # A rig's worker card keeps running until finish(); other workers' asks are done once answered.
+        card["status"] = ("running" if self.rig or not worker else "done") if approved else "rejected"
         _redraw()
         if not approved:
             self.card["declined"] = True
+            if self.rig:
+                for shown in self.shown:
+                    shown['cost'] = rig_text.price(0, self.card.get('rig_balance'))
             raise cloud_http.CloudError(spending.declined(kind, details, settings, calls=chat_turn.paid_calls),
                                         "declined")
         return True
 
+    def finish(self, result):
+        """A rig's mirrored worker card ends with the call's result."""
+        if not self.rig:
+            return
+        for card in self.shown[1:]:
+            card.update(status='done' if result.ok else 'rejected' if self.card.get('declined') else 'failed',
+                        output=result.text)
+
     def _settle(self, charged, text: str) -> None:
+        if self.rig:
+            self._settle_rig(charged, text)
+            return
         if self.hold is None and not charged:
             return  # Nothing held and nothing charged: a free call keeps "Free", a skipped one its price.
         if text:
@@ -1001,6 +1098,33 @@ class _Consent:
             chat_session, _ = self.chat()
             with spending.lock:
                 spending.settle(spending.ledger(chat_session), held, charged, auto)
+            _save_spend(chat_session)
+        _redraw()
+
+    def _settle_rig(self, charged, text: str) -> None:
+        """A rig's charge can drop after it settled: a failed local apply is refunded (rig_refund)."""
+        from . import rig_text
+        if charged is not None and not spending._amount(charged):
+            return
+        chat_session, _ = self.chat()
+        with spending.lock:
+            previous = self.hold or self.settled
+            if previous is None:
+                if charged == 0:
+                    for card in self.shown:
+                        card['cost'] = rig_text.price(0, self.card.get('rig_balance'))
+                return  # Free and skipped calls retain their original price text.
+            if self.hold is None and (charged is None or charged > previous[0]):
+                return  # Historical completion events cannot undo a confirmed refund.
+            if charged is not None:
+                held, auto = previous
+                self.hold = None
+                self.settled = (charged, auto)
+                spending.settle(spending.ledger(chat_session), held, charged, auto)
+            text = rig_text.price(charged, self.card.get('rig_balance'), settled=True)
+            for card in self.shown:
+                card["cost"] = text
+        if charged is not None:
             _save_spend(chat_session)
         _redraw()
 
@@ -1062,10 +1186,21 @@ def _look_note(turn: Turn) -> str:
             f"after each change. Finish soon, and say what you could not verify.)")
 
 
-def _correlation_headers(session: dict, role: str) -> dict:
+def try_it_card(turn) -> str:
+    """The setup Try it card whose unedited request started this turn (Turn.try_it); for a worker's turn, the
+    user's turn it works for (Turn.chat). "" for any other turn, a later one in the same conversation included.
+    Every chat request of such a turn says so (llm.correlation_headers' x-loopcut-try-it)."""
+    if turn is None:
+        return ""
+    chat = getattr(turn, "chat", None)
+    return getattr(chat[1] if chat else turn, "try_it", "") or ""
+
+
+def _correlation_headers(session: dict, role: str, turn=None) -> dict:
     """This session's x-loopcut-conversation / x-loopcut-role (llm.correlation_headers) for the
-    given role (orchestrator/worker/single here; router.py and context.py send their own)."""
-    return llm.correlation_headers(session["id"], role)
+    given role (orchestrator/worker/single here; router.py and context.py send their own), with the
+    turn's Try it card (try_it_card) when it has one."""
+    return llm.correlation_headers(session["id"], role, try_it_card(turn))
 
 
 def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single",
@@ -1090,7 +1225,7 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
         messages=[{"role": "system", "content": REFERENCE_PROMPT}, {"role": "user", "content": parts}],
         tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
         max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-        headers=_correlation_headers(session, "reference"), on_retry=lambda: None)  # Nothing shown mid-stream to undo.
+        headers=_correlation_headers(session, "reference", turn), on_retry=lambda: None)  # Nothing shown mid-stream to undo.
     if turn is not None:
         _hosted_reply(turn, cfg, completion.account, success=True, session=session)
     card = completion.text.strip()
@@ -1219,6 +1354,9 @@ def _route(session: dict, turn: Turn) -> None:
     roles = getattr(turn, "roles", None)
     divert = router.to_workspace if getattr(turn, "may_divert", False) else None
     def stream(**kwargs):
+        card = try_it_card(turn)
+        if card:  # The router's request is one of the card's turn too (router.ask sends the correlation headers).
+            kwargs["headers"] = {**(kwargs.get("headers") or {}), llm.TRY_IT_HEADER: card}
         completion = llm.stream_chat(**kwargs)
         _hosted_reply(turn, roles.router, completion.account, success=True, session=session)
         return completion
@@ -1461,7 +1599,10 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
         system += "\n\n" + waves.unavailable_note(session)
     schemas = _session_schemas(session, spec)
     fixed = context.fixed_tokens(system, schemas, prompt_id=hosted, index=index)
-    prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed, skill_index=index)
+    card = try_it_card(turn)  # A summary made in a Try it card's turn is one of its requests too.
+    summarize = {"summarize": functools.partial(context.summarize, try_it=card)} if card else {}
+    prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed, skill_index=index,
+                                          **summarize)
     if compacted:
         items.append(state.item_notice(
             f"Summarized {compacted} earlier messages so requests stay small."))
@@ -1493,7 +1634,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                 messages=messages, tools=schemas, reasoning_effort=effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
                 max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-                headers=_correlation_headers(session, spec.role), on_retry=on_retry,
+                headers=_correlation_headers(session, spec.role, turn), on_retry=on_retry,
                 prompt_id=hosted,
             )
         except llm.LLMError as ex:
@@ -1556,11 +1697,71 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
             if not getattr(turn, "tool_steps", 0):  # Nothing happened this turn: say so, with Try again.
                 _drop_empty(items, reply)
                 raise llm.LLMError(EMPTY_REPLY_MESSAGE, code=llm.EMPTY_REPLY)
+    _drop_copied_records(completion, reply, items, spec, session["messages"])
     reply["streaming"] = False
     finish_reply(reply, turn.roots[0] if turn.roots else None)
     if not reply["text"].strip():
         items.remove(reply)
     return completion
+
+
+def _drop_copied_records(completion: llm.Completion, reply: dict, items: list, spec: LoopSpec,
+                         messages: list) -> None:
+    """A reply that copied the records of earlier steps (context.fold) has them taken out of what is shown
+    and stored: a call written out that way never ran, so the panel says so instead (completion.unmade).
+    A recap of a call in messages that ran stays. A reply left with nothing is stored as UNMADE_STORED."""
+    text, unmade = context.copied_records(completion.text, {call.name for call in completion.tool_calls}, messages)
+    if text == completion.text:
+        return
+    print(f"Loopcut: {spec.role} reply copied an earlier-steps record"
+          + (f" of {', '.join(dict.fromkeys(unmade))}, which it did not call" if unmade else "")
+          + "; removed from the reply.")
+    reply["text"] = text
+    completion.text = text or ("" if completion.tool_calls else UNMADE_STORED)  # Never an empty stored reply.
+    completion.unmade = list(dict.fromkeys(unmade))
+    if completion.unmade:
+        items.append(state.item_notice(_unmade_text(completion.unmade)))
+
+
+def _unmade_text(names: list[str]) -> str:
+    from . import cloud
+    labels = [(cloud.describe(name, {}) or (name,))[0].split(" · ")[0] for name in names]  # A cloud tool's card title.
+    if len(labels) == 1:
+        return f"{labels[0]} was only written out in the reply, not called: it did not run and nothing was charged."
+    return (f"{', '.join(labels[:-1])} and {labels[-1]} were only written out in the reply, not called: they did "
+            "not run and nothing was charged.")
+
+
+def _unmade(session: dict, turn: Turn, request: dict, completion: llm.Completion, added: list,
+            may_retry: bool = True) -> str | None:
+    """A reply that called nothing and only wrote its calls out would end the turn on an account of steps
+    that never happened (ar-artist-1: "both sides fixed"; ar-artist-2: "restored to the exact pre-fix state";
+    p6c: a whole detail pass, nothing but copied records). Its card comes down, so that account is never the
+    last word. While the turn has a nudge left (completion_guard.nudges_left, shared with announced steps) and
+    has had no record correction, the model is sent back once to call the tools or say plainly that nothing ran:
+    the returned text. Otherwise None, and the stored reply says what happened; run_loop ends the turn on
+    UNMADE_FINAL unless a finish gate sends it on. added: the items this request added. may_retry: False at
+    the step limit or once the turn has an outcome, as for an announced step."""
+    items, messages = session["items"], session["messages"]
+    one = len(completion.unmade) == 1
+    names = ", ".join(completion.unmade[:-1]) + " and " * (not one) + completion.unmade[-1]
+    text = _unmade_text(completion.unmade)
+    notice = next((i for i in added if i["kind"] == "notice" and i["text"] == text), None)
+    retry = may_retry and not turn.unrun_claim and completion_guard.nudges_left(request) > 0
+    # Out by identity, from the end: a note the user queues meanwhile is appended, never lost (turn.notes).
+    gone = {id(i) for i in added if i["kind"] == "assistant" or (i is notice and not retry)}
+    for index in range(len(items) - 1, -1, -1):
+        if id(items[index]) in gone:
+            del items[index]
+    if retry:
+        turn.unrun_claim = request[completion_guard.CORRECTED] = True
+        if notice is not None:
+            notice["text"] += f" Asked the assistant to run {'it' if one else 'them'}."
+        print(f"Loopcut: reply only wrote out {names}; sent back once to call them or say nothing ran.")
+        return UNMADE_PROMPT.format(calls=names, them="it" if one else "them")
+    completion.text = messages[-1]["content"] = UNMADE_STORED  # The next turn reads what happened, not the claim.
+    print(f"Loopcut: reply only wrote out {names} and the turn has no correction left; not sent back.")
+    return None
 
 
 def _wrap_up(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SINGLE_SPEC,
@@ -1614,18 +1815,19 @@ def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
 def _continue_announced(session: dict, turn: Turn, spec: LoopSpec, request: dict, completion, cfg: config.Config,
                         step: int, scene_action) -> bool:
     """A reply that announces its next step and calls no tool ("I will next import the desk.") goes on with
-    completion_guard.CONTINUE instead of ending the turn. At most MAX_CONTINUES per user turn and never twice
-    without a tool run in between, counted on the user's message so a resumed turn keeps the count. Never
-    for a worker, after a Stop, at the step limit, on a question or other request for no scene work (even
-    after a read tool ran), with a note the user sent during the reply (it goes to the model next), while
-    a card waits for the user anywhere in the turn, before the router's own nudge to delegate on a level-3
-    turn, or while workers have yet to report (the finish gate collects them and continues the turn)."""
+    completion_guard.CONTINUE instead of ending the turn. At most MAX_CONTINUES per user turn, the turn's record
+    correction included (completion_guard.nudges_left), and never twice without a tool run in between, counted
+    on the user's message so a resumed turn keeps the count. Never for a worker, after a Stop, at the step
+    limit, on a question or other request for no scene work (even after a read tool ran), with a note the
+    user sent during the reply (it goes to the model next), while a card waits for the user anywhere in the
+    turn, before the router's own nudge to delegate on a level-3 turn, or while workers have yet to report
+    (the finish gate collects them and continues the turn)."""
     if (spec.role == "worker" or turn.cancel.is_set() or turn.outcome != "running" or turn.notes
             or (cfg.max_steps and step >= cfg.max_steps)
             or scene_action is False or not (scene_action or turn.executed_tools)):
         return False
     used = request.get(completion_guard.CONTINUED, 0)
-    if (used >= completion_guard.MAX_CONTINUES
+    if (completion_guard.nudges_left(request) <= 0
             or turn.executed_tools <= request.get(completion_guard.CONTINUED_AT, -1)):
         return False
     routed = getattr(turn, "routed", None)
@@ -1708,6 +1910,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
     turn.unrun_claim = request.get(completion_guard.CORRECTED, turn.unrun_claim)
     scene_action = completion_guard.scene_request(request)
     plan_turn = uuid.uuid4().hex
+    consent = None
     alike = alike or _alike_on_main
     if run_tool is _run_tool_on_main:
         run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
@@ -1759,21 +1962,34 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if no_progress:
                     no_progress.reset()
             _fold_notes(session, turn)
+            shown = {id(item) for item in items}  # Not an index: a request may drop an earlier setup error.
             # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
             messages.append(completion.as_message())
             if not completion.tool_calls:
                 bounce = None
-                if (spec.role != "worker" and scene_action and not turn.executed_tools
-                        and not turn.unrun_claim and not turn.cancel.is_set()
+                # The turn's one record correction, from the nudges it shares with announced steps: for calls the
+                # reply only wrote out (_unmade), else for other imitated records. Like the nudge, never for a
+                # worker, after a Stop, on a question, or on a reply that says plainly it stops or nothing ran.
+                honest = completion_guard.stops_honestly(completion.text)
+                written_out = bool(completion.unmade and spec.role != "worker" and not turn.cancel.is_set()
+                                   and scene_action is not False and (scene_action or turn.executed_tools)
+                                   and not honest)
+                if written_out:
+                    bounce = _unmade(session, turn, request, completion, [i for i in items if id(i) not in shown],
+                                     turn.outcome == "running" and not (cfg.max_steps and step >= cfg.max_steps))
+                elif (spec.role != "worker" and scene_action and not turn.executed_tools
+                        and not turn.unrun_claim and not turn.cancel.is_set() and not honest
+                        and completion_guard.nudges_left(request) > 0
                         and completion_guard.imitates_records(completion.text, (
                             s["function"]["name"] for s in _session_schemas(session, spec)))):
                     turn.unrun_claim = request[completion_guard.CORRECTED] = True
                     bounce = completion_guard.CORRECTION
-                # Before the finish gates: they stamp Verified records on a reply they let end the turn.
-                if not bounce and _continue_announced(session, turn, spec, request, completion, cfg, step,
-                                                      scene_action):
+                # Before the finish gates: they stamp Verified records on a reply they let end the turn. Never on
+                # a reply that only wrote its calls out (one nudge per reply), or that stops honestly.
+                if not bounce and not written_out and not honest and _continue_announced(
+                        session, turn, spec, request, completion, cfg, step, scene_action):
                     bounce = completion_guard.CONTINUE
                 if not bounce:
                     bounce = _final_reply(session, turn, completion, spec)
@@ -1786,6 +2002,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     spec.save(session)
                     _redraw()
                     continue
+                if written_out:  # Not sent back, and nothing sent the turn on: it ends on Loopcut's line.
+                    turn.unmade_final = UNMADE_FINAL if turn.unrun_claim else UNMADE_FINAL.replace(" again", "")
                 turn.outcome = "cancelled" if turn.cancel.is_set() else "completed"
                 return
 
@@ -1873,8 +2091,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 delegations = len(turn.delegations)
                 _plan_attempt(card, call, session, plan_turn)
                 from . import cloud_account
-                with cloud_account.approval_context(_Consent(session, turn, card, spec.asks,
-                                                             files_allowed=cfg.auto_run or session['auto_run'])):
+                consent = _Consent(session, turn, card, spec.asks, files_allowed=cfg.auto_run or session['auto_run'])
+                with cloud_account.approval_context(consent):
                     turn.executed_tools += 1
                     request[completion_guard.EXECUTED] = turn.executed_tools
                     result = run_tool(call.name, arguments)
@@ -1894,7 +2112,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                                 or (getattr(result, "scene_before", None) is not None
                                     and getattr(result, "scene_after", None) is not None))
                     stalled = no_progress.record(key, result.ok, changed or (may_change and not measured))
-                result.text += turn.ledger.record(step, key, result.text, result.ok, read, step_message)
+                ledger_note = turn.ledger.record(step, key, result.text, result.ok, read, step_message)
+                if consent.rig:  # The rig card shows its result text; the ledger's note is for the model.
+                    result.model_note = (getattr(result, 'model_note', '') or '') + ledger_note
+                else:
+                    result.text += ledger_note
                 if note:
                     result.text += note
                 if spec.after_tool:
@@ -1913,11 +2135,14 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 card["output"] = result.text
                 if card.get("plan_turn") and getattr(result, "plan_refused", False):
                     card["plan_repair"] = "needed"
-                if getattr(result, "receipt", ""):
+                consent.finish(result)
+                if getattr(result, "receipt", "") and not consent.rig:
                     card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
                 for guard in getattr(result, "guard_notes", None) or ():  # Already in result.text too.
                     items.append(state.item_guard(guard["text"], guard["modifiers"]))
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result.text})
+                model_note = getattr(result, 'model_note', '')
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": result.text + ('\n\n' + model_note if model_note else '')})
                 if changed and not asked_look and not refusal:
                     changed_by = (card, messages[-1])
                 if result.image_path:
@@ -2025,7 +2250,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             nudges.flush(session)  # A waiting trial or low-credit card, after the reply, never during it.
         if turn.scene_after is not None and not turn.returned_submission:
             session["scene_seen"] = turn.scene_after  # What the next message's context diffs against.
-        for item in items:
+        for item in items + (consent.shown[1:] if consent else []):
             if item.get("streaming"):
                 item["streaming"] = False
                 finish_reply(item, turn.roots[0] if turn.roots else None)
@@ -2056,8 +2281,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             elif item in items:
                 items.remove(item)
         # Only a correction warrants this notice. Finish hooks may have appended real runtime
-        # records to the UI since the model's final text was checked above.
-        if (spec.role != "worker" and not spec.drive and not turn.executed_tools
+        # records to the UI since the model's final text was checked above. A reply that only wrote its
+        # calls out and ended the turn has Loopcut's own line instead.
+        if turn.unmade_final:
+            items.append(state.item_notice(turn.unmade_final))
+        elif (spec.role != "worker" and not spec.drive and not turn.executed_tools
                 and turn.unrun_claim):
             items.append(state.item_notice(completion_guard.NOTICE))
         try:
@@ -2124,8 +2352,11 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         telemetry.first_use("result_error")
         return False
     messages = session["messages"]
-    if messages and messages[-1].get(context.STEP_LIMIT) and messages[-1].get("content") == completion_guard.CONTINUE:
-        messages.pop()  # Left last by a Stop or an error; resume() goes on from it, a new message replaces it.
+    last = str(messages[-1].get("content")) if messages and messages[-1].get(context.STEP_LIMIT) else ""
+    if last in (completion_guard.CONTINUE, completion_guard.CORRECTION) or last.startswith(UNMADE_PROMPT[:30]):
+        # A nudge or record correction left last by a Stop or an error; resume() goes on from it, a new message
+        # replaces it (it would ask the model to run what the user stopped).
+        messages.pop()
     if turn.config is not None and config.on_service(turn.config.base_url):
         turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),
                            "messages": deepcopy(session["messages"]), "references": list(session["references"]),

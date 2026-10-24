@@ -35,7 +35,7 @@ MAX_SKILLS = 128
 MAX_SKILL_BYTES = 256 * 1024
 UPDATE_MESSAGE = "Update Loopcut to use cloud tools"
 _APPLY = {"add_image_reference", "import_model", "import_material", "add_audio_strip",
-          "load_frames", "attach_report", "none", "apply_shape_keys", "apply_motion"}
+          "load_frames", "attach_report", "none", "apply_shape_keys", "apply_motion", "apply_rig"}
 _FIELD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _runtime = None
 _snapshot_at = 0
@@ -219,6 +219,8 @@ def schema(descriptor):
     required = parameters.setdefault("required", [])
     description = descriptor["description"]
     for field in descriptor.get("file_inputs", []):
+        if descriptor.get('apply') == 'apply_rig':
+            continue  # Generated from selected originals, never arbitrary paths supplied by the model.
         name = field["field"]
         video = any(mime.startswith("video/") for mime in field.get("accept", []))
         properties[name] = {"type": "string", "description": (
@@ -243,6 +245,19 @@ def schema(descriptor):
                 "description": "Optional quote from a previous call with the same inputs. The client obtains a quote and asks for approval before submission."}
     if _packs_scene(descriptor):  # The model cannot build a bundle; the contract's bundle field is filled per call.
         description += " Loopcut packs and uploads the current scene as its bundle itself."
+    if descriptor.get('apply') == 'apply_rig':
+        # The quote obtains consent for both rig tiers. This is a client-owned
+        # capability flag, not something the model may accidentally omit.
+        properties.pop('accept_experimental', None)
+        if 'accept_experimental' in required:
+            required.remove('accept_experimental')
+        description += (" First use character_rig(action='inspect') on the character. Loopcut checks again locally "
+                        "and generates geometry-only files; materials and textures stay here. For 'make him walk' "
+                        "on an unrigged character, rig it first. Standard humanoid rigs support motion tools. "
+                        "Experimental rigs keep the AI's native skeleton and cost the same 20 credits; use their "
+                        "returned bone chains to keyframe, rename or fix bones and weights with ordinary Blender tools. "
+                        "Never send an experimental rig to motion tools. Never promise a refund for a local "
+                        "apply failure unless the service confirms it.")
     return {"type": "function", "function": {"name": PREFIX + descriptor["name"],
             "title": descriptor["title"], "description": description, "parameters": parameters}}
 
@@ -932,7 +947,7 @@ def tool_schemas():
     if locked:
         schemas.append(offer_schema(locked))
     with _jobs_lock:
-        pending = any(row["result"] is None for row in _jobs.values())
+        pending = any(row["result"] is None or row["result"].then is not None for row in _jobs.values())
     if any(d["latency"] == "long" for d in descriptors) or pending:
         schemas.append(deepcopy(JOB_SCHEMA))
     return schemas
@@ -1093,6 +1108,8 @@ def describe(name, arguments):
         row = next((r for r in locked_tools() if r["name"] == (arguments or {}).get("tool")), None)
         return f"How to unlock {row['title'] if row else 'a cloud tool'}", ""
     title = descriptor["title"] if descriptor else bare
+    if bare == 'auto_rig':
+        return 'Rig your character', ''
     quote = None
     if descriptor and descriptor["backend"] == "managed" and isinstance(arguments.get("quote_id"), str):
         with _runtime.lock:
@@ -1101,9 +1118,18 @@ def describe(name, arguments):
     return f"{title} · {route}", ""
 
 
-def error_text(error):
+def error_text(error, *, rig=False):
+    if rig or error.extra.get('rig_code') or (isinstance(error.extra.get('job'), dict)
+                                            and error.extra['job'].get('tool') == 'auto_rig'):
+        from . import rig_text
+        if isinstance(error, cloud_http.CloudError):
+            cloud_account.report_error(error)  # Keep account recovery buttons beside the short copy.
+        return rig_text.error(error)
     # Preserve contract extras for retries, quotes, refunds and policy explanations.
     # A confirm_token (C47) is a single-use approval capability: never in model text or history.
+    if error.code == 'experimental_rig':
+        from .rig_experimental import MOTION_REFUSAL
+        return MOTION_REFUSAL
     extra = {k: v for k, v in error.extra.items() if k not in {"job", "upgrade", "confirm_token"}}
     return safe_value(_error_message(error) + ("\n" + json.dumps({"error": {"code": error.code,
         "type": error.error_type, **extra}}, ensure_ascii=False) if extra else ""))
@@ -1142,6 +1168,9 @@ def _error_message(error):
     code, extra = error.code, error.extra
     if code == "quote_required":
         return f"quote_required: {extra.get('credits', '?')} credits. Ask the user to approve this quote, then repeat the same inputs with quote_id."
+    if extra.get('rig_code') or (isinstance(extra.get('job'), dict) and extra['job'].get('tool') == 'auto_rig'):
+        from . import rig_text
+        return rig_text.error(error)
     if code == "vendor_failed" and extra.get("field") == "input.bundle":
         return _BUNDLE_REFUSED.format(refunded="credits refunded" if extra.get("refunded") else "no credits charged",
                                       detail=re.sub(r"\s*To try again,.*", "", str(error))[:300])
@@ -1177,15 +1206,43 @@ class _Cancel(threading.Event):
         self.is_cancelled = lambda: False
 
 
+def _card_progress(card, progress):
+    card['output'] = safe_value(f"{progress.get('pct', 0)}% · {progress.get('message', 'Working…')}"
+                               if isinstance(progress, dict) else str(progress))
+    if tool_name(card.get('name', '')) == 'auto_rig':
+        card['rig_stage'] = safe_value(progress.get('message', 'Rigging your character…')
+                                      if isinstance(progress, dict) else str(progress))
+        if isinstance(progress, dict) and progress.get('job_id'):
+            card['cloud_job_id'] = progress['job_id']
+
+
 def _progress(name, progress):
     from . import mainthread, state
+    report = cloud_account.progress_reporter()
     def update():
-        card = next((i for i in reversed(state.session()["items"]) if i.get("name") == name and i.get("status") == "running"), None)
-        if card is not None:
-            card["output"] = safe_value(f"{progress.get('pct', 0)}% · {progress.get('message', 'Working…')}"
-                                        if isinstance(progress, dict) else str(progress))
+        job_id = progress.get('job_id') if isinstance(progress, dict) else None
+        if report:
+            report(progress)
+        else:
+            card = next((i for i in reversed(state.session()["items"])
+                         if i.get("name") == name and i.get("status") == "running"
+                         and (not job_id or i.get('cloud_job_id') == job_id)), None)
+            if card is not None:
+                _card_progress(card, progress)
         mainthread.request_redraw()
-    mainthread.run_on_main(update)
+    if name == PREFIX + 'auto_rig' and threading.current_thread() is threading.main_thread():
+        update()
+        # Preparation/apply runs synchronously on Blender's main thread. Draw its
+        # stage before the bounded scene work, rather than revealing it afterwards.
+        import bpy
+        if not getattr(getattr(bpy, 'app', None), 'background', True):
+            windows = bpy.context.window_manager.windows
+            window = bpy.context.window or (windows[0] if windows else None)
+            if window:
+                with bpy.context.temp_override(window=window, screen=window.screen):
+                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+    else:
+        mainthread.run_on_main(update)
 
 
 def _run(runtime, module, descriptor, arguments, files, out_dir, cancel, progress):
@@ -1226,7 +1283,8 @@ def _validate_arguments(descriptor, arguments):
     json.dumps(arguments, allow_nan=False)
     parameters = schema(descriptor)["function"]["parameters"]
     properties = parameters.get("properties", {})
-    file_fields = {f["field"]: f for f in descriptor.get("file_inputs", [])}
+    file_fields = ({} if descriptor.get('apply') == 'apply_rig' else
+                   {f["field"]: f for f in descriptor.get("file_inputs", [])})
     required = set(parameters.get("required", [])) | {
         field for field, spec in file_fields.items() if spec["required"]}
     missing = required - arguments.keys()
@@ -1309,6 +1367,7 @@ def execute(name, arguments):
     from . import checkpoints, state, tools
     import bpy
     origin_scene = getattr(getattr(bpy, 'context', None), 'scene', None)
+    rig = tool_name(name) == 'auto_rig'
     try:
         sync_settings()
     except config.ConfigError as ex:
@@ -1329,17 +1388,19 @@ def execute(name, arguments):
         if runtime and runtime.supported and runtime.no_generation() and refused and refused.get("kind") == "gen":
             scope = "account" if ((runtime.manifest.get("account") or {}).get("settings") or {}).get("no_generation") else "project"
             return tools.ToolResult(error_text(cloud_http.CloudError("Generation disabled", "generation_disabled", 403,
-                                                                    {"scope": scope})), ok=False)
+                                                                    {"scope": scope}), rig=rig), ok=False)
         if runtime and refused and (refused.get("unavailable_reason") == "private_mode"
                 or runtime.private_mode() and (refused.get("byok") or {}).get("data_class") in ("C", "D")):
             error = cloud_http.CloudError("Private mode refuses this vendor route", "private_mode", 403,
                                           {"data_class": (refused.get("byok") or {}).get("data_class", "unknown")})
-            return tools.ToolResult(error_text(error), ok=False)
+            return tools.ToolResult(error_text(error, rig=rig), ok=False)
         if runtime and refused:
             reason = cloud_account.refusal(refused, {"no_generation": runtime.no_generation(),
                                                      "private_mode": runtime.private_mode()})
             if reason:
                 return tools.ToolResult(reason, ok=False)
+        if rig:
+            return tools.ToolResult('Rigging is unavailable; sign in or refresh your tools and retry.', ok=False)
         return tools.ToolResult((runtime.message if runtime else "") or "Cloud tool unavailable. Sign in, add credits or configure a vendor key, then choose an available tool.", ok=False)
     try:
         module = importlib.import_module(".cloud_jobs", __package__)
@@ -1350,13 +1411,24 @@ def execute(name, arguments):
     if any(not callable(getattr(module, fn, None)) for fn in ("resolve_files", "run", "apply_result")):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is incomplete).", ok=False)
     out_dir, session, bundle_checkpoint = None, None, None
+    rig_notice, rig_notice_first = '', False
     if _packs_scene(descriptor):
         arguments = {k: v for k, v in arguments.items() if k != "bundle"}  # Only the scene packed here is sent.
     try:
         _validate_arguments(descriptor, arguments)
+        if descriptor.get('apply') == 'apply_rig':
+            if descriptor['version'] != 3:
+                raise cloud_http.CloudError('Refresh the tools to use the current auto-rig service.', 'tool_disabled')
+            arguments = {**arguments, 'accept_experimental': True}
         out_dir = runtime.cache_dir / "jobs" / uuid.uuid4().hex
         out_dir.mkdir(parents=True, exist_ok=True)
+        if descriptor.get('apply') == 'apply_rig':
+            from .autorig import STAGES
+            _progress(name, STAGES['checking'])
         files = module.resolve_files(descriptor, arguments, out_dir)
+        if descriptor.get('apply') == 'apply_rig':
+            from . import autorig
+            rig_notice, rig_notice_first = autorig.quote_notice(out_dir)
         prepare = getattr(module, "prepare_inputs", None)
         if callable(prepare):  # Measured inputs (a video's length) and the apply handler's resolved target.
             arguments = prepare(descriptor, arguments, files)
@@ -1386,10 +1458,14 @@ def execute(name, arguments):
     except (cloud_http.CloudError, config.ConfigError, OSError, ValueError, tools.ToolError,
             checkpoints.CheckpointError) as ex:
         if out_dir is not None:
+            if descriptor.get('apply') == 'apply_rig':
+                from . import autorig
+                autorig.discard(out_dir)
             _discard_preparation(out_dir)
         if isinstance(ex, cloud_http.CloudError):
             runtime.handle_error(ex)
-        return tools.ToolResult(error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False)
+        return tools.ToolResult(error_text(ex, rig=True) if descriptor.get('apply') == 'apply_rig' else
+                                error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False)
     # Freeze policies and routing before leaving Blender's thread.
     snapshot = SimpleNamespace(policy={"no_generation": runtime.no_generation(), "private_mode": runtime.private_mode()},
                                handle_error=runtime.handle_error, client=client, vendor_key=vendor_key, account=runtime)
@@ -1407,20 +1483,27 @@ def execute(name, arguments):
             if bundle_checkpoint:  # Packed once: the quote, its card and an Approve retry all send this hash.
                 call_arguments = {**arguments, "bundle": _upload_bundle(session, bundle_checkpoint, out_dir / "bundle",
                                                                         snapshot.client, cancel, progress)}
+            if descriptor.get('apply') == 'apply_rig':
+                from .autorig import STAGES
+                progress(STAGES['uploading'])
             approved_arguments = cloud_account.authorize(module, descriptor, call_arguments, files, runtime=runtime,
                 project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
-                cancel=cancel, client=snapshot.client)
+                cancel=cancel, client=snapshot.client, notice=rig_notice, notice_first=rig_notice_first,
+                on_progress=progress if descriptor.get('apply') == 'apply_rig' else None)  # Quote stages: a rig's only.
             on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
             authorized = True
         except cloud_http.CloudError as ex:
             runtime.handle_error(ex)
             report(0)  # Nothing was submitted: a hold taken at consent is released.
-            return tools.ToolResult(error_text(ex), ok=False)
+            return tools.ToolResult(error_text(ex, rig=descriptor.get('apply') == 'apply_rig'), ok=False)
         finally:
             if bundle_checkpoint:  # Collected or not, its snapshot is no restore point; not waited for.
                 from . import mainthread
                 mainthread.run_on_main(lambda: checkpoints.discard(session, bundle_checkpoint))
             if not authorized:
+                if descriptor.get('apply') == 'apply_rig':
+                    from . import autorig
+                    on_main(lambda: autorig.discard(out_dir))
                 _discard_preparation(out_dir)
         try:
             job = _run(snapshot, module, descriptor, approved_arguments, files, out_dir, cancel, progress)
@@ -1428,13 +1511,14 @@ def execute(name, arguments):
                 cancel.detach()
                 release = lambda spent=False: cloud_account.complete(runtime, approved_arguments, spent)
                 with _jobs_lock:
-                    finished = [key for key, row in _jobs.items() if row["result"] is not None]
+                    finished = [key for key, row in _jobs.items()
+                                if row["result"] is not None and row["result"].then is None]
                     for key in finished[:-31]:
                         del _jobs[key]
                     _jobs.setdefault(job["id"], {"descriptor": descriptor, "module": module,
                                                 "handle_error": runtime.handle_error,
                                                 "report_error": cloud_account.error_reporter(), "result": None,
-                                                'scene': origin_scene, 'complete': release})
+                                                'scene': origin_scene, 'complete': release, 'charge_reporter': report})
                 watch = getattr(module, "watch", None)
                 if job.get("status") in ("succeeded", "failed", "canceled"):
                     _settle_final(report, job, None)
@@ -1452,10 +1536,16 @@ def execute(name, arguments):
                 return tools.ToolResult("Cloud call canceled; no output applied.", ok=False)
             if job.get("status") != "succeeded":
                 return tools.ToolResult(f"Cloud job {job.get('status', 'incomplete')}; no output applied.", ok=False)
-            return on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene))
+            result = on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene, report=report))
+            return result.then(is_cancelled, on_main) if result.then else result
         except cloud_http.CloudError as ex:
             _settle_error(report, ex)
-            return tools.ToolResult(error_text(ex), ok=False)
+            if descriptor.get('apply') == 'apply_rig' and (ex.code == 'canceled' or
+                    (ex.extra.get('job') or {}).get('status') in ('failed', 'canceled')):
+                from . import autorig
+                on_main(lambda: autorig.discard(out_dir))
+            result = _rig_failure_result(module, descriptor, ex, report=report)
+            return result.then(is_cancelled, on_main) if result.then else result
         finally:
             if descriptor['backend'] == 'managed':
                 _discard_preparation(out_dir)
@@ -1513,27 +1603,78 @@ def _settle_error(report, error):
         report(0)
 
 
-def _apply(module, descriptor, job):
+def _rig_failure_result(module, descriptor, ex, *, report=None, before=None, after=None):
+    """One retryable receipt flow for failed rig verification or scene application."""
+    from . import tools
+    result = tools.ToolResult(error_text(ex, rig=descriptor.get('apply') == 'apply_rig'), ok=False,
+                              scene_before=before, scene_after=after)
+    job = ex.extra.get('job') or {}
+    if descriptor.get('apply') == 'apply_rig' and ex.extra.get('apply_failure') is True:
+        from .rig_text import STAGES
+        _progress(PREFIX + 'auto_rig', STAGES['refund'])
+        waited = False
+        def finish(is_cancelled, on_main):
+            nonlocal waited
+            # Reporting changes no scene and spends nothing. Finish its
+            # bounded request even if cancellation arrives after apply failed.
+            outcome = module.wait_rig_refund(job['id'], retry=waited)
+            waited = True
+            if outcome is None:
+                return tools.ToolResult(result.text, ok=False, scene_before=before, scene_after=result.scene_after)
+            if report is not None:
+                _settle_final(report, outcome['job'], None)
+            def complete():
+                result.text = outcome['message']
+                result.receipt = cloud_account.receipt(outcome['job'])
+                result.model_note = (f"Check the refund with loopcut_cloud.job_status using job_id {job['id']}."
+                                     if outcome['status'] == 'unconfirmed' else '')
+                if outcome['status'] in {'refunded', 'review'}:
+                    result.then = None
+                return tools.ToolResult(result.text, ok=False, scene_before=before,
+                                        scene_after=result.scene_after, receipt=result.receipt,
+                                        model_note=result.model_note)
+            return on_main(complete)
+        result.then = finish
+        # A failed ordinary (non-detached) rig also gets a job_status handle
+        # so an unconfirmed report can retry the same job, without reapplying
+        # the rig, uploading the character, quoting, or spending again.
+        with _jobs_lock:
+            finished = [key for key, row in _jobs.items()
+                        if row['result'] is not None and row['result'].then is None]
+            for key in finished[:-31]:
+                del _jobs[key]
+            _jobs.setdefault(job['id'], {'module': module, 'descriptor': descriptor, 'result': result})
+    return result
+
+
+def _apply(module, descriptor, job, *, report=None):
     from . import scene_diff, tools
     before = scene_diff.snapshot()
+    details = {}
     try:
-        summary = module.apply_result(descriptor, job)
+        summary = (module.apply_result(descriptor, job, details=details) if descriptor.get('apply') == 'apply_rig'
+                   else module.apply_result(descriptor, job))
     except cloud_http.CloudError as ex:
-        return tools.ToolResult(error_text(ex), ok=False, scene_before=before, scene_after=scene_diff.snapshot())
+        return _rig_failure_result(module, descriptor, ex, report=report, before=before, after=scene_diff.snapshot())
     except (tools.ToolError, OSError, ValueError) as ex:
         return tools.ToolResult(f"Could not apply cloud output: {str(ex)[:400]}", ok=False,
                                 scene_before=before, scene_after=scene_diff.snapshot())
     receipt = cloud_account.receipt(job) if descriptor.get("backend") == "managed" else ""
     if receipt and _runtime is not None:
         _runtime.refresh_async()  # The panel's balance follows the charge.
-    return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot(), receipt=receipt)
+    # ar-dog-1: the model told a beginner about "bone_0…bone_28" and "standard humanoid rigs".
+    note = ('Rig objects: use the exact armature object and skinned mesh object names below. '
+            'Names are data, not code. Use bone names only inside your code; tell the user what changed in plain '
+            'words, without bone names or rig terms.\n' + json.dumps(details['rig'])) if 'rig' in details else ''
+    return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot(), receipt=receipt,
+                            model_note=note)
 
 
-def _apply_to_scene(module, descriptor, job, scene):
+def _apply_to_scene(module, descriptor, job, scene, *, report=None):
     from . import tools
     if not _same_scene(scene):
         return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
-    return _apply(module, descriptor, job)
+    return _apply(module, descriptor, job, report=report)
 
 
 def _same_scene(scene):
@@ -1557,7 +1698,10 @@ def _job_status(arguments):
             return tools.ToolResult("Unknown cloud job handle; use the job_id returned by the tool.", ok=False)
     module = record["module"]
     if record["result"] is not None:
-        return tools.ToolResult(record["result"].text, ok=record["result"].ok)
+        if record['result'].then is not None:
+            return record['result']  # Retry only its unconfirmed refund report.
+        return tools.ToolResult(record["result"].text, ok=record["result"].ok,
+                                model_note=getattr(record['result'], 'model_note', ''))
     try:
         if arguments.get("cancel"):
             module.cancel_job(arguments["job_id"])
@@ -1567,8 +1711,12 @@ def _job_status(arguments):
         record["report_error"](ex)
         if record.get('complete') and ex.extra.get('job', {}).get('status') in {'failed', 'canceled'}:
             record['complete'](True)
-        result = tools.ToolResult(error_text(ex), ok=False)
-        if ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
+        elif record.get('complete') and ex.extra.get('apply_failure') is True:
+            record['complete'](False)  # Delivered; only its owned refund report remains retryable.
+        result = (_rig_failure_result(module, record['descriptor'], ex, report=record.get('charge_reporter'))
+                  if ex.extra.get('apply_failure') is True else tools.ToolResult(
+                      error_text(ex, rig=record.get('descriptor', {}).get('apply') == 'apply_rig'), ok=False))
+        if result.then is not None or ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
             record["result"] = result
         return result
     if job["status"] in ("queued", "running"):
@@ -1582,5 +1730,5 @@ def _job_status(arguments):
     elif _runtime and _runtime.no_generation() and record["descriptor"]["kind"] == "gen":
         return tools.ToolResult("generation_disabled: generation is disabled for this project; output was not applied.", ok=False)
     else:
-        record["result"] = _apply(module, record["descriptor"], job)
+        record["result"] = _apply(module, record["descriptor"], job, report=record.get('charge_reporter'))
     return record["result"]

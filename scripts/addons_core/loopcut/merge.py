@@ -110,7 +110,9 @@ def _held_note(entry: dict) -> str:
 class MergeReport:
     """created: {worker, name, id_type, type, parent, held?}; replaced: {worker, key, name, removed?,
     pointer?, held?}; renamed: "worker: TYPE old -> new"; quarantined: {worker, wave, name, id_type,
-    type, hidden}; dropped_edits: {worker, key, name, worker_value, live_value}; conflicts:
+    type, hidden}; dropped_edits: {worker, key, name, worker_value, live_value, in_copy_only?: a change
+    no copy in the result carried, from the manifest's in_copy_only; mesh_not_owned?: an owned object's
+    weight edit on a mesh it shares with an unowned one, from weights_not_merged}; conflicts:
     {worker, keys | pointer, reason, live_now, worker_value}; errors: text; checkpoint: its id.
     quarantined entries also carry reason: why it is held back (what the role makes and what would let
     it through). admitted: {worker, name, id_type, type, reason}: created outside the worker's role but
@@ -167,7 +169,9 @@ class MergeReport:
                   f"{q.get('reason') or 'outside its role'}" for q in self.quarantined]
         lines += [f"{a['worker']}: {a['name']} ({(a['type'] or a['id_type']).lower()}) merged though outside its role: "
                   f"{a['reason']}" for a in self.admitted]
-        lines += [f"{d['worker']}: edit to {d['name']} dropped (not owned" + (
+        lines += [f"{d['worker']}: weight edit to {d['name']} dropped (its mesh is shared with an object it does "
+                  f"not own, so the mesh is not owned)" if d.get("mesh_not_owned") else
+                  f"{d['worker']}: edit to {d['name']} dropped (not owned" + (
             "; a palette material changes only with aspect materials, a worker's own copy merges)"
             if d["key"].startswith("MATERIAL:") else ")") for d in self.dropped_edits]
         lines += [f"{c['worker']}: {c.get('pointer') or ', '.join(c.get('keys', []))} not merged: {c['reason']}"
@@ -891,6 +895,15 @@ def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeRepo
     live_materials = {i.name: i for i in by_uid.values() if i.id_type == "MATERIAL" and i.library is None}
     to_remove += _reuse_live_materials(created, live_materials, worker, report)
 
+    # What the worker changed but does not own and nothing in its result refers to never left its
+    # Blender, so no copy below shows it: the child's manifest lists it (write_result's in_copy_only,
+    # a worker child's only), and it is reported as a dropped edit all the same. Otherwise a worker
+    # that repaired weights on such an object said so and nothing told anyone the edit went nowhere
+    # (worker_child._changed no longer rolls weight edits back per call).
+    carried = {f"{idb.id_type}:{idb[STAMP]}" for idb in copies}
+    stayed = [key for key in (manifest.get("advisory") or {}).get("in_copy_only") or ()
+              if isinstance(key, str) and key not in owned and key not in carried and key in spawn.tokens]
+
     # Copies of what the worker doesn't own: a change is dropped and reported; references go live.
     for idb in copies:
         key = f"{idb.id_type}:{idb[STAMP]}"
@@ -905,6 +918,15 @@ def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeRepo
             del idb[STAMP]
             continue
         to_remove += swap(idb, live)
+    for key in stayed:
+        live = live_of(key)
+        report.dropped_edits.append({"worker": worker, "key": key, "name": live.name if live else key.split(":", 1)[1],
+                                     "worker_value": {}, "live_value": ownership.describe(live), "in_copy_only": True})
+    for key in (manifest.get("advisory") or {}).get("weights_not_merged") or ():
+        live = live_of(key) if isinstance(key, str) and key in owned else None
+        if live is not None:  # Owned, its mesh not (shared): the weights painted on it stay in its copy.
+            report.dropped_edits.append({"worker": worker, "key": key, "name": live.name, "worker_value": {},
+                                         "live_value": ownership.describe(live), "mesh_not_owned": True})
 
     # Owned: replace the live original unless the user changed or deleted it during the wave.
     # What the worker owns but left as it was stays the live one, whatever the user did to it.

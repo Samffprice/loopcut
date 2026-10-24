@@ -1,0 +1,21 @@
+The cleanest exact restore is the undo stack: our changes came in as discrete steps, and the target state (original heads + original weights + your stress pose) sits right before the head-move step. I'll step back one undo at a time, watching the arm bone's rest head position, and stop the moment it returns to 0.528:
+- run_python "Undo back to the state before the shoulder fix (heads + weights), verifying rest head position": ok, printed:
+    undo 1: LeftArm head z 0.5776
+    undo 2: LeftArm head z 0.5776
+    undo 3: LeftArm head z 0.5280 -> original rest position restored; stopped here
+    ~ Mesh: bounds now [-0.5159, -0.2087, -0.6604]..[0.5221, 0.5286, 1.0381]
+
+Restored to the exact pre-fix state (3 undo steps: my smoothing, the twist cycle, and the head move). The stress pose is intact (bounds match the pre-fix pose). But the 90° wrist twist went with it, so I'll re-apply that one step only, exactly as before (rotation about each hand's local Y):
+- run_python "Re-apply 90° wrist twist about hand local Y only": ok, printed:
+    mixamorig:LeftHand local-Y twist applied
+    mixamorig:RightHand local-Y twist applied
+    done
+    ~ Mesh: bounds now [-0.551, -0.1697, -0.6604]..[0.6332, 0.5286, 1.0638]
+
+Bounds match the earlier twisted state exactly. Now verifying the restored weights with the deformation check and a look:
+- character_rig({"action":"check_deformation"}): Deformation check (free; the posed mesh against rest): no spikes or torn skin at the turned joints.
+    - left shoulder, turned 80° from rest: no spikes or torn skin (stretch 1.99x, squash 0.35x, volume 97%).
+    - left elbow, turned 13° from rest: no spikes or torn skin (stretch 1.31x, squash 0.91x, volume 106%).
+    - left wrist, turned 90° from rest: no spikes or torn skin (stretch 1.45x, squash 0.48x, vol [+842 chars]
+
+- capture_viewport({"angle":"three_quarter"}): Image attached: three_quarter view of Mesh; studio lighting, not the scene's lights or world. Drawn: the viewport, Material Preview, AgX view, 640x533 px.

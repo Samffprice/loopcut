@@ -11,7 +11,8 @@ moments, in batches:
    the model needs to avoid undoing its own fixes), then per call its label, whether it worked,
    what the code printed and the full "Scene changes". Code bodies and long outputs go: the scene
    is the source of truth for exact values, and the model can read it again. Nothing is edited:
-   a step is marked FOLDED and its record is built when a request is sent.
+   a step is marked FOLDED and its record is built when a request is sent. A reply that copies a
+   record back, as if that made the call, has it taken out (copied_records).
 2. When the user sends a message, every step of the earlier turns is folded. One cache break
    per turn, when the request grows anyway.
 3. Mid-turn, only when a request would pass FOLD_AT of the budget, the oldest steps of the turn
@@ -39,9 +40,10 @@ keys on messages start with PRIVATE_PREFIX and are never sent.
 """
 
 import json
+import re
 from typing import Callable
 
-from . import llm
+from . import completion_guard, llm
 
 PRIVATE_PREFIX = "loopcut_"  # Keys we keep on stored messages. conversations.wire_messages drops them.
 FOLDED = "loopcut_folded"     # On an assistant message with tool calls: the step is sent as its record.
@@ -57,6 +59,7 @@ KEEP_IMAGES = 3      # Captures sent per request: the newest step's, until the m
 KEEP_ATTACHED = 3    # Pinned references sent per request, newest first.
 RECORD_HEAD = ("Earlier steps. Their code and full results are no longer shown; what you said at each step "
                "and what it changed are. The scene is the source of truth: read it again for exact values.")
+LOOK_HEAD = "Earlier look, image no longer attached:"
 
 LIVE_STEPS = 3       # The newest steps of a turn are never folded mid-turn.
 FOLD_AT = 0.75       # Mid-turn folding starts when a request would exceed this share of the budget...
@@ -66,17 +69,20 @@ RECORD_PRINTED = 400  # Characters of what a step's code printed that its record
 RECORD_READ = 300     # Characters of any other tool's result that its record keeps.
 RECORD_CHANGES = 15   # Scene-change lines a record keeps.
 RECORD_LOOK = 300     # Characters of what a dropped capture showed.
+RECORD_ARGUMENTS = 100  # Characters of a call's arguments that its record keeps.
 # Measured on the Loopcut gateway (Meta upstream) against 56 logged requests, within 7%:
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 8260     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 8500     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
                         # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures;
                         # 8,194 on 2026-10-17 with the captures' labels switch; 8,198 in 0.2.13; 8,199 on
-                        # 2026-10-23 with asset pick numbers, the cap raised from 8,200 to 8,260 for headroom).
-WORKSPACE_FIXED_TOKENS = 4080  # The workspace prompt and tools including live inspect_api: 3,833 on 2026-10-09,
+                        # 2026-10-23 with asset pick numbers; 8,407 with auto-rig's tools on 2026-10-22, which only
+                        # accounts with auto-rig access get).
+WORKSPACE_FIXED_TOKENS = 4400  # Workspace prompt/tools including character_rig: 4,280 on 2026-10-22,
+                               # 3,833 on 2026-10-09 with live inspect_api,
                                # 4,012 on 2026-10-10 with the asset libraries note; 4,044 on 2026-10-15 with
                                # shell's summary; 4,067 on 2026-10-17 with capture_viewport's labels.
 WORKSPACE_BUDGET = 200_000     # The least budget a workspace turn gets (agent._workspace_config), so a long build
@@ -349,6 +355,94 @@ def _clause(text: str, limit: int) -> str:
     return (text[:cut] if cut > limit // 2 else text[:limit].rsplit(" ", 1)[0]) + " …"
 
 
+# --- Copied records ------------------------------------------------------------------------------------
+# The record shapes a reply can copy, kept here in one place to change with how fold writes them (_call_lines,
+# _look_line): the heads, whole lines; a call's line, '- name({json}): result' or '- run_python "summary": outcome';
+# the detail indented under it; a look's line. A reply is written before its calls run, so none of these reports a
+# step of its own: a hosted model wrote "- loopcut_cloud__motion_from_text({...}): Applied motion" and told the user
+# it was generating; ar-artist-1 wrote "- looked: ... no spikes" for a check that never happened.
+COPIED_HEADS = (RECORD_HEAD, LOOK_HEAD)
+COPIED_CALL = re.compile(r'- (?P<name>[A-Za-z_][\w.]*)\(\{.*\): |- (?P<python>run_python) "(?:[^"\n]|"(?!: ))*": ')
+COPIED_DETAIL = re.compile(r"(?: {2,}|\t)\S")
+COPIED_LOOK = re.compile(r'- looked(?P<file> at file)?(?:: | at the viewport\s*$)')
+LOOK_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene", "view_image", "see_render"}
+_FENCE = re.compile(r"\s*(?:```|~~~)")
+
+
+def _squash(line: str) -> str:
+    return re.sub(r"\s+", "", line).rstrip("…")
+
+
+def _records_made(messages: list) -> list[list[str]]:
+    """The record of every call that has a result, and the line of every look, as fold writes them."""
+    results = {m.get("tool_call_id"): m for m in messages if m.get("role") == "tool"}
+    made = [_call_lines(call, results[call.get("id")]) for m in messages if m.get("role") == "assistant"
+            for call in m.get("tool_calls") or [] if call.get("id") in results]
+    return [[_squash(line) for line in lines] for lines in made + [[_look_line(m)] for m in messages if m.get(CAPTURE)]]
+
+
+def _recap(block: list[str], made: list[list[str]]) -> bool:
+    """Whether a copied block repeats the record of a call that ran: its line a start of that record's, and
+    every detail line a start of one of its lines. A forgery of the same call says something else ("Wave 3
+    started" for a wave 2 that ran) or adds detail ("~ scene: +Desk")."""
+    head, *detail = [_squash(line) for line in block]
+    return any(record[0].startswith(head) and all(any(line.startswith(d) for line in record[1:]) for d in detail)
+               for record in made)
+
+
+def copied_records(text: str, called: set, messages: list = ()) -> tuple[str, list[str]]:
+    """text without what it copied from the records of earlier steps: their heads, a look's line, and a call's
+    line with its detail, unless the reply made that call. Kept: what is in a code fence or follows a line that
+    introduces an example or earlier steps (completion_guard.introduces_example), and a recap of a call that ran
+    (one of messages, _recap), unless the reply is nothing but records. Returns (text, the calls written out but
+    not made; a look counts as capture_viewport or view_image when the reply called no tool that looks); text
+    comes back as it was when nothing was copied."""
+    segments, block, fence, example = [], None, False, 0  # example: 1 after its introduction, 2 in its body.
+    for line in text.split("\n"):
+        if block is not None and COPIED_DETAIL.match(line):
+            block["lines"].append(line)
+            continue
+        block = None
+        look, call = COPIED_LOOK.match(line), COPIED_CALL.match(line)
+        if fence or _FENCE.match(line):
+            fence = fence != bool(_FENCE.match(line))
+        elif line.strip() in COPIED_HEADS:
+            segments.append({"kind": "head", "lines": [line]})
+            continue
+        elif not line.strip():
+            example = 0 if example == 2 else example
+        elif example:
+            example = 2
+        elif look or call:
+            name = ("view_image" if look.group("file") else "capture_viewport") if look else call.group(call.lastgroup)
+            block = {"kind": "look" if look else "call", "name": name, "lines": [line]}
+            segments.append(block)
+            continue
+        else:
+            example = 1 if completion_guard.introduces_example(line) else 0
+        segments.append(line)
+    copies = [s for s in segments if isinstance(s, dict)]
+    if not copies:
+        return text, []
+    only_records = not any(isinstance(s, str) and s.strip() for s in segments)
+    made = _records_made(messages) if messages and not only_records else []
+    kept, unmade = [], []
+    for segment in segments:
+        if isinstance(segment, str):
+            kept.append(segment)
+        elif segment["kind"] == "head":
+            continue
+        elif segment["kind"] == "call" and segment["name"] in called:
+            kept.extend(segment["lines"])
+        elif made and _recap(segment["lines"], made):
+            kept.extend(segment["lines"])
+        elif segment["kind"] == "call" or not called & LOOK_TOOLS:
+            unmade.append(segment["name"])
+    if len(kept) == len(text.split("\n")):
+        return text, []
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip(), unmade
+
+
 def record(message: dict, results: list[dict]) -> list[str]:
     """A folded step: what the model said, then each call's outcome."""
     lines = [message["content"].strip()] if isinstance(message.get("content"), str) and message["content"].strip() else []
@@ -367,7 +461,7 @@ def fold(messages: list, kept: set[int]) -> list[dict]:
         if entries:
             # Only dropped looks between live steps: one line each, not the records' preamble again.
             looks_only = all(e.startswith("- looked") for e in entries)
-            head = "Earlier look, image no longer attached:" if looks_only else RECORD_HEAD + "\n"
+            head = LOOK_HEAD if looks_only else RECORD_HEAD + "\n"
             out.append({"role": "assistant", "content": head + "\n" + "\n\n".join(entries)})
             entries.clear()
 
@@ -469,14 +563,15 @@ def transcript(messages: list) -> str:
     return "\n\n".join(lines)
 
 
-def summarize(cfg, messages: list, is_cancelled: Callable[[], bool], session: dict) -> str:
+def summarize(cfg, messages: list, is_cancelled: Callable[[], bool], session: dict, try_it: str = "") -> str:
+    """try_it: the Try it card of the turn this summary is made in (llm.correlation_headers); "" for any other."""
     completion = llm.stream_chat(
         base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
         messages=[{"role": "system", "content": SUMMARY_PROMPT},
                   {"role": "user", "content": transcript(messages) + "\n\nSummarize the conversation above as instructed."}],
         tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
         max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-        headers=llm.correlation_headers(session["id"], "summary"), on_retry=lambda: None)
+        headers=llm.correlation_headers(session["id"], "summary", try_it), on_retry=lambda: None)
     return completion.text.strip()
 
 

@@ -7,5 +7,10 @@ loopcut/tests/test_chatgpt_eval.py
 loopcut/tests/test_codex_answer.py
 # Managed server code belongs to the private platform repository.
 loopcut-web/
+# Auto-rig repair recipes mirror the hosted, private skills/recipes/autorig-repairs.md; they and the Blender checks
+# that run them stay private (0.2.15 dry run: 134 platform hits, none allowlistable).
+loopcut/AUTORIG-RECIPES.md
+loopcut/harness/autorig_recipe_check.py
+loopcut/harness/autorig_blender_api_check.py
 # Third-party captures must never enter a public snapshot. Their folders are named only in the private
 # loopcut/track/research_folders.txt (excluded above), which public_release.py adds to these rules.

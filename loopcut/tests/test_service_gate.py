@@ -118,7 +118,7 @@ class HeadersTest(unittest.TestCase):
         return {name.lower(): value for name, value in opened.call_args.args[0].header_items()}
 
     def test_byok_strips_every_loopcut_header_case_insensitively(self):
-        supplied = {**llm.correlation_headers("conv", "worker"), "X-LOOPCUT-Prompt": "worker",
+        supplied = {**llm.correlation_headers("conv", "worker", "motion"), "X-LOOPCUT-Prompt": "worker",
                     "x-LoopCut-future": "metadata", "X-Other": "keep"}
         with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": ""}):
             for url in (BYOK, LOCAL):
@@ -137,6 +137,14 @@ class HeadersTest(unittest.TestCase):
                 self.assertEqual(headers["x-loopcut-conversation"], "conv")
                 self.assertEqual(headers["x-loopcut-role"], prompt)
                 self.assertEqual(headers["x-loopcut-prompt"], prompt)
+
+    def test_service_receives_a_try_it_cards_header_only_when_given_one(self):
+        headers = self.request(config.SERVICE_BASE_URL, headers=llm.correlation_headers("conv", "worker", "photo_3d"),
+                               prompt_id="worker")
+        self.assertEqual(headers["x-loopcut-try-it"], "photo_3d")
+        headers = self.request(config.SERVICE_BASE_URL, headers=llm.correlation_headers("conv", "worker"),
+                               prompt_id="worker")
+        self.assertNotIn("x-loopcut-try-it", headers)
 
     def test_service_has_no_prompt_header_when_prompt_id_is_absent(self):
         for supplied in (llm.correlation_headers("conv", "single"), {"X-Loopcut-Prompt": "single"}):

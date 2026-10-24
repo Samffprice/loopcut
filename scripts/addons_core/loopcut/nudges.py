@@ -238,18 +238,35 @@ def observe(manifest: dict, signed_in: bool, live: list[str]) -> None:
     credits = (manifest.get("account") or {}).get("credits") or {}
     balance, monthly = credits.get("balance"), credits.get("monthly")
     trial = credits.get("trial")
-    if isinstance(trial, dict) and type(trial.get("amount")) in (int, float) and trial["amount"] > 0:
+    # The credits arm's setup already says what the free credits are; after a first paid turn this card would only
+    # read as news beside a lower balance (0.2.15).
+    credits_arm = (manifest.get("account") or {}).get("billing") == "credits"
+    if (not credits_arm and isinstance(trial, dict) and type(trial.get("amount")) in (int, float)
+            and trial["amount"] > 0):
         key = str(trial.get("granted_at") or trial["amount"])
         _queue(trial_card(trial["amount"], live), "trial", key)
     if type(balance) not in (int, float):
         return
     monthly = monthly if type(monthly) in (int, float) and monthly > 0 else 0
     low = balance < monthly * LOW_SHARE if monthly else 0 < balance < LOW_FLOOR
-    if low:
+    if low and not credits_arm:  # The arm's chat says it itself, from the replies' balance (agent._warn_low_credits).
         renews = str(credits.get("resets_at") or "")[:10]
         account = manifest.get("account") or {}
         top_ups = not (account.get("billing") == "credits" and account.get("plan") not in ("pro", "max"))
         _queue(low_credits_card(balance, monthly, renews, top_ups), "low_credits", f"{renews or 'balance'}:{monthly}")
+
+
+def first_time(kind: str, key: str) -> bool:
+    """True once per kind and key on this device, then False (kept in nudges.json's once list). Not a soft card:
+    no daily cap and no tips switch, for notices that are about the account rather than tips."""
+    mark = f"{kind}:{key}"
+    with _lock:
+        data = _load()
+        if mark in data["once"]:
+            return False
+        data["once"] = (data["once"] + [mark])[-200:]
+        _save(data)
+    return True
 
 
 def _queue(card: dict, kind: str, key: str) -> None:

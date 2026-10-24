@@ -344,6 +344,7 @@ def failure_reason(output: str, exit_code=None) -> str:
 def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     status = item["status"]
+    rig = item["name"] in ("loopcut_cloud__auto_rig", "loopcut_cloud.auto_rig")
     glyph, glyph_color = STATUS_GLYPH[status]
     plan_repair = item.get("plan_repair")
     code_failure = (status == "failed" and item["name"] in CODE_TOOLS
@@ -363,12 +364,12 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + f.px(7)
     f.text(f"item{n}.tool.glyph", inner_x, cursor, glyph, size, glyph_color)
     label_x = inner_x + f.px(18)
-    summary = item["summary"] or item["name"]
+    summary = "Rig your character" if rig else item["summary"] or item["name"]
     if plan_repair:
         summary = {"resolved": "Helper started", "retried": "Adjusted the helper plan and retried",
                    "adjusting": "Adjusting the helper plan…"}.get(
             plan_repair, "Helper plan needs adjustment")
-    show_name = expanded and item["name"].strip().casefold() != summary.strip().casefold()
+    show_name = not rig and expanded and item["name"].strip().casefold() != summary.strip().casefold()
     if awaiting:
         label_width = inner_w - f.px(18)
         cursor += f.paragraph(f"item{n}.tool.summary", label_x, cursor, label_width, summary, size, T.TEXT)
@@ -407,7 +408,24 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         f.button(f"item{n}.tool.details", inner_x, cursor, "Hide details" if expanded else "Details",
                  T.BUTTON_GHOST, T.TEXT_MUTED, ("toggle", n))
         cursor += f.px(24)
-    if status == "failed" and not expanded and not plan_repair and not code_failure:
+    if rig:
+        from .. import rig_text
+        cursor += f.paragraph(f'item{n}.tool.cost', inner_x, cursor, inner_w,
+                              item.get('cost') or rig_text.price(0), small, T.TEXT)
+        if awaiting:
+            message = ' '.join(item.get('ask_lines') or [item.get('rig_notice') or rig_text.QUOTE])
+        elif status == 'running':
+            message = rig_text.progress(item.get('rig_stage') or rig_text.STAGES['checking'])
+        else:
+            message = item.get('output') or ''
+        cursor += f.paragraph(f'item{n}.tool.message', inner_x, cursor, inner_w, message, small,
+                              T.ERROR if status == 'failed' else T.TEXT_MUTED)
+        job = next((r for r in f.ui.get('cloud_jobs', []) if r['id'] == item.get('cloud_job_id')), None)
+        if status == 'running' and job and job['cancelable']:
+            f.button(f'item{n}.tool.cancel', inner_x, cursor, 'Cancel', T.BUTTON_GHOST, T.TEXT,
+                     ('cloud_job_cancel', job['id']))
+            cursor += f.px(24)
+    if status == "failed" and not expanded and not plan_repair and not code_failure and not rig:
         reason = failure_reason(item.get("output") or "", item.get("exit_code"))
         f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
                small, T.TEXT_MUTED)
@@ -418,9 +436,9 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
             "search_assets", "loopcut_cloud__asset_search", "loopcut_cloud.asset_search"}:
         cursor += f.paragraph(f"item{n}.tool.credit", inner_x, cursor, inner_w,
                               "Powered by Poly Haven", small, T.TEXT_MUTED)
-    if item.get("cost"):
+    if item.get("cost") and not rig:
         cursor += f.paragraph(f"item{n}.tool.cost", inner_x, cursor, inner_w, item["cost"], small, T.TEXT)
-    if awaiting and item.get("ask"):  # A paid step's ask (spending.py): what was hit, the balance before → after.
+    if awaiting and item.get("ask") and not rig:  # A paid step's ask (spending.py): what was hit, the balance before → after.
         for k, line in enumerate(item.get("ask_lines") or ()):
             cursor += f.paragraph(f"item{n}.tool.ask{k}", inner_x, cursor, inner_w, line, small,
                                   T.TEXT_MUTED if k == 0 and item.get("worker") else T.TEXT)
@@ -431,7 +449,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                  "Hide details" if item.get("details_expanded") else "Details", T.BUTTON_GHOST, T.TEXT_MUTED,
                  ("toggle_details", n))
         cursor += f.px(24)
-    if expanded and item["code"] and (not delegate or item.get("details_expanded")):
+    if expanded and not rig and item["code"] and (not delegate or item.get("details_expanded")):
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
                                T.CODE_PREVIEW_LINES if awaiting else None)
@@ -451,14 +469,14 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
             f.button(f"item{n}.tool.image.open", inner_x, cursor, "Open image", T.BUTTON_GHOST, T.TEXT,
                      ("reference_open", image_path))
             cursor += f.px(24)
-    if expanded and item["output"] and (not delegate or item.get("details_expanded")):
+    if expanded and item["output"] and not rig and (not delegate or item.get("details_expanded")):
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
                               f.px(T.FONT_SIZE_CODE),
                               T.ERROR if status == "failed" and not code_repair
                               and plan_repair not in {"resolved", "retried", "adjusting"}
                               else T.TEXT_MUTED, "mono")
-    if expanded and (item.get("cloud_error") or {}).get("message"):
+    if expanded and not rig and (item.get("cloud_error") or {}).get("message"):
         cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
                               item["cloud_error"]["message"], small, T.ERROR)
     if config.billing_open() and expanded and (item.get("cloud_error") or {}).get("upgrade"):
@@ -708,8 +726,9 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
     if kind:  # Out of credits, or variant B: the slim card; its button opens the pop-up again.
         newest = n == state.latest_limit(f.session["items"])
         live = (f.ui.get("allowance_notice") or {}).get("item") is item  # A reloaded card is history.
+        # Once the credits are back, an out-of-credits stop keeps one button: Continue (0.2.15).
         return _slim_card(f, f"item{n}.limit", n, item, kind, x, y, width,
-                          buttons=newest and live and not _limit_over(f, item))
+                          buttons=newest and live and (not _limit_over(f, item) or kind == "credits"))
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
@@ -782,6 +801,12 @@ def _credits_arm(f: Frame) -> bool:
     return _billing(f) == chat_credits.CREDITS
 
 
+def _own_ai(f: Frame) -> bool:
+    """Chat runs on the user's own AI (a ChatGPT plan, a key), so it spends no credits: the out-of-credits pop-up
+    sells the cloud tools' credits instead (0.2.15)."""
+    return f.ui.get("provider", "LOOPCUT") != "LOOPCUT"
+
+
 def _offer_card(f: Frame, item: dict) -> str:
     """Which new card a limit item gets: "credits" (out of credits), "offer" (variant B), or "" (0.2.13's card)."""
     if item.get("reason") == chat_credits.CODE:
@@ -803,7 +828,7 @@ def _limit_over(f: Frame, item: dict) -> bool:
         plan = (f.ui.get("chat_credits") or {}).get("plan")
         if item.get("plan") and plan and plan != item["plan"]:
             return True  # Upgraded on the site, from a card or an email: the plan's credits are there now.
-        return chat_credits.expired(item.get("resets_at"), f.ui.get("now"))
+        return chat_credits.refused_until_passed(item, f.ui.get("now"))
     notice = f.ui.get("allowance_notice") or {}
     if notice.get("item") is item:
         return allowance.refused_window(f.ui.get("account"), notice, f.ui.get("now")) is None
@@ -819,20 +844,50 @@ def _notice_index(f: Frame, item: dict):
     return n
 
 
+def _come_back(f: Frame, item: dict, short: bool = False) -> str:
+    """When the credits come back: the sooner weekly top-up when the server names one, else the monthly grant."""
+    data = f.ui.get("chat_credits") or {}
+    refill = chat_credits.next_refill(item, data, f.ui.get("now"))
+    own = chat_credits.refill_of(item.get("refill"))
+    if refill is None and own and chat_credits.expired(own["at"], f.ui.get("now")):
+        refill = own  # The top-up it named has come: "Free credits came back", not the monthly date.
+    return chat_credits.come_back(data, item.get("resets_at", ""), f.ui.get("now"), short=short, refill=refill)
+
+
 def _slim_text(f: Frame, item: dict, kind: str) -> tuple[str, str, tuple]:
     status = item.get("status", "") if config.billing_open() else ""
     if status == "done":
         return "Upgraded", item.get("text", ""), T.OK
     if status == "waiting":
         return "Waiting for your upgrade", "Finish in the browser.", T.WARN
+    if kind == "credits" and _limit_over(f, item):  # The reset or the top-up came: say so (0.2.15).
+        n = _notice_index(f, item)
+        resumable = (isinstance(n, int) and n == state.latest_limit(f.session["items"]) and state.can_resume(f.session)
+                     and (f.ui.get("allowance_notice") or {}).get("item") is item)  # Its Continue shows.
+        return "Credits are back", "Continue where it stopped." if resumable else "Free credits came back.", T.OK
     if kind == "credits":
-        return "You're out of credits", chat_credits.come_back(f.ui.get("chat_credits") or {}, item.get("resets_at", ""),
-                                                               f.ui.get("now"), short=True), T.WARN
+        return "You're out of credits", _come_back(f, item, short=True), T.WARN
     when = chat_credits.short_reset(item.get("resets_at"), f.ui.get("now"))
     return chat_credits.used_title(item), f"Refills {when}" if when else "Refills soon", T.WARN
 
 
+_SLIM_FAILURES: set[str] = set()
+
+
 def _slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, buttons: bool = True) -> int:
+    """The slim card, failing open: one that cannot draw is left out (height 0), never the panel."""
+    first_prim, first_hit = len(f.prims), len(f.hits)
+    try:
+        return _draw_slim_card(f, id, n, item, kind, x, y, width, buttons)
+    except Exception as ex:
+        del f.prims[first_prim:], f.hits[first_hit:]
+        if repr(ex) not in _SLIM_FAILURES:  # Once, not on every redraw.
+            _SLIM_FAILURES.add(repr(ex))
+            print(f"Loopcut: a plan card could not draw: {ex!r}")
+        return 0
+
+
+def _draw_slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, buttons: bool = True) -> int:
     """Round2 D: what stays once the pop-up is closed. A ring, what happened, when it comes back, and one button
     that opens the pop-up again ("See Pro" when there is a plan to get)."""
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
@@ -841,7 +896,11 @@ def _slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, buttons
     ring = f.px(20)
     actions = []
     status = item.get("status", "") if config.billing_open() else ""
-    if buttons and status in ("", "waiting") and not f.session.get("busy"):
+    over = kind == "credits" and _limit_over(f, item)
+    if over:  # Credits back (or a new plan): only the stopped turn's Continue, while there is one.
+        if buttons and isinstance(n, int) and state.can_resume(f.session) and not f.session.get("busy"):
+            actions.append((id + ".retry", "Continue", T.BUTTON_GHOST, T.TEXT, ("limit_retry", n)))
+    elif buttons and status in ("", "waiting") and not f.session.get("busy"):
         plan = str((item.get("upgrade") or {}).get("plan") or "pro").capitalize()
         upgrade = status == "" and config.billing_open() and (item.get("upgrade") or {}).get("url")
         # While an upgrade waits, the free ways on stay one click away (an abandoned checkout never resets it).
@@ -849,10 +908,15 @@ def _slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, buttons
                         T.BUTTON_TEXT if upgrade else T.TEXT, ("limit_popup_open", n)))
         if kind == "offer" and isinstance(n, int) and state.can_resume(f.session):
             actions.append((id + ".retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
+        elif kind == "credits" and isinstance(n, int) and state.can_resume(f.session):
+            # The stopped turn goes on from where it was once credits are back (0.2.15, the pop-up's promise).
+            actions.append((id + ".retry", "Continue", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
     widths = [round(f.measure("ui", small, label)) + f.px(20) for _, label, *_ in actions]
     side = sum(widths) + f.px(8) * max(0, len(actions) - 1)
     text_x = x + pad + ring + f.px(10)
-    beside = bool(side) and width - (text_x - x) - pad - side - f.px(8) >= f.px(120)  # Else under the text.
+    room = width - (text_x - x) - pad - side - f.px(8)
+    # Else under the text; two buttons also go under when the line would wrap beside them (0.2.15's Continue).
+    beside = bool(side) and room >= f.px(120) and (len(actions) < 2 or f.measure("ui", small, line) <= room)
     text_w = width - (text_x - x) - pad - (side + f.px(8) if beside else 0)
     cursor = y + pad
     cursor += f.paragraph(id + ".title", text_x, cursor, text_w, title, size, T.TEXT)
@@ -920,13 +984,12 @@ def _lock(f: Frame, id: str, x, y) -> None:
 
 
 def _keep_chatting(f: Frame, id: str, n, x, y, width) -> int:
-    """The free way on: the user's own ChatGPT plan or API key."""
-    pad, size, small = f.px(10), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    """The free way on: the user's own ChatGPT plan or API key. One line that holds for every reader (0.2.15):
+    "Keep chatting for free" read as false to people on ChatGPT Free or in a blocked country."""
+    pad, small = f.px(10), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
-    cursor = y + f.px(8)
-    cursor += f.paragraph(id + ".title", x + pad, cursor, width - 2 * pad, "Keep chatting for free", size, T.TEXT)
-    cursor += f.paragraph(id + ".text", x + pad, cursor, width - 2 * pad, "Connect ChatGPT Plus/Pro or an API key",
-                          small, T.TEXT_MUTED)
+    cursor = y + f.px(8)  # Small, so the one line stays one line in a panel of usual width.
+    cursor += f.paragraph(id + ".title", x + pad, cursor, width - 2 * pad, chat_credits.KEEP_CHATTING, small, T.TEXT)
     chatgpt = ("limit_chatgpt", n) if f.ui.get("chatgpt_plan") else ("sign_in", "chatgpt")
     cursor += f.px(8) + _button_row(f, x + pad, cursor + f.px(8), width - 2 * pad, [
         (id + ".chatgpt", "Use ChatGPT Plus/Pro", T.BUTTON_GHOST, T.TEXT, chatgpt),
@@ -935,6 +998,17 @@ def _keep_chatting(f: Frame, id: str, n, x, y, width) -> int:
     f.prims.insert(mark, {"t": "rect", "id": id + ".card", "x": x, "y": y, "w": width, "h": height,
                           "color": FREE_BG, "radius": f.px(T.RADIUS_SMALL), "border": 1, "border_color": FREE_BORDER})
     return height
+
+
+def _request_line(f: Frame, item: dict, n) -> str:
+    """What became of the request the refusal stopped (0.2.15), said only where it is true. A stop mid-turn keeps
+    the turn: upgrading resumes it (host._start_upgrade), and the slim card's Continue does once credits are back.
+    A new message refused before anything ran went back into the input box, which the conversation saves."""
+    if isinstance(n, int) and state.can_resume(f.session):
+        return "Your request is saved; it picks up when you continue."
+    if n == f.session.get("id") and str(f.session.get("input") or "").strip():
+        return "Your message is saved in the box below."
+    return ""
 
 
 def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) -> int:
@@ -948,9 +1022,10 @@ def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) 
     text_w = inner_w - ring - f.px(10) - f.px(22)
     top = cursor
     cursor += f.paragraph("popup.title", text_x, cursor, text_w, "You're out of credits", title, T.BUTTON_TEXT)
-    cursor += f.paragraph("popup.text", text_x, cursor, text_w,
-                          chat_credits.come_back(f.ui.get("chat_credits") or {}, item.get("resets_at", ""),
-                                                 f.ui.get("now")), small, T.TEXT_MUTED)
+    cursor += f.paragraph("popup.text", text_x, cursor, text_w, _come_back(f, item), small, T.TEXT_MUTED)
+    saved = _request_line(f, item, n)
+    if saved:
+        cursor += f.paragraph("popup.saved", text_x, cursor, text_w, saved, small, T.TEXT_MUTED)
     _close(f, "popup.close", x + width - f.px(6), y + f.px(6))
     cursor = max(cursor, top + ring + f.px(4)) + f.px(10)
     if compact:
@@ -971,18 +1046,24 @@ def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) 
         f.rect(f"popup.tile{k}.border", tx, ty, tile_w, tile_h, T.NONE, f.px(4), 1, T.CARD_BORDER)
         f.text(f"popup.tile{k}.label", tx + f.px(5), ty + tile_h - f.line_height(label_size) - f.px(3),
                _ellipsize(f, label, label_size, tile_w - f.px(10)), label_size, T.TEXT)
-        _lock(f, f"popup.tile{k}.lock", tx + tile_w - f.px(13), ty + f.px(5))
+        if not (label == chat_credits.AGENT_TILE and _own_ai(f)):  # Their own AI chats on: no padlock on it.
+            _lock(f, f"popup.tile{k}.lock", tx + tile_w - f.px(13), ty + f.px(5))
     rows = -(-len(chat_credits.LOCKED_TILES) // columns)
     cursor += rows * tile_h + (rows - 1) * gap + f.px(12)
     return _credits_actions(f, item, n, inner_x, cursor, inner_w) + pad - y
 
 
 def _credits_actions(f: Frame, item: dict, n, inner_x, cursor, inner_w) -> int:
-    """The out-of-credits sheet's ways on: Pro, its fine print, then the user's own AI. Returns the bottom."""
+    """The out-of-credits sheet's ways on: Pro (its price line in plain units, then the button), its fine print,
+    then the user's own AI. Returns the bottom."""
     small = f.px(T.FONT_SIZE_SMALL)
     upgrade = item.get("upgrade") or {}
     if config.billing_open() and upgrade.get("url"):
-        _wide_button(f, "popup.upgrade", inner_x, cursor, inner_w, f.px(34), chat_credits.upgrade_button(upgrade),
+        line = chat_credits.offer_line(upgrade, tools_only=_own_ai(f))
+        if line:  # "Pro: 2,200 credits a month ($22), about 110 builds" over "Get Pro · $20 a month".
+            cursor += _centered(f, "popup.offer", inner_x, cursor, inner_w, line, small, T.TEXT) + f.px(6)
+        label = chat_credits.upgrade_button(upgrade, short=bool(line))
+        _wide_button(f, "popup.upgrade", inner_x, cursor, inner_w, f.px(34), label,
                      ("limit_upgrade", n), chat_credits.upgrade_button(upgrade, short=True))
         cursor += f.px(34) + f.px(8)
         cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Cancel anytime · Asset search stays free",
@@ -990,6 +1071,8 @@ def _credits_actions(f: Frame, item: dict, n, inner_x, cursor, inner_w) -> int:
     else:
         cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Asset search stays free", small,
                             T.TEXT_MUTED)
+    if _own_ai(f):  # Already chatting on their own AI: nothing to switch to.
+        return cursor
     cursor += f.px(10)
     return cursor + _keep_chatting(f, "popup.free", n, inner_x, cursor, inner_w)
 
@@ -1040,15 +1123,27 @@ def _offer_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) ->
     when = chat_credits.short_reset(item.get("resets_at"), f.ui.get("now"))
     fine = "Cancel anytime" + (f" · {'Free chat' if (item.get('plan') or 'free') == 'free' else 'Chat'} refills {when}"
                                if when else "")
-    cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, fine, small, T.TEXT_MUTED) + f.px(8)
-    chatgpt = ("limit_chatgpt", n) if f.ui.get("chatgpt_plan") else ("sign_in", "chatgpt")
-    cursor += _button_row(f, inner_x, cursor, inner_w, [
-        ("popup.chatgpt", "Use ChatGPT Plus/Pro", T.BUTTON_GHOST, T.TEXT, chatgpt),
-        ("popup.key", "Add an API key", T.BUTTON_GHOST, T.TEXT, ("own_key", None))])
+    cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, fine, small, T.TEXT_MUTED) + f.px(10)
+    # The credits pop-up's green box (0.2.15, persona test): the free way on, said so it holds without Plus.
+    cursor += _keep_chatting(f, "popup.free", n, inner_x, cursor, inner_w)
     return cursor + pad - y
 
 
 def _popup(f: Frame, top: int) -> None:
+    """The open pop-up, failing open: a pop-up that cannot draw closes to its slim card and the chat stays usable
+    (a pop-up never traps)."""
+    first_prim, first_hit = len(f.prims), len(f.hits)
+    try:
+        _draw_popup(f, top)
+    except Exception as ex:
+        del f.prims[first_prim:], f.hits[first_hit:]
+        item = (f.ui.get("allowance_notice") or {}).get("item")
+        if isinstance(item, dict):
+            item["popup_closed"] = True  # Not tried again each frame; its slim card can open it again.
+        print(f"Loopcut: the plan pop-up could not draw, so it closed: {ex!r}")
+
+
+def _draw_popup(f: Frame, top: int) -> None:
     """The open pop-up over the dimmed panel; a click outside it closes it to its slim card."""
     item, kind = _popup_item(f)
     if item is None:
@@ -1587,7 +1682,9 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
         if item.get("kind") == "tool" and item.get("name") in CODE_TOOLS:
             item = {**item, "code_repair": code_repairs.get(n)}
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
-    cursor = _cloud_jobs(f, cursor)
+    owned_jobs = {item.get('cloud_job_id') for item in items
+                  if item.get('name') in ('loopcut_cloud__auto_rig', 'loopcut_cloud.auto_rig')}
+    cursor = _cloud_jobs(f, cursor, exclude=owned_jobs)
     # Queued notes do not replace the active stream or tool as the source of activity.
     tool_statuses = {item["status"] for item in items if item["kind"] == "tool"}
     if session["busy"] and "awaiting" not in tool_statuses:
@@ -1799,18 +1896,29 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
     balance = f.ui.get("credit_balance")
     if _credits_arm(f) and isinstance(balance, (int, float)):
         total = chat_credits.chat_total(f.session)
-        line = f"{math.floor(balance):,} credits" + (f" · chat {chat_credits.credits_text(total).split()[0]}"
-                                                     if total else "")
+        whole = math.floor(balance)
+        line = f"{whole:,} credits ({chat_credits.balance_dollars(whole)})"
         # No "Today: N credits": it counts cloud jobs only (the daily cloud limit's counter), never chat.
-        return [line]
+        if not total:
+            return [line]
+        spent = f"This chat: {chat_credits.credits_text(total)}"  # Was "chat N", which read as nothing (0.2.15).
+        joined = f"{line} · {spent}"
+        return [joined] if f.measure("ui", small, joined) <= width else [line, spent]
     spend = f.session.get("spend")
     chat = spending.chat_label(spend) if f.ui.get("credits") or (
         spending.valid_ledger(spend) and spend.get("credits")) else ""
     extras = [part for part in (chat, f.ui.get("today") or "") if part]
-    lines = [f.ui["credits"]] if f.ui.get("credits") else []
+    lines = [f.ui["credits"]] if f.ui.get("credits") and not _offer_live(f) else []
     if extras and f.measure("ui", small, " · ".join(extras)) <= width:
         return lines + [" · ".join(extras)]
     return lines + extras
+
+
+def _offer_live(f: Frame) -> bool:
+    """Variant B's refusal stands (its pop-up or slim card shows): the balance stays out of view meanwhile, as
+    "100 credits ($1.00)" beside a chat that will not go on read as broken (0.2.15)."""
+    item = (f.ui.get("allowance_notice") or {}).get("item")
+    return bool(item) and _offer_card(f, item) == "offer" and not _limit_over(f, item)
 
 
 def _chat_tip(f: Frame) -> str:
@@ -2284,7 +2392,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
             f.text("input.credits" + (str(k) if k else ""), inner_x, credit_y + f.line_height(small) * k,
                    _ellipsize(f, line, small, inner_w), small, T.TEXT_MUTED)
         # The balance alone opens the account; neither the spend rows nor blank space are links.
-        if f.ui.get("credits") or _credits_arm(f):
+        if (f.ui.get("credits") and not _offer_live(f)) or _credits_arm(f):
             balance = _ellipsize(f, credit_lines[0], small, inner_w)
             f.hit("input.credits", inner_x, credit_y, round(f.measure("ui", small, balance)),
                   f.line_height(small), ("open_account", None), tip=_chat_tip(f) if _credits_arm(f) else "")
@@ -2429,10 +2537,12 @@ def _update_banner(f: Frame, top: int) -> int:
     return height
 
 
-def _cloud_jobs(f: Frame, cursor):
+def _cloud_jobs(f: Frame, cursor, *, exclude=()):
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
     for row in f.ui.get("cloud_jobs", []):
         id = row["id"]
+        if id in exclude:
+            continue
         right = f.width - pad
         if row["cancelable"]:
             cancel_w = round(f.measure("ui", small, "Cancel")) + f.px(20)
@@ -2445,8 +2555,10 @@ def _cloud_jobs(f: Frame, cursor):
         title_w = right - pct_w - f.px(8) - pad
         f.text(f"cloud.{id}.title", pad, cursor + f.px(3), _ellipsize(f, row['title'], small, title_w), small, T.TEXT)
         cursor += f.px(26)
+        if row.get("rig") and row.get("note"):
+            cursor += f.paragraph(f"cloud.{id}.price", pad, cursor, f.width - pad * 2, row["note"], small, T.TEXT)
         cursor += f.paragraph(f"cloud.{id}.progress", pad, cursor, f.width - pad * 2, row["message"], small, T.TEXT_MUTED)
-        if row.get("note"):  # "80 credits held. Cancel returns them." or why it can't be canceled now (C47).
+        if row.get("note") and not row.get("rig"):  # "80 credits held. Cancel returns them." or why it can't be canceled now (C47).
             cursor += f.paragraph(f"cloud.{id}.note", pad, cursor, f.width - pad * 2, row["note"], small, T.TEXT_FAINT)
         cursor += pad
     return cursor

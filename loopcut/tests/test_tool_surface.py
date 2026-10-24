@@ -19,7 +19,7 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import (agent, asset_libraries, assets, blenderkit, camera, config, contact, context,  # noqa: E402
+from loopcut import (agent, asset_libraries, assets, autorig, blenderkit, camera, config, contact, context,  # noqa: E402
                      conversations, files, inspection, job_tools, llm, polyhaven, polypizza, state, texture_tools, tools,
                      uv_tools)
 
@@ -37,6 +37,7 @@ OFFERED = [
     ("import_asset", "change"), ("frame_camera", "change"), ("inspect_uv", "read"), ("uv_unwrap", "change"),
     ("transfer_textures", "change"), ("inspect_texture", "read"),
 ]
+RIG_OFFERED = [("character_rig", "change")]  # Only beside the account's cloud auto_rig (agent._tool_schemas).
 
 
 def execute(name: str, **arguments) -> tools.ToolResult:
@@ -66,12 +67,23 @@ class OfferedTest(unittest.TestCase):
         self.assertEqual(schemas[0]["function"]["title"], "Reading data", "the UI registry must stay intact")
         self.assertEqual(context.fixed_tokens("prompt", schemas), context.fixed_tokens("prompt", expected))
 
+    def test_character_rig_is_offered_only_beside_cloud_auto_rig(self):
+        from loopcut import cloud
+        rig = cloud.PREFIX + "auto_rig"
+        remote = [{"type": "function", "function": {"name": rig, "description": "Rig.", "parameters": {}}}]
+        with mock.patch.object(cloud, "tool_schemas", return_value=remote):
+            names = [s["function"]["name"] for s in TOOL_SCHEMAS()]
+        self.assertEqual(names, [name for name, _ in OFFERED + RIG_OFFERED] + [rig])
+        self.assertEqual(set(autorig.DISPATCH), {name for name, _ in RIG_OFFERED})
+        self.assertNotIn("character_rig", [s["function"]["name"] for s in TOOL_SCHEMAS()])
+        self.assertNotIn("character_rig", [s["function"]["name"] for s in agent._workspace_schemas()])
+
     def test_every_tool_has_a_short_activity_title_in_every_loop(self):
         from loopcut import cloud, orchestrator, video_attach, workers
         from loopcut.byok import catalog
         descriptors = catalog.descriptors(no_generation=False, private_mode=False, keys_set={})
         registries = [TOOL_SCHEMAS(), agent._orchestrator_schemas(), agent._workspace_schemas(), workers.schemas(),
-                      video_attach.SCHEMAS, [orchestrator.WAIT_SCHEMA, cloud.JOB_SCHEMA],
+                      video_attach.SCHEMAS, autorig.SCHEMAS, [orchestrator.WAIT_SCHEMA, cloud.JOB_SCHEMA],
                       [cloud.schema(d) for d in descriptors],
                       [cloud.offer_schema([{"name": "test", "title": "Example"}])]]
         for schemas in registries:
@@ -214,7 +226,7 @@ class ApprovalTest(unittest.TestCase):
 
     def test_each_tool_is_offered_in_order_with_its_class(self):
         self.assertEqual([s["function"]["name"] for s in TOOL_SCHEMAS()], [name for name, _ in OFFERED])
-        for name, kind in OFFERED:
+        for name, kind in OFFERED + RIG_OFFERED:
             changes, read = CHANGES_SCENE(name, "{}"), SAME_WHILE_UNCHANGED(name, "{}")
             self.assertFalse(changes and read, name)
             self.assertEqual("change" if changes else "read" if read else "", kind, name)

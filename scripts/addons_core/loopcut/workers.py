@@ -285,7 +285,8 @@ def opening(brief: dict, shared: dict, others: list[dict], scene: str, requests=
         planned = f", planned {_bounds(other['bounds'])}" if other.get("bounds") else ""
         lines.append(f"also in this wave (not yours): {other['deliverable']} by {other['id']} ({other['role']}){planned}")
     lines += ["</shared>", "<brief>",
-              f"deliverable: {brief['deliverable']} (the root object's name)",
+              f"deliverable: {brief['deliverable']} (the name of the root object of what you create; a brief that "
+              f"only edits what you own creates no root)",
               f"role: {brief['role']}",
               f"prefix: {brief['prefix']}: for materials and other internal/helper datablocks "
               f"({brief['prefix']}_Name); name parts for what they are",

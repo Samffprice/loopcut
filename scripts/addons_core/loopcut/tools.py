@@ -45,6 +45,7 @@ class ToolResult:
     file_image: bool = False  # The image is a file preview, not a look at the open scene.
     receipt: str = ""  # A paid cloud call that finished: what it used ("Used 6 credits ($0.06)"), for its card.
     plan_refused: bool = False  # Helper arguments/plan validation; raw text still goes to the model and Details.
+    model_note: str = ""  # Structured continuation details for the model, kept out of the user's result card.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -176,7 +177,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # (paint_tools.py, offered to workers only). clip_background puts an attached clip behind a camera.
 CHANGES_SCENE = {"run_python", "import_asset", "frame_camera", "delegate", "accept_quarantine", "uv_unwrap",
                  "transfer_textures", "bake_paint_masks", "stylize_material", "apply_build",
-                 "clip_background"}  # A camera background and the scene's frame rate (video_attach.py).
+                 "clip_background", "character_rig"}  # A camera background and the scene's frame rate (video_attach.py).
 NEEDS_APPROVAL = CHANGES_SCENE
 # Tools since merged into one with a `source` or an `action`: old name -> (current name, the
 # arguments the old name implied, the old name of its `id` argument). Saved conversations still
@@ -253,7 +254,8 @@ def installs(name: str, arguments: dict) -> bool:
 def only_reads(name: str, arguments: dict) -> bool:
     """A call to a scene-changing tool that only measures: frame_camera with report_only. It takes
     no checkpoint, needs no go-ahead, and counts as a read (SAME_WHILE_UNCHANGED)."""
-    return name == "frame_camera" and str(arguments.get("report_only")).lower() == "true"
+    return (name == "frame_camera" and str(arguments.get("report_only")).lower() == "true"
+            or name == "character_rig" and arguments.get('action') in ('inspect', 'check_deformation'))
 
 
 def is_heavy(name: str, arguments: dict) -> bool:
@@ -1243,11 +1245,11 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         if not isinstance(arguments, dict):
             return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
         return cloud.execute(name, arguments)
-    from . import (assets, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
+    from . import (assets, autorig, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
                    uv_tools, video_attach, workspace)
     tables = (_DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, assets.DISPATCH,
               camera.DISPATCH, orchestrator.DISPATCH, uv_tools.DISPATCH, texture_tools.DISPATCH, paint_tools.DISPATCH,
-              workspace.DISPATCH, video_attach.DISPATCH)
+              workspace.DISPATCH, video_attach.DISPATCH, autorig.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
         return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)

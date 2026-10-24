@@ -23,7 +23,7 @@ from . import blobs, cloud_http
 
 TERMINAL = {"succeeded", "failed", "canceled"}
 STATES = {"queued", "running"} | TERMINAL
-OUTPUT_TYPES = {"image", "model_3d", "material", "audio", "video", "render_frames", "report", "motion"}
+OUTPUT_TYPES = {"image", "model_3d", "material", "audio", "video", "render_frames", "report", "motion", "rig"}
 POLL_SECONDS = .25
 STREAM_TIMEOUT = 2
 STREAM_ATTEMPTS = 2
@@ -81,6 +81,17 @@ def _redraw():
     mainthread.request_redraw()
 
 
+def _job_progress(job):
+    progress = dict(job['progress'])
+    if job.get('tool') == 'auto_rig':
+        progress['job_id'] = job['id']
+    if job.get('tool') == 'auto_rig':
+        from .autorig import STAGES
+        progress['message'] = ('Preparing rig' if progress['message'] == 'Downloading outputs'
+                               else STAGES.get(job['status'], 'Preparing rig'))
+    return progress
+
+
 def progress_rows(registry):
     """Pure panel data, with no Events, locks, Blender or mutable registry values exposed. A running job can be
     canceled and the service returns its whole credit hold (C47); once it has finished and only its outputs are
@@ -88,17 +99,28 @@ def progress_rows(registry):
     rows = []
     for key, row in registry.items():
         job = row["job"]
+        rig = job.get('tool') == 'auto_rig'
+        from . import rig_text
+        if row.get('rig_refund') is not None:
+            report = row['rig_refund'].snapshot()
+            rows.append({'id': key, 'title': 'Rig your character', 'pct': 100, 'message': report['message'],
+                         'cancelable': False, 'rig': True, 'note': rig_text.price(report['job']['credits']['charged'], settled=True)})
+            continue
         downloading = job["status"] == "succeeded" and not row.get("ready", True)
         if row.get("error") or (job["status"] in TERMINAL and not downloading):
             continue
-        message = "Downloading outputs" if downloading else job["progress"]["message"]
+        message = "Downloading outputs" if downloading else _job_progress(job)['message']
         held = (job.get("credits") or {}).get("reserved", 0) if not downloading else 0
         note = ("Finished and charged; it can't be canceled now." if downloading
                 else f"{held:,} credits held. Cancel returns them." if held else "")
-        rows.append({"id": key, "title": row["title"], "pct": job["progress"]["pct"],
-                     "message": "Canceling…" if row.get("canceling") else message,
+        if rig:
+            message = rig_text.progress('Canceling rig' if row.get('canceling') else
+                                        'Preparing rig' if downloading else message)
+            note = rig_text.price(job['credits']['charged'] if downloading else held, settled=downloading)
+        rows.append({"id": key, "title": "Rig your character" if rig else row["title"], **({"rig": True} if rig else {}), "pct": job["progress"]["pct"],
+                     "message": "Canceling…" if row.get("canceling") and not rig else message,
                      "cancelable": not row.get("canceling", False) and not downloading,
-                     "note": "" if row.get("canceling") else note})
+                     "note": "" if row.get("canceling") and not rig else note})
     from .cloud import safe_value
     return safe_value(rows)
 
@@ -177,25 +199,30 @@ def job_status(job_id):
                                              for output in job['outputs']]})
 
 
-def _remember(job, title, cancel, inputs=None, apply_args=None, references=None):
+def _remember(job, title, cancel, inputs=None, apply_args=None, references=None, *, client=None):
     """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it.
-    apply_args: the call's client-only arguments for the apply handler (contract 0.7), never sent.
+    apply_args: the call's client-only arguments for the apply handler (contract 0.7), never sent. A replay of a
+    known job keeps the job and takes the replay's.
     references: the scene references its files came from (a clip's name), for names only."""
     with _lock:
         if job["id"] in _registry:
             row = _registry[job['id']]
+            if row.get('rig_refund') is not None:
+                return False  # Preserve the original account and immutable report on same-job replay.
             error = row.get('error')
             if error is None or error.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
                 return False  # Preserve live workers and definitive outcomes on replay.
             del _registry[job['id']]
         # Keep a bounded history for job_status, retaining every running job.
         finished = [key for key, row in _registry.items()
-                    if (row["job"]["status"] in TERMINAL and row.get("ready", True)) or row.get("error")]
+                    if ((row["job"]["status"] in TERMINAL and row.get("ready", True)) or row.get("error"))
+                    and (row.get('rig_refund') is None
+                         or row['rig_refund'].snapshot()['status'] in {'refunded', 'review'})]
         for key in finished[:-31]:
             del _registry[key]
         _registry[job["id"]] = {"title": title, "job": copy.deepcopy(job), "cancel": cancel, "ready": False,
                                 "input": copy.deepcopy(inputs or {}), "apply_args": copy.deepcopy(apply_args or {}),
-                                "references": dict(references or {}),
+                                "references": dict(references or {}), 'client': client,
                                 'final': job['status'] in TERMINAL and (job['status'] != 'failed' or bool(job.get('error')))}
     _redraw()
     return True
@@ -208,7 +235,7 @@ def _wait_known(job_id, cancel, on_progress):
             cancel_job(job_id)
         job = job_status(job_id)
         if on_progress:
-            on_progress(dict(job["progress"]))
+            on_progress(_job_progress(job))
         if job["status"] in TERMINAL:
             return job
         time.sleep(POLL_SECONDS)
@@ -221,7 +248,7 @@ def _update(job, on_progress, *, final=False):
             _registry[job['id']]['final'] = final
     _redraw()
     if on_progress:
-        on_progress(dict(job["progress"]))
+        on_progress(_job_progress(job))
 
 
 def _progress(value):
@@ -288,6 +315,13 @@ def _job(value, *, expected=None, local=False):
 
 
 def _output_limits(job):
+    if job.get('tool') == 'auto_rig':
+        from .rig_bundle import LIMITS
+        names = [o['name'] for o in job['outputs']]
+        if (len(names) != len(set(names)) or any(n not in LIMITS for n in names)
+                or any(o['size'] > LIMITS[o['name']][0] or o['mime'] != LIMITS[o['name']][1]
+                       for o in job['outputs'])):
+            raise _invalid('The returned rig files are too large or include unexpected files')
     if (len(job['outputs']) > MAX_OUTPUTS or sum(o['size'] for o in job['outputs']) > MAX_DOWNLOAD
             or any(o['type'] == 'report' and o['size'] > MAX_REPORT_FILE for o in job['outputs'])):
         raise _invalid('Cloud outputs exceed the local download limit')
@@ -461,6 +495,9 @@ def _finish(client, job, cancel, on_progress):
         return job
     except cloud_http.CloudError as ex:
         ex.extra.setdefault('job', job)
+        if job['tool'] == 'auto_rig' and job['status'] == 'succeeded' and ex.code == 'hash_mismatch':
+            ex.extra.update(apply_failure=_report_rig_failure(job, 'validation_failed'),
+                            apply_message='The returned rig files failed verification. Your character has not been changed.')
         with _lock:
             _registry[job["id"]]["error"] = ex
         _redraw()
@@ -530,6 +567,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     inputs = {k: v for k, v in arguments.items()
               if k not in file_fields | local | {"bundle", "quote_id", "idempotency_key"}}
     payload = {"tool": descriptor["name"], "input": inputs, "files": hashes}
+    if descriptor['name'] == 'auto_rig':
+        payload['tool_version'] = descriptor['version']  # Admission version applies to both quotes and jobs.
     if arguments.get("bundle") is not None:
         digest = arguments["bundle"]
         if not isinstance(digest, str) or not _HASH.fullmatch(digest):
@@ -538,6 +577,9 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     elif (descriptor.get("bundle_input") or {}).get("required"):
         raise _input_error("An uploaded bundle manifest is required", "bundle")
     try:
+        if descriptor.get('apply') == 'apply_rig' and on_progress:
+            from .autorig import STAGES
+            on_progress({'pct': 5, 'message': STAGES['uploading']})
         blobs.upload_missing(selected, client=client, cancel=cancel, multipart=_blob_multipart())
     except (OSError, ValueError) as ex:
         raise _input_error("Tool file changed or could not be read during upload", "files") from ex
@@ -547,6 +589,12 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     confirm = {"headers": {"x-loopcut-confirm": confirm_token}} if confirm_token else {}
     # A quote_required tool always, and any tool when asked (cloud_account.authorize prices every paid call).
     if ((descriptor.get("cost") or {}).get("quote_required") or quote) and not arguments.get("quote_id"):
+        # auto_rig's validated quote starts server warm-up. Request immediately
+        # after immutable uploads, before authorize() presents the price. Local
+        # safety/export checks already ran on main; never warm refused geometry.
+        if descriptor.get('apply') == 'apply_rig' and on_progress:
+            from .autorig import STAGES
+            on_progress({'pct': 10, 'message': STAGES['quoting']})
         quote = client.request("POST", "/v1/quotes", payload, **confirm)
         if (not isinstance(quote.get("quote_id"), str) or type(quote.get("credits")) is not int
                 or quote["credits"] < 0 or not isinstance(quote.get("expires_at"), str)):
@@ -571,7 +619,7 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
                     raise
         if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs,
                          {k: v for k, v in arguments.items() if k in local},
-                         {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}):
+                         {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}, client=client):
             if descriptor.get("latency") == "long":
                 if cancel.is_set():
                     cancel_job(job["id"])
@@ -595,6 +643,10 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
     import bpy
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
+    if descriptor.get('apply') == 'apply_rig':
+        from . import autorig, tools
+        with tools._editor_context('VIEW_3D'):
+            return autorig.prepare(arguments, directory)
     found = {}
     for n, row in enumerate(descriptor.get("file_inputs", [])):
         field, value = row["field"], arguments.get(row["field"])
@@ -754,6 +806,10 @@ def prepare_inputs(descriptor: dict, arguments: dict, files: dict) -> dict:
                 out["video_seconds"] = round(plan["seconds"], 3)
             out.update({k: v for k, v in plan["trim"].items() if k in properties})
     from .cloud import apply_args as client_args
+    if descriptor.get('apply') == 'apply_rig':
+        from . import autorig, rig_transport
+        task = rig_transport.read_json(files['rig_task'], 1_000_000)
+        out['targets'] = autorig._prepared[task['task_id']]['names']
     if descriptor.get("apply") == "apply_motion" and "target_armature" in client_args(descriptor):
         target = motion_target(arguments.get("target_armature"))
         if target is not None:
@@ -766,13 +822,15 @@ def motion_target(name):
     selected humanoid armature, else None (a new skeleton). A named one that is not a humanoid is refused."""
     _main_only()
     import bpy
-    from . import motion_retarget
+    from . import motion_retarget, rig_experimental
     if name is not None:
         ob = bpy.data.objects.get(name)
         armature = motion_retarget.armature_of(ob)
         if armature is None:
             raise _input_error(f"{name!r} is not an armature or a mesh deformed by one in this file; name an "
                                "armature, or leave target_armature out for a new skeleton", "target_armature")
+        if rig_experimental.marked(armature):
+            raise cloud_http.CloudError(rig_experimental.MOTION_REFUSAL, 'experimental_rig')
         if motion_retarget.rig_of(armature) is None:
             raise _input_error(f"{armature.name!r} does not look like a humanoid rig (hips, legs, arms and head); "
                                "leave target_armature out for a new skeleton", "target_armature")
@@ -780,8 +838,12 @@ def motion_target(name):
     view_layer = bpy.context.view_layer
     candidates = [motion_retarget.armature_of(view_layer.objects.active)]
     selected = {motion_retarget.armature_of(o) for o in getattr(bpy.context, "selected_objects", ())} - {None}
+    if any(rig_experimental.marked(a) for a in selected):
+        raise cloud_http.CloudError(rig_experimental.MOTION_REFUSAL, 'experimental_rig')
     if len(selected) == 1:
         candidates.append(selected.pop())
+    if any(rig_experimental.marked(a) for a in candidates):
+        raise cloud_http.CloudError(rig_experimental.MOTION_REFUSAL, 'experimental_rig')
     return next((a for a in candidates if a is not None and motion_retarget.rig_of(a) is not None), None)
 
 
@@ -823,11 +885,15 @@ def stamp_provenance(blocks, provenance):
 
 def result_summary(handler, job, names=(), reports=()):
     """Pure model-facing result; reports are also saved in Text datablocks and the conversation."""
+    from .cloud import safe_value
+    if handler == 'apply_rig':
+        # The card already carries the job and receipt. Keep the beginner's next
+        # step readable instead of appending an opaque identifier to this summary.
+        return safe_value('\n'.join(names))
     actions = {"add_image_reference": "Added image references", "import_model": "Imported and selected models",
                "add_audio_strip": "Added sound strips at the current frame", "load_frames": "Loaded frames in the sequencer",
                "attach_report": "Attached reports", "none": "Saved outputs", "apply_motion": "Applied motion"}
     line = f"{actions[handler]}: {', '.join(names) or 'no outputs'}. Job {job['id']}; provenance recorded."
-    from .cloud import safe_value
     return safe_value(line + ("\n" + "\n".join(reports) if reports else ""))
 
 
@@ -1427,7 +1493,66 @@ def _apply_motion(job):
     return [line + ("; " + "; ".join(notes) if notes else "")]
 
 
-def apply_result(descriptor: dict, job: dict) -> str:
+def _report_rig_failure(job, code):
+    """Queue a free report using this job's original private account snapshot."""
+    from .rig_refund import ApplyFailure
+    with _lock:
+        row = _registry.get(job['id'])
+        if row is None or row.get('client') is None:
+            return False  # Never send a saved result to a newly selected account/service.
+        report = row.get('rig_refund')
+        if report is None:
+            if not job['credits']['charged']:
+                return False
+            def publish(value):
+                with _lock:
+                    current = _registry.get(job['id'])
+                    if current is not None:
+                        current['job']['credits'] = copy.deepcopy(value['job']['credits'])
+                _redraw()
+                if value['status'] in {'refunded', 'review'}:
+                    from . import cloud
+                    if cloud._runtime is not None:
+                        cloud._runtime.refresh_async()
+            report = ApplyFailure(job, code, row['client'], publish)
+            row['rig_refund'] = report
+    report.start()
+    return True
+
+
+def wait_rig_refund(job_id, *, retry=False):
+    """Agent-thread wait/retry; the UI and Blender main thread remain responsive."""
+    if threading.current_thread() is threading.main_thread():
+        raise RuntimeError('Wait for rig refunds off the main thread')
+    with _lock:
+        report = (_registry.get(job_id) or {}).get('rig_refund')
+    return report.wait(retry=retry) if report is not None else None
+
+
+def _apply_rig(job, details=None):
+    from . import autorig, cloud, tools
+    def progress(stage):
+        cloud._progress(cloud.PREFIX + 'auto_rig', {'message': autorig.STAGES[stage], 'job_id': job['id'], 'pct': 100})
+    try:
+        with tools._editor_context('VIEW_3D'):
+            return [autorig.apply(job['outputs'], progress, details=details)]
+    except (ValueError, OSError, RuntimeError, KeyError, TypeError, IndexError) as ex:
+        if isinstance(ex, autorig.RigError):
+            message, code = str(ex), ex.code
+        else:
+            import traceback
+            traceback.print_exc()
+            message, code = ('The returned rig could not be verified or applied. Your character has not been changed.',
+                             'apply_failed')
+        charged = (job.get('credits') or {}).get('charged', 0)
+        billing = (f' The cloud job used {charged} credits; no refund has been confirmed.'
+                   if charged else '')
+        reporting = _report_rig_failure(job, code)
+        raise cloud_http.CloudError(message + billing, code,
+            extra={'job': job, 'apply_failure': reporting, 'apply_message': message}) from ex
+
+
+def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
     """Apply a finished managed or BYOK job and stamp every newly created ID datablock."""
     _main_only()
     import bpy
@@ -1441,13 +1566,14 @@ def apply_result(descriptor: dict, job: dict) -> str:
     handlers = {"add_image_reference": _add_images, "import_model": _model_import,
                 "add_audio_strip": _add_audio, "load_frames": _load_frames,
                 "attach_report": lambda job: [o["name"] for o in job["outputs"] if o["type"] == "report"],
-                "apply_motion": _apply_motion, "none": lambda job: [o["path"] for o in job["outputs"]]}
+                "apply_motion": _apply_motion, "apply_rig": lambda job: _apply_rig(job, details),
+                "none": lambda job: [o["path"] for o in job["outputs"]]}
     if handler not in handlers:
         raise cloud_http.CloudError(f"Result handler {handler!r} is not available in this build", "apply_not_available")
     before = datablock_snapshot(bpy.data)
     try:
         names = handlers[handler](job)
-        reports = _reports(job) if handler not in ("none", "apply_motion") else []
+        reports = _reports(job) if handler not in ("none", "apply_motion", "apply_rig") else []
         if handler == "apply_motion" and job.get("tool") in MOTION_CHECK:
             reports = [MOTION_CHECK[job["tool"]]]
         if descriptor.get("name") == "asset_search" and handler == "attach_report":

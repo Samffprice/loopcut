@@ -747,6 +747,24 @@ class PureTest(unittest.TestCase):
         self.assertIs(workspace.snapshot_for(data, None), second, "no number: the newest")
         self.assertIs(workspace.snapshot_for(data, 7), second)
 
+    def test_a_record_from_an_earlier_loopcut_is_named_so_apply_build_refuses_it(self):
+        """0.2.14's state.json: tokens without a version. Objects with vertex groups hash differently
+        since, so an untouched rigged object read as dropped and an owned edit as a conflict."""
+        from loopcut import ownership
+        now = ownership.TOKEN_VERSION
+        old = {"snapshots": [{"number": 1, "tokens": {"OBJECT:Dog": "t1"}}],
+               "live": {"tokens": {"OBJECT:Dog": ["t2", 1]}, "names": {}, "pointers": None, "settings": None}}
+        self.assertEqual(workspace.outdated(old, old["snapshots"][0]), "snapshot 1 was taken")
+        old["snapshots"][0]["token_version"] = now
+        self.assertEqual(workspace.outdated(old, old["snapshots"][0]), "the last apply")
+        old["live"]["tokens"]["OBJECT:Dog"].append(now)
+        self.assertEqual(workspace.outdated(old, old["snapshots"][0]), "")
+        old["snapshots"].append({"number": 2, "tokens": {}, "token_version": now})
+        old["live"]["tokens"]["OBJECT:Rug"] = ["t3", 1]  # Applied before snapshot 2: already in its source.
+        self.assertEqual(workspace.outdated(old, old["snapshots"][1]), "", "a new snapshot clears the old record")
+        self.assertEqual(workspace.live_side(old, old["snapshots"][0])[0], {"OBJECT:Dog": "t2", "OBJECT:Rug": "t3"},
+                         "a versioned live entry still reads as [token, count]")
+
     def test_the_tools_ask_like_run_python_and_view_image_reads_like_read_file(self):
         roots = (Path("/w"),)
         for name in ("shell", "run_blender", "edit_file"):
@@ -791,10 +809,12 @@ class PureTest(unittest.TestCase):
         self.assertNotIn("## Workers", workspace.PROMPT)
 
     def test_the_live_tools_it_keeps_exist(self):
-        live = {s["function"]["name"] for s in agent._tool_schemas()}
+        from loopcut import autorig
+        live = {s["function"]["name"] for s in agent._tool_schemas() + autorig.SCHEMAS}
         self.assertLessEqual(set(workspace.LIVE_TOOLS), live)
         offered = [s["function"]["name"] for s in agent._workspace_schemas()]
-        self.assertEqual(offered, list(workspace.LIVE_TOOLS) + list(workspace.TOOLS))
+        # character_rig only with auto-rig access (test_tool_surface).
+        self.assertEqual(offered, [t for t in workspace.LIVE_TOOLS if t != "character_rig"] + list(workspace.TOOLS))
 
     def test_inspect_api_keeps_the_single_agents_schema_and_read_semantics(self):
         schema = next(s for s in tools.SCHEMAS if s['function']['name'] == 'inspect_api')
