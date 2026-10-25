@@ -110,6 +110,16 @@ class RunPythonTest(unittest.TestCase):
                 self.assertIn("Scene changes: none", result.text)
                 self.assertNotIn(KEPT_CHANGES, result.text)
 
+    def test_a_double_slash_path_that_failed_in_a_never_saved_file_says_so_and_one_that_ran_does_not(self):
+        from loopcut import api_docs
+        self.enterContext(mock.patch.object(api_docs.bpy, "data", N(filepath=""), create=True))
+        result = tools.run_python("path = '//TurboCar.blend'\nraise RuntimeError('Error: Cannot open file "
+                                  "C:\\\\Program Files\\\\Loopcut\\\\Loopcut 5.2\\\\TurboCar.blend@ for writing')")
+        self.assertIn(f"NOTE: {api_docs.UNSAVED_RELATIVE}", result.text)
+        result = tools.run_python("path = '//TurboCar.blend'\nprint(path)")
+        self.assertTrue(result.ok)
+        self.assertNotIn("NOTE", result.text)
+
     def test_kept_changes_message_survives_clipping_and_capture_sees_changes(self):
         from loopcut import shaders
 

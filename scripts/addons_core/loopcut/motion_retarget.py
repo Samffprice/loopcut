@@ -29,6 +29,7 @@ MAX_BVH_BYTES = 64 * 1024 * 1024
 MAX_JOINTS = 512
 MAX_FRAMES = 36_000  # 20 minutes at 30 fps; the service caps a video at 60 s.
 ACTION_PREFIX = "Motion: "
+TRAVEL_NOTE = 1.  # Metres of root travel past which the result says how far it goes and how to keep it in view.
 NAME_BYTES = 48  # Of the prompt or clip in an action's name; Blender keeps 63 bytes.
 
 
@@ -914,6 +915,8 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     if in_place:  # Keep the sway, drop the travel: subtract a one-second moving average of the path.
         trend = smooth(src_pelvis, round(fps_scene))
         travel = [(p[0] - t[0], p[1] - t[1], p[2]) for p, t in zip(src_pelvis, trend)]
+    # How far the hips get from where they start, in scene units (ar-beginner-2's walk left the view at 5.5 m).
+    reach = max((((p[0] - travel[0][0]) ** 2 + (p[1] - travel[0][1]) ** 2) ** .5 for p in travel), default=0.) * k
 
     # Bones whose pose the chain math assumes: the mapped ones, the travel bone and their ancestors.
     needed = set(pairs) | {root}
@@ -1037,7 +1040,7 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
                         "the deforming bones (a limb left in IK mode?)")
     return {"action": action, "frames": (frames[0], frames[-1]), "count": len(frames), "fps": fps_scene,
             "mapped": len(pairs), "stashed": stashed, "warnings": warnings, "scale": k, "evaluated": evaluate,
-            "relaxed": len(relaxed), "kept": len(kept)}
+            "relaxed": len(relaxed), "kept": len(kept), "travel": reach}
 
 
 def _rotation_values(mats, mode):
@@ -1469,6 +1472,14 @@ def read_meta(text):
     return out
 
 
+def travel_note(metres):
+    """How far the root goes and how to keep it in view, past TRAVEL_NOTE metres: ar-beginner-2's character walked
+    5.5 m out of view, and from the front he "just gets bigger"."""
+    if metres < TRAVEL_NOTE:
+        return ""
+    return f"it travels {metres:.1f} m from where it starts, so view it from the side or follow it to keep it in view"
+
+
 def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_start=None, scene=None):
     """Main thread. target: an armature object, or None for SOMA's own skeleton with a generated body.
     Returns the result line for the model."""
@@ -1519,6 +1530,9 @@ def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_
     notes += report["warnings"][:5]
     line = (f"Motion '{report['action'].name}' {where}: frames {first}–{last} at {rate} ({seconds:.1f} s), "
             f"root motion {'in place' if in_place else 'in world'}")
+    travel = "" if in_place else travel_note(report.get("travel", 0.) * (scene.unit_settings.scale_length or 1.))
+    if travel:
+        notes.insert(0, travel)
     if notes:
         notes[0] = notes[0][:1].upper() + notes[0][1:]
     return line + (". " + "; ".join(notes) if notes else "")

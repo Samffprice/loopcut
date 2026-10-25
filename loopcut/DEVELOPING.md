@@ -664,7 +664,10 @@ remembers what was tried, and its notices go into the tool results so the histor
   even with other calls in between. Duplicate calls, cached reads, refused captures and checkpoint
   failures count without running the tool. Eight allows several retries after the existing repeat
   notes. A success resets only that key; successful reads of other keys leave counts unchanged.
-  A scene change, user note or approval rejection resets every key. Equal before/after snapshots let
+  A scene change, user note or approval rejection resets every key. Twenty reads refused as repeats, of any
+  calls, in one run of the loop (`repeats.REPEAT_REFUSALS`; nothing resets it, a new message or Try again starts a
+  new run) stop it the same way: a hosted turn rotating among repeated `inspect_api` calls had 237 refused and
+  never gave one call eight. Equal before/after snapshots let
   failing mutations count; without snapshots, potentially scene-changing tools conservatively reset
   all counts. Workers use the child's measured `changed` flag instead of full snapshots. The chat
   shows a short notice, followed by a text-only wrap-up of what is done, blocked and unverified.
@@ -766,6 +769,24 @@ single loop). `LOOPCUT_ORCH_*` and `LOOPCUT_WORKER_*` (`BASE_URL`, `MODEL`, `API
 `LOOPCUT_JOB_MAX_USD` (0.40, 0 = off), `LOOPCUT_WORKER_MAX_SECONDS` (1800 per worker run; the old
 name `LOOPCUT_WAVE_MAX_SECONDS` still sets it) (`config.Roles`). `LOOPCUT_WORKER_MAX_STEPS` and
 `LOOPCUT_JOB_MAX_STEPS` are obsolete and ignored, including invalid values.
+
+The server can set these per account: the signed-in manifest's optional `account.agent` (agreed with the
+gateway 2026-10-24; `config.agent_terms` checks each field and ignores a bad one with a console note). They
+apply only with both roles on Loopcut's own gateway (`SERVICE_BASE_URL`, never a `LOOPCUT_SERVICE_URLS`
+stand-in) and `LOOPCUT_AGENT_TERMS` on (the default; `off` for evals). `max_workers` (1-6) is the workers one
+turn may start in all, across its waves, counted on the turn's message so a resume goes on from them; at most
+3 of them (`config.MAX_WORKERS_AT_ONCE`) run at once. The routing note says "This turn can start at most N
+workers" before planning; `delegate` refuses a wave past what is left ("this turn can start N more workers")
+on its own neutral card, never "Helper plan needs adjustment", and with none left the finish gate's bounce no
+longer offers sending a fix back to a worker. `job_max_usd` (0-100) replaces 0.40; `prices`
+(`{alias: [input, cached input, output]}` USD per million tokens) price the job's dollars before `pricing.py`,
+and with terms a response's `usage.cost` (USD) is charged before either; a server that sends no terms keeps
+0.2.15's token pricing even if its usage carries a cost. `typical_build` (1-1000) is the showcase's "A typical
+first build uses about N" (`chat_credits.TYPICAL_BUILD`, 12, otherwise). `worker_max_steps` and
+`orchestrator_max_steps` are read and checked, not enforced. Every field is optional; an older server,
+signing out, BYOK and the ChatGPT plan keep the defaults, and an explicit `LOOPCUT_MAX_WORKERS` (at once
+only, as before) or `LOOPCUT_JOB_MAX_USD` still wins. Read as a turn starts (`agent._configure`), so a
+manifest refreshed mid-turn applies from the next turn.
 
 In the panel a wave shows as a card with a row per worker (deliverable, status, steps taken,
 checks, and Cancel while it runs, which stops that worker only), and its merge as a card listing

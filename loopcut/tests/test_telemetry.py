@@ -106,6 +106,8 @@ def payloads() -> list[dict]:
     start = [telemetry.app_start_props(first, (5, 2, 2), cycle, os_value, machine)
              for first, cycle, os_value, machine in ((True, "release", "darwin", "arm64"), (False, "alpha", "win32", "AMD64"),
                                                      (False, "", "linux", "aarch64"), (True, "beta", "freebsd14", "riscv64"))]
+    start += [telemetry.app_start_props(True, (5, 2, 2), "", "win32", "AMD64", language)
+              for language in ("ja_JP", "zh_HANS", "en_US", "es")]
     steps = [telemetry.setup_step_props(step, choice, ok, code)
              for step in telemetry.STEPS for choice in telemetry.CHOICES
              for ok, code in ((True, None), (False, "access_denied"), (False, 502), (False, "Could not reach x: y"))]
@@ -136,6 +138,8 @@ class PayloadTest(unittest.TestCase):
                 self.assertIn(props["os"], telemetry.OS_NAMES)
                 self.assertIn(props["arch"], telemetry.ARCHES)
                 self.assertRegex(props["blender_version"], r"\A[0-9]+(\.[0-9]+){0,3}(-[0-9A-Za-z]+)?\Z")
+                if "ui_language" in props:
+                    self.assertRegex(props["ui_language"], r"\A[a-z]{2,3}(_([A-Z]{2}|[A-Za-z]{4}))?\Z")
             elif body["event"] == "setup_step":
                 self.assertIn(props["step"], telemetry.STEPS)
                 self.assertIn(props["choice"], telemetry.CHOICES)
@@ -155,6 +159,19 @@ class PayloadTest(unittest.TestCase):
                          ["arm64", "x86_64", "x86_64", "arm64", "other"])
         self.assertEqual(telemetry.blender_version((5, 2, 2), "release"), "5.2.2")
         self.assertEqual(telemetry.blender_version((5, 3, 0), "alpha"), "5.3.0-alpha")
+
+    def test_interface_language(self):
+        self.assertEqual(telemetry.ui_language(None), "en_US")
+        self.assertEqual(telemetry.ui_language(("ja_JP", "Japanese")), "ja_JP")
+        self.assertEqual(telemetry.ui_language(("zh_HANS", "Simplified Chinese")), "zh_HANS")
+        for odd in ("ja-JP", "JA_jp", "x", "ja_JP.UTF-8", "ja_JP\n", ""):
+            with self.subTest(odd=odd):
+                self.assertIsNone(telemetry.ui_language((odd, "?")))
+        self.assertEqual(telemetry.app_start_props(True, (5, 2, 2), "", "darwin", "arm64", "ko_KR")["ui_language"],
+                         "ko_KR")
+        self.assertNotIn("ui_language", telemetry.app_start_props(True, (5, 2, 2), "", "darwin", "arm64"))
+        with self.assertRaises(ValueError):
+            telemetry.app_start_props(True, (5, 2, 2), "", "darwin", "arm64", "Japanese")
 
     def test_no_free_text_gets_through(self):
         self.assertEqual(telemetry.model_id("own_key", "My Client's Secret Finetune v2"), "other")

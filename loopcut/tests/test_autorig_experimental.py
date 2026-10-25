@@ -133,9 +133,10 @@ class ExperimentalDispatch(unittest.TestCase):
                             patch.object(cloud_jobs.blobs, 'upload_missing') as upload:
                         result = cloud.execute(cloud.PREFIX + d['name'], arguments)
                     with self.subTest(mode=mode, video=video):
-                        self.assertFalse(result.ok)
+                        self.assertTrue(result.ok, 'R12: a condition, not a failure, so no red card')
                         self.assertIsNone(result.then)
                         self.assertEqual(result.text, exp.MOTION_REFUSAL)
+                        self.assertEqual(result.model_note, exp.MOTION_NOTE)
                         authorize.assert_not_called()
                         run.assert_not_called()
                         upload.assert_not_called()

@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -240,6 +241,72 @@ class TouchedTest(unittest.TestCase):
                              "Torch_Light": {"type": "LIGHT", "visible": True}, "Ghost": {**mesh, "visible": False, "x": 1}}}
         self.assertEqual(scene_diff.touched(before, after), ["Tile_2", "Wall", "Torch"])
         self.assertEqual(scene_diff.touched({**before, "too_many": True}, after), [], "too many to say: frame all")
+
+
+class Image:
+    """bpy.types.Image as _images reads it: 4x4 px, one channel, `data` the bytes foreach_get copies."""
+    library, type, channels, size = None, "IMAGE", 1, (4, 4)
+
+    def __init__(self, name, fill=0, has_data=True, packed=True, temp=False):
+        self.name, self.has_data, self.is_dirty = name, has_data, False
+        self.data = bytearray([fill]) * 64
+        self.pixels = types.SimpleNamespace(foreach_get=lambda buffer: buffer.__setitem__(slice(None), self.data))
+        self.packed_file = types.SimpleNamespace(size=64, data=bytes(self.data)) if packed else None
+        self.props = {"lc_temp": True} if temp else {}
+
+    def get(self, key, default=None):
+        return self.props.get(key, default)
+
+
+class Material:
+    def __init__(self, name, images):
+        self.name = name
+        self.node_tree = types.SimpleNamespace(session_uid=1, nodes=[
+            types.SimpleNamespace(type="TEX_IMAGE", image=image) for image in images])
+
+
+class LookTest(unittest.TestCase):
+    """A look between two snapshots is no change of the user's. Its draw loads the textures it shows,
+    which moves _images' pixel budget, and the chat shows its picture as an image of ours (ui/draw.py
+    tags it lc_temp). What the user loads, paints or packs still is a change."""
+
+    def setUp(self):
+        self.textures = [Image(f"Rock_{n}", fill=i) for i, n in enumerate(("AO", "Color", "Disp", "Normal", "Rough"))]
+        self.textures[0].has_data = False  # Imported by the step, not drawn yet.
+        self.objects = [types.SimpleNamespace(material_slots=[types.SimpleNamespace(material=Material("Rock", self.textures))])]
+        self.decal = Image("decal.png", packed=False)  # Past the budget, not packed.
+        self.images = [*self.textures, self.decal]
+        fakes = {"bpy": types.SimpleNamespace(data=types.SimpleNamespace(images=self.images)),
+                 "numpy": types.SimpleNamespace(float32="float32", empty=lambda n, dtype: bytearray(4 * n))}
+        for patch in (mock.patch.dict(sys.modules, fakes), mock.patch.object(scene_diff, "MAX_IMAGE_PIXELS", 4 * 16)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def snapshot(self) -> dict:
+        return scene(images=scene_diff._images(self.objects), texts={})
+
+    def look(self):
+        self.textures[0].has_data = True  # EEVEE's draw loaded it: it now takes the budget Rock_Rough had.
+        self.images.append(Image(".05cb008bb.png", packed=False, temp=True))
+
+    def test_a_look_between_two_snapshots_is_no_change(self):
+        before = self.snapshot()
+        self.look()
+        after = self.snapshot()
+        self.assertEqual((before["images"]["Rock_Rough"]["pixels"] is None, after["images"]["Rock_Rough"]["pixels"]),
+                         (False, None), "hashed before, read by its packed data after")
+        changes = scene_diff.diff(before, after)
+        self.assertTrue(scene_diff.is_empty(changes), scene_diff.lines(changes))
+
+    def test_what_the_user_loads_paints_or_packs_still_is(self):
+        before = self.snapshot()
+        self.look()
+        self.textures[1].data[:4], self.textures[1].is_dirty = b"\x01\x02\x03\x04", True
+        self.decal.packed_file = types.SimpleNamespace(size=64, data=b"\x07" * 64)
+        self.images.append(Image("photo.jpg", packed=False))  # Opened in the Image Editor.
+        changes = scene_diff.diff(before, self.snapshot())
+        self.assertEqual(changes["added"], ["image photo.jpg (4x4)"])
+        self.assertEqual(changes["changed"], ["image Rock_Color: pixels edited (in Rock)", "image decal.png: packed"])
 
 
 class Vector:

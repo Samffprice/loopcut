@@ -9,10 +9,11 @@ import math
 import struct
 import threading
 import uuid
+from operator import itemgetter
 from pathlib import Path
 
 from . import (rig_bundle, rig_canonicalize, rig_correspondence, rig_deform, rig_experimental, rig_inspect,
-               rig_pose, rig_transport)
+               rig_parts, rig_pose, rig_transport)
 from .rig_inspect import RigError
 
 from .rig_text import STAGES, TIME_HINT
@@ -541,6 +542,7 @@ def apply(outputs, progress=lambda stage: None, *, details=None):
         arm[_KEY] = json.dumps({'targets': preparation['names'], 'selection': selected, 'active': active_name,
                                 'source_snapshot_sha256': preparation['task']['source_snapshot_sha256']})
         arm[rig_experimental.TIER_PROPERTY] = 'experimental' if experimental else 'standard'
+        arm['loopcut_rig_rest'] = json.dumps(_rest(arm))  # The joints the skin is weighted to (check_deformation).
         arm.data.display_type = 'STICK'
         arm.show_in_front = True
         _select([arm])
@@ -567,6 +569,9 @@ def apply(outputs, progress=lambda stage: None, *, details=None):
             return rig_experimental.result_message(len(names))
         if details is not None:
             details['rig']['meshes'] = [o.name for o in originals]
+            walk = motion_price()
+            if walk:  # R5-B1: under Balanced the walk's 10 credits ran with no card and no word about its price.
+                details['rig']['next'] = f'Before a ready-made walk or run, tell the user its price: {walk}.'
         return f'Standard rig added: {len(names)} bones; try a free test pose or ask for a walk.'
     finally:
         if not committed:
@@ -603,7 +608,7 @@ def _selected_rig(name):
     ob = bpy.data.objects.get(name) if name is not None else bpy.context.view_layer.objects.active
     arm = ob if ob and ob.type == 'ARMATURE' else ob.find_armature() if ob else None
     if arm is None or _KEY not in arm:
-        raise RigError('Select a character rig made by Loopcut.', 'invalid_input')
+        raise RigError('Select a character rig made by Loopcut.', 'not_loopcut_rig')
     return arm
 
 
@@ -647,16 +652,27 @@ def _skeleton(arm):
                      _rows(arm.pose.bones[b.name].matrix_basis), b.length) for b in arm.data.bones}
 
 
+def gentle(side):
+    """The gentle pose's result says what it bent and what it left untested: ar-artist-2's model called its
+    joints, and the untouched shoulders, hips and wrists, clean."""
+    bent = 'both knees and elbows' if side == 'both' else f'the {side} knee and elbow'
+    other = '' if side == 'both' else f', nor the {"right" if side == "left" else "left"} side'
+    return (f'Free test pose: {bent} bent {rig_pose.GENTLE}°. Shoulders, hips and wrists were not tested{other}; '
+            'pose stress bends and checks every joint.')
+
+
 def preview(name=None, reset=False, pose='gentle', side='both'):
     import bpy
     from .merge import _undo
     from mathutils import Matrix, Quaternion
     arm = _selected_rig(name)
     if rig_experimental.marked(arm):
-        raise RigError('This experimental rig has no standard test pose. Ask the agent to pose or animate it.',
-                       'experimental_rig')
-    if arm.animation_data or any(b.constraints for b in arm.pose.bones):
-        raise RigError('This rig already has animation or controls. Pose it directly or play its animation.', 'already_animated')
+        raise RigError('This experimental rig has no built-in test poses: pose or keyframe its bones, then run '
+                       'check_deformation.', 'experimental_rig')
+    ad = arm.animation_data
+    if ad and (ad.action or len(ad.nla_tracks) or len(ad.drivers)) or any(b.constraints for b in arm.pose.bones):
+        raise RigError('This rig already has animation or controls, so test poses are off; check_deformation '
+                       'checks its animation.', 'already_animated')
     saved = json.loads(arm.get('loopcut_rig_preview', '{}'))
     if reset and not saved:
         return 'There is no test pose to reset.'
@@ -675,6 +691,8 @@ def preview(name=None, reset=False, pose='gentle', side='both'):
             bone.matrix_basis = Matrix(row['matrix'])
     if reset:
         del arm['loopcut_rig_preview']
+        if 'loopcut_rig_test_pose' in arm:
+            del arm['loopcut_rig_test_pose']
     else:
         for bone_name, q in turns.items():
             bone = arm.pose.bones[bone_name]
@@ -682,6 +700,9 @@ def preview(name=None, reset=False, pose='gentle', side='both'):
             bone.rotation_mode = 'QUATERNION'
             bone.rotation_quaternion = Quaternion(q)
         arm['loopcut_rig_preview'] = json.dumps(saved)
+        # What this test pose set, so the check can tell it from a pose made by hand.
+        arm['loopcut_rig_test_pose'] = json.dumps({'pose': pose, 'side': side,
+                                                   'turns': {n: list(q) for n, q in turns.items()}})
     _select([arm])
     bpy.ops.object.mode_set(mode='POSE')
     _undo('push', 'Free rig test pose')
@@ -690,8 +711,7 @@ def preview(name=None, reset=False, pose='gentle', side='both'):
     # Plain words for the user (ar-artist-1's reply offered to "run reset_preview").
     back = ' To put it back, reset the test pose or undo once; tell the user it is the test pose.'
     if pose == 'gentle':
-        bent = 'both knees and elbows are' if side == 'both' else f'the {side} knee and elbow are'
-        return f'Free test pose: {bent} bent.' + back
+        return gentle(side) + back
     bpy.context.view_layer.update()
     posed = {b.name: _rows(b.matrix) for b in arm.pose.bones}
     measured = rig_pose.measure(posed, _skeleton(arm), pose, side)
@@ -701,20 +721,48 @@ def preview(name=None, reset=False, pose='gentle', side='both'):
     return text + '\n\n' + check_deformation(arm.name)
 
 
+def _segment_distance(c, a, b):
+    d = b - a
+    t = max(0., min(1., (c - a).dot(d) / d.length_squared)) if d.length_squared else 0.
+    return (a + d * t - c).length
+
+
 def _joints(arm):
-    """(names, armature-space rest heads, posed heads, radii, bend degrees) of the joint regions this rig has."""
+    """(names, armature-space rest heads, posed heads, radii, turn degrees, bend from straight (elbows and
+    knees, else None), and the deforming bones near the joint, whose turns make its pose) of the joint
+    regions this rig has."""
     found = []
+    bones, pose = arm.data.bones, arm.pose.bones
     for side in ('Left', 'Right'):
         for region, role, share in rig_deform.REGIONS:
-            bone = arm.data.bones.get(rig_pose.PREFIX + side + role)
+            bone = bones.get(rig_pose.PREFIX + side + role)
             if bone is None:
                 continue
-            turned = [arm.pose.bones[n].matrix_basis.to_quaternion().angle for n in
+            turned = [pose[n].matrix_basis.to_quaternion().angle for n in
                       [bone.name] + ([rig_pose.PREFIX + side + 'Shoulder'] if region == 'shoulder' else [])
-                      if n in arm.pose.bones]
-            found.append((f'{side.lower()} {region}', bone.head_local.copy(), arm.pose.bones[bone.name].head.copy(),
-                          bone.length * share, math.degrees(max(turned))))
+                      if n in pose]
+            radius = bone.length * share
+            near = [b.name for b in bones if b == bone or b == bone.parent or b.use_deform
+                    and _segment_distance(bone.head_local, b.head_local, b.tail_local) < radius]
+            bend = (math.degrees((pose[bone.name].tail - pose[bone.name].head).angle(
+                pose[bone.parent.name].tail - pose[bone.parent.name].head, 0.))
+                    if region in rig_deform.HINGES and bone.parent else None)
+            found.append((f'{side.lower()} {region}', bone.head_local.copy(), pose[bone.name].head.copy(),
+                          radius, math.degrees(max(turned)), bend, near))
     return found
+
+
+def _rest(arm):
+    """Each bone's rest head and Y and Z axes, armature space, as saved at apply (rig_deform.moved)."""
+    return {b.name: [round(x, 6) for x in (*b.head_local, *b.matrix_local.col[1][:3], *b.matrix_local.col[2][:3])]
+            for b in arm.data.bones}
+
+
+def _json(arm, key, default):
+    try:
+        return json.loads(arm.get(key, ''))
+    except (TypeError, ValueError):
+        return default
 
 
 def _mesh_state(obj, deps, topology=True):
@@ -739,58 +787,354 @@ def _mesh_state(obj, deps, topology=True):
 SMOOTHING = {'SUBSURF', 'MULTIRES'}  # After the rig they smooth its cage; the check reads the cage.
 
 
+def _rig_meshes(arm):
+    import bpy
+    return [o for o in (bpy.data.objects.get(n) for n in json.loads(arm[_KEY])['targets'])
+            if o is not None and o.type == 'MESH']
+
+
+def _placement(o, arm):
+    """(armature space -> o's mesh space, armature units -> mesh units) as the rig is placed now."""
+    return o.matrix_world.inverted() @ arm.matrix_world, arm.matrix_world.to_scale()[0] / o.matrix_world.to_scale()[0]
+
+
+def _standard_now(arm, meshes):
+    """(rows' joint specs, {mesh: [(rest centre, posed centre, radius)]} in its space, the bones near each joint)
+    of a standard rig's joint regions in its current, evaluated pose."""
+    joints = _joints(arm)
+    centres = {}
+    for o in meshes:
+        to_mesh, size = _placement(o, arm)
+        centres[o.name] = [(tuple(to_mesh @ a), tuple(to_mesh @ b), r * size) for _, a, b, r, *_ in joints]
+    return ([{'name': n, 'bent': bent, 'bend': bend} for n, _, _, _, bent, bend, _ in joints], centres,
+            {n: near for n, *_, near in joints})
+
+
+def _turns(arm):
+    """{bone: degrees turned from rest} in the current pose; a bone moved a fifth of its length off its rest head
+    counts as turned (an experimental rig's keys may move bones)."""
+    out = {}
+    for b in arm.pose.bones:
+        basis = b.matrix_basis
+        moved = basis.translation.length > .2 * b.length
+        out[b.name] = max(math.degrees(basis.to_quaternion().angle), rig_deform.BENT if moved else 0.)
+    return out
+
+
+def _parts(arm, meshes, rest):
+    """An experimental rig's body parts (rig_parts) and each vertex's part, -1 for none, by its strongest bone.
+    rest: {mesh: rest points in its space}. Positions are read in armature space, up being the world's."""
+    from mathutils import Vector
+    bones, data = {}, arm.data.bones
+    up = (arm.matrix_world.inverted().to_3x3() @ Vector((0., 0., 1.))).normalized()
+    owners, everything = {}, []
+    for o in meshes:
+        to_arm = arm.matrix_world.inverted() @ o.matrix_world
+        names = {g.index: g.name for g in o.vertex_groups if g.name in data and data[g.name].use_deform}
+        top = []
+        for v in o.data.vertices:
+            best = max(((g.weight, names[g.group]) for g in v.groups if g.group in names and g.weight > 0),
+                       default=None)
+            top.append(best[1] if best else None)
+        points = [to_arm @ Vector(p) for p in rest[o.name]]
+        owners[o.name] = top
+        everything += points
+        for name, p in zip(top, points):
+            if name is not None:
+                row = bones.setdefault(name, [0, math.inf, Vector()])
+                row[0] += 1
+                row[1] = min(row[1], p.dot(up))
+                row[2] += p
+    heights = [p.dot(up) for p in everything]
+    ground, height = min(heights), max(heights) - min(heights) or 1.
+    flat = lambda v: v - up * v.dot(up)  # noqa: E731
+    low = [flat(p) for p, h in zip(everything, heights) if h <= ground + .06 * height]
+    above = [flat(p) for p, h in zip(everything, heights) if ground + .08 * height <= h <= ground + .18 * height]
+    feet = tuple(sum(low, Vector()) / len(low) - sum(above, Vector()) / len(above)) if low and above else None
+    found = rig_parts.parts({b.name: {'parent': b.parent.name if b.parent else None, 'head': tuple(b.head_local),
+                                      'vertices': bones.get(b.name, [0])[0],
+                                      'low': bones[b.name][1] if b.name in bones else None,
+                                      'centroid': tuple(bones[b.name][2] / bones[b.name][0]) if b.name in bones else None}
+                             for b in data}, ground, height, tuple(up), feet)
+    index = {b: k for k, part in enumerate(found['parts']) for b in part['bones']}
+    for part in found['parts']:
+        apex = sum((data[b].head_local for b in part['apex']), Vector()) / len(part['apex'])
+        part['radius'] = max([.05 * height] + [(data[b].head_local - apex).length for b in part['bones']]
+                             + [(data[b].tail_local - apex).length for b in part['bones']])
+    regions = {o.name: [index.get(n, -1) if n is not None else -1 for n in owners[o.name]] for o in meshes}
+    return found, regions
+
+
+def _pose(arm):
+    """What a part check needs of the current, evaluated pose: each bone's turn and posed head."""
+    return _turns(arm), {b.name: b.head.copy() for b in arm.pose.bones}
+
+
+def _parts_now(arm, meshes, found, pose=None):
+    """_standard_now for an experimental rig's parts, in the current pose or one _pose() read earlier."""
+    from mathutils import Vector
+    (turns, heads), data = pose or _pose(arm), arm.data.bones
+    specs, centres = [], {o.name: [] for o in meshes}
+    for part in found['parts']:
+        specs.append({'name': part['name'], 'bent': max(turns.get(b, 0.) for b in part['bones'])})
+        rest = sum((data[b].head_local for b in part['apex']), Vector()) / len(part['apex'])
+        posed = sum((heads[b] for b in part['apex']), Vector()) / len(part['apex'])
+        for o in meshes:
+            to_mesh, size = _placement(o, arm)
+            centres[o.name].append((tuple(to_mesh @ rest), tuple(to_mesh @ posed), part['radius'] * size))
+    return specs, centres, {}
+
+
+def _fcurves(arm):
+    """The F-curves of the rig's active action for its slot (actions are layered and slotted since 4.4)."""
+    ad = arm.animation_data
+    action = ad.action if ad else None
+    if action is None:
+        return None, []
+    legacy = getattr(action, 'fcurves', None)
+    if legacy is not None and not hasattr(action, 'layers'):
+        return action, list(legacy)
+    slot, out = getattr(ad, 'action_slot', None), []
+    for layer in getattr(action, 'layers', ()):
+        for strip in layer.strips:
+            bag = strip.channelbag(slot) if slot is not None else None
+            if bag is not None:
+                out += list(bag.fcurves)
+    return action, out
+
+
+def _channels(arm, curves=None):
+    """(action, [(owner, property, index or None, fcurve)]) the rig's animation sets, read without frame_set: a
+    frame change would also reset every other animated object's unkeyed edits and run frame handlers."""
+    action, curves = _fcurves(arm) if curves is None else curves
+    out = []
+    for fc in curves:
+        if fc.mute or fc.data_path.endswith(']'):
+            continue  # Custom properties (rig switches) keep their value.
+        path, _, prop = fc.data_path.rpartition('.')
+        try:
+            owner = arm.path_resolve(path) if path else arm
+            value = getattr(owner, prop)
+        except (AttributeError, ValueError):
+            continue
+        array = hasattr(value, '__len__') and not isinstance(value, str)
+        out.append((owner, prop, fc.array_index if array else None, fc))
+    return action, out
+
+
+def _curves_only(arm, meshes, curves, channels):
+    """Whether setting the action's curves gives what frame_set would: no constraints, drivers, NLA, action blending
+    or skipped (custom property) curves on the rig, and nothing animated on its meshes or their shape keys."""
+    ad = arm.animation_data
+    if (len(channels) != len(curves) or len(ad.drivers) or ad.action_influence < 1 or ad.action_blend_type != 'REPLACE'
+            or any(not t.mute and len(t.strips) for t in ad.nla_tracks)
+            or any(c.influence > 0 and not c.mute for b in arm.pose.bones for c in b.constraints)
+            or any(c.influence > 0 and not c.mute for c in arm.constraints)
+            or getattr(arm.data, 'animation_data', None)):
+        return False
+    for o in meshes:
+        for block in (o, o.data, o.data.shape_keys):
+            data = getattr(block, 'animation_data', None) if block is not None else None
+            if data is not None and (data.action is not None or len(data.drivers) or len(data.nla_tracks)):
+                return False
+    return True
+
+
+def _get(owner, prop, index):
+    value = getattr(owner, prop)
+    return value[index] if index is not None else value
+
+
+def _put(owner, prop, index, value):
+    try:
+        if index is None:
+            setattr(owner, prop, type(getattr(owner, prop))(value))
+        else:
+            getattr(owner, prop)[index] = value
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
+def _span(action, channels):
+    """rig_deform.span for the rig's action and the scene's playback range."""
+    import bpy
+    scene = bpy.context.scene
+    cyclic = any(m.type == 'CYCLES' for *_, fc in channels for m in fc.modifiers)
+    return rig_deform.span(tuple(action.frame_range), (scene.frame_start, scene.frame_end), cyclic) if channels else None
+
+
+def _frames(first, last, channels):
+    """rig_deform.frames, with each frame's turn from rest read from the curves, so nothing is evaluated."""
+    from mathutils import Euler, Quaternion
+    rotations = {}
+    for owner, prop, index, fc in channels:
+        if prop in ('rotation_quaternion', 'rotation_euler') and index is not None and hasattr(owner, 'rotation_mode'):
+            rotations.setdefault((owner.name, prop), [owner.rotation_mode, {}])[1][index] = fc
+
+    def amount(frame):
+        total = 0.
+        for (_, prop), (mode, curves) in rotations.items():
+            if prop == 'rotation_quaternion' and mode == 'QUATERNION':
+                q = Quaternion([curves[k].evaluate(frame) if k in curves else float(k == 0) for k in range(4)])
+                total += q.normalized().angle if q.magnitude > 1e-9 else 0.
+            elif prop == 'rotation_euler' and mode not in ('QUATERNION', 'AXIS_ANGLE'):
+                total += Euler([curves[k].evaluate(frame) if k in curves else 0. for k in range(3)],
+                               mode).to_quaternion().angle
+        return total
+    return rig_deform.frames(first, last, amount)
+
+
 def check_deformation(name=None):
-    """Free: the current pose against rest, per joint region (rig_deform). Changes nothing: the rig is put
-    at rest for one evaluation and back, with any subdivision after it off for both reads (the check is
-    calibrated on cages, and a live 66k-vertex subdivision made it 0.8 s)."""
+    """Free: the current pose against rest, per joint region (rig_deform), or per body part on an experimental rig
+    (rig_parts); on a rig with an animation, sampled frames of it, worst first. Changes nothing in the scene: the
+    rig is put at rest for one evaluation and back (an animation's frames are set from its curves and put back),
+    with any subdivision after it off for every read (the check is calibrated on cages, and a live 66k-vertex
+    subdivision made it 0.8 s). It remembers its numbers on the rig, to compare the next check of the same pose
+    or animation with."""
     import bpy
     _main()
     arm = _selected_rig(name)
-    if rig_experimental.marked(arm):
-        raise RigError('The deformation check needs a standard rig; look at this one in the viewport instead.',
-                       'experimental_rig')
-    meshes = [o for o in (bpy.data.objects.get(n) for n in json.loads(arm[_KEY])['targets'])
-              if o is not None and o.type == 'MESH']
+    experimental = rig_experimental.marked(arm)
+    meshes = _rig_meshes(arm)
     layer = bpy.context.view_layer
     smoothing = [m for o in meshes for k, m in enumerate(o.modifiers) if m.type in SMOOTHING and m.show_viewport
                  and any(r.type == 'ARMATURE' and r.object == arm for r in list(o.modifiers)[:k])]
     position = arm.data.pose_position
+    curves = _fcurves(arm)
+    action, channels = _channels(arm, curves)
+    span = _span(action, channels) if action is not None else None
+    saved = [(owner, prop, index, _get(owner, prop, index)) for owner, prop, index, _ in channels] if span else []
+    scene = bpy.context.scene
+    # With constraints, drivers, NLA or animated meshes the frame is set by Blender (then put back); otherwise from the
+    # curves, which leaves other objects' unkeyed edits alone.
+    direct = span is not None and _curves_only(arm, meshes, curves[1], channels)
+    frame_now = (scene.frame_current, scene.frame_subframe)
+    now = (lambda found: _parts_now(arm, meshes, found)) if experimental else (lambda found: _standard_now(arm, meshes))
+    frames, sampled = [], []
     try:
         for m in smoothing:
             m.show_viewport = False
         layer.update()
-        joints = _joints(arm)  # Posed heads need the update.
-        if not meshes or not joints:
-            raise RigError('This rig has no skinned mesh or joints to check.', 'invalid_input')
-        deps = bpy.context.evaluated_depsgraph_get()
-        posed = {o.name: _mesh_state(o, deps) for o in meshes}
+        if not meshes:
+            raise RigError('This rig has no skinned mesh to check.', 'invalid_input')
+        if span is None:  # The posed state, read before the rest evaluation replaces it.
+            current = _pose(arm) if experimental else now(None)
+            deps = bpy.context.evaluated_depsgraph_get()
+            posed = {o.name: _mesh_state(o, deps) for o in meshes}
         arm.data.pose_position = 'REST'
         layer.update()
-        rest = {o.name: _mesh_state(o, bpy.context.evaluated_depsgraph_get(), topology=False)[0] for o in meshes}
+        deps = bpy.context.evaluated_depsgraph_get()
+        rest = {o.name: _mesh_state(o, deps, topology=span is not None) for o in meshes}
+        arm.data.pose_position = position
+        found, regions = _parts(arm, meshes, {n: r[0] for n, r in rest.items()}) if experimental else (None, {})
+        if span is not None:
+            layer.update()
+            first_spec, first_centres, nears = now(found)
+            if not first_spec:
+                raise RigError('This rig has no joints to check.', 'invalid_input')
+            inputs, kept = [], []
+            for o in meshes:
+                points, edges, tris = rest[o.name]
+                inputs.append({'rest': points, 'edges': edges, 'tris': tris, 'region': regions.get(o.name),
+                               'boundary': experimental, 'scale': o.matrix_world.to_scale()[0] * _unit(),
+                               'joints': first_centres[o.name]})
+                kept.append(o)
+            planned = rig_deform.plan(inputs)
+            step = (span[1] - span[0]) / (rig_deform.ANIMATION_FRAMES - 1)
+
+            def sample(frame):
+                if direct:
+                    for owner, prop, index, fc in channels:
+                        _put(owner, prop, index, fc.evaluate(frame))
+                    layer.update()
+                else:
+                    scene.frame_set(frame)
+                spec, centres, _ = now(found)
+                deps = bpy.context.evaluated_depsgraph_get()
+                posed_now = []
+                for o, mesh in zip(kept, planned):
+                    points = _mesh_state(o, deps, topology=False)[0]
+                    posed_now.append((points if len(points) == len(mesh['rest']) else mesh['rest'],
+                                      [c for _, c, _ in centres[o.name]]))
+                frames.append((frame, rig_deform.measure_pose(planned, spec, posed_now)))
+                sampled.append(frame)
+
+            for frame in _frames(span[0], span[1], channels):
+                sample(frame)
+            # Halfway to the samples beside the worst one: a stretch peaks between samples.
+            top = max(range(len(frames)), key=lambda k: max(map(rig_deform.severity, frames[k][1])))
+            for frame in sorted({round(frames[top][0] - step / 2), round(frames[top][0] + step / 2)}):
+                if span[0] <= frame <= span[1] and frame not in sampled:
+                    sample(frame)
     finally:
+        if span is not None and not direct and frames:
+            scene.frame_set(frame_now[0], subframe=frame_now[1])
+        for owner, prop, index, value in saved:
+            _put(owner, prop, index, value)
         arm.data.pose_position = position
         for m in smoothing:
             m.show_viewport = True
         layer.update()  # Pose bones read their matrices from the last evaluation: put the posed one back.
-    unit = bpy.context.scene.unit_settings.scale_length or 1.
+    word = 'part' if experimental else 'joint'
+    saved_rest = _json(arm, 'loopcut_rig_rest', {})
+    label = ({b: part['name'] for part in found['parts'] for b in part['bones']} if experimental else None)
+    edited = rig_deform.moved(saved_rest, _rest(arm), {b.name: b.parent and b.parent.name for b in arm.data.bones},
+                              arm.matrix_world.to_scale()[0] * _unit(), label) if isinstance(saved_rest, dict) else ''
+    edited = [edited] if edited else []
+    if span is not None:
+        rows = rig_deform.worst(sorted(frames, key=itemgetter(0)))
+        memory = _json(arm, 'loopcut_rig_animation_checks', [])
+        lead, remembered = rig_deform.remember_animation(memory if isinstance(memory, list) else [], action.name, rows)
+        if remembered != memory:
+            arm['loopcut_rig_animation_checks'] = json.dumps(remembered)
+        animation = {'frames': len(frames), 'first': span[0], 'last': span[1]}
+        return '\n'.join(rig_deform.lines(rows, lead + edited, (), animation, word))
+    specs, centres, nears = _parts_now(arm, meshes, found, current) if experimental else current
+    if not specs:
+        raise RigError('This rig has no joints to check.', 'invalid_input')
     inputs = []
     for o in meshes:
         points, edges, tris = posed[o.name]
-        if len(rest[o.name]) != len(points):
+        if len(rest[o.name][0]) != len(points):
             continue  # A modifier that changes the vertex count with the pose has no rest to compare.
-        to_mesh = o.matrix_world.inverted() @ arm.matrix_world
-        size = arm.matrix_world.to_scale()[0] / o.matrix_world.to_scale()[0]
-        inputs.append({'rest': rest[o.name], 'posed': points, 'edges': edges, 'tris': tris,
-                       'scale': o.matrix_world.to_scale()[0] * unit,
-                       'joints': [(tuple(to_mesh @ a), tuple(to_mesh @ b), r * size) for _, a, b, r, _ in joints]})
-    rows = rig_deform.measure(inputs, [{'name': n, 'bent': bent} for n, _, _, _, bent in joints])
-    return '\n'.join(rig_deform.lines(rows))
+        inputs.append({'rest': rest[o.name][0], 'posed': points, 'edges': edges, 'tris': tris,
+                       'region': regions.get(o.name), 'boundary': experimental,
+                       'scale': o.matrix_world.to_scale()[0] * _unit(), 'joints': centres[o.name]})
+    rows = rig_deform.measure(inputs, specs)
+    # Each joint against the last check of it in the same pose (its nearby bones' turns, or a part's own),
+    # remembered on the rig: ar-artist-2's "fix" took a shoulder from 97% to 54% volume and the check still
+    # called it clean.
+    if experimental:
+        nears = {part['name']: part['bones'] for part in found['parts']}
+    poses = {n: {b: [round(x, 5) for x in arm.pose.bones[b].matrix_basis.to_quaternion()] for b in near}
+             for n, near in nears.items()}
+    memory = _json(arm, 'loopcut_rig_checks', [])
+    lead, remembered = rig_deform.remember(memory if isinstance(memory, list) else [], rows, poses)
+    if remembered != memory:
+        arm['loopcut_rig_checks'] = json.dumps(remembered)
+    test = _json(arm, 'loopcut_rig_test_pose', {})
+    by_hand = rig_pose.by_hand(test.get('turns', {}) if isinstance(test, dict) else {},
+                               {b.name: tuple(b.matrix_basis.to_quaternion()) for b in arm.pose.bones})
+    notes = ([BY_HAND] if by_hand and not experimental and any(row['bent'] >= rig_deform.BENT for row in rows)
+             else [])
+    return '\n'.join(rig_deform.lines(rows, lead + edited, notes, None, word))
+
+
+def _unit():
+    import bpy
+    return bpy.context.scene.unit_settings.scale_length or 1.
+
+
+# ar-artist-2's model hand-wrote its stress pose twice in run_python and its elbows reached 13°.
+BY_HAND = ('Posed by hand, not with a built-in test pose: for test poses use preview with pose stress (free), even '
+           'when other angles were asked; it bends every joint to known angles and checks them.')
 
 
 SCHEMAS = [{'type': 'function', 'function': {
-    'name': 'character_rig', 'title': 'Checking your character', 'description': 'Free local inspect, standard-rig test poses/reset and bend check, and '
-    'rig removal. Inspect before loopcut_cloud.auto_rig, which quotes before spending. Experimental rigs need direct '
-    'bone keyframes or repairs; only standard humanoid rigs support motion tools.',
+    'name': 'character_rig', 'title': 'Checking your character', 'description': 'Free local inspect, standard-rig test poses (preview pose stress, even for '
+    'other angles; not run_python), reset, bend check (any Loopcut rig; on an animated one, its whole animation) and '
+    'rig removal. Inspect before loopcut_cloud.auto_rig (it quotes first). Experimental rigs: bone keyframes, no motion '
+    'tools.',
     'parameters': {'type': 'object', 'properties': {
         'action': {'type': 'string', 'enum': ['inspect', 'preview', 'check_deformation', 'reset_preview', 'remove']},
         'targets': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Mesh names to inspect; defaults to selection.'},
@@ -799,12 +1143,166 @@ SCHEMAS = [{'type': 'function', 'function': {
         'side': {'type': 'string', 'enum': list(rig_pose.SIDES)}}, 'required': ['action']}}}]
 
 
+def _animation_digest(arm):
+    """A short hash of the rig's active action: its name, curves, keys and modifiers; None without one."""
+    import hashlib
+    from array import array
+    action, curves = _fcurves(arm)
+    if action is None:
+        return None
+    digest = hashlib.blake2b(action.name.encode(), digest_size=8)
+    for fc in curves:
+        digest.update(f'{fc.data_path}|{fc.array_index}|{fc.mute}|{[m.type for m in fc.modifiers]}'.encode())
+        co = array('f', bytes(8 * len(fc.keyframe_points)))
+        fc.keyframe_points.foreach_get('co', co)
+        digest.update(co.tobytes())
+    return digest.hexdigest()
+
+
+def rig_state():
+    """What run_python compares around the model's code (R5-B2, three weight "fixes" told to the user unchecked):
+    ({mesh: (its weights' hash, its rig)} of Loopcut-rigged meshes, {rig: its animation's hash})."""
+    import bpy
+    from .ownership import weights_hash
+    weights, motion = {}, {}
+    for ob in bpy.context.scene.objects:
+        if _KEY not in ob:
+            continue
+        if ob.type == 'ARMATURE':
+            motion[ob.name] = _animation_digest(ob)
+        elif ob.type == 'MESH' and ob.vertex_groups:
+            try:
+                rig = json.loads(ob[_KEY]).get('armature')
+            except (TypeError, ValueError, AttributeError):
+                continue
+            weights[ob.name] = (weights_hash(ob.data), rig)
+    return weights, motion
+
+
+def rig_changes(before, after):
+    """run_python's line when the code changed a Loopcut rig's weights or its animation, else ''."""
+    import bpy
+    (weights, motion), (weights_now, motion_now) = before, after
+    changed = [n for n, (digest, _) in weights_now.items() if n in weights and weights[n][0] != digest]
+    keyed = [n for n, digest in motion_now.items() if digest is not None and motion.get(n) != digest]
+    out = []
+    if changed:
+        rigs = {weights_now[n][1] for n in changed}
+        if any(motion_now.get(r) for r in rigs):
+            how = 'run character_rig check_deformation: it checks the whole animation'
+        elif any(rig_experimental.marked(bpy.data.objects.get(r)) for r in rigs):
+            how = 'pose its bones and run character_rig check_deformation'
+        else:
+            how = 'run character_rig preview with pose stress (free): it bends every joint and checks it'
+        out.append(f"Weights changed on {', '.join(changed)}: before telling the user it is fixed, {how}.")
+    if keyed:
+        out.append(f"Animation changed on {', '.join(keyed)}: run character_rig check_deformation before telling the "
+                   "user it works.")
+    return '\n'.join(out)
+
+
+# Conditions, not failures, so their cards are not red (ar-dog-3: three red X cards in a row, "feels like
+# everything is failing"): the model gets what to do instead.
+EXPECTED = frozenset(('experimental_rig', 'already_animated', 'not_loopcut_rig'))
+
+
+def prices():
+    """(rig credits, ready-made motion credits per second, its default seconds) from the signed-in catalog's
+    estimates (credits_estimate prices a tool's default arguments), or None where it has none."""
+    from . import cloud
+    runtime = cloud._runtime
+    try:
+        rows = {d.get('name'): d for d in (runtime.descriptors() if runtime else [])}
+    except Exception:  # A catalog that cannot be read gives no prices, never a failed check.
+        rows = {}
+    def estimate(name):
+        value = ((rows.get(name) or {}).get('cost') or {}).get('credits_estimate')
+        return value if type(value) in (int, float) and value > 0 else None
+    seconds = ((((rows.get('motion_from_text') or {}).get('input_schema') or {}).get('properties') or {})
+               .get('duration_s') or {}).get('default', MOTION_SECONDS)
+    motion = estimate('motion_from_text')
+    per = motion / seconds if motion and type(seconds) in (int, float) and seconds > 0 else None
+    return estimate('auto_rig'), per, seconds if per else None
+
+
+MOTION_SECONDS = 5  # The contract's default motion length, which credits_estimate prices (CATALOG.md).
+
+
+def motion_price():
+    """'2 credits a second (10 for 5 s)', or '' without a catalog."""
+    _, per, seconds = prices()
+    return f'{per:g} credits a second ({per * seconds:g} for {seconds:g} s)' if per else ''
+
+
+def price_note():
+    """R5-B1: the walk's 10 credits ran without the model ever saying a walk costs extra."""
+    rig, _, _ = prices()
+    walk = motion_price()
+    if not rig and not walk:
+        return ''
+    parts = ([f'the rig is {rig:g} credits'] if rig else []) + ([f'a ready-made walk or run is {walk}'] if walk else [])
+    return 'Before rigging, tell the user the total: ' + ' and '.join(parts) + '.'
+
+
+def rigged(names=None):
+    """inspect on a character that already has a skeleton describes it instead of refusing (ar-dog-3 got auto-rig's
+    "already has a skeleton… remove it" after its own rig was applied): what it is and what works. None when the
+    meshes have no skeleton."""
+    import bpy
+    _main()
+    if names:
+        objects = [o for o in (bpy.context.scene.objects.get(n) for n in names if isinstance(n, str)) if o is not None]
+    else:
+        objects = list(bpy.context.selected_objects) or [o for o in [bpy.context.view_layer.objects.active] if o]
+    for ob in objects:
+        arm = ob if ob.type == 'ARMATURE' else ob.find_armature() if ob.type == 'MESH' else None
+        if arm is None and ob.type == 'MESH':
+            arm = next((m.object for m in ob.modifiers if m.type == 'ARMATURE' and m.object), None)
+        if arm is not None and arm.type == 'ARMATURE':
+            return describe_rig(arm)
+    return None
+
+
+def describe_rig(arm):
+    from . import motion_retarget
+    ours = _KEY in arm
+    tier = 'experimental' if rig_experimental.marked(arm) else 'standard' if ours else None
+    action, channels = _channels(arm)
+    span = _span(action, channels) if action is not None else None
+    meshes = _rig_meshes(arm) if ours else []
+    out = {'rigged': True, 'armature': arm.name, 'made_by_loopcut': ours, 'tier': tier or 'own rig',
+           'bone_count': len(arm.data.bones), 'meshes': [o.name for o in meshes],
+           'animated': f'frames {span[0]}-{span[1]}' if span else False}
+    check = 'check_deformation checks ' + ('the whole animation' if span else 'the current pose')
+    if tier == 'experimental':
+        text = (f'Already rigged by Loopcut (experimental, {len(arm.data.bones)} bones): no ready-made motions, so '
+                f'animate it with bone keyframes (free); {check}.')
+    elif tier == 'standard':
+        walk = motion_price()
+        text = (f'Already rigged by Loopcut (standard, {len(arm.data.bones)} bones): ready-made walks and runs work'
+                + (f' ({walk}; tell the user first)' if walk else '') + f'; preview pose stress tests poses; {check}.')
+    else:
+        moves = motion_retarget.rig_of(arm) is not None
+        text = (f'Already has its own skeleton ({len(arm.data.bones)} bones): '
+                + ('ready-made motions can target it' if moves else 'animate it with bone keyframes')
+                + "; Loopcut's test poses and bend check need a Loopcut rig.")
+    out['message'] = text + ' It needs no new rig.'
+    return out
+
+
 def tool(action, targets=None, rig=None, pose='gentle', side='both'):
     from .tools import ToolResult, _editor_context
     try:
         with _editor_context('VIEW_3D'):
             if action == 'inspect':
-                return ToolResult(json.dumps(inspect(targets)[3]))
+                described = rigged(targets)
+                if described is not None:
+                    return ToolResult(json.dumps(described))
+                report = inspect(targets)[3]
+                note = price_note()
+                if note:
+                    report['price_note'] = note
+                return ToolResult(json.dumps(report))
             if action == 'remove':
                 return ToolResult(remove(rig))
             if action == 'check_deformation':
@@ -814,7 +1312,7 @@ def tool(action, targets=None, rig=None, pose='gentle', side='both'):
             raise RigError('Choose Check character, Try a free test pose, Check how it bends, Reset test pose or '
                            'Remove character rig.', 'invalid_input')
     except RigError as ex:
-        return ToolResult(str(ex), ok=False)
+        return ToolResult(str(ex), ok=ex.code in EXPECTED)
 
 
 DISPATCH = {'character_rig': tool}

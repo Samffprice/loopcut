@@ -307,6 +307,15 @@ def solve(bones, pose='gentle', side='both'):
     return rig.solved, notes
 
 
+def by_hand(turns, bases, tolerance=2):
+    """Whether the rig is posed other than as the last test pose left it: turns {bone: (w, x, y, z)} that preview
+    set, bases {bone: (w, x, y, z)} now. A bone turned past `tolerance` degrees that the test pose did not set
+    so was posed by hand (the check then points the model at the built-in poses)."""
+    identity = (1., 0., 0., 0.)
+    return any(math.degrees(2 * math.acos(min(1., abs(dot(q, turns.get(n, identity)))))) > tolerance
+               for n, q in bases.items())
+
+
 def measure(posed, bones, pose, side='both'):
     """What the pose came to, from armature-space pose matrices ({name: 4x4 rows}): plain phrases with
     numbers, for the result the model reports from."""

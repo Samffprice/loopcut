@@ -8,6 +8,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -150,6 +151,69 @@ class SceneFactsTest(unittest.TestCase):
     def test_scene_facts_is_empty_for_a_plain_scene(self):
         cube = obj(name="Cube", type="MESH", data=None)
         self.assertEqual(sc._scene_facts([cube]), [])
+
+
+def shot(images: dict) -> dict:
+    """A scene_diff snapshot of an empty scene but its images."""
+    return {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "worlds": {}, "collections": {},
+            "scene": {}, "mode": "OBJECT", "texts": {}, "images": images}
+
+
+class SinceLastStepTest(unittest.TestCase):
+    """The "by the user, not you" lines: a texture the agent's own look loaded moves scene_diff's pixel
+    budget, and the image it took from is not one the user packed (test_scene_diff.LookTest)."""
+
+    def test_a_look_is_not_a_user_change_and_an_image_the_user_opened_is(self):
+        from loopcut import scene_diff
+        rough = {"size": (2048, 2048), "pixels": "9f3a0c1d", "packed": "", "dirty": False, "materials": ("Rock",)}
+        since = shot({"Rock_Rough": rough})
+        looked = {"Rock_Rough": {**rough, "pixels": None, "packed": "5592405:1a2b3c4d"}}
+        with mock.patch.object(scene_diff, "snapshot", return_value=shot(looked)):
+            self.assertEqual(sc._since_last_step(since), [])
+        photo = {"size": (1024, 768), "pixels": None, "packed": "", "dirty": False, "materials": ()}
+        with mock.patch.object(scene_diff, "snapshot", return_value=shot({**looked, "photo.jpg": photo})):
+            self.assertEqual(sc._since_last_step(since), ["changed since your last step (by the user, not you):",
+                                                          "  + image photo.jpg (1024x768)"])
+
+
+
+def view(translate=True, items=(("ja_JP", "Japanese - 日本語"), ("zh_HANS", "Chinese (Simplified) - 简体中文"),
+                                ("sr_RS@latin", "Serbian Latin - srpski latinica"), ("en_US", "English - English"))):
+    """preferences.view as interface_language reads it: the translate switch and the language enum."""
+    language = types.SimpleNamespace(enum_items=[types.SimpleNamespace(identifier=i, name=n) for i, n in items])
+    return types.SimpleNamespace(use_translate_interface=translate,
+                                 bl_rna=types.SimpleNamespace(properties={"language": language} if items else {}))
+
+
+class InterfaceLanguageTest(unittest.TestCase):
+    def test_translated_interface_names_its_language(self):
+        self.assertEqual(sc.interface_language(view(), "ja_JP"), ("ja_JP", "Japanese"))
+        self.assertEqual(sc.interface_language(view(), "zh_HANS"), ("zh_HANS", "Chinese (Simplified)"))
+        self.assertEqual(sc.interface_language(view(), "sr_RS@latin"), ("sr_RS", "Serbian Latin"))
+
+    def test_english_or_untranslated_needs_no_line(self):
+        self.assertIsNone(sc.interface_language(view(), "en_US"))
+        self.assertIsNone(sc.interface_language(view(), "en_GB"))
+        self.assertIsNone(sc.interface_language(view(translate=False), "ja_JP"))
+        self.assertIsNone(sc.interface_language(view(), ""))  # A build without translations.
+
+    def test_unlisted_locale_falls_back_to_its_code(self):
+        self.assertEqual(sc.interface_language(view(), "ko_KR"), ("ko_KR", "ko_KR"))
+        self.assertEqual(sc.interface_language(view(items=()), "ja_JP.UTF-8"), ("ja_JP", "ja_JP"))
+
+    def test_line_says_which_language_to_answer_in(self):
+        line = sc.language_line("Japanese", starter=False)
+        self.assertTrue(line.startswith("interface language: Japanese."))
+        self.assertIn("language the user writes in", line)
+        self.assertIn("romaji", line)
+        self.assertTrue(line.endswith("reply in Japanese."))
+        starter = sc.language_line("Japanese", starter=True)
+        self.assertIn("starter Loopcut wrote", starter)
+        self.assertTrue(starter.endswith("reply in Japanese."))
+
+    def test_every_card_prompt_counts_as_a_starter(self):
+        from loopcut import try_it
+        self.assertEqual(try_it.PROMPTS, {card["prompt"] for card in try_it.CARDS})
 
 
 if __name__ == "__main__":

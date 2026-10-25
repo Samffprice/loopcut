@@ -7,7 +7,9 @@ import math
 
 MAX_TRIANGLES = 100_000
 MAX_VERTICES = 300_000
-SHAPE_WARNING = "This unusual shape may get an experimental rig."
+# R5-D1: ar-dog-3's model promised a ready-made run before the rig, which then refused it after the purchase.
+SHAPE_WARNING = ("This unusual shape may get an experimental rig: no ready-made motions, so Loopcut animates it "
+                 "with bone keyframes, and the bend check works on it.")
 CLOTHING_WARNING = 'Long coats may stretch between the legs.'
 # ar-dog-1: a 3.9 m upload height and a 100x scale read as "resize first", and the model shrank the
 # dog out of sight before rigging; the upload includes size and rotation (autorig.geometry).

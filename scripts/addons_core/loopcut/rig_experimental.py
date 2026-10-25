@@ -4,6 +4,8 @@ TIER_PROPERTY = 'loopcut_rig_tier'
 from .rig_text import QUOTE
 
 MOTION_REFUSAL = 'Ready-made motions need a person-shaped character, so ask Loopcut to animate this one instead.'
+MOTION_NOTE = ('No credits used. Animate this experimental rig with bone keyframes instead (free), then run '
+               'character_rig check_deformation: it checks the whole animation.')
 REASONS = frozenset(('pelvis_branches', 'too_few_joints', 'not_humanoid', 'front_ambiguous', 'finger_count'))
 
 
@@ -49,5 +51,8 @@ def describe(joints, armature):
     return {'tier': 'experimental', 'armature': armature, 'bone_count': len(joints),
             'root': joints[root]['name'], 'bone_chains': chains, 'rotation_mode': 'XYZ',
             'motion_tools_supported': False,
-            'next_steps': ['Keyframe bones with ordinary Blender tools for a simple cycle, such as a four-leg walk.',
-                           'Rename bones.', 'Fix weights.', 'Delete stray bones.']}
+            # ar-dog-3: the bones left in view read as "still broken", and the gallop was called verified unchecked.
+            'next_steps': [f'Hide {armature} before showing the user the result; its bones draw over the mesh.',
+                           'Keyframe bones with ordinary Blender tools for a simple cycle, such as a four-leg walk.',
+                           'Then run character_rig check_deformation: it checks the whole animation.',
+                           'Rename bones, fix weights or delete stray bones only if asked.']}

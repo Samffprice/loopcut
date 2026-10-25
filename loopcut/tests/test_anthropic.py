@@ -488,6 +488,25 @@ class ErrorTest(Base):
         self.assertEqual(sent.count('"type": "image"') + sent.count("omitted to keep the request small"), 7,
                          "every look sent, smaller, or named in a note")
 
+    def test_a_bare_oserror_in_place_of_the_status_line_is_retried(self):
+        """0.2.14 logs: Windows raised FileNotFoundError(2) from getresponse, which urlopen does not wrap."""
+        Fake.script = [(200, reply(text("ok")))]
+        calls, real = [], am._post
+
+        def post(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise FileNotFoundError(2, "No such file or directory")
+            return real(*args)
+        with mock.patch.object(am, "_post", post):
+            completion, _ = self.stream()
+        self.assertEqual((completion.text, len(calls)), ("ok", 2))
+        with mock.patch.object(am, "_post", side_effect=FileNotFoundError(2, "No such file or directory")) as post, \
+                self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual((caught.exception.code, post.call_count), (llm.CONNECTION_LOST, 4))
+        self.assertRegex(str(caught.exception), r"^Could not reach \S+: network error, errno 2$")
+
     def test_rate_limit_waits_as_retry_after_says_capped(self):
         Fake.script = [(429, error_body("rate_limit_error"), {"retry-after": "2"}),
                        (429, error_body("rate_limit_error"), {"retry-after": "900"}),
@@ -537,6 +556,41 @@ class ErrorTest(Base):
         Fake.script = [(200, reply(text("cut"), end=False))]   # Ends without message_stop.
         with self.assertRaisesRegex(llm.LLMError, "Connection lost"):
             self.stream()
+
+    def breaks(self, error):
+        """The body read raising `error` where message_stop would come: the socket broke mid-reply."""
+        real = am._events
+
+        def events(response):
+            for kind, event in real(response):
+                if kind == "message_stop":
+                    raise error
+                yield kind, event
+        patcher = mock.patch.object(am, "_events", events)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_bare_oserror_reading_the_body_reads_as_a_network_error_not_a_missing_file(self):
+        """Windows' bare FileNotFoundError(2) (0.2.14 logs), here from the body read: after text, and before any."""
+        self.breaks(FileNotFoundError(2, "No such file or directory"))
+        Fake.script = [(200, reply(text("Half a rep")))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(caught.exception.code, llm.CONNECTION_LOST)
+        self.assertEqual(str(caught.exception), "Connection lost while streaming the reply: network error, errno 2")
+        Fake.script = [(200, reply())] * (len(llm.RETRY_DELAYS) + 1)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(str(caught.exception), "Connection lost before any reply arrived: network error, errno 2")
+        self.assertNotIn("No such file", str(caught.exception))
+
+    def test_a_reset_reading_the_body_keeps_its_own_text(self):
+        self.breaks(ConnectionResetError(54, "Connection reset by peer"))
+        Fake.script = [(200, reply(text("Half a rep")))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(str(caught.exception),
+                         "Connection lost while streaming the reply: ConnectionResetError(54, 'Connection reset by peer')")
 
     def test_an_invalid_request_in_the_stream_is_shown(self):
         Fake.script = [(200, reply(end=False) + event("error", error={"type": "invalid_request_error", "message": "bad"}))]

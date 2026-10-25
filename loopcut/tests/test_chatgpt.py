@@ -921,6 +921,44 @@ class StreamTest(Base):
                 self.stream()
         self.assertIs(caught.exception.__cause__, disconnected)
 
+    def breaks(self, error):
+        """The body read raising `error` where response.completed would come: the socket broke mid-reply."""
+        real = chatgpt_responses._events
+
+        def events(response):
+            for kind, event in real(response):
+                if kind == "response.completed":
+                    raise error
+                yield kind, event
+        patcher = mock.patch.object(chatgpt_responses, "_events", events)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_bare_oserror_reading_the_body_reads_as_a_network_error_not_a_missing_file(self):
+        """Windows' bare FileNotFoundError(2) (0.2.14 logs), here from the body read: after text, and before any."""
+        self.breaks(FileNotFoundError(2, "No such file or directory"))
+        FakeResponses.script = [(200, reply("Half a rep"))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(caught.exception.code, llm.CONNECTION_LOST)
+        self.assertEqual(str(caught.exception), "The connection to ChatGPT dropped while it was replying. "
+                                                "Nothing was lost: press Try again. (network error, errno 2)")
+        FakeResponses.script = [(200, reply())] * (len(llm.RETRY_DELAYS) + 1)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(str(caught.exception), "The connection to ChatGPT dropped before it could answer. "
+                                                "Nothing was lost: press Try again. (network error, errno 2)")
+        self.assertNotIn("No such file", str(caught.exception))
+
+    def test_a_reset_reading_the_body_keeps_its_own_text(self):
+        self.breaks(ConnectionResetError(54, "Connection reset by peer"))
+        FakeResponses.script = [(200, reply("Half a rep"))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(str(caught.exception), "The connection to ChatGPT dropped while it was replying. "
+                                                "Nothing was lost: press Try again. (ConnectionResetError: Connection "
+                                                "reset by peer)")
+
     @staticmethod
     def interrupted(cause):
         raise chatgpt_responses._Interrupted(False) from cause
@@ -1058,6 +1096,21 @@ class StreamTest(Base):
                             ConnectionResetError(54, "Connection reset by peer"), http.client.IncompleteRead(b""))
         completion, _ = self.stream()
         self.assertEqual((completion.text, len(calls)), ("ok", 4))
+
+    def test_a_bare_oserror_in_place_of_the_status_line_is_retried(self):
+        """0.2.14 logs: Windows raised FileNotFoundError(2) from getresponse, which urlopen does not wrap."""
+        FakeResponses.script = [(200, reply("ok"))]
+        calls = self._drops(FileNotFoundError(2, "No such file or directory"))
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(calls)), ("ok", 2))
+
+    def test_a_bare_oserror_every_try_reads_as_a_network_error_not_a_missing_file(self):
+        calls = self._drops(*[FileNotFoundError(2, "No such file or directory")] * 4)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual((caught.exception.code, len(calls)), (llm.CONNECTION_LOST, 4))
+        self.assertEqual(str(caught.exception), "The connection to ChatGPT dropped before it could answer. "
+                                                "Nothing was lost: press Try again. (network error, errno 2)")
 
     def test_a_broken_pipe_is_retried_with_smaller_images(self):
         # 2026-10-17: every try re-sent the same 6-7 MB of images, and every try was cut off with a broken pipe.

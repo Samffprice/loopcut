@@ -7,6 +7,7 @@ import uuid
 # free: try_samples supplies the shipped result. seconds: scales the manifest's displayed motion price.
 # arm_free: no tool, but the credits arm's gateway serves the card's tagged requests on the house (x-loopcut-try-it,
 # server TRY_IT_CARDS), so in that arm it is tagged and priced "Free" too (0.2.15).
+# waiting: shown under the panel's Thinking line until the first reply arrives, for a card whose first step is slow.
 # thumbnail: in media/, our studio renders of the jumping mannequin and Poly Haven's CC0 Treasure Chest,
 # alongside the card photo (our dwarf warrior concept). The setup continues to expose these definitions as
 # onboarding.CARDS.
@@ -21,8 +22,10 @@ CARDS = (
                "cube."},
     {"id": "model", "title": "Model a treasure chest", "tool": None, "arm_free": True,
      "thumbnail": "card_chest.jpg", "line": "Built step by step with Blender's own tools.",
+     "waiting": "Planning the chest. The first step can take a minute or two.",
      "prompt": "Model a stylized treasure chest with gold trim"},  # A starter checked to finish on the free tier.
 )
+PROMPTS = frozenset(card["prompt"] for card in CARDS)  # A message with exactly these words came from a card.
 
 
 def first_call(card_id: str, session: dict, schemas: list[dict]):

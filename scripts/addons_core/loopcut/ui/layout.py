@@ -220,6 +220,18 @@ def _mix(a, b, t: float):
     return tuple(a[i] + (b[i] - a[i]) * t for i in range(4))
 
 
+def starter_waiting(items: list) -> str:
+    """A starter card's note while its first step is planned: the last message sent is the card's prompt and
+    nothing has come back for it yet (a slow first step otherwise reads as a stuck panel)."""
+    from .. import try_it
+    last = next((n for n in reversed(range(len(items)))
+                 if items[n]["kind"] == "user" and not items[n].get("queued")), None)
+    if last is None or any(i["kind"] != "assistant" or i["text"].strip() for i in items[last + 1:]):
+        return ""
+    text = items[last]["text"].strip()
+    return next((card.get("waiting", "") for card in try_it.CARDS if card["prompt"] == text), "")
+
+
 def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
     """The waiting line, animated the way people expect: a highlight sweeps along the word and the
     ellipsis after it pulses (a still frame reads "Working…", never "Working."). Driven by ui["now"];
@@ -354,6 +366,8 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         glyph, glyph_color = "✓", T.TEXT_MUTED
     elif plan_repair == "adjusting":
         glyph, glyph_color = "…", T.TEXT_MUTED
+    elif plan_repair == "capped":  # The turn's worker limit (orchestrator.CAP_SPENT): said, nothing to fix.
+        glyph, glyph_color = "–", T.TEXT_MUTED
     if code_repair:
         glyph, glyph_color = ("–" if code_repair == "continued" else "↻"), T.TEXT_MUTED
     awaiting = status == "awaiting"
@@ -367,7 +381,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     summary = "Rig your character" if rig else item["summary"] or item["name"]
     if plan_repair:
         summary = {"resolved": "Helper started", "retried": "Adjusted the helper plan and retried",
-                   "adjusting": "Adjusting the helper plan…"}.get(
+                   "adjusting": "Adjusting the helper plan…", "capped": "Helper limit for this turn"}.get(
             plan_repair, "Helper plan needs adjustment")
     show_name = not rig and expanded and item["name"].strip().casefold() != summary.strip().casefold()
     if awaiting:
@@ -449,7 +463,16 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                  "Hide details" if item.get("details_expanded") else "Details", T.BUTTON_GHOST, T.TEXT_MUTED,
                  ("toggle_details", n))
         cursor += f.px(24)
-    if expanded and not rig and item["code"] and (not delegate or item.get("details_expanded")):
+    show_code = expanded and not rig and item["code"] and (not delegate or item.get("details_expanded"))
+    if show_code and awaiting and not delegate and not item.get("install"):
+        # An ask leads with its summary; the code waits behind its own toggle. An install shows what it runs.
+        cursor += f.px(6)
+        f.button(f"item{n}.tool.code_toggle", inner_x, cursor,
+                 "Hide code" if item.get("details_expanded") else "Show code", T.BUTTON_GHOST, T.TEXT_MUTED,
+                 ("toggle_details", n))
+        cursor += f.px(24)
+        show_code = item.get("details_expanded")
+    if show_code:
         cursor += f.px(6)
         cursor += f.code_block(f"item{n}.tool.code", inner_x, cursor, inner_w, item["code"],
                                T.CODE_PREVIEW_LINES if awaiting else None)
@@ -474,7 +497,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
                               f.px(T.FONT_SIZE_CODE),
                               T.ERROR if status == "failed" and not code_repair
-                              and plan_repair not in {"resolved", "retried", "adjusting"}
+                              and plan_repair not in {"resolved", "retried", "adjusting", "capped"}
                               else T.TEXT_MUTED, "mono")
     if expanded and not rig and (item.get("cloud_error") or {}).get("message"):
         cursor += f.paragraph(f"item{n}.tool.account_error", inner_x, cursor, inner_w,
@@ -539,12 +562,17 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
+_AFTER_RETRY = frozenset({"changes", "merge", "notice"})  # The turn's end cards, added after its error.
+
+
 def _item_error(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size = f.px(T.CARD_PAD), f.px(T.FONT_SIZE)
     mark = len(f.prims)
     height = f.paragraph(f"item{n}.error", x + pad, y + pad, width - 2 * pad, item["text"], size, T.ERROR) + 2 * pad
-    # A dropped connection: Try again sends the same request (agent.resume), while it is the newest item.
-    if item.get("retry") and n == len(f.session["items"]) - 1 and not f.session.get("busy"):
+    # A dropped connection, the gateway's vendor failing: Try again sends the same request (agent.resume), while
+    # only cards about the stopped turn follow (what it changed, a notice), so never on an older error.
+    if (item.get("retry") and not f.session.get("busy")
+            and all(later.get("kind") in _AFTER_RETRY for later in f.session["items"][n + 1:])):
         height += _button_row(f, x + pad, y + height - pad, width - 2 * pad,
                               [(f"item{n}.error.retry", "Try again", T.BUTTON_GHOST, T.TEXT, ("resume", n))]) + f.px(4)
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.error.card", "x": x, "y": y, "w": width, "h": height,
@@ -1597,6 +1625,8 @@ def _plan_repairs(items: list, active_turn: str = "") -> dict:
         if item.get("kind") != "tool" or item.get("name") != "delegate":
             continue
         turn = item.get("plan_turn") or item.get("turn_id")
+        if item.get("plan_repair") == "capped":  # The turn's worker limit: neither a plan to fix nor a fix.
+            continue
         if item.get("plan_repair"):
             repairs[n] = "adjusting" if active_turn and turn == active_turn else "needed"
         if not isinstance(turn, str) or not turn:
@@ -1694,6 +1724,10 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
             cursor += thinking(f, f"item{stream}.thinking", x, cursor, f.px(T.FONT_SIZE)) + gap
         else:
             cursor += thinking(f, "chat.working", x, cursor, f.px(T.FONT_SIZE), "Working") + gap
+        waiting = starter_waiting(items)
+        if waiting:
+            cursor += f.paragraph("chat.starter_waiting", x, cursor, width, waiting, f.px(T.FONT_SIZE_SMALL),
+                                  T.TEXT_MUTED) + gap
 
     empty = not items and not f.ui.get("cloud_jobs") and not session["busy"]
     if empty:

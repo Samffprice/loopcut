@@ -310,6 +310,37 @@ class TryItTest(unittest.TestCase):
         self.assertEqual(self.events, ["model"])
         self.assertEqual(self.session["messages"][:-1], original)
 
+    def test_try_again_after_the_sample_ran_is_still_the_card_s_free_turn_and_does_not_repeat_it(self):
+        """The gateway's vendor failed on the request after the sample; Try again (resume) starts a fresh Turn. The
+        card comes back from the mark on the card's message: free chat again, and neither the sample nor the
+        router runs twice."""
+        error = llm.LLMError("HTTP 502: down", 502, "upstream_error", {"code": "upstream_error", "message": "down"})
+        failures, headers = [], []
+
+        def chat(build, *args):
+            headers.append(build().get_header("X-loopcut-try-it"))
+            if failures:
+                raise failures.pop()
+            return self.chat_request(build, *args)
+        self.patched(llm, "_open", side_effect=chat)
+        for orchestrate in (False, True):
+            with self.subTest(orchestrate=orchestrate):
+                failures[:], headers[:] = [error], []
+                turn = self.prepare("motion", orchestrate=orchestrate)
+                agent.run_loop(self.session, turn, turn.spec, run_tool=self.run_tool,
+                               ensure_checkpoint=checkpoints.ensure_for_turn)
+                self.assertEqual(turn.outcome, "error")
+                self.assertTrue(self.session["items"][-1].get("retry"))
+                self.turn = agent.Turn()  # As resume() makes it: the config and loop, no card.
+                self.turn.config, self.turn.spec = turn.config, turn.spec
+                self.session["busy"], self.session["turn"] = True, self.turn
+                self.run_turn()
+                self.assertEqual(self.turn.try_it, "motion")
+                self.assertEqual(self.events, ["checkpoint", "tool", "apply", "model"])
+                self.assertEqual(headers, ["motion", "motion"])
+                self.assert_history()
+        self.route.assert_not_called()
+
     def test_photo_card_can_remove_default_cube_after_grounded_import(self):
         self.prepare("photo_3d")
         code = "bpy.data.objects.remove(bpy.data.objects['Cube'], do_unlink=True)"

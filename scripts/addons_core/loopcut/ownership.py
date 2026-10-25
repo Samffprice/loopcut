@@ -489,11 +489,12 @@ def _image(image) -> dict:
     return d
 
 
-def token(idb, uid2spawn=None, weights: bool = True) -> str:
-    """What a datablock is, as a short hash. uid2spawn (parent side: live session_uid -> spawn name)
-    makes references to renamed live datablocks read as at spawn, and marks which collection members
-    existed then; in the child, the stamps do both. weights=False leaves an object's deform weights
-    out (its vertex group names stay): the worker's per-call check, compared against CALL_TOKENS."""
+def token_fields(idb, uid2spawn=None, weights: bool = True) -> dict:
+    """What a datablock is, field by field: token before the hash. uid2spawn (parent side: live
+    session_uid -> spawn name) makes references to renamed live datablocks read as at spawn, and marks
+    which collection members existed then; in the child, the stamps do both. weights=False leaves an
+    object's deform weights out (its vertex group names stay): the worker's per-call check, compared
+    against CALL_TOKENS."""
     t = idb.id_type
     moving = _moving(idb)
     if t == "OBJECT":
@@ -547,7 +548,25 @@ def token(idb, uid2spawn=None, weights: bool = True) -> str:
     keys = getattr(idb, "shape_keys", None)  # A mesh's, curve's or lattice's; one without keeps its old token.
     if keys is not None:
         d["keys"] = _shape_keys(keys, uid2spawn)
-    return hashlib.blake2b(json.dumps(d, sort_keys=True, default=str).encode(), digest_size=8).hexdigest()
+    return d
+
+
+def token(idb, uid2spawn=None, weights: bool = True) -> str:
+    """What a datablock is, as a short hash of token_fields."""
+    return hashlib.blake2b(json.dumps(token_fields(idb, uid2spawn, weights), sort_keys=True, default=str).encode(),
+                           digest_size=8).hexdigest()
+
+
+def plain_fields(idb, uid2spawn=None) -> dict:
+    """token_fields as plain JSON values: what spawn_fields keeps and differs compares."""
+    return json.loads(json.dumps(token_fields(idb, uid2spawn), sort_keys=True, default=str))
+
+
+def differs(before: dict, after: dict) -> list[str]:
+    """The top-level fields of two plain_fields that differ, as the token sees them: names only, never values."""
+    def text(d, k):
+        return json.dumps(d[k], sort_keys=True) if k in d else None
+    return sorted(k for k in set(before) | set(after) if text(before, k) != text(after, k))
 
 
 def describe(idb) -> dict:
@@ -580,6 +599,15 @@ def spawn_state() -> tuple[dict[str, int], dict[str, str]]:
     with one_pass():
         tokens = {key_of(idb): token(idb, uid2spawn) for idb in all_ids()}
     return ids, tokens
+
+
+def spawn_fields(keys, ids: dict) -> dict:
+    """Parent, beside spawn_state, for a wave's owned keys only (cheap): key -> plain_fields, so a conflict
+    over one can say which fields changed since (merge._why_conflict)."""
+    uid2spawn = {uid: key.split(":", 1)[1] for key, uid in ids.items()}
+    wanted = {ids[key] for key in keys if key in ids}
+    with one_pass():
+        return {key_of(idb): plain_fields(idb, uid2spawn) for idb in all_ids() if idb.session_uid in wanted}
 
 
 def find(name: str):

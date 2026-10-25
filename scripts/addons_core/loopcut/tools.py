@@ -45,6 +45,7 @@ class ToolResult:
     file_image: bool = False  # The image is a file preview, not a look at the open scene.
     receipt: str = ""  # A paid cloud call that finished: what it used ("Used 6 credits ($0.06)"), for its card.
     plan_refused: bool = False  # Helper arguments/plan validation; raw text still goes to the model and Details.
+    plan_capped: bool = False   # delegate refused only by the account's max_workers this turn: a neutral card.
     model_note: str = ""  # Structured continuation details for the model, kept out of the user's result card.
 
 
@@ -60,7 +61,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "One undo step per call."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "description": "Python source to execute"},
-            "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
+            "summary": {"type": "string", "description": "A few words for the user on what this does, in the language "
+                        "they write in"},
             "editor": {"type": "string", "description": "Editor whose context bpy.ops run in, for operators that "
                        "need one: ShaderNodeTree, GeometryNodeTree, IMAGE_EDITOR, SEQUENCE_EDITOR... Default VIEW_3D."},
             "capture": {"type": "string", "enum": ["three_quarter", "front", "side", "top", "camera", "sheet"],
@@ -458,14 +460,14 @@ class _Deadline:
         return self._line
 
 
-def _model_traceback(ex: BaseException) -> str:
+def _model_traceback(ex: BaseException, code: str = "") -> str:
     """Only the frames in the model's own code: our wrapper's frames and Blender's paths are
     noise it pays for on every later step."""
     from . import api_docs
     frames = [f for f in traceback.extract_tb(ex.__traceback__) if f.filename == "<loopcut>"]
     text = "".join(["Traceback (most recent call last):\n", *traceback.format_list(frames),
                     *traceback.format_exception_only(type(ex), ex)])
-    note = api_docs.error_note(ex)  # An Action note for action.fcurves, how to write // for an exporter.
+    note = api_docs.error_note(ex, code)  # An Action note for action.fcurves, how to write // for an exporter.
     return text + (f"NOTE: {note}\n" if note else "")
 
 
@@ -491,6 +493,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
     shape_key_guard.install()
     cost_guard.begin()
     before = scene_diff.snapshot()
+    rig_before = _rig_state()
     with _preserve_host_areas() as host_notices, _editor_context(editor):
         bpy.ops.ed.undo_push(message=f"Before Loopcut: {summary or 'run_python'}"[:60])
         previous_trace = sys.gettrace()
@@ -509,7 +512,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
                          f"loop that never ends. Whatever it changed before that is listed below.")
         except Exception as ex:
             ok, raised = False, True
-            stdout.write("\n" + _model_traceback(ex))
+            stdout.write("\n" + _model_traceback(ex, code))
         finally:
             sys.settrace(previous_trace)
             shape_key_guard.check()
@@ -526,8 +529,9 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
     if raised and not scene_diff.is_empty(diff):
         # A paint that landed before a later line failed read as lost (eval 20260930-154037 W0022).
         changes = "The code made these changes before the error; they stay in the scene.\n" + changes
-    result = ToolResult(f"{output}\n\n{guarded}{changes}", ok=ok, scene_before=before, scene_after=after,
-                        guard_notes=notes)
+    rig_note = _rig_changes(rig_before)
+    result = ToolResult(f"{output}\n\n{guarded}{changes}" + (f"\n{rig_note}" if rig_note else ""), ok=ok,
+                        scene_before=before, scene_after=after, guard_notes=notes)
     if capture:
         # One request instead of two: the step and the look at what it did. Shaders the code just
         # made compile first, off the main thread (shaders.py); then the look, in its own task.
@@ -549,6 +553,27 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
                 return result
             result.then = then
     return result
+
+
+def _rig_state():
+    """autorig.rig_state, or None: reading a rig never fails the model's code."""
+    try:
+        from . import autorig
+        return autorig.rig_state()
+    except Exception:
+        return None
+
+
+def _rig_changes(before) -> str:
+    """The line for a Loopcut rig whose weights or animation the code changed (autorig.rig_changes)."""
+    after = _rig_state() if before is not None else None
+    if after is None:
+        return ""
+    from . import autorig
+    try:
+        return autorig.rig_changes(before, after)
+    except Exception:
+        return ""
 
 
 def _add_shot(result: ToolResult, shot: ToolResult) -> None:

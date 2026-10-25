@@ -276,7 +276,7 @@ class DeformationCheck(unittest.TestCase):
         smooth = bend(points, 60)
         (row,) = self.run_check(smooth, points, edges, tris)
         self.assertEqual(rig_deform.problems(row), ([], []), row)
-        self.assertIn('left elbow, turned 90° from rest: no spikes or torn skin', '\n'.join(rig_deform.lines([row])))
+        self.assertIn('left elbow, turned 90° from rest: no spikes or torn edges', '\n'.join(rig_deform.lines([row])))
         (row,) = self.run_check(self.pull(smooth, [12 * 16 + 3]), points, edges, tris)
         self.assertEqual((row['spikes'], row['spiked']), (1, [(0, 12 * 16 + 3)]))
         self.assertTrue(6 < row['spike_cm'] < 13, row['spike_cm'])  # Off its neighbours' mean, not the 12 cm pull.
@@ -286,7 +286,7 @@ class DeformationCheck(unittest.TestCase):
         text = '\n'.join(rig_deform.lines([row]))
         self.assertIn('left elbow, turned 90° from rest: PROBLEM: 3 vertices pulled out into spikes, up to', text)
         self.assertIn('problems at left elbow', text)
-        self.assertIn('do not call a flagged joint clean', text)
+        self.assertIn('do not call a flagged or untested joint clean', text)
 
     def test_a_rigid_turn_is_no_spike_however_far_it_moves(self):
         # The fists' finger bones turn rigidly 200°+: their vertices leave their neighbours' mean, stretch nothing.
@@ -304,7 +304,7 @@ class DeformationCheck(unittest.TestCase):
         self.assertLess(row['volume'], .8)
         self.assertIn('volume', '\n'.join(rig_deform.lines([row])))
         rows = self.run_check(points, points, edges, tris, bent=0)
-        self.assertIn('Not turned, nothing found: left elbow.', rig_deform.lines(rows))
+        self.assertIn('nothing was tested', rig_deform.lines(rows)[0])  # R11: an unposed check tests nothing.
 
     def test_spikes_in_an_unbent_region_count_at_the_bent_joint_that_moved_them(self):
         points, edges, tris = tube()
@@ -312,7 +312,7 @@ class DeformationCheck(unittest.TestCase):
         rows = self.run_check(pulled, points, edges, tris, joints=[((0, 0, .3), (0, 0, .3), .12),
                                                                    ((0, 0, .55), (0, 0, .55), .1)])
         self.assertEqual([r['spikes'] for r in rows], [3, 0])
-        self.assertEqual(rig_deform.lines(rows)[-2], 'Not turned, nothing found: left wrist.')
+        self.assertEqual(rig_deform.lines(rows)[-2], 'Not tested, since not turned: left wrist.')
 
     def test_preview_results_tell_the_model_plain_words(self):
         source = Path(autorig.__file__).read_text()

@@ -55,6 +55,9 @@ MAX_FAIL_LINES = 4
 CRASH_NOTE = ("[Loopcut] Your Blender crashed during {tool}; the scene is back at the start of your brief, and "
               "nothing you built is kept. Build it again, in smaller steps.")
 _usage_lock = threading.Lock()  # Worker threads add to the parent session's usage at once.
+# On the message that started the turn, with the account's max_workers: the workers it started, so a resumed
+# turn (agent.resume, a new Job) goes on counting from them. Written as the turn ends (end_turn).
+WORKERS_STARTED = "loopcut_workers_started"
 _running: dict[tuple[str, str], "Worker"] = {}  # (wave, worker) -> Worker, for the rows' Cancel buttons.
 
 
@@ -141,11 +144,15 @@ def budget_steps_left(*, steps: int, elapsed: float, seconds: float, job_steps: 
 
 
 class JobBudget:
-    """Shared dollars for one turn and seconds per worker run; worker steps are counted, never capped."""
+    """Shared dollars for one turn and seconds per worker run; worker steps are counted, never capped.
+    prices: the account's own (config.Roles.prices), before pricing.PRICES. reported: the account's terms
+    apply, so a reply's usage.cost is what it is charged (without them, the tokens as in 0.2.15)."""
 
-    def __init__(self, usd: float, seconds: float, clock=None):
+    def __init__(self, usd: float, seconds: float, clock=None, *, prices: dict | None = None, reported=False):
         self.max_usd, self.seconds = usd, seconds
+        self.prices, self.reported = dict(prices or {}), reported
         self.steps, self.usd = 0, 0.0
+        self.costed = False  # A reply said what it cost (usage.cost): its dollars count even for an unpriced model.
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
 
@@ -170,11 +177,19 @@ class JobBudget:
             self.steps += 1
             return left
 
-    def add(self, model: str, usage: dict) -> None:
-        cost = pricing.usd(model, usage)  # None for a model with no price: then time bounds the run.
-        if cost:
-            with self._lock:
+    def priced(self, model: str) -> bool:
+        return self.costed or pricing.usd(model, {"input": 0}, self.prices) is not None
+
+    def add(self, model: str, usage: dict) -> float | None:
+        """One reply's dollars, counted and returned: with the account's terms what its usage says it cost, else
+        its tokens at the account's prices or the table's (pricing.charged); None for a model with no price, then
+        time bounds the run."""
+        cost = (pricing.charged if self.reported else pricing.usd)(model, usage, self.prices)
+        with self._lock:
+            self.costed = self.costed or (self.reported and "cost" in (usage or {}))
+            if cost:
                 self.usd += cost
+        return cost
 
 
 class Job:
@@ -191,8 +206,13 @@ class Job:
             n += 1
         self.id = f"{turn}-{n}"
         self.folder = jobs_root() / session["id"] / self.id
-        self.budget = JobBudget(roles.job_max_usd, roles.worker_max_seconds)
+        self.budget = JobBudget(roles.job_max_usd, roles.worker_max_seconds, prices=dict(getattr(roles, "prices", ())),
+                                reported=getattr(roles, "terms", False))
         self.max_workers = roles.max_workers
+        # Workers this turn may start in all (workers_left), and how many it started before a resume (end_turn).
+        self.turn_workers = getattr(roles, "turn_workers", 0)
+        self.request = next((m for m in reversed(session.get("messages") or []) if context.is_turn_start(m)), {})
+        self.started_before = int(self.request.get(WORKERS_STARTED) or 0) if self.turn_workers else 0
         self.bounces = 0
         self.checks: dict[tuple[str, str], dict] = {}  # (worker, check id) -> check
         self.own: dict[str, dict] = {}                  # The orchestrator's (orchestrator.checks add): "o1" -> check.
@@ -335,8 +355,8 @@ def _owned_keys(brief: dict) -> list:
     return sorted(ownership.expand_owns(brief["owns"], brief["aspects"]))
 
 
-def _save_spawn(folder: Path, palette=()):
-    return merge.save_spawn(folder, palette)
+def _save_spawn(folder: Path, palette=(), owned=()):
+    return merge.save_spawn(folder, palette, owned)
 
 
 def _scene_context(text: str) -> str:
@@ -397,7 +417,8 @@ def prepare(session: dict, turn, plan: dict, message_index: int, save_spawn=None
                      if item.get("kind") == "tool" and item.get("name") == "delegate"
                      and item.get("status") == "running"), None)
     checkpoint = _wave_checkpoint(session, number, message_index, item_index)
-    spawn = save_spawn(folder) if save_spawn else _save_spawn(folder, palette)
+    owned = sorted({key for brief in plan["workers"] for key in brief["owned"]})  # Their token fields kept too.
+    spawn = save_spawn(folder) if save_spawn else _save_spawn(folder, palette, owned)
     job.absorb(spawn)
     session["wave_count"] = number
     wave_id = str(getattr(spawn, "wave", "") or f"w{number}-{uuid.uuid4().hex[:4]}")
@@ -560,6 +581,7 @@ class Worker:
         self.budget_warned = False  # One warning per run, also across a child crash/retry.
         self.first_call_cached = None
         self.usage = {"input": 0, "cached": 0, "output": 0, "requests": 0}
+        self.usd: float | None = None  # Its dollars as the job's budget counted them (JobBudget.add).
         self.checks: list = []    # The child's results for the brief's checks, at the end.
         self.advice: list = []    # And for its advisory checks: shown, never counted.
         self.manifest: dict | None = None
@@ -630,7 +652,7 @@ class Worker:
                 raise llm.Cancelled()
             running = sum(w.thread is not None and w.finished is None for w in job.crew)
         left = job.budget.take_step(self.started, worker_steps=self.steps, running=running,
-                                    priced=pricing.usd(self.model, {"input": 0}) is not None)
+                                    priced=job.budget.priced(self.model))
         if not self.budget_warned and left is not None and left <= agent.STEPS_LEFT_NOTICE:
             self.budget_warned = True
             note = self.spec.steps_left_note.format(left=agent.STEPS_LEFT_NOTICE).strip()
@@ -679,7 +701,9 @@ class Worker:
                 parent["usage"][key] += value  # The sum the UI shows stays the sum.
             self.usage["requests"] += 1
             bucket["requests"] += 1
-        self.wave.job.budget.add(self.model, usage)
+        cost = self.wave.job.budget.add(self.model, usage)
+        if cost is not None:
+            self.usd = (self.usd or 0.0) + cost
 
     def after_step(self, session: dict, turn) -> bool:
         # The loop has already stored captures under stable conversation paths. Keep the latest
@@ -1602,7 +1626,8 @@ def _log_worker(worker: Worker, tokens: dict) -> dict:
                            deferred=sum(1 for r in worker.checks if r.get("status") == "deferred")),
             "change_requests": (worker.report or {}).get("change_requests") or [],
             "cr_targets_token_at_report": tokens, "model": worker.model, "usage": dict(worker.usage),
-            "usd": pricing.usd(worker.model, worker.usage),
+            "usd": worker.usd if worker.usd is not None else pricing.usd(worker.model, worker.usage,
+                                                                          worker.wave.job.budget.prices),
             "peak_rss_mb": getattr(worker.runtime, "peak_rss_mb", None), "t": dict(worker.t),
             "note": worker.note, "crashes": list(worker.crashes), "missing": _missing(worker),
             "first_call_cached": worker.first_call_cached, "facts": _facts(worker), "flags": _flags(worker),
@@ -1612,14 +1637,17 @@ def _log_worker(worker: Worker, tokens: dict) -> dict:
 
 def _log_merge(merge_report, error: str) -> dict:
     if error or merge_report is None:
-        return {"created": 0, "replaced": [], "quarantined": [], "conflicts": [], "dropped_edits": [], "seconds": 0.0,
-                **({"error": error} if error else {})}
+        return {"created": 0, "replaced": [], "quarantined": [], "conflicts": [], "conflict_differs": [],
+                "dropped_edits": [], "seconds": 0.0, **({"error": error} if error else {})}
     seconds = merge_report.get("seconds") if isinstance(merge_report, dict) else getattr(merge_report, "seconds", 0.0)
     return {"created": len(_field(merge_report, "created")),
             "objects": sum(1 for e in _field(merge_report, "created")
                            if (e.get("id_type") if isinstance(e, dict) else str(e).split(":", 1)[0]) == "OBJECT"),
             **{key: [_short(e) for e in _field(merge_report, key)] for key in ("replaced", "quarantined", "conflicts",
                                                                             "dropped_edits")},
+            # Each conflict's why, by kind, no names (merge._why_conflict): in step with conflicts.
+            "conflict_differs": [(e.get("differs") or []) if isinstance(e, dict) else [] for e in
+                                 _field(merge_report, "conflicts")],
             "seconds": seconds}
 
 
@@ -1774,6 +1802,27 @@ def busy(job: Job | None) -> dict:
                        "role": w.brief["role"], "bounds": w.brief.get("bounds"), "wave": w.wave.number,
                        "state": _state(w)}
                 for w in job.crew if not w.reported}
+
+
+def workers_left(job: Job | None, roles) -> int | None:
+    """How many more workers this turn may start, by the account's max_workers (config.Roles.turn_workers), or
+    None without that limit. Every brief its waves took counts, queued or run, but one stopped before it started;
+    so do the ones it started before a resume."""
+    cap = getattr(job if job is not None else roles, "turn_workers", 0)
+    if not cap:
+        return None
+    if job is None:
+        return cap
+    with job.lock:
+        used = sum(1 for w in job.crew if w.thread is not None or w.finished is None)
+    return max(0, cap - getattr(job, "started_before", 0) - used)
+
+
+def started_deliverables(job: Job) -> list[tuple[str, bool]]:
+    """(deliverable, still to report) of each worker workers_left counts, in the order asked for."""
+    with job.lock:
+        return [(w.brief["deliverable"], not w.reported) for w in job.crew
+                if w.thread is not None or w.finished is None]
 
 
 def _schedule(job: Job, is_cancelled) -> None:
@@ -1931,17 +1980,23 @@ def end_turn(session: dict, turn) -> None:
     job = getattr(turn, "job", None)
     if job is None or not job.crew:
         return
-    if turn.cancel.is_set():
-        stop(job)
-        return
-    late = drain(job, turn.cancel.is_set)
-    if late is not None:
-        session["items"].append(state.item_notice(
-            "Workers still running when the turn ended were waited for; see each worker's outcome in its wave card. "
-            "The agent did not review them."))
-        if getattr(late, "scene_after", None) is not None:
-            turn.scene_before = turn.scene_before or late.scene_before
-            turn.scene_after = late.scene_after
+    try:
+        if turn.cancel.is_set():
+            stop(job)
+            return
+        late = drain(job, turn.cancel.is_set)
+        if late is not None:
+            session["items"].append(state.item_notice(
+                "Loopcut waited for the helpers still working when the turn ended; see each helper's outcome in its "
+                "wave card. The agent did not review them."))
+            if getattr(late, "scene_after", None) is not None:
+                turn.scene_before = turn.scene_before or late.scene_before
+                turn.scene_after = late.scene_after
+    finally:
+        if job.turn_workers:  # For a resume of this turn: what it started counts against its max_workers.
+            with job.lock:
+                started = sum(1 for w in job.crew if w.thread is not None)
+            job.request[WORKERS_STARTED] = job.started_before + started
 
 
 def _waits_on(check: dict, busy_: list[Worker]) -> list[str]:

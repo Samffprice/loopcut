@@ -490,7 +490,11 @@ def _image_change(old: dict | None, new: dict) -> str:
         return "pixels edited" if old["pixels"] != new["pixels"] else ""
     if old.get("packed") and new.get("packed") and old["packed"] != new["packed"]:
         return "pixels edited (packed again)"
-    if new.get("packed") and not old.get("packed") and old["size"][0]:
+    # Packed only when the old reading could have seen packed data: hashed before and read by its packed
+    # data now is the pixel budget moving, not a pack. A look's draw loads the textures it shows, and one
+    # loaded ahead of this image in _images' order takes its share (a local run, 2026-10-11, the message
+    # after the agent's looks: "by the user, not you: ~ image Leaf_01_albedo.jpg.002: packed" and five more).
+    if new.get("packed") and not old.get("packed") and old["size"][0] and not old["pixels"]:
         return "packed"
     return "pixels edited (unsaved)" if new["dirty"] and not old["dirty"] else ""
 

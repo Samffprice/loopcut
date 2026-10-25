@@ -2,7 +2,8 @@
 
 The platform cannot see where people stop: it sees downloads, sign-ups and hosted requests, but not a launch, the
 first-run setup or a turn on a ChatGPT plan or the user's own key. Three events fill that gap:
-- app_start: Blender and add-on versions, OS, processor type and whether this is the first launch; once a session.
+- app_start: Blender and add-on versions, OS, processor type, whether this is the first launch and the language
+  Blender's interface is drawn in; once a session.
 - setup_step: the first-run step reached, the option picked, whether it worked and a short code: the error,
   or which action of the step it was (shown, claim, a first-project card), since steps and choices are a
   closed list in the contract.
@@ -42,7 +43,7 @@ OUTCOMES = ("ok", "error", "cancelled", "empty")
 OS_NAMES = ("mac", "windows", "linux")
 ARCHES = ("arm64", "x86_64", "other")
 PROPS = {  # The exact allow-list per event: (required keys, optional keys).
-    "app_start": ({"blender_version", "os", "arch", "first_run"}, set()),
+    "app_start": ({"blender_version", "os", "arch", "first_run"}, {"ui_language"}),
     "setup_step": ({"step", "choice", "ok"}, {"error_code"}),
     "turn": ({"provider", "model", "outcome", "duration_ms", "tool_calls"}, {"error_code"}),
 }
@@ -54,6 +55,7 @@ _CODE = re.compile(r"[a-z0-9_]{1,64}\Z")
 _MODEL = re.compile(r"[a-z0-9._-]{1,32}\Z")
 _BLENDER = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}(?:-[0-9A-Za-z]+)?\Z")
 _INSTALL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+_UI_LANGUAGE = re.compile(r"[a-z]{2,3}(?:_(?:[A-Z]{2}|[A-Za-z]{4}))?\Z")  # ja_JP, zh_HANS, es.
 _APP_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?\Z")
 # Public model families a user's own key may name. Anything else is "other": a fine-tune or a local model's
 # name is the user's own text.
@@ -130,10 +132,33 @@ def model_id(provider: str, model: str) -> str:
     return text
 
 
+def ui_language(language: tuple[str, str] | None) -> str | None:
+    """scene_context.interface_language's result as the event's locale: en_US for an English interface, None
+    for a locale outside the contract's pattern."""
+    code = language[0] if language else "en_US"
+    return code if _UI_LANGUAGE.match(code) else None
+
+
 def app_start_props(first_run: bool, version=None, cycle: str = "", os_value: str | None = None,
-                    machine: str | None = None) -> dict:
-    return {"blender_version": blender_version(version, cycle) if version is not None else blender_version(),
-            "os": os_name(os_value), "arch": arch_name(machine), "first_run": bool(first_run)}
+                    machine: str | None = None, language: str | None = None) -> dict:
+    props = {"blender_version": blender_version(version, cycle) if version is not None else blender_version(),
+             "os": os_name(os_value), "arch": arch_name(machine), "first_run": bool(first_run)}
+    if language:
+        if not _UI_LANGUAGE.match(language):
+            raise ValueError("Unexpected interface language")
+        props["ui_language"] = language
+    return props
+
+
+def _interface_language() -> str | None:
+    """Optional: a Blender (or stand-in) without the translation settings still sends its app_start."""
+    import bpy
+    from . import scene_context
+    try:
+        view, locale = bpy.context.preferences.view, bpy.app.translations.locale
+    except AttributeError:
+        return None
+    return ui_language(scene_context.interface_language(view, locale))
 
 
 def setup_step_props(step: str, choice: str | None, ok: bool, code=None) -> dict:
@@ -312,7 +337,7 @@ def note_first_run() -> None:
 
 
 def app_start() -> None:
-    record("app_start", lambda: app_start_props(bool(_first_run)))
+    record("app_start", lambda: app_start_props(bool(_first_run), language=_interface_language()))
 
 
 def setup_step(step: str, choice: str | None, ok: bool = True, code=None) -> None:

@@ -7,11 +7,14 @@ Retry-After is honoured and capped, not obeyed verbatim. No Blender needed.
 import io
 import json
 import os
+import ssl
 import struct
 import sys
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -49,6 +52,24 @@ class Trickle:
 
     def __init__(self, pieces: list[str], interval: float = 0.03):
         self.pieces, self.interval = pieces, interval
+
+
+def windows_drop() -> OSError:
+    """What Windows raised from the socket in 0.2.14's logs, waiting for a hosted reply's status line: a bare
+    OSError (no winerror), which urlopen does not wrap as URLError."""
+    return FileNotFoundError(2, "No such file or directory")
+
+
+class Breaks(io.BytesIO):
+    """A response urlopen returned whose body reads `data`, then raises `error`: the socket broke mid-body."""
+
+    def __init__(self, data: bytes, error: OSError):
+        super().__init__(data)
+        self.headers, self.error = {}, error
+
+    def __iter__(self):
+        yield from iter(self.readline, b"")
+        raise self.error
 
 
 class Script:
@@ -212,6 +233,33 @@ class LLMTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("ok"))
         self.assertEqual(self.call().text, "ok")
 
+    def test_a_cost_in_the_final_usage_chunk_rides_on_the_usage(self):
+        """The gateway's usage.cost (USD), which the job budget charges over the tokens (pricing.charged)."""
+        usage = {"prompt_tokens": 10, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 4}}
+        for cost, expected in ((0.0123, 0.0123), (0, 0.0), (-1, None), ("0.01", None), (True, None),
+                               (float("nan"), None), (None, None)):
+            with self.subTest(cost=cost):
+                SCRIPT.replies.append(sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+                                          {"choices": [], "usage": {**usage, **({} if cost is None else {"cost": cost})}}))
+                completion = self.call()
+                self.assertEqual(completion.usage.get("cost"), expected)
+                self.assertEqual({k: completion.usage[k] for k in ("input", "cached", "output")},
+                                 {"input": 10, "cached": 4, "output": 2})
+
+    def test_an_error_event_mid_stream_keeps_its_code_as_an_http_error_does(self):
+        """Loopcut's gateway ends a stream whose vendor failed with an error event; agent.py reads its code."""
+        error = {"code": "upstream_error", "message": "The model provider returned an error."}
+        SCRIPT.replies.append(sse({"choices": [{"delta": {"content": "Here is "}}]}, {"error": error}))
+        with self.assertRaises(llm.LLMError) as caught:
+            self.call()
+        ex = caught.exception
+        self.assertEqual((str(ex), ex.status, ex.code, ex.details),
+                         ("The model provider returned an error.", None, "upstream_error", error))
+        SCRIPT.replies.append(sse({"error": "overloaded"}))  # No error object: no code, as before.
+        with self.assertRaises(llm.LLMError) as caught:
+            self.call()
+        self.assertEqual((str(caught.exception), caught.exception.code), ('{"error": "overloaded"}', ""))
+
     def test_correlation_headers_builds_both_headers_for_a_role(self):
         self.assertEqual(llm.correlation_headers("abc123", "router"),
                          {"x-loopcut-conversation": "abc123", "x-loopcut-role": "router"})
@@ -308,6 +356,85 @@ class LLMTest(unittest.TestCase):
             self.hung(on_text=buffer.append, on_retry=lambda: buffer.clear())
         self.assertIn("Connection lost while streaming the reply", str(cm.exception))
         self.assertEqual(len(SCRIPT.requests), 2, "one retry used, then the second break surfaced as today")
+
+    # ------------------------------------------------------------------ bare OSErrors (Windows)
+
+    def flaky(self, *failures, **kw) -> llm.Completion:
+        """stream_chat whose first urlopen calls go to `failures` in turn (an exception is raised from urlopen, a
+        Breaks is returned as its response), then to the scripted server. self.opens counts every call."""
+        real, queue, self.opens = urllib.request.urlopen, list(failures), 0
+
+        def urlopen(request, timeout=None):
+            self.opens += 1
+            if not queue:
+                return real(request, timeout=timeout)
+            failure = queue.pop(0)
+            if isinstance(failure, BaseException):
+                raise failure
+            return failure
+        with mock.patch.object(llm.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(llm, "_wait", lambda s, c: None):
+            return llm.stream_chat(base_url=self.base_url, api_key="secret", model="fast",
+                                   messages=[{"role": "user", "content": "hi"}], tools=[], reasoning_effort="low",
+                                   is_cancelled=lambda: False, **{"on_text": lambda _: None, **kw})
+
+    def test_a_bare_oserror_from_urlopen_is_retried_like_a_dropped_connection(self):
+        """0.2.14 logs: on Windows the status line never came and getresponse raised FileNotFoundError(2), which
+        urlopen does not wrap. The turn ended as 'Internal error' with no Try again; now it is retried."""
+        SCRIPT.replies.append(text_reply("ok"))
+        self.assertEqual(self.flaky(windows_drop()).text, "ok")
+        self.assertEqual((self.opens, len(SCRIPT.requests)), (2, 1))
+
+    def test_a_bare_oserror_from_urlopen_every_try_ends_as_connection_lost(self):
+        with self.assertRaises(llm.LLMError) as caught:
+            self.flaky(*[windows_drop() for _ in range(len(llm.RETRY_DELAYS) + 1)])
+        self.assertEqual((caught.exception.code, self.opens), (llm.CONNECTION_LOST, 4), "4 tries, as for a URLError")
+        self.assertEqual(str(caught.exception), "The connection to the model dropped before it could answer. "
+                                                "Nothing was lost: press Try again. (network error, errno 2)")
+
+    def test_an_unknown_oserror_reads_as_a_network_error_and_a_known_one_keeps_its_words(self):
+        """On a card that says the connection dropped, 'No such file or directory' read as a missing file (0.2.14)."""
+        self.assertEqual(llm.network_cause(windows_drop()), "network error, errno 2")
+        self.assertEqual(llm.network_cause(OSError()), "network error, OSError")
+        for known in (TimeoutError("timed out"), ConnectionResetError(54, "Connection reset by peer"),
+                      ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac"),
+                      urllib.error.URLError(windows_drop()), ValueError("not a network error")):
+            with self.subTest(known=repr(known)):
+                self.assertIsNone(llm.network_cause(known))
+
+    def test_a_bare_oserror_reading_the_body_before_any_content_is_retried(self):
+        SCRIPT.replies.append(text_reply("ok"))
+        reasoning = b'data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}\n\n'  # Nothing shown yet.
+        self.assertEqual(self.flaky(Breaks(reasoning, windows_drop())).text, "ok")
+        self.assertEqual(self.opens, 2)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.flaky(*[Breaks(b"", windows_drop()) for _ in range(len(llm.RETRY_DELAYS) + 1)])
+        self.assertEqual((caught.exception.code, self.opens), (llm.CONNECTION_LOST, 4))
+        self.assertEqual(str(caught.exception), "Connection lost before any reply arrived: network error, errno 2")
+
+    def test_a_bare_oserror_reading_the_body_after_content_follows_the_mid_reply_rule(self):
+        partial = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        with self.assertRaises(llm.LLMError) as caught:
+            self.flaky(Breaks(partial, windows_drop()))
+        self.assertEqual((caught.exception.code, self.opens), (llm.CONNECTION_LOST, 1), "no on_retry: surfaced at once")
+        self.assertEqual(str(caught.exception), "Connection lost while streaming the reply: network error, errno 2")
+        SCRIPT.replies.append(text_reply("fresh"))
+        buffer = []
+        completion = self.flaky(Breaks(partial, windows_drop()), on_text=buffer.append, on_retry=buffer.clear)
+        self.assertEqual((completion.text, buffer, self.opens), ("fresh", ["fresh"], 2), "once, from scratch")
+
+    def test_an_http_error_and_a_refused_certificate_are_not_dropped_connections(self):
+        """Both are OSErrors too, but an HTTPError is an answer and a refused certificate fails the same way every
+        time: as before, the first is the API's error at once, and the second is raised as it is."""
+        body = io.BytesIO(json.dumps({"error": {"code": "invalid_api_key", "message": "Bad key."}}).encode())
+        with self.assertRaises(llm.LLMError) as caught:
+            self.flaky(urllib.error.HTTPError(self.base_url, 401, "Unauthorized", {}, body))
+        self.assertEqual((caught.exception.status, caught.exception.code, self.opens), (401, "invalid_api_key", 1))
+        refused = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        for failure in (refused, Breaks(b"", refused)):
+            with self.subTest(failure=type(failure).__name__), self.assertRaises(ssl.SSLCertVerificationError):
+                self.flaky(failure)
+            self.assertEqual(self.opens, 1)
 
     # ------------------------------------------------------------------ max_tokens
 

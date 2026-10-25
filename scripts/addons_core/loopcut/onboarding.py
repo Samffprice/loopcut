@@ -322,7 +322,7 @@ def _signature() -> tuple:
         shown += (_account_plan(), _unit_prices(_descriptors()))
     elif step == "showcase":
         shown += tuple(sorted(_showcase_prices(_descriptors(), _manifest_account()).items())) + (
-            _showcase_monthly(), _showcase_weekly())
+            _showcase_monthly(), _showcase_weekly(), chat_credits.typical_build(_manifest_account()))
     elif step == "done":
         shown += (_connected(), tuple(card_cost(card, _descriptors()) for card in CARDS))
     if step in ("account", "how", "showcase", "connect", "done"):
@@ -1282,7 +1282,7 @@ def _draw_showcase(layout, context) -> None:
         _text(words, "free credits every week, AI chat included.")
     else:
         _text(words, f"{'free ' if free else ''}credits every month for anything above,\nAI chat included.")
-    _text(words, f"A typical first build uses about {chat_credits.TYPICAL_BUILD}.", MUTED, tight=True)
+    _text(words, f"A typical first build uses about {chat_credits.typical_build(account_info)}.", MUTED, tight=True)
     props = _primary(column, "loopcut.onboarding_step", "Next")
     props.step, props.save = "connect", False
     left, _ = _footer(column)

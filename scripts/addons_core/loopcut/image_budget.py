@@ -1,6 +1,6 @@
 """Keeping the images a request carries small, for every provider.
 
-Every request re-sends each image it keeps (context.kept_messages; in keep mode every look of the turn)
+Every request re-sends each image it keeps (context.kept_messages; in keep mode every look since the last fold)
 as base64, so image bytes, not tokens, are what breaks uploads. On 2026-10-17 a ChatGPT conversation whose
 tool images were stored as PNGs (0.25-1.2 MB each) failed every try with BrokenPipeError at 6-7 MB a
 request; with all of them converted to JPEG it still failed: a pose-matching session that compares every

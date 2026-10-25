@@ -51,6 +51,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -769,9 +770,12 @@ def _open(build: Callable[[], tuple[dict, list[str]]], url: str, api_key: str, t
                 delay = min(max(delay, float(retry_after)), llm.MAX_RETRY_AFTER)
             print(f"Loopcut: retrying the Anthropic request after HTTP {ex.code} "
                   f"({attempt + 1}/{len(llm.RETRY_DELAYS)}, waiting {delay:g}s)")
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as ex:
+        except OSError as ex:  # URLError, or one from getresponse, which urlopen does not wrap (see llm._open).
+            if isinstance(ex, ssl.SSLCertVerificationError):
+                raise
             if attempt >= len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Could not reach {host}: {getattr(ex, 'reason', ex)}", code=llm.CONNECTION_LOST) from None
+                cause = llm.network_cause(ex) or getattr(ex, "reason", ex)
+                raise llm.LLMError(f"Could not reach {host}: {cause}", code=llm.CONNECTION_LOST) from None
             on_drop()
             delay = llm.RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the Anthropic request after {getattr(ex, 'reason', ex)!r} "
@@ -804,16 +808,17 @@ def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], too
             return _read(response, on_text, is_cancelled, deadline, meta)
         except _Interrupted as ex:
             cause = ex.__cause__ or "the stream ended before message_stop"
+            shown = llm.network_cause(cause) or repr(cause)
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise llm.LLMError(f"Connection lost while streaming the reply: {cause!r}",
+                    raise llm.LLMError(f"Connection lost while streaming the reply: {shown}",
                                        code=llm.CONNECTION_LOST) from ex.__cause__
                 retried_partial = True
                 print(f"Loopcut: retrying the Anthropic request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(llm.RETRY_DELAYS):
-                raise llm.LLMError(f"Connection lost before any reply arrived: {cause!r}",
+                raise llm.LLMError(f"Connection lost before any reply arrived: {shown}",
                                    code=llm.CONNECTION_LOST) from ex.__cause__
             delay = llm.RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the Anthropic request after {cause!r} "

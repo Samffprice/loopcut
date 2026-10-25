@@ -92,19 +92,25 @@ def note_for(rna) -> str:
 # as it is, which is /x.glb (Blender 5.2.2), and a glb export failed that way in the evals of 2026-09-27.
 BLEND_RELATIVE = ("Exporters and open() do not expand // (next to the .blend): pass "
                   "bpy.path.abspath('//name.glb'), which needs the .blend saved.")
+# With the .blend never saved, // has no folder (0.2.13 on Windows): stl_export opened "//name.stl" as it is, and
+# save_as_mainfile wrote "//TurboCar.blend" in the install folder. Models then saved to bpy.app.tempdir.
+UNSAVED_RELATIVE = ("This .blend has never been saved, so // has no folder. Ask the user where to put the file, "
+                    "or use an absolute path in a folder they will find (not bpy.app.tempdir), and tell them "
+                    "where it went.")
 
 
-def error_note(ex: BaseException) -> str:
-    """Best-effort facts appended to run_python's original error; diagnostics must never replace it."""
+def error_note(ex: BaseException, code: str = "") -> str:
+    """Best-effort facts appended to run_python's original error; diagnostics must never replace it.
+    `code` is the code that raised it, whose // paths an error may name only once resolved."""
     try:
-        return _error_note(ex)
+        return _error_note(ex, code)
     except Exception:
         # Intentional diagnostic boundary: even stale RNA or an exception's broken __str__ must
         # leave the original traceback intact. No scene values or exception text are logged here.
         return ""
 
 
-def _error_note(ex: BaseException) -> str:
+def _error_note(ex: BaseException, code: str = "") -> str:
     message = str(ex)
     named = re.match(r"'(\w+)' object", message) if isinstance(ex, (AttributeError, TypeError)) else None
     rna = getattr(getattr(bpy.types, named[1], None), "bl_rna", None) if named else None
@@ -121,7 +127,20 @@ def _error_note(ex: BaseException) -> str:
             note = _attribute_note(rna.identifier, missing[1])
             if note:
                 return note
-    return BLEND_RELATIVE if re.search(r"(?:^|[\s'\"])//[^/\s'\"]", message) else ""
+    relative = re.search(r"(?:^|[\s'\"])//[^/\s'\"]", message) is not None
+    if (relative or _names_relative_path(code, message)) and not bpy.data.filepath:
+        return UNSAVED_RELATIVE
+    return BLEND_RELATIVE if relative else ""
+
+
+def _names_relative_path(code: str, message: str) -> bool:
+    """The error names the file of a // path in the code, resolved: save_as_mainfile's "Cannot open file
+    C:\\Program Files\\Loopcut\\Loopcut 5.2\\TurboCar.blend@ for writing" for "//TurboCar.blend"."""
+    for path in re.findall(r"['\"]//([^'\"\n]+)['\"]", code):
+        name = re.split(r"[/\\]", path.rstrip("/\\"))[-1]
+        if name and name in message:
+            return True
+    return False
 
 
 @dataclass

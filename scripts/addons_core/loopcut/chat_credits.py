@@ -31,7 +31,7 @@ CODE = "insufficient_credits"  # The 402's error.code on chat (and on cloud tool
 MEDIA = Path(__file__).parent / "media"
 SETTLE_SECONDS = 1.5  # After a turn, before reading the balance: the last request's charge is booked as it ends.
 REFRESH_TRIES = 4     # A manifest refresh already running blocks ours; try again this many times, a second apart.
-TYPICAL_BUILD = 20    # Credits a typical first build uses (owner's estimate, round3 mockup).
+TYPICAL_BUILD = 12    # Credits a typical first build uses, unless the server says (its figure at the 1x markup, 0.2.16).
 LOW_BALANCE = 20      # The heads-up before the hard stop (0.2.15): at about this many credits, once a refill period.
 # The plans as loopcut.org/pricing sets them (2026-10-23); onboarding.PLANS is this table. When a price or a monthly
 # grant changes, change it here. The free plan's 100 a month starts in the month after sign-up (the sign-up month
@@ -102,6 +102,13 @@ def step_label(account: dict, short: bool = False) -> str:
     """"≈1 credit / step", or "≈1 / step" on a tile's price."""
     n = step_credits(account)
     return f"≈{n} / step" if short else f"≈{n} credit{'' if n == 1 else 's'} / step"
+
+
+def typical_build(account: dict) -> int:
+    """Credits a typical first build uses, for the showcase: the account's agent terms say (account.agent.typical_build,
+    config.agent_terms), else TYPICAL_BUILD."""
+    from . import config
+    return config.agent_terms(account if isinstance(account, dict) else {}).get("typical_build", TYPICAL_BUILD)
 
 
 def plan_of(account: dict) -> str:

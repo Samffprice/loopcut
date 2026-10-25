@@ -35,7 +35,7 @@ _ILLUSTRATION = re.compile(
     r"\b(?:example|sample|previous (?:step|turn)|earlier (?:step|turn|output|result|record))\b|"
     r"^plan\b|^(?:I'll|I will)\b.*:$|\b(?:here|following)\b.*\b(?:code|script)\b", re.I)
 _RESULT = r"(?:ok|done|success(?:ful)?|failed|printed|output|result)\b"
-# _ILLUSTRATION's explicit part, plurals included. Not in _ILLUSTRATION itself: RECORD_HEAD begins "Earlier steps.",
+# _ILLUSTRATION's explicit part, plurals included. Not in _ILLUSTRATION itself: OLD_RECORD_HEAD begins "Earlier steps.",
 # and the 0.2.13 correction must still see the forged records after a copied head (rel015-app).
 _EXAMPLE_INTRO = re.compile(r"\b(?:example|sample|previous (?:steps?|turns?)|"
                             r"earlier (?:steps?|turns?|outputs?|results?|records?))\b", re.I)

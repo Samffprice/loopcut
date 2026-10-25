@@ -4,6 +4,8 @@ Stdlib only, so the extension ships without wheels. Blocking; call from a worker
 """
 
 import json
+import math
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -55,6 +57,16 @@ def dropped_connection(ex) -> bool:
     return isinstance(ex, (TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException))
 
 
+def network_cause(ex) -> str | None:
+    """For an OSError a network call raised that dropped_connection does not know, such as Windows' bare
+    FileNotFoundError(2) waiting for a reply (0.2.14 logs): "network error, errno 2" (or the type's name,
+    without an errno), since "No such file or directory" on a card that says the connection dropped reads as a
+    missing file. None for anything else, whose own text stays. The console line keeps repr(ex)."""
+    if not isinstance(ex, OSError) or isinstance(ex, urllib.error.URLError) or dropped_connection(ex):
+        return None
+    return f"network error, errno {ex.errno}" if ex.errno else f"network error, {type(ex).__name__}"
+
+
 def short_cause(ex) -> str:
     """"SSLError: SSLV3_ALERT_BAD_RECORD_MAC", "BrokenPipeError: Broken pipe": enough for a bug report, short."""
     if isinstance(ex, str):
@@ -87,7 +99,7 @@ class Completion:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
-    usage: dict | None = None  # {"input": tokens, "output": tokens} when the API reports it.
+    usage: dict | None = None  # {"input": tokens, "output": tokens[, "cost": USD]} when the API reports it.
     account: dict | None = None  # Plan and window usage from Loopcut's gateway headers; see account_from_headers.
     timed_out: bool = False  # call_max_seconds cut the stream short; finish_reason is set to "length" too.
     prompt_version: str | None = None
@@ -166,11 +178,13 @@ def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
 def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: float,
           is_cancelled: Callable[[], bool], on_drop: Callable[[], bool] = lambda: False):
     """Open the stream, retrying failures that are likely to pass. Nothing has been streamed to
-    the user yet at this point, so a retry is invisible apart from the wait. A read or connect
-    timeout at this stage (getting the status line and headers) is a socket.timeout/TimeoutError
-    that urlopen itself wraps as URLError, so it is already covered by the clause below. The
-    request is built again for each try: after a dropped connection or a 413, on_drop
-    (image_budget.Sized.tighten) has made its images smaller."""
+    the user yet at this point, so a retry is invisible apart from the wait. urlopen wraps an
+    OSError from connecting and sending as URLError, but not one from waiting for the status line
+    (getresponse): a read timeout, a reset, a TLS alert, or the bare FileNotFoundError(2) Windows
+    raised there after ~19s (0.2.14 logs). That is retried the same way, unless it is a refused
+    certificate, which fails the same way every time. The request is built again for each try:
+    after a dropped connection or a 413, on_drop (image_budget.Sized.tighten) has made its images
+    smaller."""
     for attempt in range(len(RETRY_DELAYS) + 1):
         last = attempt == len(RETRY_DELAYS)
         request = build()
@@ -201,29 +215,35 @@ def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: f
             delay = RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the request after {ex.reason!r} ({attempt + 1}/{len(RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")
+        except OSError as ex:  # From getresponse, which urlopen does not wrap (see above).
+            if isinstance(ex, ssl.SSLCertVerificationError):
+                raise
+            if last:
+                raise connection_lost("the model", network_cause(ex) or ex) from ex
+            on_drop()
+            delay = RETRY_DELAYS[attempt]
+            print(f"Loopcut: retrying the request after {ex!r} ({attempt + 1}/{len(RETRY_DELAYS)}, waiting {delay:g}s)")
         _wait(delay, is_cancelled)
     raise AssertionError("unreachable")
 
 
 class _ReadInterrupted(Exception):
-    """A read timeout or connection reset while a stream's body was being read (after urlopen
-    already returned the status line and headers): urlopen wraps neither as URLError, since they
-    happen later, outside its own call. streamed: whether a content or tool-call delta had already
-    reached on_text this attempt, so the caller may have applied something from it."""
+    """A read timeout, connection reset or other socket error while a stream's body was being read
+    (after urlopen already returned the status line and headers): urlopen wraps none as URLError,
+    since they happen later, outside its own call. streamed: whether a content or tool-call delta
+    had already reached on_text this attempt, so the caller may have applied something from it."""
 
     def __init__(self, streamed: bool):
         super().__init__(streamed)
         self.streamed = streamed
 
 
-_READ_ERRORS = (TimeoutError, ConnectionResetError)  # socket.timeout is TimeoutError since Python 3.10.
-
-
 def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
          deadline: float | None = None) -> Completion:
-    """One stream, start to finish, into a Completion. Raises _ReadInterrupted(streamed) for a read
-    timeout or connection reset (see _READ_ERRORS); everything else (a malformed chunk, an error
-    object in the stream, Cancelled) is unrelated to the connection and is not retryable here.
+    """One stream, start to finish, into a Completion. Raises _ReadInterrupted(streamed) for an
+    OSError from the socket (a read timeout, a reset, a TLS alert, Windows' bare FileNotFoundError(2);
+    not a refused certificate); everything else (a malformed chunk, an error object in the stream,
+    Cancelled) is unrelated to the connection and is not retryable here.
 
     deadline: a time.monotonic() past which the stream is cut short like a normal finish, not an
     error -- finish_reason is set to "length" (and timed_out=True) so a caller that already retries
@@ -254,12 +274,18 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                 except ValueError as ex:
                     raise LLMError(f"Malformed stream chunk: {data[:200]}") from ex
                 if chunk.get("error"):
-                    raise LLMError(_error_detail(data.encode("utf-8")))
+                    # With its code, as an HTTP error has it: Loopcut's gateway sends upstream_error this way too.
+                    error = _error_payload(data.encode("utf-8"))
+                    raise LLMError(_error_detail(data.encode("utf-8")),
+                                   code=str(error.get("code") or error.get("type") or ""), details=error)
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     completion.usage = {"input": int(usage.get("prompt_tokens") or 0),
                                         "cached": int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
                                         "output": int(usage.get("completion_tokens") or 0)}
+                    cost = usage.get("cost")  # USD, when the gateway says what the response cost (pricing.charged).
+                    if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+                        completion.usage["cost"] = float(cost)
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
                     text = delta.get("content")
@@ -279,7 +305,9 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         call.arguments += function.get("arguments") or ""
                     if choice.get("finish_reason"):
                         completion.finish_reason = choice["finish_reason"]
-    except _READ_ERRORS as ex:
+    except OSError as ex:  # socket.timeout is TimeoutError since Python 3.10.
+        if isinstance(ex, ssl.SSLCertVerificationError):
+            raise
         raise _ReadInterrupted(streamed) from ex
     completion.tool_calls = [calls[i] for i in sorted(calls)]
     return completion
@@ -438,15 +466,17 @@ def stream_chat(
             return _read(response, on_text, is_cancelled, deadline)
         except _ReadInterrupted as ex:
             cause = ex.__cause__
+            shown = network_cause(cause) or repr(cause)
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise LLMError(f"Connection lost while streaming the reply: {cause!r}", code=CONNECTION_LOST) from cause
+                    raise LLMError(f"Connection lost while streaming the reply: {shown}",
+                                   code=CONNECTION_LOST) from cause
                 retried_partial = True
                 print(f"Loopcut: retrying once from scratch after the stream broke mid-reply ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(RETRY_DELAYS):
-                raise LLMError(f"Connection lost before any reply arrived: {cause!r}", code=CONNECTION_LOST) from cause
+                raise LLMError(f"Connection lost before any reply arrived: {shown}", code=CONNECTION_LOST) from cause
             delay = RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the request after {cause!r} ({before_content + 1}/{len(RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")

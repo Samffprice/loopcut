@@ -16,14 +16,16 @@ The result card, with the real count:
 
 > Added {n} bones so your character can bend. Loopcut can animate it with keyframes; ready-made motions need a person-shaped character.
 
-Both motion tools refuse locally before quoting:
+Both motion tools refuse locally before quoting, as a neutral result (no red card; R12):
 
 > Ready-made motions need a person-shaped character, so ask Loopcut to animate this one instead.
+
+with the model's note `No credits used. Animate this experimental rig with bone keyframes instead (free), then run character_rig check_deformation: it checks the whole animation.`
 
 Other new messages:
 
 - `Checking the rig and your original character…`
-- `This experimental rig has no standard test pose. Ask the agent to pose or animate it.`
+- `This experimental rig has no built-in test poses: pose or keyframe its bones, then run check_deformation.` (neutral)
 - `The experimental rig choice could not be read.`
 - `Refresh the tools to use the current auto-rig service.`
 
@@ -39,8 +41,11 @@ Bundle refusal prefixes (followed by ` Your character has not been changed.`):
 
 The model's separate continuation note includes tier, count, root, native chains,
 motion-tool incompatibility, the XYZ rotation mode every native bone gets (so
-ordinary rotation_euler keys work) and keyframing/renaming/weight-fixing/deletion
-options. It tells the model to keep bone names in code and use plain words with the
+ordinary rotation_euler keys work) and its next steps (R12): `Hide {armature} before showing the user the
+result; its bones draw over the mesh.`, `Keyframe bones with ordinary Blender tools for a simple cycle, such as a
+four-leg walk.`, `Then run character_rig check_deformation: it checks the whole animation.`, `Rename bones, fix
+weights or delete stray bones only if asked.` A standard rig's note adds `next`: `Before a ready-made walk or run,
+tell the user its price: {2} credits a second ({10} for {5} s).` (from the catalog's estimates). It tells the model to keep bone names in code and use plain words with the
 user. It does not expand the user card with technical bone data.
 
 ## New local messages
@@ -93,18 +98,32 @@ user. It does not expand the user card with technical bone data.
 - `'A rigged character part is missing. Use Undo to restore it first.'`
 - `'A rigged character part is missing. Use Undo to restore it first.'`
 - `'Rig removed. Your original character is back.'`
-- `'Select a character rig made by Loopcut.'`
-- `'This rig already has animation or controls. Pose it directly or play its animation.'`
+- `'Select a character rig made by Loopcut.'` (neutral, `not_loopcut_rig`)
+- `'This rig already has animation or controls, so test poses are off; check_deformation checks its animation.'` (neutral)
 - `'There is no test pose to reset.'`
 - `'Original pose restored.'`
-- `Free test pose: both knees and elbows are bent. To put it back, reset the test pose or undo once; tell the user it is the test pose.` (gentle; `the {side} knee and elbow are` for one side)
+- `Free test pose: both knees and elbows bent 25°. Shoulders, hips and wrists were not tested; pose stress bends and checks every joint. To put it back, reset the test pose or undo once; tell the user it is the test pose.` (gentle; `the {side} knee and elbow bent 25°` and `were not tested, nor the {other} side` for one side)
 - `Free test pose: {what}{, left side only}. Measured: {angles}.{ Left out: {note}.} To put it back, reset the test pose or undo once; tell the user it is the test pose.` then the deformation check (other poses)
+- Deformation check (rig_deform.lines; model-facing, in this order):
+  - `Worse since the last check: {joint} volume 97% → 54%, stretch 1.99x → 3.77x{, spikes 0 → 5}{; next joint …}; undo the last change.` or `Still worse than the first check of this pose: {joint} {changes}.` or `Better since the last check: {joint} {changes}.` or `No clear change since the last check of this pose.`
+  - `Rest skeleton changed since rigging: the {left upper arm} joint moved {5.0} cm{, the {left hand} bone turned {10}°}{ and {n} more}; the skin was weighted to the old joints, so it can tear there.`
+  - `Deformation check (free; the posed mesh against rest) at {elbows bent left 60°, right 61° from straight; shoulders turned left 80°, right 80° from rest}: problems at {joints}.` or `…: no spikes or torn edges at the turned joints.`
+  - `- {left shoulder}, {turned 80° from rest | bent 60° from straight}: PROBLEM: {n} vertices pulled out into spikes, up to {cm} cm; skin torn: …; skin crushed: … (stretch {x}x, squash {x}x, volume {p}).` (`minor: {n} stray vertices, up to {cm} cm`, or `no spikes or torn edges`)
+  - `Not tested, since not turned: {joints}.` and `Turned, but no skin there to test: {joints}.`
+  - `Posed by hand, not with a built-in test pose: for test poses use preview with pose stress (free), even when other angles were asked; it bends every joint to known angles and checks them.`
+  - `Spikes: vertices over 3 edge lengths off their neighbours with a stretched edge; torn or crushed: edges past 6x or under 0.1x. Volume is the joint's against rest; automatic weights lose some at strong bends. The check cannot see skin pushed through skin or layers poking out, so look at the joint too. Report these numbers and angles; do not call a flagged or untested joint clean.`
+  - With no joint turned, instead: `Deformation check (free): nothing was tested, because no joint is turned from rest; this says nothing about how the rig bends, so do not call any joint clean. Pose it first: preview with pose stress (free) bends every joint and checks it.`
+  - Regions: shoulder, elbow, wrist, hip, knee and (R12) ankle on each side. On an experimental rig (R12) the regions are body parts (rig_parts: `head` or `upper body`, `body`, `tail`, `{front|second|…|back} {left|right|middle} leg`, `{left|right} arm`, or `leg {k} of {n}` with no front to go by), `joint` reads `part` throughout, the rest-joint line says `a {front left leg} joint moved {cm} cm` / `a {tail} bone turned {n}°`, and the nothing-tested line ends `Pose or animate it first, then check again.`
+  - On a rig with an animation (R12), first: `Worst at frame {59}: {left ankle}, {skin torn: edges stretched to 7.2x}.` (or `…, stretch {x}x, squash {x}x, no spikes or torn edges.`), then `Worse since the last check of this animation: …; undo the last change.` (only when no flagged joint was mended; else `Since the last check of this animation, better: …; worse: ….`; at most four items a list, then `and N more`) / `Still worse than the first check of this animation: ….` / `Better since the last check of this animation: ….` / `No clear change since the last check of this animation.`, then `Deformation check over the animation (free; {14} frames from {1} to {120}, each against rest): {problems at …. | no spikes or torn edges at the turned joints.}`, joint lines `- {joint}, worst at frame {f}, {angle}: …`, `Not tested, since never turned: ….`, and the footer ending ` It checked {14} frames, not every one, so look at the worst one too.` With nothing turned: `Deformation check (free): nothing was tested, because no joint is turned from rest in the {14} frames checked from {1} to {120}; this says nothing about how the rig bends, so do not call any joint clean.`
 - `'Choose Check character, Try a free test pose, Check how it bends, Reset test pose or Remove character rig.'`
 - `'Check character (free)'`
 - `'Try a free test pose'`
 - `'Check how it bends (free)'`
-- `'The deformation check needs a standard rig; look at this one in the viewport instead.'`
-- `'This rig has no skinned mesh or joints to check.'`
+- `'This rig has no skinned mesh to check.'`, `'This rig has no joints to check.'`
+- Inspect on a character that already has a skeleton (R12, neutral; JSON `rigged`, `armature`, `made_by_loopcut`, `tier`, `bone_count`, `meshes`, `animated`, `message`): `Already rigged by Loopcut (experimental, {33} bones): no ready-made motions, so animate it with bone keyframes (free); check_deformation checks {the current pose | the whole animation}. It needs no new rig.`, `Already rigged by Loopcut (standard, {34} bones): ready-made walks and runs work ({2 credits a second (10 for 5 s)}; tell the user first); preview pose stress tests poses; check_deformation checks …. It needs no new rig.`, `Already has its own skeleton ({n} bones): {ready-made motions can target it | animate it with bone keyframes}; Loopcut's test poses and bend check need a Loopcut rig. It needs no new rig.`
+- Inspect's `price_note` (R12, from the catalog's estimates): `Before rigging, tell the user the total: the rig is {20} credits and a ready-made walk or run is {2} credits a second ({10} for {5} s).`
+- run_python results (tools.py, R12), when the code changed a Loopcut rig: `Weights changed on {Mesh}: before telling the user it is fixed, {run character_rig check_deformation: it checks the whole animation | pose its bones and run character_rig check_deformation | run character_rig preview with pose stress (free): it bends every joint and checks it}.` and `Animation changed on {Character Rig}: run character_rig check_deformation before telling the user it works.` (once per step, Loopcut-made rigs only). Animation checks set frames from the action's curves, or with frame_set (then put back) when the rig has constraints, drivers, playing NLA, action blending or skipped curves, or its meshes or shape keys are animated.
+- Motion result (motion_retarget.py, R12), past 1 m of root travel: `It travels {5.5} m from where it starts, so view it from the side or follow it to keep it in view` (first of the result's notes).
 - Pose refusals (rig_pose.py): `Choose a test pose: …`, `This rig is missing the arm or leg bones a test pose needs.`, `This rig has no finger bones that can close, so there is no fist pose.`, `This rig has no shoulder bones to raise; the arms-up pose still works.`
 - `'Remove character rig'`
 - `'Reset test pose'`
@@ -120,7 +139,7 @@ user. It does not expand the user card with technical bone data.
 - `The mesh contains invalid faces. Repair the mesh first.`
 - `Several complete characters are selected. Select just one character, including its clothes, hair and eyes.`
 - `Ready for a rigging quote: {count} triangles. Checking was free.`
-- `This character's shape is unusual. It may get an experimental rig.`
+- `This unusual shape may get an experimental rig: no ready-made motions, so Loopcut animates it with bone keyframes, and the bend check works on it.` (R12; it was `This unusual shape may get an experimental rig.`)
 
 The last line is advisory: it follows the free-check message and appears with that
 character's price on its quote card. Leg gaps, head shape, arm separation and body
@@ -176,7 +195,7 @@ apply failures; their window, cap and unconfirmed outcomes are stated below.
 - The result card uses the success message directly. The existing card retains job metadata, artifacts and the actual credit receipt.
 - Unexpected local apply failure: `The returned rig could not be verified or applied. Your character has not been changed.`
 - Charged local failure suffix: ` The cloud job used {charged} credits; no refund has been confirmed.`
-- `character_rig` description: `Free local character rig checks, test pose and removal. Inspect before auto_rig or before making an unrigged character walk. Inspection never uploads or uses credits. After inspection use loopcut_cloud.auto_rig for an eligible humanoid; it quotes before spending.`
+- `character_rig` description: `Free local inspect, standard-rig test poses (preview pose stress, even for other angles; not run_python), reset, bend check (any Loopcut rig; on an animated one, its whole animation) and rig removal. Inspect before loopcut_cloud.auto_rig (it quotes first). Experimental rigs: bone keyframes, no motion tools.`
 - `targets` description: `Mesh names to inspect; defaults to selection.`
 - `rig` description: `Rig name for preview, reset or remove; defaults to selection.`
 - Cloud descriptor guidance appended by the client: ` First use character_rig(action='inspect') on the character. Loopcut checks again locally and generates geometry-only files; materials and textures stay here. For 'make him walk' on an unrigged character, rig it first, then use motion_from_text on the returned rig. Uncertain shapes receive a warning on the quote; the server checks the returned skeleton and refuses unsupported bodies without a charge. Never promise a refund for a local apply failure unless the service confirms it.`

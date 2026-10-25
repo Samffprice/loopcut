@@ -481,7 +481,7 @@ class ToolCardLabelTest(unittest.TestCase):
             for expanded in (False, True):
                 with self.subTest(width=width, scale=scale, expanded=expanded):
                     item = state.item_tool("run_python", summary, code)
-                    item.update(status="awaiting", expanded=expanded)
+                    item.update(status="awaiting", expanded=expanded, details_expanded=True)  # Code shown.
                     original = deepcopy(item)
                     frame = layout.Frame(width, 600, scale, measure)
                     x, y = frame.px(T.PAD), frame.px(9)
@@ -502,8 +502,11 @@ class ToolCardLabelTest(unittest.TestCase):
                     name = names[0]
                     self.assertEqual(name["size"], frame.px(T.FONT_SIZE_SMALL))
                     self.assertGreaterEqual(name["y"], rows[-1]["y"] + rows[-1]["h"])
+                    toggle = hit(display, "item0.tool.code_toggle")
+                    self.assertEqual(prim(display, "item0.tool.code_toggle.label")["text"], "Hide code")
+                    self.assertGreaterEqual(toggle["y"], name["y"] + name["h"])
                     preview = prim(display, "item0.tool.code.bg")
-                    self.assertGreaterEqual(preview["y"], name["y"] + name["h"])
+                    self.assertGreaterEqual(preview["y"], toggle["y"] + toggle["h"])
                     code_rows = [p for p in frame.prims if p["id"].startswith("item0.tool.code.l")]
                     self.assertEqual([p["text"] for p in code_rows], ["pass"] * T.CODE_PREVIEW_LINES)
                     self.assertEqual(prim(display, "item0.tool.code.more")["text"], "… 2 more lines")
@@ -519,10 +522,73 @@ class ToolCardLabelTest(unittest.TestCase):
                             self.assertLessEqual(p["x"] + measure(p["font"], p["size"], p["text"]),
                                                  card["x"] + card["w"] - frame.px(T.CARD_PAD), p["id"])
                     self.assertEqual(item, original)
-                    actions = [("approve", 0), ("reject", 0)]
+                    actions = [("toggle_details", 0), ("approve", 0), ("reject", 0)]
                     if width != 240:
                         actions.append(("approve_always", 0))
                     self.assertEqual([h["action"] for h in frame.hits], actions)
+
+
+class ApprovalCodeTest(unittest.TestCase):
+    """An ask leads with its summary: its code waits behind Show code, except an install's."""
+
+    def display(self, status="awaiting", **flags):
+        session = state.new_session()
+        item = state.item_tool("run_python", "Build the chest", "import bpy\nbpy.ops.mesh.primitive_cube_add()")
+        item.update(status=status, **flags)
+        session["items"].append(item)
+        return layout.build(session, 640, 600, 1, measure)
+
+    def test_code_is_collapsed_until_asked_for(self):
+        display = self.display()
+        self.assertNotIn("item0.tool.code.bg", ids(display, "prims"))
+        self.assertEqual(hit(display, "item0.tool.code_toggle")["action"], ("toggle_details", 0))
+        self.assertEqual(prim(display, "item0.tool.code_toggle.label")["text"], "Show code")
+        self.assertEqual(hit(display, "item0.tool.run")["action"], ("approve", 0))
+        shown = self.display(details_expanded=True)
+        self.assertIn("item0.tool.code.bg", ids(shown, "prims"))
+        self.assertEqual(prim(shown, "item0.tool.code_toggle.label")["text"], "Hide code")
+
+    def test_install_ask_shows_what_it_runs(self):
+        display = self.display(install=True)
+        self.assertIn("item0.tool.code.bg", ids(display, "prims"))
+        self.assertNotIn("item0.tool.code_toggle", ids(display, "hits"))
+
+    def test_an_opened_card_after_the_ask_shows_code_without_the_toggle(self):
+        for status in ("running", "done", "rejected"):
+            with self.subTest(status=status):
+                display = self.display(status, expanded=True)
+                self.assertIn("item0.tool.code.bg", ids(display, "prims"))
+                self.assertNotIn("item0.tool.code_toggle", ids(display, "hits"))
+
+
+class StarterWaitingTest(unittest.TestCase):
+    """A slow starter card says so under Thinking until its first reply arrives."""
+
+    def session(self, text):
+        from loopcut import try_it
+        session = state.new_session()
+        session["busy"] = True
+        session["items"] = [state.item_user(text), state.item_assistant()]
+        return session, next(card for card in try_it.CARDS if card.get("waiting"))
+
+    def test_note_shows_while_the_card_waits(self):
+        chest = self.session("")[1]
+        session, _ = self.session(chest["prompt"])
+        self.assertEqual(prim(build(session), "chat.starter_waiting.l0")["text"], chest["waiting"])
+
+    def test_no_note_once_something_came_back_or_for_typed_requests(self):
+        chest = self.session("")[1]
+        session, _ = self.session(chest["prompt"])
+        session["items"][-1]["text"] = "Planning the lid first."
+        self.assertNotIn("chat.starter_waiting.l0", ids(build(session), "prims"))
+        session, _ = self.session(chest["prompt"])
+        session["items"].append(state.item_tool("run_python", "Build", "pass"))
+        self.assertNotIn("chat.starter_waiting.l0", ids(build(session), "prims"))
+        session, _ = self.session("Model a chest")
+        self.assertNotIn("chat.starter_waiting.l0", ids(build(session), "prims"))
+        session, _ = self.session(chest["prompt"])
+        session["busy"] = False
+        self.assertNotIn("chat.starter_waiting.l0", ids(build(session), "prims"))
 
 
 class ApprovalScopeTest(unittest.TestCase):
@@ -837,6 +903,19 @@ class ErrorCardTest(unittest.TestCase):
         session["busy"] = False
         session["items"].append(state.item_user("next"))
         self.assertNotIn("item0.error.retry", ids(build(session), "hits"))
+
+    def test_try_again_stays_under_the_turn_s_end_cards_and_only_on_the_newest_error(self):
+        """A failed turn that changed the scene ends with its changes card (and maybe a notice) after the error."""
+        session = state.new_session()
+        session["items"] += [state.item_error("The connection dropped.", retry=True),
+                             state.item_changes("1 added", ["+ Sphere"], "cp1"), state.item_notice("Saved a copy.")]
+        hits = {h["id"]: h for h in build(session)["hits"]}
+        self.assertEqual(hits["item0.error.retry"]["action"], ("resume", 0))
+        self.assertIn("item1.changes.undo", hits, "the changes card keeps its own buttons")
+        for later in (state.item_error("Could not save this conversation: disk full"), state.item_user("next")):
+            with self.subTest(later=later["kind"]):
+                display = build({**session, "items": session["items"] + [later]})
+                self.assertNotIn("item0.error.retry", ids(display, "hits"))
 
     def test_other_errors_have_no_button(self):
         session = state.new_session()
@@ -1210,6 +1289,32 @@ class DelegateDetailsTest(unittest.TestCase):
         retry["plan_started"] = True
         self.assertEqual(texts(layout.build(session, 900, 2000, 1.0, measure))["item0.tool.summary"],
                          "Helper started")
+
+    def test_a_refusal_by_the_turns_worker_limit_is_a_neutral_card(self):
+        """orchestrator.CAP_SPENT / CAP_LINE (the account's max_workers, 2026-10-24): never the red "needs
+        adjustment", collapsed or expanded, busy or not, and a later wave never turns it into a repair."""
+        from loopcut import orchestrator
+        for busy, expanded in product((False, True), (False, True)):
+            with self.subTest(busy=busy, expanded=expanded):
+                item = state.item_tool("delegate", "Start helpers", '{"workers": [{"id": "c"}, {"id": "d"}]}')
+                item.update(status="failed", expanded=expanded, details_expanded=expanded, plan_repair="capped",
+                            plan_turn="turn1", plan_workers=[["c", "modeling"], ["d", "modeling"]],
+                            output=orchestrator.CAP_SPENT.format(cap=2, started="", running=""))
+                smaller = state.item_tool("delegate", "Start a helper", "")
+                smaller.update(status="done", plan_turn="turn1", plan_started=True, plan_workers=[["c", "modeling"]])
+                session = chat(item, busy=busy)
+                session["items"].append(smaller)
+                if busy:
+                    session["turn"] = types.SimpleNamespace(plan_turn="turn1")
+                self.assertNotIn(0, layout._plan_repairs(session["items"], "turn1" if busy else ""))
+                display = build(session)
+                self.assertTrue("Helper limit for this turn".startswith(texts(display)["item0.tool.summary"].rstrip("…")))
+                self.assertEqual(prim(display, "item0.tool.glyph"), {**prim(display, "item0.tool.glyph"),
+                                                                     "text": "–", "color": T.TEXT_MUTED})
+                self.assertNotIn("Helper plan needs adjustment", " ".join(texts(display).values()))
+                if expanded:
+                    self.assertIn("this turn can start 0 more workers", " ".join(texts(display).values()))
+                    self.assertEqual(prim(display, "item0.tool.output.l0")["color"], T.TEXT_MUTED)
 
     def test_plan_diagnostics_and_budget_stay_behind_details(self):
         for repair in ("needed", "adjusting", "resolved"):

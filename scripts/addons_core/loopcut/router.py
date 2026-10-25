@@ -240,8 +240,11 @@ def skeleton(decision: Decision, threads: dict | None = None) -> str:
     return "workers: [" + ", ".join(parts) + "]"
 
 
-def note(decision: Decision, threads: dict | None = None) -> str:
-    """The line added to the user's message for the orchestrator."""
+CAP_NOTE = "This turn can start at most {n} workers."  # The account's max_workers (config.Roles.turn_workers).
+
+
+def note(decision: Decision, threads: dict | None = None, workers: int = 0) -> str:
+    """The line added to the user's message for the orchestrator; workers: the turn's worker limit, 0 for none."""
     listing = _listing(decision)
     if decision.level == 0:
         body = "level 0 — a question: answer it; change nothing."
@@ -255,6 +258,8 @@ def note(decision: Decision, threads: dict | None = None) -> str:
                 f"({STYLE}), planned bounds and a dry_run first; do shared setup ({SHARED_SETUP}) yourself.")
     if decision.level >= 2 and decision.deliverables:
         body += f" Skeleton: {skeleton(decision, threads)}"
+    if decision.level >= 2 and workers:
+        body += " " + CAP_NOTE.format(n=workers)
     if decision.source == "parked":
         body = body.replace(" — ", " — the work your question was about: ", 1)
     return f"<routing>{body}</routing>"
@@ -382,10 +387,13 @@ def start_turn(session: dict, turn, cfg, is_cancelled, stream=None, divert=None)
     decision = route(session, message, cfg, is_cancelled, stream)
     turn.routed = decision
     message[ROUTED] = decision.level if decision else -1
+    workers = getattr(getattr(turn, "roles", None), "turn_workers", 0)
     if decision is None:
+        if workers:  # No routing decision, but the orchestrator still hears the turn's worker limit first.
+            _add_note(message, f"<routing>{CAP_NOTE.format(n=workers)}</routing>")
         return
     session["routing"] = decision.record()
     if divert is not None and divert(decision):
         turn.diverted = True
         return
-    _add_note(message, note(decision, session.get("worker_threads")))
+    _add_note(message, note(decision, session.get("worker_threads"), workers))

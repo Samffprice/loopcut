@@ -13,8 +13,8 @@ folder. Status of a running job without `wait`, from the POLLS-th time in a turn
 sleeps right after a render_job call, get a line pointing to status with wait.
 
 Pure Python and locked: one Ledger per turn now, one shared by a job's workers later.
-NoProgress separately counts failures and refusals per call since the last scene change in every loop,
-including workers, whose dollars and time are also budgeted.
+NoProgress separately counts failures and refusals per call since the last scene change, and refused
+repeats of any call, in every loop, including workers, whose dollars and time are also budgeted.
 """
 
 import hashlib
@@ -28,6 +28,8 @@ SHOWN_TRIES = 4    # Earlier attempts listed by step; any older ones are counted
 GIST = 60          # Characters of an attempt's gist.
 POLLS = 3          # Status calls without wait that find a job running, in a turn, before the model is told to wait.
 NO_PROGRESS_FAILURES = 8  # Allow several retries after the repeat notes before stopping an unchanged failure.
+REPEAT_REFUSALS = 20  # Refused repeats of any calls in a loop, never reset: a hosted turn rotating among
+                      # repeated inspect_api calls had 237 refused and never reached the limit above.
 
 _HEX = re.compile(r"0x[0-9a-fA-F]+")
 # Names: anything in double quotes, and single-quoted words. A single-quoted phrase with spaces is
@@ -109,9 +111,11 @@ def _steps(steps: list[int]) -> str:
 class NoProgress:
     """Failures and refusals per call_key since the last scene change, consecutive or not.
     Success clears only its key; scene changes, user notes and approval rejections clear all keys.
-    Successful reads of other keys preserve counts because they do not change the scene."""
+    Successful reads of other keys preserve counts because they do not change the scene.
+    Refused repeats (Ledger.refusal) are also counted for the whole loop, whatever the key and scene changes."""
 
     def __init__(self):
+        self._refused = 0
         self.reset()
 
     def reset(self) -> None:
@@ -120,6 +124,11 @@ class NoProgress:
     def skip(self, key: tuple[str, str]) -> bool:
         """Count an automatic refusal as no progress, just like an executed failure."""
         return self.record(key, ok=False, changed=False)
+
+    def refused(self, key: tuple[str, str]) -> bool:
+        """Count a read refused as a repeat: toward its key like skip(), and toward REPEAT_REFUSALS."""
+        self._refused += 1
+        return self.skip(key) or self._refused >= REPEAT_REFUSALS
 
     def record(self, key: tuple[str, str], ok: bool, changed: bool) -> bool:
         """Whether this call reaches the limit; a scene change resets even if the call failed."""

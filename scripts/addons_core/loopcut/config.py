@@ -8,6 +8,7 @@ Preferences belong to Blender's main thread: load() is called there (agent.send)
 handed to the worker.
 """
 
+import math
 import os
 import shutil
 from dataclasses import dataclass, replace
@@ -129,6 +130,13 @@ class Roles:
     max_workers: int = 3          # Children running at once.
     job_max_usd: float = 0.40     # Worker dollars in all (pricing.py); 0 = no limit.
     worker_max_seconds: int = 1800  # One worker run's wall time (LOOPCUT_WAVE_MAX_SECONDS is the old name).
+    # From the account's agent terms (agent_terms); False, 0 and () without them, today's: whether they apply (then a
+    # reply's usage.cost is what the job is charged, pricing.charged); the workers one turn may start in all, across
+    # its waves (waves.workers_left); and the account's own prices per alias, ((alias, (input, cached input,
+    # output)), ...), for job_max_usd.
+    terms: bool = False
+    turn_workers: int = 0
+    prices: tuple = ()
     # The router (router.py): a cheap call naming each turn's level and deliverables before the
     # orchestrator's first request. None = off. Its provider, model and key default to the worker's;
     # it runs only on the gateway.
@@ -446,23 +454,102 @@ def _whole(get, key: str, default: int, low: int, high: int) -> int:
     return int(value)
 
 
+# The signed-in account's agent terms: the manifest's optional account.agent (contract agreed with the gateway,
+# 2026-10-24). Every field is optional and replaces the default it names; a missing one, an older server that sends
+# none, signing out, BYOK, the ChatGPT plan, a harness stand-in for the gateway and LOOPCUT_AGENT_TERMS=off keep
+# today's. A value of the wrong type or outside its range is ignored with a console note. Prices are USD per million
+# tokens (input, cached input, output) of the model actually serving that alias for the account. worker_max_steps
+# and orchestrator_max_steps are read and checked, and not enforced.
+AGENT_TERMS = {"max_workers": (1, 6), "worker_max_steps": (5, 200), "orchestrator_max_steps": (5, 200),
+               "job_max_usd": (0, 100), "typical_build": (1, 1000)}
+MAX_WORKERS_AT_ONCE = 3  # The account's max_workers is the turn's total; at most this many of them run at once.
+_agent_notes: set = set()  # The notes already printed: load_roles runs every turn.
+
+
+def _agent_note(key: str, value) -> None:
+    note = f"Loopcut: ignoring the server's account.agent.{key}: {value!r}"[:300]
+    if note not in _agent_notes:
+        _agent_notes.add(note)
+        print(note)
+
+
+def _number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _manifest_account() -> dict:
+    """The signed-in account's manifest object; {} signed out, before a manifest, or outside the add-on."""
+    try:
+        from . import cloud
+    except ImportError:  # This file loaded on its own (harness/evals/run.py).
+        return {}
+    runtime = cloud._runtime
+    if runtime is None or not runtime.signed_in:
+        return {}
+    with runtime.lock:
+        account = runtime.manifest.get("account")
+        return dict(account) if isinstance(account, dict) else {}
+
+
+def agent_terms(account: dict | None = None) -> dict:
+    """The valid fields of account.agent, of the signed-in account's manifest unless an account object is given;
+    {} without any. prices comes back as {alias: (input, cached input, output)}, only its valid rows."""
+    account = _manifest_account() if account is None else account
+    agent = account.get("agent") if isinstance(account, dict) else None
+    if agent is None:
+        return {}
+    if not isinstance(agent, dict):
+        _agent_note("agent", agent)
+        return {}
+    terms = {}
+    for key, value in agent.items():
+        if key == "prices":
+            rows = value.items() if isinstance(value, dict) else ()
+            if not isinstance(value, dict):
+                _agent_note(key, value)
+            prices = {}
+            for alias, row in rows:
+                if (isinstance(alias, str) and alias.strip() and isinstance(row, list) and len(row) == 3
+                        and all(_number(n) and n >= 0 for n in row)):
+                    prices[alias.strip().lower()] = tuple(float(n) for n in row)
+                else:
+                    _agent_note(f"prices.{alias}", row)
+            if prices:
+                terms[key] = prices
+        elif key in AGENT_TERMS:
+            low, high = AGENT_TERMS[key]
+            whole = type(value) is int if key != "job_max_usd" else _number(value)
+            if whole and low <= value <= high:
+                terms[key] = value
+            else:
+                _agent_note(key, value)
+    return terms  # A field a later contract adds is left alone.
+
+
 def load_roles() -> Roles:
     """load() per role: LOOPCUT_ORCH_* and LOOPCUT_WORKER_* override the LOOPCUT_* values, and
     LOOPCUT_ROUTER_* the worker's (LOOPCUT_ROUTER=off: no router). Workers default on only when both
     roles use the gateway; the router defaults on only on its own gateway URL. Main thread, like load(). Keep
     mode per role is agent._turn_roles' business. On the ChatGPT plan: the single agent in its workspace,
-    never workers or the router, and no craft notes unless LOOPCUT_SINGLE_CRAFT asks for them."""
+    never workers or the router, and no craft notes unless LOOPCUT_SINGLE_CRAFT asks for them.
+
+    With both roles on Loopcut's own gateway (SERVICE_BASE_URL, never a LOOPCUT_SERVICE_URLS stand-in) the
+    account's agent terms (agent_terms) replace the defaults of the limits they name, unless LOOPCUT_AGENT_TERMS is
+    off; an explicit LOOPCUT_MAX_WORKERS or LOOPCUT_JOB_MAX_USD (evals, dev runs) still wins, as today. Read per
+    turn (agent._configure): a manifest refreshed mid-turn applies from the next one."""
     base = load()
     _, get = _getter()
     plan = chatgpt_plan(base.base_url)
+    worker = _role(base, get, "LOOPCUT_WORKER_", SERVICE_WORKER_MODEL)
+    orchestrator = _role(base, get, "LOOPCUT_ORCH_")
+    hosted = not plan and SERVICE_BASE_URL == orchestrator.base_url == worker.base_url
+    terms = agent_terms() if hosted and _as_bool(get("LOOPCUT_AGENT_TERMS", "on"), "LOOPCUT_AGENT_TERMS") else {}
     try:
-        usd = float(get("LOOPCUT_JOB_MAX_USD", "0.40"))
+        usd = float(get("LOOPCUT_JOB_MAX_USD", str(terms.get("job_max_usd", 0.40))))
     except ValueError:
         usd = -1.0
     if not 0 <= usd <= 100:
         raise ConfigError(f"LOOPCUT_JOB_MAX_USD must be 0-100 (0 = no limit), got {get('LOOPCUT_JOB_MAX_USD')!r}")
-    worker = _role(base, get, "LOOPCUT_WORKER_", SERVICE_WORKER_MODEL)
-    orchestrator = _role(base, get, "LOOPCUT_ORCH_")
     router = None
     if not plan and _as_bool(get("LOOPCUT_ROUTER", "on"), "LOOPCUT_ROUTER"):
         router = _role(worker, get, "LOOPCUT_ROUTER_")
@@ -480,8 +567,13 @@ def load_roles() -> Roles:
                     and _as_bool(get("LOOPCUT_ORCHESTRATE", "true"), "LOOPCUT_ORCHESTRATE"),
         workspace=plan or _as_bool(get("LOOPCUT_WORKSPACE", "false"), "LOOPCUT_WORKSPACE"),
         single_craft=_as_bool(get("LOOPCUT_SINGLE_CRAFT", "false" if plan else "true"), "LOOPCUT_SINGLE_CRAFT"),
-        max_workers=_whole(get, "LOOPCUT_MAX_WORKERS", 3, 1, 6),
+        # The account's max_workers is the turn's total, and MAX_WORKERS_AT_ONCE of them at most run at once;
+        # LOOPCUT_MAX_WORKERS is at once only, as today.
+        max_workers=_whole(get, "LOOPCUT_MAX_WORKERS", min(terms.get("max_workers", 3), MAX_WORKERS_AT_ONCE), 1, 6),
+        turn_workers=0 if get("LOOPCUT_MAX_WORKERS") else terms.get("max_workers", 0),
         job_max_usd=usd,
         worker_max_seconds=_whole(get, "LOOPCUT_WORKER_MAX_SECONDS" if get("LOOPCUT_WORKER_MAX_SECONDS")
                                   else "LOOPCUT_WAVE_MAX_SECONDS", 1800, 60, 7200),
+        terms=bool(terms),
+        prices=tuple(sorted(terms.get("prices", {}).items())),
     )

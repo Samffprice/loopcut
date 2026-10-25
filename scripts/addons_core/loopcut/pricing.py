@@ -6,7 +6,13 @@ plus "cache_write" from providers that bill writing the cache (Anthropic: 1.25x 
 cache), priced at the fourth figure, else as uncached input; other keys (a role bucket's "requests") are
 ignored. Sources: the 2026-09-21 model-tiers analysis and the gateway's model catalogue (loopcut-web
 supabase/migrations), which uses the Muse ids below; Anthropic's from platform.claude.com/docs/en/about-claude/pricing.
+
+The table is the fallback for the job budget (waves.JobBudget): a signed-in account's own prices (the manifest's
+account.agent.prices, config.agent_terms) come first, as "fast" may be served by another model than GLM, and a
+response whose usage says what it cost ("cost", USD, from the gateway's final usage chunk) is charged that (charged).
 """
+
+import math
 
 _GLM_FLASH = (0.15, 0.03, 0.50)
 _MUSE_STANDARD = (1.25, 0.15, 4.25)
@@ -44,13 +50,16 @@ PRICES = {
 LONG_CONTEXT = {"claude-haiku-5-5": (100_000, (0.50, 0.05, 2.50, 0.625))}
 
 
-def usd(model, usage):
-    """Dollars for one usage dict, or None when the model has no price."""
-    price = PRICES.get((model or "").lower())
+def usd(model, usage, prices=None):
+    """Dollars for one usage dict, or None when the model has no price. prices: the account's own
+    {alias: (input, cached input, output)}, looked up before PRICES."""
+    key = (model or "").lower()
+    own = (prices or {}).get(key)
+    price = own or PRICES.get(key)
     if price is None or not usage:
         return None
     total = int(usage.get("input") or 0)
-    long = LONG_CONTEXT.get((model or "").lower())
+    long = None if own else LONG_CONTEXT.get(key)
     if long and total > long[0]:
         price = long[1]
     cached = min(int(usage.get("cached") or 0), total)
@@ -58,3 +67,11 @@ def usd(model, usage):
     write_price = price[3] if len(price) > 3 else price[0]
     return ((total - cached - written) * price[0] + cached * price[1] + written * write_price
             + int(usage.get("output") or 0) * price[2]) / 1e6
+
+
+def charged(model, usage, prices=None):
+    """One response's dollars: the cost its usage reports (usage["cost"]) when it has one, else usd()."""
+    cost = (usage or {}).get("cost")
+    if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+        return float(cost)
+    return usd(model, usage, prices)

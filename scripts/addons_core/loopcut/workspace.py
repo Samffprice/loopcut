@@ -143,7 +143,8 @@ SCHEMAS = [  # Sent with every workspace request: every word here is paid for on
             "logs/). No input. Windows: cmd.exe; inline Python refused: write_file a .py, then python3 file.py."),
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
-            "summary": {"type": "string", "description": "A few words on what this does, shown to the user"},
+            "summary": {"type": "string", "description": "A few words for the user on what this does, in the language "
+                        "they write in"},
             "timeout": {"type": "integer", "description": f"Seconds, default {SHELL_TIMEOUT}, at most {MAX_TIMEOUT}"},
         }, "required": ["command", "summary"]},
     }},

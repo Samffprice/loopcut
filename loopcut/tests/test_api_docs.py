@@ -40,13 +40,14 @@ STRUCTS = {"ID": ID, "Action": ACTION, "ActionSlot": rna("ActionSlot"), "ActionS
 FAKE_TYPES = types.SimpleNamespace(**{name: types.SimpleNamespace(bl_rna=struct) for name, struct in STRUCTS.items()})
 
 
-def failed_run(message: str, error=AttributeError) -> str:
-    """What run_python writes for model code that raised this."""
+def failed_run(message: str, error=AttributeError, code: str = "", blend: str = "/Users/me/scene.blend") -> str:
+    """What run_python writes for model code that raised this: `code` as the code it ran, in `blend` ("" unsaved)."""
     try:
         exec(compile(f"raise {error.__name__}({message!r})", "<loopcut>", "exec"))
     except error as ex:
-        with mock.patch.object(api_docs.bpy, "types", FAKE_TYPES, create=True):
-            return tools._model_traceback(ex)
+        with mock.patch.object(api_docs.bpy, "types", FAKE_TYPES, create=True), \
+                mock.patch.object(api_docs.bpy, "data", types.SimpleNamespace(filepath=blend), create=True):
+            return tools._model_traceback(ex, code)
     raise AssertionError("did not raise")
 
 
@@ -85,6 +86,27 @@ class NotesTest(unittest.TestCase):
             self.assertIn(f"NOTE: {api_docs.BLEND_RELATIVE}", failed_run(message, error), message)
         for message in ("Cannot open file '/tmp/z.obj'", "cannot fetch https://example.com/x.glb", "a // b"):
             self.assertNotIn("NOTE", failed_run(message, RuntimeError), message)
+
+    def test_a_double_slash_path_in_a_never_saved_file_says_it_has_no_folder(self):
+        # 0.2.13 on Windows, both in a .blend never saved: BLEND_RELATIVE's abspath could not help, and the
+        # model wrote to bpy.app.tempdir; save_as_mainfile's error named only the path // resolved to.
+        stl = 'bpy.ops.wm.stl_export(filepath="//name.stl", export_selected_objects=True)'
+        save = "bpy.ops.wm.save_as_mainfile(filepath='//TurboCar.blend')"
+        failures = (('Error: Export STL: Cannot open file "//name.stl" for writing\n', stl),
+                    ("Error: Cannot open file C:\\Program Files\\Loopcut\\Loopcut 5.2\\TurboCar.blend@ for writing: "
+                     "Permission denied\n", save))
+        for message, code in failures:
+            text = failed_run(message, RuntimeError, code, blend="")
+            self.assertIn(f"NOTE: {api_docs.UNSAVED_RELATIVE}", text, message)
+            self.assertNotIn(api_docs.BLEND_RELATIVE, text)
+        saved = [failed_run(message, RuntimeError, code) for message, code in failures]
+        self.assertIn(f"NOTE: {api_docs.BLEND_RELATIVE}", saved[0])
+        self.assertNotIn("NOTE", saved[1], "saved: as before")
+        for message, error in (("name 'car' is not defined", NameError),
+                               ("Operator bpy.ops.wm.save_as_mainfile.poll() failed, context is incorrect",
+                                RuntimeError),
+                               ("Cannot open file C:\\Users\\me\\Desktop\\other.blend@ for writing", RuntimeError)):
+            self.assertNotIn("NOTE", failed_run(message, error, save, blend=""), message)
 
 
 class AttributeNotesTest(unittest.TestCase):

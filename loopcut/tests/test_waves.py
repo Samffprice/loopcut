@@ -28,7 +28,7 @@ fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
 from loopcut import (agent, checkpoints, config, context, conversations, llm, merge, orchestrator,  # noqa: E402
-                     ownership, state, tools, waves, workers)
+                     ownership, pricing, state, tools, waves, workers)
 
 _BRIEF = re.compile(r"deliverable: (\w+)")
 
@@ -1642,7 +1642,7 @@ class WaveTest(unittest.TestCase):
             self.run_wave(wave)
             waves.end_turn(self.session, self.turn)
         self.assertEqual(self.merges, [["a"], ["b"]])
-        self.assertIn("see each worker's outcome in its wave card", self.session["items"][-1]["text"])
+        self.assertIn("see each helper's outcome in its wave card", self.session["items"][-1]["text"])
         self.assertIn("did not review them", self.session["items"][-1]["text"])
         self.assertEqual((self.turn.scene_before, self.turn.scene_after), ({"after": True}, {"after": True}))
 
@@ -1713,9 +1713,10 @@ class WaveTest(unittest.TestCase):
         self.assertTrue(users[-1].startswith(workers.CONTINUE))
         self.assertIn("roll the arms", users[-1])
         self.assertNotIn("<role_notes>", users[-1], "same role: its notes are already in the conversation")
-        self.assertEqual([m["role"] for m in request["messages"]], ["user", "assistant", "user"],
+        self.assertEqual([m["role"] for m in request["messages"]], ["user", "user", "user"],
                          "the earlier conversation folded into its record, as any earlier turn is (context.py)")
-        self.assertIn('report_back({"summary":"Chair built."})', request["messages"][1]["content"])
+        self.assertTrue(context.is_record(request["messages"][1]))
+        self.assertIn('Loopcut ran your report_back call with summary "Chair built."', request["messages"][1]["content"])
         self.assertGreater(earlier, 3)
         now = self.session["worker_threads"]["a"]
         self.assertEqual(now["wave"], 2)
@@ -1952,6 +1953,17 @@ class WaveTest(unittest.TestCase):
         self.assertIn("The build is blocked.", worker.summary())
         self.assertEqual(self.merges, [["a"]])
 
+    def test_twenty_refused_repeats_of_any_reads_end_a_worker_with_the_no_progress_guard(self):
+        # Four reads in turn, each run twice: the 20th refusal comes before any read's 8th (the 29th).
+        reads = [calls(("get_scene_info", {"name_contains": name})) for name in "abcd"]
+        MODELS.scripts.update(a=reads * 7 + [text("Kept reading the same things.")])
+        wave = self.wave(["a"])
+        self.run_wave(wave)
+        worker, = wave.crew
+        self.assertEqual((worker.turn.outcome, worker.steps), ("no_progress", 8 + 20))
+        self.assertIn(agent.NO_PROGRESS_NOTICE, [i.get("text") for i in worker.session["items"]])
+        self.assertTrue(self.logged()["a"]["cap_hit"])
+
     def test_a_scene_change_resets_worker_failures(self):
         MODELS.scripts.update(a=[build("fail")] * 7 + [build()] + [build("fail")] * 7 + [finish()])
         wave = self.wave(["a"])
@@ -2005,6 +2017,253 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(self.registry.started, ["a"])
         self.assertIn("[b] B · modeling · stopped · 0 steps", result.text)
         self.assertIn("not started: the job's $0.40 is used", result.text)
+
+    # --- The account's agent terms (config.agent_terms, 2026-10-24; test_agent_terms has the rest) ---------------
+
+    def test_with_terms_a_reported_cost_is_charged_over_the_token_price(self):
+        with mock.patch.dict(USAGE["usage"], {"cost": 0.25}):  # The gateway's usage.cost, in USD.
+            script = [build(), build(), text("Built most of it; the legs are not bevelled.")]
+        MODELS.scripts.update(a=script)
+        wave = self.wave(["a"], terms=True)
+        result = self.run_wave(wave)
+        self.assert_budget_stop(wave, result, "the job's $0.40 is used", 2)
+        self.assertAlmostEqual(wave.job.budget.usd, 0.75, msg="the wrap-up is still charged")
+        self.assertAlmostEqual(self.logged()["a"]["usd"], 0.75)
+
+    def test_without_terms_a_reported_cost_is_not_charged(self):
+        """A server that sends no account.agent keeps 0.2.15's dollars: the tokens at the table's prices."""
+        with mock.patch.dict(USAGE["usage"], {"cost": 0.25}):
+            MODELS.scripts.update(a=[build(), finish()])
+        wave = self.wave(["a"])
+        self.run_wave(wave)
+        self.assertEqual(self.rows(wave), {"a": "done"})
+        self.assertAlmostEqual(wave.job.budget.usd, 2 * pricing.usd("glm-5.3-flash", {"input": 1000, "cached": 400,
+                                                                                       "output": 50}))
+
+    def test_the_accounts_prices_are_what_the_joblog_records(self):
+        MODELS.scripts.update(a=[build(), finish()])
+        wave = self.wave(["a"], prices=(("glm-5.3-flash", (1.0, 0.5, 2.0)),))
+        self.run_wave(wave)
+        self.assertAlmostEqual(self.logged()["a"]["usd"], 2 * (600 * 1.0 + 400 * 0.5 + 50 * 2.0) / 1e6)
+        self.assertAlmostEqual(wave.job.budget.usd, self.logged()["a"]["usd"])
+
+    def test_the_accounts_max_workers_counts_every_wave_of_the_turn(self):
+        """delegate refuses a wave that would start more than the turn has left, nothing started; queued and run
+        workers of earlier waves count, at once never more than the total."""
+        MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()], c=[build(), finish()])
+        wave = self.wave(["a", "b"], max_workers=3, turn_workers=3)
+        with mock.patch.object(waves, "BATCH_SECONDS", 0.2):
+            self.run_wave(wave)
+            while waves.pending(wave.job):
+                self.collect(wave.job)
+        self.assertEqual(waves.workers_left(wave.job, self.turn.roles), 1)
+        self.session["turn"] = self.turn
+
+        def brief(wid):
+            return {"id": wid, "deliverable": wid.capitalize(), "role": "modeling", "prefix": wid.capitalize(),
+                    "requirements": [{"quote": "a chair", "do": "x"}],
+                    "checks": [{"kind": "exists", "name": wid.capitalize(), "quote": "a chair"}]}
+
+        def delegate(*ids, dry_run=False):
+            with mock.patch.object(state, "_session", self.session), \
+                    mock.patch.object(orchestrator, "live_facts", lambda plan: {"objects": {}, "materials": [], "names": []}), \
+                    mock.patch.object(orchestrator, "layout", lambda plan, live, project: ([], [], [], [])), \
+                    mock.patch.object(waves, "prepare", side_effect=AssertionError("nothing may start")):
+                return orchestrator.delegate(wave={"shared": {}, "workers": [brief(i) for i in ids]}, dry_run=dry_run)
+
+        refused = delegate("c", "d")
+        self.assertEqual((refused.ok, refused.plan_capped, refused.plan_refused), (False, True, False))
+        self.assertTrue(refused.text.startswith("delegate refused; nothing started."), refused.text)
+        self.assertIn("- workers: this turn can start 1 more worker, and this wave briefs 2; brief at most 1, or do "
+                      "the rest yourself", refused.text)
+        self.assertEqual(len(self.session["jobs"][-1]["waves"]), 1, "no second wave")
+        dry = delegate("c", dry_run=True)
+        self.assertIn("a real delegate would start", dry.text)
+        self.assertIn("after these, start no more workers this turn and do any further work yourself (for your "
+                      "planning; to the user, workers are helpers).", dry.text)
+        third = self.more([brief("c")])
+        self.run_wave(third)
+        self.assertEqual(waves.workers_left(wave.job, self.turn.roles), 0)
+        spent = delegate("d")
+        self.assertEqual((spent.text, spent.plan_capped), (orchestrator.CAP_SPENT.format(
+            cap=3, started=": A, B, C", running=""), True))
+        self.assertLessEqual(self.registry.peak, 3)
+        self.assertEqual(self.merges, [["a", "b"], ["c"]])
+
+    def capped_delegate(self, **arguments):
+        """orchestrator.delegate in this turn, where a wave that would start a worker fails loudly."""
+        self.session["turn"] = self.turn
+        with mock.patch.object(state, "_session", self.session), \
+                mock.patch.object(orchestrator, "live_facts", lambda plan: {"objects": {}, "materials": [], "names": []}), \
+                mock.patch.object(orchestrator, "layout", lambda plan, live, project: ([], [], [], [])), \
+                mock.patch.object(orchestrator, "_snapshot", dict), \
+                mock.patch.object(waves, "prepare", side_effect=AssertionError("nothing may start")):
+            return orchestrator.delegate(**arguments)
+
+    def test_with_no_workers_left_a_wave_sent_again_with_wait_waits_for_the_running_ones(self):
+        """GLM, wb-free-1 20261024-172724: its 2 workers started, it sent the running anvil worker's wave again with
+        wait true, read CAP_SPENT as "cannot wait" and built a second anvil. That call is a wait; a refusal names
+        what the turn's workers build, and which still run."""
+        MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()])
+        MODELS.delays[("b", 1)] = 1.0
+        wave = self.wave(["a", "b"], max_workers=2, turn_workers=2)
+        again = {"shared": {}, "workers": [{"continues": "b"}]}
+        with mock.patch.object(waves, "BATCH_SECONDS", 0.2):
+            self.run_wave(wave)
+            refused = self.capped_delegate(wave=again)
+            self.assertEqual((refused.ok, refused.plan_capped), (False, True))
+            self.assertEqual(refused.text, "delegate refused; nothing started: this turn can start 0 more workers (its "
+                                           "2 are started: A, B). Still running: B; wait for them (delegate wait "
+                                           "true), do not build their objects. Do the rest yourself, or say plainly "
+                                           "what is not done (for your planning; to the user, workers are "
+                                           "helpers).")
+            waited = self.capped_delegate(wave=again, wait=True)
+            self.assertEqual((waited.ok, waited.plan_capped, waited.text), (True, False, "Waiting for the workers "
+                             "already running (nothing new started: this turn's 2 workers are its limit)."))
+            rest = waited.then(threading.Event().is_set, lambda fn: fn())
+        self.assertTrue(rest.text.startswith(waited.text), rest.text)
+        self.assertIn("[b] B · modeling · done", rest.text)
+        self.assertEqual(self.merges, [["a"], ["b"]], "b merged once, nothing started again")
+        self.assertEqual(len(self.session["jobs"][-1]["waves"]), 1)
+        done = self.capped_delegate(wave=again, wait=True)
+        self.assertEqual((done.plan_capped, done.text), (True, "delegate refused; nothing started: this turn can start "
+                         "0 more workers (its 2 are started: A, B). Do the rest yourself, or say plainly what is not "
+                         "done (for your planning; to the user, workers are helpers)."))
+
+    def test_with_workers_left_a_new_wave_sent_with_wait_still_starts(self):
+        MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()])
+        MODELS.delays[("b", 1)] = 1.0
+        wave = self.wave(["a", "b"], max_workers=3, turn_workers=3)
+        c = {"id": "c", "deliverable": "C", "role": "modeling", "prefix": "C", "requirements": [{"quote": "a chair",
+             "do": "x"}], "checks": [{"kind": "exists", "name": "C", "quote": "a chair"}]}
+        with mock.patch.object(waves, "BATCH_SECONDS", 0.2):
+            self.run_wave(wave)
+            self.assertTrue(waves.pending(wave.job))
+            started = self.capped_delegate(wave={"shared": {}, "workers": [c]}, wait=True)
+            self.collect(wave.job)
+        self.assertEqual(started.text, "Could not start the workers: nothing may start. Nothing started; do it "
+                                       "yourself or tell the user.", "the normal path, to waves.prepare")
+
+    def asked_delegate(self, auto_run=False, approve=False, before=None, **arguments) -> tuple[dict, bool]:
+        """One delegate call through the orchestrator's loop: its card, and whether it asked (approve: the user's
+        answer). before runs once the loop has decided, just ahead of delegate."""
+        self.session["messages"].append({"role": "user", "content": "a chair and a table, keep the bottle"})
+        self.session["turn"] = self.turn
+        self.turn.config = dataclasses.replace(self.turn.roles.orchestrator, auto_run=auto_run)
+        spec = agent.LoopSpec(role="orchestrator", system=lambda session: "", schemas=lambda: [],
+                              save=lambda session: None, checkpoints=False, changes_card=False,
+                              scene_changed=lambda result: False)
+
+        def run_tool(name, arguments):
+            if before:
+                before()
+            result = self.capped_delegate(**json.loads(arguments))
+            return result.then(self.turn.cancel.is_set, lambda fn: fn()) if result.then else result
+        replies = [llm.Completion(tool_calls=[llm.ToolCall("d2", "delegate", json.dumps(arguments))]),
+                   llm.Completion(text="Done.")]
+        with mock.patch.object(state, "_session", self.session), \
+                mock.patch.object(agent, "_request", side_effect=replies), \
+                mock.patch.object(agent, "_redraw"), mock.patch.object(agent, "_note_level"), \
+                mock.patch.object(agent, "_record_level"), \
+                mock.patch.object(agent, "_wait_for_approval", return_value=approve) as asked:
+            agent.run_loop(self.session, self.turn, spec, run_tool=run_tool)
+        self.assertIsNone(getattr(self.turn, "capped_call", None), "the mark is for that one call")
+        return next(i for i in reversed(self.session["items"]) if i.get("name") == "delegate"), asked.called
+
+    def test_with_no_workers_left_a_wave_is_not_asked_about_it_waits_or_is_refused(self):
+        """The same call, auto-run off: asked as "Start 1 helper for B", it started nothing if approved, and a
+        rejection stopped no worker. With B running it is the wait, under the wait's card; once all reported,
+        the refusal, at once."""
+        MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()])
+        MODELS.delays[("b", 1)] = 1.0
+        wave = self.wave(["a", "b"], max_workers=2, turn_workers=2)
+        again = {"shared": {}, "workers": [dict(wave.plan["workers"][1])]}
+        with mock.patch.object(waves, "BATCH_SECONDS", 0.2):
+            self.run_wave(wave)
+            card, asked = self.asked_delegate(wave=again, wait=True)
+        self.assertFalse(asked, "no approval card")
+        self.assertEqual((card["summary"], card["code"], card["status"]),
+                         ("Wait for the helpers' next results", "", "done"))
+        self.assertTrue(card["output"].startswith(orchestrator.CAP_WAIT.format(cap=2)), card["output"])
+        self.assertIn("[b] B · modeling · done", card["output"], "collected")
+        self.assertEqual(self.merges, [["a"], ["b"]], "b merged once, nothing started again")
+        card, asked = self.asked_delegate(wave=again, wait=True)
+        self.assertFalse(asked, "no approval card for a refusal")
+        self.assertEqual((card["summary"], card["code"]), ("No more helpers this turn", ""),
+                         "never titled as starting helpers")
+        self.assertEqual((card["status"], card["plan_repair"], card["output"]),
+                         ("failed", "capped", orchestrator.cap_spent(wave.job)))
+        self.assertIn("this turn can start 0 more workers (its 2 are started: A, B). Do the rest", card["output"])
+
+    def test_a_call_let_run_because_nothing_could_start_starts_nothing_when_a_slot_frees_before_it_runs(self):
+        """A queued worker dropped (its budget, its row's Cancel) after the loop decided frees a slot; the call the
+        user was not asked about still starts nothing. Dropped once the card is titled as the wait, nothing asks
+        under that title (approve: the user would say yes). With auto-run on, nothing was skipped: as before."""
+        d = {"id": "d", "deliverable": "D", "role": "modeling", "prefix": "D", "requirements": [{"quote": "a chair",
+             "do": "x"}], "checks": [{"kind": "exists", "name": "D", "quote": "a chair"}]}
+        described = agent._describe
+        for wait, auto_run, at in ((True, False, "delegate"), (False, False, "delegate"), (True, False, "card"),
+                                   (True, True, "delegate")):
+            with self.subTest(wait=wait, auto_run=auto_run, at=at):
+                MODELS.arrivals.clear()
+                MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()], c=[build(), finish()])
+                MODELS.delays[("b", 1)] = 1.0
+                self.merges.clear()
+                wave = self.wave(["a", "b", "c"], max_workers=1, turn_workers=3)
+
+                def drop():
+                    queued = next(w for w in wave.job.crew if w.id == "c")
+                    with wave.job.lock:
+                        self.assertIsNone(queued.thread, "c is still queued")
+                        queued.never_started("not started: the budget is spent")
+                    self.assertEqual(waves.workers_left(wave.job, self.turn.roles), 1, "a slot freed")
+
+
+                def describe(call, *args):
+                    try:
+                        return described(call, *args)
+                    finally:
+                        if call.name == "delegate":  # The workers' loops describe their steps too.
+                            drop()
+                with mock.patch.object(waves, "BATCH_SECONDS", 0.2), \
+                        mock.patch.object(agent, "_describe", describe if at == "card" else described):
+                    self.run_wave(wave)
+                    card, asked = self.asked_delegate(wave={"shared": {}, "workers": [d]}, wait=wait, approve=True,
+                                                      auto_run=auto_run, before=drop if at == "delegate" else None)
+                    spent = orchestrator.cap_spent(wave.job)
+                    while waves.pending(wave.job):
+                        self.collect(wave.job)
+                self.assertFalse(asked)
+                if auto_run:
+                    self.assertEqual(card["output"], "Could not start the workers: nothing may start. Nothing "
+                                     "started; do it yourself or tell the user.", "the limit read again, to prepare")
+                elif wait:
+                    self.assertTrue(card["output"].startswith(orchestrator.CAP_WAIT.format(cap=3)), card["output"])
+                    self.assertIn("[c] C · modeling · stopped", card["output"], "collected: c's result")
+                else:
+                    self.assertEqual((card["output"], card["plan_repair"]), (spent, "capped"))
+                    self.assertIn("Still running: B; wait for them", spent)
+                self.assertEqual(self.merges, [["a"], ["b"]], "d never started")
+
+    def test_with_workers_left_a_wave_sent_with_wait_still_asks_first(self):
+        MODELS.scripts.update(a=[build(), finish()], b=[build(), finish()])
+        MODELS.delays[("b", 1)] = 1.0
+        wave = self.wave(["a", "b"], max_workers=3, turn_workers=3)
+        c = {"id": "c", "deliverable": "C", "role": "modeling", "prefix": "C", "requirements": [{"quote": "a chair",
+             "do": "x"}], "checks": [{"kind": "exists", "name": "C", "quote": "a chair"}]}
+        for approve in (False, True):
+            with self.subTest(approve=approve), mock.patch.object(waves, "BATCH_SECONDS", 0.2):
+                if not approve:
+                    self.run_wave(wave)
+                card, asked = self.asked_delegate(wave={"shared": {}, "workers": [c]}, wait=True, approve=approve)
+                self.assertTrue(asked)
+                self.assertTrue(card["summary"].startswith("Start 1 helper for C. Runs in the background"),
+                                card["summary"])
+                self.assertEqual((card["status"], card["output"]) if approve else card["status"], (
+                    "failed", "Could not start the workers: nothing may start. Nothing started; do it yourself or "
+                              "tell the user.") if approve else "rejected", "approved: to waves.prepare")
+        self.collect(wave.job)
+        self.assertEqual(self.merges, [["a"], ["b"]], "nothing of either wave started")
 
     def test_status_comes_from_checks_never_from_what_the_worker_says(self):
         MODELS.scripts.update(a=[build(), finish("Everything is perfect.")])
@@ -2543,7 +2802,8 @@ class WaveTest(unittest.TestCase):
         self.assertTrue(session["items"][-1]["text"].endswith(
             "Checked: both rest on the rug.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
             "Requirements (the user's words): 2 of 2 covered."), session["items"][-1]["text"])
-        self.assertIn("Loopcut collected their outcomes", " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
+        self.assertIn("Helpers were still working when the agent replied",
+                      " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
         self.assertEqual((session["jobs"][0]["bounces"], session["jobs"][0]["late_bounces"]), (0, 1),
                          "the checks passed; the late workers are counted apart")
 
@@ -2559,7 +2819,7 @@ class WaveTest(unittest.TestCase):
         patches = [mock.patch.object(orchestrator, "live_facts", lambda plan: live),
                    mock.patch.object(orchestrator, "_snapshot", lambda: {"scene": "before"}),
                    mock.patch.object(agent, "_changes_item", lambda session, turn: None),
-                   mock.patch.object(waves, "_save_spawn", lambda folder, palette=(): spawn),
+                   mock.patch.object(waves, "_save_spawn", lambda folder, palette=(), owned=(): spawn),
                    mock.patch.object(waves, "_scene_context", lambda text: "<scene_context>\nf\n</scene_context>"),
                    mock.patch.object(waves, "_HostRuntime", self.runtime), mock.patch.object(waves, "_merge", self.merge),
                    mock.patch.object(waves, "_run_checks", lambda checks, spawn: seen.append(len(checks)) or

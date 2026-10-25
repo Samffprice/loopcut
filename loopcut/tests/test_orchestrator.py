@@ -68,6 +68,10 @@ def fake_camera(camera, points):
     return [((x + 1) / 2, z / 1.5, y + 5) for x, y, z in points]
 
 
+NESTING_HINT = ("; if one goes around or inside the other (rings around a sphere, a ship in a bottle), send them as "
+                "one worker, or send the wave again as planned")
+
+
 def refusals(wave: dict, words: str = USER, live: dict = LIVE) -> list[str]:
     return orchestrator.validate_wave(orchestrator.normalise_wave(wave), words, live)
 
@@ -1073,7 +1077,7 @@ class LayoutTest(unittest.TestCase):
         wave["workers"][1]["bounds"] = [[-0.3, 0.5, 0.015], [0.3, 1.1, 0.57]]
         problems, _, _, _ = self.layout(wave)
         self.assertEqual(problems, ["armchair and table: planned bounds overlap by 0.20 x 0.50 x 0.55 m; move one "
-                                    "apart or shrink it"])
+                                    "apart or shrink it" + NESTING_HINT])
 
     def test_a_base_off_its_support_within_5cm_is_snapped_not_refused(self):
         """M4: most refused delegate calls were small mistakes like this; a repair, not a refusal."""
@@ -1192,14 +1196,16 @@ class ScatteredBoundsTest(unittest.TestCase):
         return wave
 
     def test_bounds_may_be_a_box_per_prop_and_the_dry_run_checks_each(self):
+        # Box 3 is half in the armchair's: an overlap (one wholly inside it would be nested, not refused).
         boxes = [[[-1.8, -0.9, 0.015], [-1.6, -0.7, 0.2]], [[0.9, -0.9, 0.0], [1.1, -0.7, 0.2]],
-                 [[-0.5, 0.5, 0.015], [-0.3, 0.7, 0.2]], [[0.8, 1.2, 0.015], [1.4, 1.4, 0.2]]]
+                 [[-1.0, 0.5, 0.015], [-0.8, 0.7, 0.2]], [[0.8, 1.2, 0.015], [1.4, 1.4, 0.2]]]
         wave = self.wave(boxes)
         self.assertEqual(refusals(wave), [])
         problems, repairs, warnings, notes = orchestrator.layout(orchestrator.normalise_wave(wave), LIVE, fake_camera)
         self.assertEqual(repairs, ["books box 2: bounds z0 0.000 snapped to 0.015 (rests on Rug, was -15 mm off)"])
         self.assertEqual(problems, [
-            "armchair and books box 3: planned bounds overlap by 0.20 x 0.20 x 0.18 m; move one apart or shrink it",
+            "armchair and books box 3: planned bounds overlap by 0.10 x 0.20 x 0.18 m; move one apart or shrink it"
+            + NESTING_HINT,
             "books c1: Books's box 1 is 0% inside the frame of Camera (needs 100%); corners past left. Move the camera "
             "(frame_camera report_only measures it) or the planned bounds",
             "books c1: Books's box 2 is 50% inside the frame of Camera (needs 100%); corners past right. Move the camera "
@@ -1239,6 +1245,86 @@ class ScatteredBoundsTest(unittest.TestCase):
             "Dry run, nothing started: a real delegate would start.\nNumbers checked:"))
         self.assertIn("The layout is checked once these are fixed.",
                       orchestrator.dry_run_report(["workers[0].id: ..."], [], [], [], layout_checked=False))
+
+
+class NestedBoundsTest(unittest.TestCase):
+    """Real users' hosted logs (0.2.14): a black sphere, orbital rings around it and data particles around both
+    were refused 6, 6 and 4 times running ("blacksphere and orbitalrings: planned bounds overlap by 4.10 x 4.10 x
+    4.10 m; move one apart or shrink it"), the overlap being the design. A box wholly inside another is nested,
+    a warning; any other overlap is refused once a pair a turn, and kept as planned when sent again."""
+
+    WORDS = "A black sphere with a small moon, orbital rings around it, and data particles around both."
+    QUOTES = {"sphere": "A black sphere", "moon": "a small moon", "rings": "orbital rings around it",
+              "particles": "data particles around both"}
+    SPHERE = [[-2.05, -2.05, -2.05], [2.05, 2.05, 2.05]]
+    RINGS = [[-12.0, -12.0, -0.5], [12.0, 12.0, 0.5]]  # Flat: the sphere's top and bottom stick out.
+
+    def setUp(self):
+        self.session = state.reset()
+        self.addCleanup(state.reset)
+        self.session["items"].append(state.item_user(self.WORDS))
+        self.new_turn()
+
+    def new_turn(self):
+        cfg = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast", reasoning_effort="low",
+                            auto_run=True, auto_look=False, max_steps=0, context_budget=40_000)
+        self.session["turn"] = agent.Turn()
+        self.session["turn"].roles = config.Roles(orchestrator=cfg, worker=cfg, orchestrate=True)
+
+    def delegate(self, *planned, dry_run=True):
+        """planned: (worker id, its box) per worker, each a modeling worker."""
+        workers = [{"id": wid, "deliverable": wid.title(), "role": "modeling", "prefix": wid.title(),
+                    "requirements": [{"quote": self.QUOTES[wid], "do": wid}], "bounds": box} for wid, box in planned]
+        with mock.patch.object(orchestrator, "live_facts", lambda plan: {"objects": {}, "materials": [], "names": []}):
+            return orchestrator.delegate({"shared": {}, "workers": workers}, dry_run=dry_run)
+
+    def test_boxes_inside_each_other_are_nested_not_refused(self):
+        particles = [[-15.0, -15.0, -15.0], [15.0, 15.0, 15.0]]
+        result = self.delegate(("sphere", self.SPHERE), ("rings", [[-12.0, -12.0, -3.0], [12.0, 12.0, 3.0]]),
+                               ("particles", particles))
+        self.assertTrue(result.ok, result.text)
+        self.assertIn("a real delegate would start.", result.text)
+        for nested in ("sphere sits inside rings's", "sphere sits inside particles's", "rings sits inside particles's"):
+            self.assertIn(f"- not refused (warning): {nested} planned bounds (nested; not refused)", result.text)
+
+    def test_an_overlap_is_refused_with_how_to_send_nested_parts(self):
+        result = self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS), dry_run=False)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.plan_refused)
+        self.assertIn("- sphere and rings: planned bounds overlap by 4.10 x 4.10 x 1.00 m; move one apart or shrink "
+                      "it" + NESTING_HINT, result.text)
+
+    def test_the_same_pair_sent_again_this_turn_is_kept_as_planned(self):
+        self.assertFalse(self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS), dry_run=False).ok)
+        result = self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS))
+        self.assertTrue(result.ok, result.text)
+        self.assertIn("a real delegate would start.", result.text)
+        self.assertIn("- not refused (warning): sphere and rings: planned bounds overlap by 4.10 x 4.10 x 1.00 m "
+                      "(refused once this turn; kept as planned)", result.text)
+        self.assertTrue(self.delegate(("rings", self.RINGS), ("sphere", self.SPHERE)).ok,
+                        "the same pair, whichever comes first")
+
+    def test_another_overlapping_pair_is_still_refused_once(self):
+        self.assertFalse(self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS)).ok)
+        moon = [[1.5, -0.5, -0.5], [3.0, 0.5, 0.5]]  # Half in the sphere's box, wholly in the rings'.
+        result = self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS), ("moon", moon))
+        self.assertFalse(result.ok)
+        self.assertIn("a real delegate would be refused (1 problem)", result.text)
+        self.assertIn("- refused: sphere and moon: planned bounds overlap by 0.55 x 1.00 x 1.00 m; move one apart or "
+                      "shrink it" + NESTING_HINT, result.text)
+        self.assertIn("(refused once this turn; kept as planned)", result.text)
+        self.assertIn("- not refused (warning): moon sits inside rings's planned bounds (nested; not refused)",
+                      result.text)
+        self.assertTrue(self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS), ("moon", moon)).ok)
+
+    def test_a_new_turn_refuses_again(self):
+        self.assertFalse(self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS)).ok)
+        self.assertTrue(self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS)).ok)
+        self.new_turn()
+        result = self.delegate(("sphere", self.SPHERE), ("rings", self.RINGS))
+        self.assertFalse(result.ok)
+        self.assertIn("- refused: sphere and rings: planned bounds overlap by 4.10 x 4.10 x 1.00 m; move one apart or "
+                      "shrink it" + NESTING_HINT, result.text)
 
 
 class DelegateArgumentsTest(unittest.TestCase):
@@ -1350,13 +1436,29 @@ class RoleTypesTest(unittest.TestCase):
 
 
 class PromptTest(unittest.TestCase):
-    def test_the_orchestrators_fixed_cost_stays_under_10545_tokens(self):
+    def test_the_orchestrators_fixed_cost_stays_under_10555_tokens(self):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
         fixed = context.fixed_tokens("", agent._orchestrator_schemas(), prompt_id="orchestrator", index=index)
-        self.assertLessEqual(fixed, 10545)  # 10,534 on 2026-10-17 with the captures' labels switch.
+        # 10,534 on 2026-10-17 with the captures' labels switch; 10,549 on 2026-10-24, when the tool summaries
+        # were asked for in the user's language.
+        self.assertLessEqual(fixed, 10555)
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
+
+    def test_step_titles_are_in_the_language_the_user_writes_in(self):
+        """"The user's language" let GLM title an English writer's steps in Russian, the request being a Soviet
+        print shop (0.2.16 gate run rel016-app3): the summary says whose words decide, as language_line does,
+        at the same fixed cost."""
+        from loopcut import tools, workspace
+        for schemas in (tools.SCHEMAS, workspace.SCHEMAS):
+            summaries = [s["function"]["parameters"]["properties"]["summary"]["description"] for s in schemas
+                         if "summary" in s["function"]["parameters"]["properties"]]
+            self.assertTrue(summaries)
+            for text in summaries:
+                self.assertIn("for the user", text)
+                self.assertIn("in the language they write in", text)
+                self.assertNotIn("the user's language", text)
 
 
     def test_the_delegate_schema_says_the_limits_it_refuses_by(self):
@@ -1868,7 +1970,8 @@ class RunningClashTest(unittest.TestCase):
                              "bounds": [[-2, -2, 0], [2, 2, 3]]}}
         problems, _, _, _ = orchestrator.layout(orchestrator.normalise_wave(wave), {**LIVE, "busy": running})
         self.assertEqual(problems, ["armchair and lamp (running): planned bounds overlap by 0.30 x 0.30 x 0.93 m; move "
-                                    "one apart or shrink it"], "a lighting worker's box may share space, as in a wave")
+                                    "one apart or shrink it" + NESTING_HINT],
+                         "a lighting worker's box may share space, as in a wave")
 
     def test_going_back_to_a_running_worker_waits_for_its_result(self):
         wave = reference_wave()
@@ -2180,7 +2283,23 @@ class FinishGateTest(unittest.TestCase):
         drain.assert_called_once()
         self.assertEqual(self.turn.scene_after, late.scene_after)
         self.assertIn("no-progress guard", self.session["items"][-1]["text"])
+        self.assertIn("waited for the helpers", self.session["items"][-1]["text"], "the UI's word")
         self.assertIn("did not review them", self.session["items"][-1]["text"])
+
+    def test_late_workers_come_back_asking_for_an_addendum_not_a_second_summary(self):
+        """A free-plan reply said it was wrapping up while workers ran; the reply after their results adds to it."""
+        from loopcut import waves
+        self.turn.job.log, self.turn.job.write = {}, lambda: None
+        late = types.SimpleNamespace(scene_before=None, scene_after=None, text="[ottoman] Ottoman · modeling · done")
+        with mock.patch.object(waves, "drain", return_value=late):
+            bounce = orchestrator._late_workers(self.session, self.turn, self.turn.job)
+        self.assertTrue(bounce.text.endswith("say these results are now in.\n[ottoman] Ottoman · modeling · done"))
+        self.assertIn("reply with a short addendum: in a sentence or two", bounce.text)
+        self.assertIn("without repeating your earlier reply", bounce.text)
+        self.assertNotIn("reply again", bounce.text)
+        self.assertEqual(self.turn.job.log["late_bounces"], 1)
+        self.assertEqual(self.session["items"][-1]["text"], "Helpers were still working when the agent replied; "
+                         "Loopcut waited for them, and the agent checks what they made.")
 
     def test_no_gate_without_a_job_or_after_a_stop(self):
         self.assertIsNone(orchestrator.finish_gate(self.session, agent.Turn(), self.reply("Hi."), None))

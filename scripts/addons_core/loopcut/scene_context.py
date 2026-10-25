@@ -5,9 +5,10 @@ The block is added to the message the model receives, not to what the chat shows
 message pulls in that object, material or collection by name: @Table, @"Left Chair"; a text block or
 an image too (what a worker's brief owns: a recipe it must find, not "nothing has that name").
 
-Main thread only, except parse_mentions, candidates_from and the camera/light/keyframe line
-formatters (_camera_line, _light_line, _hex_color, _aim_target, _keyed_channels, _scene_facts),
-which only duck-type against bpy's attributes and so are pure too.
+Main thread only, except parse_mentions, candidates_from, the interface language (interface_language,
+language_line) and the camera/light/keyframe line formatters (_camera_line, _light_line, _hex_color,
+_aim_target, _keyed_channels, _scene_facts), which only duck-type against bpy's attributes and so are
+pure too.
 """
 
 import json
@@ -243,11 +244,34 @@ def _since_last_step(since: dict | None) -> list[str]:
     return ["changed since your last step (by the user, not you):"] + ["  " + line for line in listed]
 
 
+def interface_language(view, locale: str) -> tuple[str, str] | None:
+    """(locale, English name) of the language Blender's interface is drawn in, or None when that is English.
+    `view` is preferences.view, `locale` bpy.app.translations.locale: the language in use, also when the
+    preference is Automatic. Pure: it only duck-types against both."""
+    if not getattr(view, "use_translate_interface", False):
+        return None
+    code = (locale or "").split("@")[0].split(".")[0]  # sr_RS@latin, a system locale's .UTF-8.
+    if not code or code.startswith("en"):
+        return None
+    prop = view.bl_rna.properties.get("language")
+    names = {item.identifier: item.name for item in prop.enum_items} if prop else {}
+    return code, (names.get(locale) or names.get(code) or code).split(" - ")[0]  # "Japanese - 日本語".
+
+
+def language_line(name: str, starter: bool) -> str:
+    """Which language to answer in, for a user whose Blender is in `name`. A starter card's words are ours,
+    in English, so they say nothing about the user's language."""
+    if starter:
+        return f"interface language: {name}. This request is a starter Loopcut wrote for the user: reply in {name}."
+    return (f"interface language: {name}. Reply in the language the user writes in; when their words don't "
+            f"settle it (romaji, a word or two), reply in {name}.")
+
+
 def for_message(text: str, since: dict | None = None) -> str:
     """The context block for one user message. Small on purpose: it is paid for on every turn.
     `since` is the scene_diff snapshot from the end of the agent's previous step, if any."""
     import bpy
-    from . import capabilities, tools
+    from . import capabilities, tools, try_it
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
     active = view_layer.objects.active
@@ -258,6 +282,9 @@ def for_message(text: str, since: dict | None = None) -> str:
     engines = capabilities.render_engines(scene.render)
     lines.append(f"Blender {bpy.app.version_string} | render engines: {', '.join(engines)} | "
                  f"current: {scene.render.engine} | camera: {scene.camera.name if scene.camera else 'none'}")
+    language = interface_language(bpy.context.preferences.view, bpy.app.translations.locale)
+    if language:
+        lines.append(language_line(language[1], text.strip() in try_it.PROMPTS))
     lines.append(f"output: {scene.render.resolution_x}x{scene.render.resolution_y} at "
                  f"{scene.render.resolution_percentage}% | {scene.render.image_settings.file_format} | "
                  f"frames: {scene.frame_start}-{scene.frame_end} | fps: "

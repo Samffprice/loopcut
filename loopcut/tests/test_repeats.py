@@ -117,6 +117,23 @@ class NoProgressTest(unittest.TestCase):
         self.assertFalse(guard.skip(key))
         self.assertTrue(guard.skip(key))
 
+    def test_refused_repeats_of_any_calls_stop_at_twenty_whatever_resets_the_per_call_counts(self):
+        guard = repeats.NoProgress()
+        keys = [run_key("A"), run_key("B"), run_key("C")]
+        for refusal in range(1, 21):
+            key = keys[refusal % 3]
+            self.assertEqual(guard.refused(key), refusal == repeats.REPEAT_REFUSALS == 20)
+            self.assertFalse(guard.record(key, True, False))  # Run again once its result folded.
+            if refusal == 7:
+                guard.record(run_key("Change"), True, True)
+            elif refusal == 14:
+                guard.reset()  # A user note or an approval rejection.
+
+    def test_refused_repeats_of_one_call_still_stop_at_eight(self):
+        guard = repeats.NoProgress()
+        for attempt in range(1, 9):
+            self.assertEqual(guard.refused(run_key("Look")), attempt == 8)
+
 
 class LedgerTest(unittest.TestCase):
     def setUp(self):

@@ -204,7 +204,8 @@ def item_changes(text: str, lines: list[str], checkpoint: str) -> dict:
 
 
 def item_error(text: str, retry: bool = False) -> dict:
-    """retry: the turn stopped on a dropped connection, so the card offers Try again (agent.resume)."""
+    """retry: the turn stopped on something another try may get past (a dropped connection, the gateway's vendor
+    failing), so the card offers Try again (agent.resume)."""
     return {"kind": "error", "text": text, **({"retry": True} if retry else {})}
 
 

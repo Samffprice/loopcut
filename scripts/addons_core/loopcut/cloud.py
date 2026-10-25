@@ -1462,6 +1462,9 @@ def execute(name, arguments):
                 from . import autorig
                 autorig.discard(out_dir)
             _discard_preparation(out_dir)
+        if isinstance(ex, cloud_http.CloudError) and ex.code == 'experimental_rig':
+            from .rig_experimental import MOTION_NOTE, MOTION_REFUSAL  # A condition, not a failure: no red card (R5-D3).
+            return tools.ToolResult(MOTION_REFUSAL, model_note=MOTION_NOTE)
         if isinstance(ex, cloud_http.CloudError):
             runtime.handle_error(ex)
         return tools.ToolResult(error_text(ex, rig=True) if descriptor.get('apply') == 'apply_rig' else

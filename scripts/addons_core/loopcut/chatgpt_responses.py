@@ -42,6 +42,7 @@ import http.client
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -455,8 +456,9 @@ _turn_lock = threading.Lock()
 
 
 def _turn(messages: list[dict]) -> int:
-    """Which user turn a request belongs to: the user messages that are not viewport captures."""
-    return sum(1 for m in messages if m.get("role") == "user" and not _is_capture(m))
+    """Which user turn a request belongs to: the user messages that are not viewport captures, nor the records
+    of earlier steps (context.fold), which a step's dropped capture adds mid-turn."""
+    return sum(1 for m in messages if m.get("role") == "user" and not _is_capture(m) and not context.is_record(m))
 
 
 def _turn_state(cache_key: str, turn: int) -> str:
@@ -556,13 +558,14 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
                 raise
             # A dropped connection: refused, reset, a broken pipe while the body went up, or a TLS alert such
             # as bad_record_mac read in place of the status line (ssl.SSLError, which urlopen does not wrap).
-            # api.openai.com cut large uploads (2.5-5 MB) that way about one time in four on 2026-10-16.
-            if not llm.dropped_connection(ex):
+            # api.openai.com cut large uploads (2.5-5 MB) that way about one time in four on 2026-10-16. Any other
+            # OSError here is the network call's too (Windows' bare FileNotFoundError(2), 0.2.14 logs), so retried.
+            if isinstance(ex, (urllib.error.URLError, ssl.SSLCertVerificationError)) and not llm.dropped_connection(ex):
                 if isinstance(ex, urllib.error.URLError):  # A refused certificate, say: the same every time.
                     raise llm.LLMError(f"Could not reach ChatGPT: {ex.reason}") from None
                 raise
             if attempt >= len(llm.RETRY_DELAYS):
-                raise llm.connection_lost("ChatGPT", ex) from None
+                raise llm.connection_lost("ChatGPT", llm.network_cause(ex) or ex) from None
             on_drop()
             delay = llm.RETRY_DELAYS[attempt]
             print(f"Loopcut: retrying the ChatGPT request after {getattr(ex, 'reason', ex)!r} "
@@ -801,15 +804,16 @@ def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_ef
             return _read(response, on_text, is_cancelled, deadline, transcript, meta)
         except _Interrupted as ex:
             cause = ex.__cause__ or EOFError("the stream ended before response.completed")
+            shown = llm.network_cause(cause) or cause
             if ex.streamed:
                 if retried_partial or on_retry is None:
-                    raise llm.connection_lost("ChatGPT", cause, while_replying=True) from cause
+                    raise llm.connection_lost("ChatGPT", shown, while_replying=True) from cause
                 retried_partial = True
                 print(f"Loopcut: retrying the ChatGPT request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(llm.RETRY_DELAYS):
-                raise llm.connection_lost("ChatGPT", cause) from cause
+                raise llm.connection_lost("ChatGPT", shown) from cause
             delay = llm.RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the ChatGPT request after {cause!r} ({before_content + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")

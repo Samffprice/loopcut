@@ -1,6 +1,9 @@
-"""Merge naming and weak-reference cleanup without Blender."""
+"""Merge naming, weak-reference cleanup and why an owned key conflicted, without Blender."""
 
+import contextlib
+import io
 import itertools
+import json
 import os
 import sys
 import types
@@ -155,6 +158,73 @@ class MergeReadonlyNamesTest(unittest.TestCase):
                 self.assertEqual(new.shape_keys.name, "keys.001" if readonly else "keys")
                 self.assertEqual(report.errors,
                                  ["worker: could not restore the name live (got appended)"] if readonly else [])
+
+
+class OwnedConflictWhyTest(unittest.TestCase):
+    """f0 #9A (0.2.14): an owned startup Cube the worker renamed and bmesh-edited was lost as "conflicted:
+    OBJECT:Cube, MESH:Cube", and nothing said whether the live one read as gone or as changed, nor what
+    changed. Each conflicted key says so on the console and in its conflict, by kind and field names only."""
+
+    setUp, remove = MergeReadonlyNamesTest.setUp, MergeReadonlyNamesTest.remove
+    KEY = "OBJECT:Cube"
+    AT_SPAWN = {"type": "MESH", "loc": [0, 0, 0], "rot": [0, 0, 0], "groups": ["SecretGroup"]}
+
+    def merge(self, live_now: dict | None, removed: bool = False) -> tuple[dict, str]:
+        """The worker's edit of the owned Cube (or its removal) against the live Cube's fields now (None: gone).
+        Returns the conflict and what the console said."""
+        live = FakeID(self.ids, name="Cube", id_type="OBJECT")
+        new = FakeID(self.ids, name="BatmobileStyleRaceCar", id_type="OBJECT")
+        for idb in (live, new):
+            idb.data, idb.users_collection = None, []
+        new.properties[ownership.STAMP] = "Cube"
+        spawn = merge.Spawn("wave", Path("/tmp/spawn.blend"), {self.KEY: live.session_uid}, {self.KEY: "before"}, {},
+                            fields={self.KEY: self.AT_SPAWN})
+        present = [live] if live_now is not None else []
+        manifest = {"result": "/tmp/result.blend", "owned": [self.KEY], "owned_deleted": [self.KEY] if removed else []}
+        report, out = merge.MergeReport(), io.StringIO()
+        with mock.patch.object(merge.os.path, "isfile", return_value=True), \
+                mock.patch.object(ownership, "all_ids", side_effect=[present, present + ([] if removed else [new])]), \
+                mock.patch.object(ownership, "token", side_effect=lambda idb, _: (
+                    "after" if idb is new else "before" if live_now == self.AT_SPAWN else "moved")), \
+                mock.patch.object(ownership, "plain_fields", side_effect=lambda idb, _: live_now), \
+                mock.patch.object(ownership, "describe", return_value={}), \
+                mock.patch.object(merge, "_append", return_value=[] if removed else [new.session_uid]), \
+                mock.patch.object(merge, "_replace", side_effect=lambda old, new, missing: [old]), \
+                mock.patch.object(merge, "_settle", return_value=[]), \
+                mock.patch.object(merge, "_worker_collections", return_value=(set(), set())), \
+                mock.patch.object(merge, "_link_created"), contextlib.redirect_stdout(out):
+            merge._merge_worker(spawn, {"manifest": manifest}, spawn.uid2spawn(), report, [], {})
+        self.assertEqual(len(report.conflicts), 1, report.conflicts)
+        self.assertEqual(report.conflicts[0]["keys"], [self.KEY])
+        for name in ("Cube", "BatmobileStyleRaceCar", "SecretGroup"):  # The uploaded logs carry console lines.
+            self.assertNotIn(name, out.getvalue() + json.dumps(report.conflicts[0]["differs"]))
+        return report.conflicts[0], out.getvalue()
+
+    def test_a_live_owned_object_changed_since_spawn_names_the_fields(self):
+        conflict, said = self.merge({**self.AT_SPAWN, "loc": [1, 0, 0], "rot": [0, 0, 1]})
+        self.assertEqual(said, "Loopcut: merge conflict OBJECT (changed): live differs from spawn in loc, rot\n")
+        self.assertEqual(conflict["differs"], [{"id_type": "OBJECT", "branch": "changed", "fields": ["loc", "rot"]}])
+        self.assertEqual(conflict["reason"], "changed in the live scene during the wave; the live version was kept")
+
+    def test_a_live_owned_object_gone_says_gone(self):
+        conflict, said = self.merge(None)
+        self.assertEqual(said, "Loopcut: merge conflict OBJECT (gone): no live datablock for its spawn identity\n")
+        self.assertEqual(conflict["differs"], [{"id_type": "OBJECT", "branch": "gone"}])
+        self.assertEqual(conflict["reason"], "deleted in the live scene during the wave")
+
+    def test_one_the_worker_removed_but_changed_live_names_the_fields(self):
+        conflict, said = self.merge({**self.AT_SPAWN, "hide": [True, False]}, removed=True)
+        self.assertEqual(said, "Loopcut: merge conflict OBJECT (changed): live differs from spawn in hide\n")
+        self.assertEqual(conflict["differs"], [{"id_type": "OBJECT", "branch": "changed", "fields": ["hide"]}])
+
+    def test_the_spawn_keeps_token_fields_for_owned_keys_only(self):
+        cube, lamp = FakeID(self.ids, name="Cube", id_type="OBJECT"), FakeID(self.ids, name="Lamp", id_type="OBJECT")
+        ids = {self.KEY: cube.session_uid, "OBJECT:Lamp": lamp.session_uid}
+        with mock.patch.object(ownership, "all_ids", return_value=[cube, lamp]), \
+                mock.patch.object(ownership, "token_fields", return_value={"loc": (1.0, 2.0, 3.0)}) as fields:
+            self.assertEqual(ownership.spawn_fields([self.KEY], ids), {self.KEY: {"loc": [1.0, 2.0, 3.0]}})
+        self.assertEqual([c.args[0] for c in fields.call_args_list], [cube], "the unowned lamp is not read")
+        self.assertEqual(ownership.differs({"loc": [1.0], "rot": [0]}, {"loc": [1.0], "hide": [True]}), ["hide", "rot"])
 
 
 if __name__ == "__main__":

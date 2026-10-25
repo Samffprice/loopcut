@@ -1993,6 +1993,22 @@ class OnboardingTest(unittest.TestCase):
         labels = [r[1] for r in splash.records if r[0] == "label"]
         return splash, labels, [r[2] for r in splash.operators()]
 
+    def test_the_showcase_names_the_accounts_typical_build(self):
+        """account.agent.typical_build (config.agent_terms, 2026-10-24) replaces TYPICAL_BUILD; a bad or missing one
+        keeps it."""
+        on = self.onboarding
+        for terms, expected in (({"typical_build": 30}, 30), ({"typical_build": 0}, 12), ({"typical_build": "30"}, 12),
+                                ({}, 12), (None, 12)):
+            account = dict(self.ARM_ACCOUNT, **({} if terms is None else {"agent": terms}))
+            with self.subTest(terms=terms), self.credits_arm(), patch("builtins.print"), \
+                    patch.object(on, "_manifest_account", return_value=account), patch.object(on, "_report"):
+                _, labels, _ = self.arm_screen("showcase")
+                self.assertIn(f"A typical first build uses about {expected}.", labels)
+                drawn = on._signature()
+                self.assertEqual(on._signature(), drawn)
+                account["agent"] = {"typical_build": 40}  # A manifest refresh while it shows: the page redraws.
+                self.assertNotEqual(on._signature(), drawn)
+
     def test_credits_arm_order_is_account_showcase_byo_ai_privacy_done(self):
         on = self.onboarding
         with self.credits_arm(), patch.object(on, "_report") as report:
@@ -2015,7 +2031,7 @@ class OnboardingTest(unittest.TestCase):
             self.assertIn("100", labels)
             self.assertIn("free credits every month for anything above,", labels)
             self.assertIn("AI chat included.", labels)
-            self.assertIn("A typical first build uses about 20.", labels)
+            self.assertIn("A typical first build uses about 12.", labels)
             self.assertEqual(texts, ["Next", "← Back"])
             self.assertTrue(all(r[4].enabled for r in splash.operators()))
             self.assertEqual(splash.records.count(("icon", 0)), 0)  # No previews here: labels stand in.

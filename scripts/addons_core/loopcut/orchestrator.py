@@ -66,8 +66,8 @@ SCHEMAS = [
         "name": "delegate",
         "title": "Planning background helpers",
         "description": (
-            "Start a wave of workers, any number (the rest queue); returns once any finish: merged, reported, "
-            "and who still runs or waits."),
+            "Start a wave of workers, up to the turn's limit (the rest queue); returns once any finish: merged, "
+            "reported, and who still runs or waits."),
         "parameters": {"type": "object", "properties": {
             "dry_run": {"type": "boolean"},
             "wait": {"type": "boolean", "description": "No wave: the running workers' next results"},
@@ -121,11 +121,31 @@ SCHEMAS = [
     *glb.SCHEMAS,
 ]
 
+# The reply after LATE adds to the one the user already saw: a second summary after "wrapping up" read as more
+# work starting (a free-plan persona, 2026-10-24, whose reply came at the server's soft-budget note).
 LATE = ("[Loopcut] You replied while workers were still running; Loopcut collected their outcomes. Review "
-        "their results as after any delegate, then reply again:\n{report}")
+        "their results as after any delegate, then reply with a short addendum: in a sentence or two, what they "
+        "change for the user (what they added, what still needs work), without repeating your earlier reply. If "
+        "it said the work was wrapping up or done, say these results are now in.\n{report}")
 BOUNCE = ("[Loopcut] These checks fail on the live scene:\n{lines}\nSend a fix to a worker's object back to that "
           "worker (delegate, continues), fix your own work yourself, or say plainly that they are not done. A check the user has since overridden, or one that is wrong, you retire "
           "with the checks tool (its id, and the user's words or what you measured); never to hide a real failure.")
+# The turn's worker limit is planning input, not a reason to narrate, and the user's word for workers is the UI's,
+# helpers (a free-plan persona, 2026-10-24, told a Japanese user "since I can't add workers..." after a budget line).
+FOR_PLANNING = "for your planning; to the user, workers are helpers"
+# The turn can start no more workers (waves.workers_left): nothing goes back to one.
+BOUNCE_NO_WORKERS = BOUNCE.replace("Send a fix to a worker's object back to that worker (delegate, continues), fix your "
+                                   "own work yourself,",
+                                   f"Fix them yourself (this turn can start no more workers, {FOR_PLANNING}),")
+# delegate's refusals by the account's max_workers (waves.workers_left): its own card, never a plan to fix.
+CAP_LINE = ("workers: this turn can start {left} more worker{s}, and this wave briefs {n}; brief at most {left}, or "
+            "do the rest yourself")
+CAP_SPENT = ("delegate refused; nothing started: this turn can start 0 more workers (its {cap} are started{started}). "
+             "{running}Do the rest yourself, or say plainly what is not done (" + FOR_PLANNING + ").")
+CAP_RUNNING = "Still running: {names}; wait for them (delegate wait true), do not build their objects. "
+# A wave sent again with wait true once none is left (GLM, wb-free-1 20261024-172724, read CAP_SPENT as "cannot
+# wait" and built a second anvil while the anvil worker ran): the wait it means, the wave not started again.
+CAP_WAIT = "Waiting for the workers already running (nothing new started: this turn's {cap} workers are its limit)."
 
 
 # ------------------------------------------------------------------ the user's words
@@ -1132,6 +1152,12 @@ def _overlap(a, b) -> list[float]:
     return [min(a[1][i], b[1][i]) - max(a[0][i], b[0][i]) for i in range(3)]
 
 
+def _inside(inner, outer) -> bool:
+    """Whether a box lies wholly within another, to TOLERANCE on every axis: nested by design (furniture in a
+    room, rings and particles around a planet), not two things planned into the same space."""
+    return all(inner[0][i] >= outer[0][i] - TOLERANCE and inner[1][i] <= outer[1][i] + TOLERANCE for i in range(3))
+
+
 def _in_frame_share(projected: list, region) -> tuple[float, list[str]]:
     """Share of a box's corners inside the frame (or region) and in front of the camera, and which
     edges the others are past."""
@@ -1169,10 +1195,14 @@ def layout(wave: dict, live: dict, project=None) -> tuple[list[str], list[str], 
     """The dry run: pure math on the planned bounds, each of a worker's boxes on its own; mutates
     wave in place for the one repair it can make (a bounds.z0 close to its support, snapped to it).
     Returns (problems, repairs, warnings, notes): problems refuse the wave; repairs already happened;
-    warnings never refuse (a slight overlap between neighbours, or a box this wave is exempt from);
-    notes are every number checked that held. project(camera, points) -> [(x, y, depth)] in frame
-    fractions, for in_frame checks against a camera that exists now; None skips them."""
+    warnings never refuse (a slight overlap between neighbours, a box nested in another, or a box this wave
+    is exempt from); notes are every number checked that held. project(camera, points) -> [(x, y, depth)]
+    in frame fractions, for in_frame checks against a camera that exists now; None skips them.
+    live["overlaps_refused"]: the worker pairs this turn already refused for overlapping (agent.Turn's), added
+    to here; a pair in it is a warning, kept as planned, so a planned overlap is refused once, not in a loop."""
     problems, repairs, warnings, notes = [], [], [], []
+    refused = live.get("overlaps_refused")
+    refused = set() if refused is None else refused
     shared, workers = wave["shared"], [w for w in wave["workers"] if isinstance(w, dict)]
     objects, tops = live.get("objects", {}), _support_tops(shared, live)
     boxes = {w["id"]: _boxes(w["bounds"]) for w in workers if w.get("bounds") is not None and _boxes(w["bounds"])}
@@ -1215,21 +1245,38 @@ def layout(wave: dict, live: dict, project=None) -> tuple[list[str], list[str], 
     for i, a in enumerate(ids):
         for b in ids[i + 1:] + running:
             nearest, clashes = None, 0  # How far apart the closest boxes are, when none overlap.
+            # A pair refused for overlapping earlier this turn and sent again is kept as planned, the overlap
+            # said (real users' rings around a sphere were refused 6 times running).
+            pair, before = tuple(sorted((a, b))), len(problems)
             for label_a, box_a in zip(_labels(a, boxes[a]), boxes[a]):
                 for label_b, box_b in zip(_labels(b, boxes[b]), boxes[b]):
                     depth = _overlap(box_a, box_b)
                     if all(d > TOLERANCE for d in depth):
-                        if min(depth) < OVERLAP_WARN:
-                            warnings.append(f"{label_a} and {label_b}: planned bounds overlap by {depth[0]:.2f} x "
-                                            f"{depth[1]:.2f} x {depth[2]:.2f} m (under {OVERLAP_WARN * 100:.0f} cm "
-                                            f"between neighbours; not refused)")
+                        size = f"{depth[0]:.2f} x {depth[1]:.2f} x {depth[2]:.2f} m"
+                        nested = ((label_a, label_b) if _inside(box_a, box_b) else
+                                  (label_b, label_a) if _inside(box_b, box_a) else None)
+                        if nested:
+                            clashes += 1
+                            warnings.append(f"{nested[0]} sits inside {nested[1]}'s planned bounds (nested; not "
+                                            f"refused)")
+                        elif min(depth) < OVERLAP_WARN:
+                            warnings.append(f"{label_a} and {label_b}: planned bounds overlap by {size} (under "
+                                            f"{OVERLAP_WARN * 100:.0f} cm between neighbours; not refused)")
+                        elif pair in refused:
+                            clashes += 1
+                            warnings.append(f"{label_a} and {label_b}: planned bounds overlap by {size} (refused once "
+                                            f"this turn; kept as planned)")
                         else:
                             clashes += 1
-                            problems.append(f"{label_a} and {label_b}: planned bounds overlap by {depth[0]:.2f} x "
-                                            f"{depth[1]:.2f} x {depth[2]:.2f} m; move one apart or shrink it")
+                            problems.append(f"{label_a} and {label_b}: planned bounds overlap by {size}; move one "
+                                            f"apart or shrink it; if one goes around or inside the other (rings "
+                                            f"around a sphere, a ship in a bottle), send them as one worker, or send "
+                                            f"the wave again as planned")
                     else:
                         gap = max(-d for d in depth)
                         nearest = gap if nearest is None else min(nearest, gap)
+            if len(problems) > before:
+                refused.add(pair)
             if nearest is not None and not clashes:
                 notes.append(f"{a} and {b}: " + (f"{nearest:.3f} m apart at the closest" if nearest >= 0 else
                                                  f"overlap {-nearest * 1000:.0f} mm at most (up to {TOLERANCE * 1000:.0f} allowed)"))
@@ -1340,13 +1387,24 @@ def _repairs_line(repairs: list) -> str:
 
 
 def budget_line(wave: dict, roles, job=None) -> str:
-    """The shared dollars still available this turn and each new worker's own time limit."""
+    """The shared dollars still available this turn, each new worker's own time limit, and, when the account
+    limits a turn's workers, how many more it can start after these."""
+    from . import waves
     roles = roles or config.Roles
     cap = job.budget.max_usd if job is not None else roles.job_max_usd
     left = max(0, cap - (job.budget.usd if job is not None else 0))
     seconds = job.budget.seconds if job is not None else roles.worker_max_seconds
+    more = waves.workers_left(job, roles)
+    if more is not None:
+        more = max(0, more - len(wave.get("workers") or ()))
+    if more is None:
+        after = ""
+    elif more:
+        after = f"; after these, you can start {more} more worker{'' if more == 1 else 's'} this turn"
+    else:  # Said as what to do, not a fact for the model to pass on.
+        after = f"; after these, start no more workers this turn and do any further work yourself ({FOR_PLANNING})"
     return ("Budget: " + (f"${left:.3f} of ${cap:.2f} left for this turn's workers; " if cap else "")
-            + f"{seconds:g} s per worker run.")
+            + f"{seconds:g} s per worker run{after}.")
 
 
 def schedule_line(wave: dict, roles, busy: dict) -> str:
@@ -1443,12 +1501,38 @@ def wave_argument(wave, shared=None) -> tuple:
                            "and the two differ. Send shared once, inside wave.")
 
 
+def cap_spent(job) -> str:
+    """CAP_SPENT with what the turn's workers build, and which are still to report, so none is built twice."""
+    from . import waves
+    started = waves.started_deliverables(job)
+    running = [name for name, pending in started if pending]
+    return CAP_SPENT.format(cap=job.turn_workers, started=": " + ", ".join(n for n, _ in started) if started else "",
+                            running=CAP_RUNNING.format(names=", ".join(running)) if running else "")
+
+
 def waits(name: str, arguments: dict) -> bool:
     """delegate wait with no briefs: the running workers' next results. It starts nothing, so it is not
     asked about (the delegate that started them was). A wave sent as a JSON string counts as its briefs."""
     wave = _decoded(arguments.get("wave"))
     return (name == "delegate" and str(arguments.get("wait")).lower() == "true"
             and not (isinstance(wave, dict) and wave.get("workers")))
+
+
+def starts_nothing(name: str, arguments: dict, turn) -> bool:
+    """delegate, not a dry run, once the turn has no worker left to start (waves.workers_left): whatever its wave,
+    it is the wait (cap_waits) or the refusal (cap_spent). So it is not asked about, and the loop marks the call
+    (agent.Turn.capped_call): delegate holds it to those even if a slot frees before it runs."""
+    from . import waves
+    return (name == "delegate" and not only_reads(name, arguments)
+            and waves.workers_left(getattr(turn, "job", None), getattr(turn, "roles", None)) == 0)
+
+
+def cap_waits(arguments: dict, job) -> bool:
+    """Of those, wait true with workers still to report: the plain wait for them (CAP_WAIT), the wave not started
+    again."""
+    from . import waves
+    return (str(arguments.get("wait")).lower() == "true" and not only_reads("delegate", arguments)
+            and not job.stopped and waves.pending(job))
 
 
 def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False, shared: dict | None = None):
@@ -1469,6 +1553,14 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         return tools.ToolResult("Workers are off in this conversation; do the work yourself.", ok=False)
     if session.get("workers_unavailable"):
         return tools.ToolResult(waves.unavailable_note(session), ok=False)
+    left = waves.workers_left(job, roles)
+    # Every worker the account's max_workers allows this turn has started, or did when the call was let run
+    # unasked (starts_nothing): it starts none, even if one queued has since been dropped.
+    if left == 0 or getattr(turn, "capped_call", None) is not None:
+        if cap_waits({"wait": wait, "dry_run": dry_run}, job):
+            lead = CAP_WAIT.format(cap=job.turn_workers)
+            return tools.ToolResult(lead, then=functools.partial(waves.collect, job, lead=lead))
+        return tools.ToolResult(cap_spent(job), ok=False, plan_capped=True)
     wave, argument_repairs, refusal = wave_argument(wave, shared)
     if refusal:
         return tools.ToolResult(refusal, ok=False, plan_refused=True)
@@ -1482,18 +1574,22 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
     live = live_facts(plan)
     live["threads"] = threads_of(session)
     live["busy"] = waves.busy(job)
+    live["overlaps_refused"] = getattr(turn, "overlaps_refused", None)  # Each overlapping pair refused once a turn.
     live["references"] = [r["name"] for r in session.get("references") or ()]  # What the user attached.
     plan, repairs = repair_wave(plan, words, live)  # Small mistakes fixed before validation ever sees them.
     repairs = argument_repairs + repairs
     errors = snapshot_errors + validate_wave(plan, words, live)
+    capped = left is not None and len(plan["workers"]) > left
+    if capped:
+        errors.append(CAP_LINE.format(left=left, s="" if left == 1 else "s", n=len(plan["workers"])))
+    refused = {"plan_capped": True} if capped and len(errors) == 1 else {"plan_refused": True}
     if errors and dry_run:
-        return tools.ToolResult(dry_run_report(errors, repairs, [], [], layout_checked=False),
-                                ok=False, plan_refused=True)
+        return tools.ToolResult(dry_run_report(errors, repairs, [], [], layout_checked=False), ok=False, **refused)
     if errors:
         lines = ["delegate refused; nothing started. Fix these and call again:", *(f"- {e}" for e in errors)]
         if repairs:
             lines.append(_repairs_line(repairs))
-        return tools.ToolResult("\n".join(lines), ok=False, plan_refused=True)
+        return tools.ToolResult("\n".join(lines), ok=False, **refused)
     problems, layout_repairs, layout_warnings, notes = layout(plan, live, project)
     repairs = repairs + layout_repairs
     warnings = role_warnings(plan) + tool_warnings(plan) + layout_warnings
@@ -1739,8 +1835,11 @@ def describe(name: str, arguments: dict):
         return f"Checks: {', '.join(p for p in parts if p) or 'run all now'}", json.dumps(arguments, indent=2)
     if name != "delegate":
         return None
-    if waits(name, arguments):
+    turn = state.session().get("turn")
+    if waits(name, arguments) or starts_nothing(name, arguments, turn) and cap_waits(arguments, turn.job):
         return "Wait for the helpers' next results", ""
+    if starts_nothing(name, arguments, turn):  # Refused as it runs (cap_spent): no helpers start, no plan to show.
+        return "No more helpers this turn", ""
     wave = wave_argument(arguments.get("wave"), arguments.get("shared"))[0]  # As delegate will read it.
     wave = wave if isinstance(wave, dict) else {}
     workers = wave.get("workers")
@@ -1914,11 +2013,11 @@ def _late_workers(session: dict, turn, job):
     if turn.outcome in ("step_limit", "no_progress"):
         reason = "at the step limit" if turn.outcome == "step_limit" else "when the no-progress guard stopped the turn"
         session["items"].append(state.item_notice(
-            f"Workers still running {reason} were waited for; see each worker's outcome in its wave card. "
+            f"Loopcut waited for the helpers still working {reason}; see each helper's outcome in its wave card. "
             "The agent did not review them."))
         return None
-    session["items"].append(state.item_notice("Workers were still running at the reply: Loopcut collected their "
-                                              "outcomes, and the agent reviews them."))
+    session["items"].append(state.item_notice("Helpers were still working when the agent replied; Loopcut waited "
+                                              "for them, and the agent checks what they made."))
     job.log["late_bounces"] = job.log.get("late_bounces", 0) + 1  # Not a check bounce: counted apart.
     job.write()
     late.text = LATE.format(report=late.text)
@@ -1956,7 +2055,9 @@ def finish_gate(session: dict, turn, completion, run_checks):
         job.bounces += 1
         session["items"].append(state.item_notice(
             f"Checked the result on the scene: {len(failed)} of {len(rows)} checks fail, so the agent goes on."))
-        return BOUNCE.format(lines="\n".join(f"- id \"{label}\": {result_line('', check, result).strip()}"
+        from . import waves
+        bounce = BOUNCE_NO_WORKERS if waves.workers_left(job, getattr(turn, "roles", None)) == 0 else BOUNCE
+        return bounce.format(lines="\n".join(f"- id \"{label}\": {result_line('', check, result).strip()}"
                                              for label, check, result in failed))
     requirements = _requirements(job)
     _append_to_reply(session, completion, verified_block(rows, retired, requirements))

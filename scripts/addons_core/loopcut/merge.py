@@ -72,6 +72,7 @@ class Spawn:
     # Only the live side reads it (changed or deleted live since); the result's own copies are measured
     # against tokens, the copy they were built from.
     live_tokens: dict = field(default_factory=dict)
+    fields: dict = field(default_factory=dict)  # key -> ownership.plain_fields at spawn, owned keys only.
 
     def uid2spawn(self) -> dict:
         return {uid: key.split(":", 1)[1] for key, uid in self.ids.items()}
@@ -113,7 +114,8 @@ class MergeReport:
     type, hidden}; dropped_edits: {worker, key, name, worker_value, live_value, in_copy_only?: a change
     no copy in the result carried, from the manifest's in_copy_only; mesh_not_owned?: an owned object's
     weight edit on a mesh it shares with an unowned one, from weights_not_merged}; conflicts:
-    {worker, keys | pointer, reason, live_now, worker_value}; errors: text; checkpoint: its id.
+    {worker, keys | pointer, reason, live_now, worker_value, differs?: per key, _why_conflict}; errors: text;
+    checkpoint: its id.
     quarantined entries also carry reason: why it is held back (what the role makes and what would let
     it through). admitted: {worker, name, id_type, type, reason}: created outside the worker's role but
     merged because the brief asks for it (a lamp's bulb light, a light's own flicker, a name the
@@ -291,10 +293,11 @@ def _unused(palette=()) -> list:
     return found
 
 
-def save_spawn(folder: Path, palette=()) -> Spawn:
+def save_spawn(folder: Path, palette=(), owned=()) -> Spawn:
     """Main thread, before a wave: a compressed copy of the scene with relative paths remapped,
     and its identity map, tokens and scene pointers. The open file is not touched: what nothing uses
-    (and the palette) goes into the copy on a fake user that is taken off again once it is saved."""
+    (and the palette) goes into the copy on a fake user that is taken off again once it is saved.
+    owned: the wave's owned keys, whose token fields are kept too (what a conflict over one names)."""
     import bpy
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -312,7 +315,7 @@ def save_spawn(folder: Path, palette=()) -> Spawn:
     pointers = {attr: ownership.key_of(getattr(scene, attr)) if getattr(scene, attr) is not None else None
                 for attr in ("camera", "world")}
     wave = f"{folder.parent.name}-{folder.name}" if folder.parent.name else folder.name
-    return Spawn(wave, path, ids, tokens, pointers)
+    return Spawn(wave, path, ids, tokens, pointers, fields=ownership.spawn_fields(owned, ids))
 
 
 # ------------------------------------------------------------------ one worker
@@ -840,6 +843,25 @@ def _held(ob) -> list[str]:
     return held
 
 
+def _why_conflict(key: str, live, spawn: Spawn, uid2spawn: dict) -> dict:
+    """Why an owned key conflicted, said on the console and kept in its conflict (the JobLog): gone, changed
+    (with the token fields that differ from spawn) or unchanged (another key of its unit conflicted). A
+    0.2.14 startup Cube lost as "conflicted: OBJECT:Cube, MESH:Cube" could not say which. Kinds and field
+    names only, no names or values: console lines go into the uploaded conversation logs."""
+    kind = key.split(":", 1)[0]
+    if live is None:
+        why, text = {"id_type": kind, "branch": "gone"}, "no live datablock for its spawn identity"
+    elif ownership.token(live, uid2spawn) == spawn.expected(key):
+        why, text = {"id_type": kind, "branch": "unchanged"}, "live matches spawn; another key of its unit conflicted"
+    else:
+        before = spawn.fields.get(key)
+        fields = ownership.differs(before, ownership.plain_fields(live, uid2spawn)) if before is not None else []
+        why = {"id_type": kind, "branch": "changed", "fields": fields}
+        text = "live differs from spawn " + (f"in {', '.join(fields)}" if fields else "(no fields kept)")
+    print(f"Loopcut: merge conflict {kind} ({why['branch']}): {text}")
+    return why
+
+
 def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeReport, found: list, moved: dict) -> None:
     """moved: key -> session_uid of what an earlier worker of the wave replaced it with."""
     import bpy
@@ -945,7 +967,8 @@ def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeRepo
                 "reason": "deleted in the live scene during the wave" if gone else
                           "changed in the live scene during the wave; the live version was kept",
                 "live_now": {k: ownership.describe(live_of(k)) for k in keys},
-                "worker_value": {k: ownership.describe(i) for k, i in zip(keys, members)}})
+                "worker_value": {k: ownership.describe(i) for k, i in zip(keys, members)},
+                "differs": [_why_conflict(k, live_of(k), spawn, uid2spawn) for k in keys]})
             for idb in members:
                 live = live_of(f"{idb.id_type}:{idb[STAMP]}")
                 to_remove += swap(idb, live) if live is not None else [idb]
@@ -966,7 +989,8 @@ def _merge_worker(spawn: Spawn, result: dict, uid2spawn: dict, report: MergeRepo
         if ownership.token(live, uid2spawn) != spawn.expected(key):
             report.conflicts.append({"worker": worker, "keys": [key], "worker_value": {key: "removed"},
                                      "reason": "removed by the worker but changed in the live scene; kept",
-                                     "live_now": {key: ownership.describe(live)}})
+                                     "live_now": {key: ownership.describe(live)},
+                                     "differs": [_why_conflict(key, live, spawn, uid2spawn)]})
             continue
         report.replaced.append({"worker": worker, "key": key, "name": live.name, "removed": True})
         to_remove.append(live)

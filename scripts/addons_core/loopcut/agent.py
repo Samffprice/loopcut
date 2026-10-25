@@ -119,11 +119,11 @@ STEP_LIMIT_PROMPT = ("[Loopcut] This turn has used all {steps} of its steps, so 
 BUDGET_PROMPT = ("[Loopcut] The job's budget is spent ({reason}), so tools are off now: any tool call is ignored. "
                  "Reply in plain text only, in three short parts: what is done, what is left, and what you did "
                  "not verify.")
-NO_PROGRESS_NOTICE = (f"Stopped after {repeats.NO_PROGRESS_FAILURES} identical tool failures in a row "
-                      "without a scene change.")
-NO_PROGRESS_PROMPT = ("[Loopcut] The same tool call keeps failing without changing the scene, so tools are off "
-                      "now: any tool call is ignored. Reply in plain text only: what is done, what is blocked "
-                      "and why, and what you did not verify.")
+# Either repeats.NoProgress limit: one call's failures and refusals, or refused repeats of any calls.
+NO_PROGRESS_NOTICE = "Stopped because the same steps kept repeating without changing the scene."
+NO_PROGRESS_PROMPT = ("[Loopcut] The same tool calls keep failing or being refused as repeats without changing the "
+                      "scene, so tools are off now: any tool call is ignored. Reply in plain text only: what is "
+                      "done, what is blocked and why, and what you did not verify.")
 # _request's one retry of a step that hit the output cap (max_tokens, or llm.py's call_max_seconds)
 # without producing anything usable: appended to that request only, never saved to the conversation.
 CAP_RETRY_PROMPT = ("[Loopcut] That reply stopped without a usable answer or tool call. Decide now and act: "
@@ -136,15 +136,24 @@ EMPTY_REPLY_MESSAGE = ("The model sent back an empty reply twice, so nothing hap
                        "another model in the model menu below.")
 FILTERED_REPLY_MESSAGE = ("The model provider's content filter stopped this reply before it said anything. Rephrase "
                           "the request, or pick another model in the model menu below.")
+# Loopcut's gateway could not get an answer from the model's vendor: a 502 with one of the upstream_* codes, the
+# same code in an error event mid-stream, or the vendor's 429 (rate_limited) still there after llm.py's retries.
+# Never the user's plan or request, so the card offers Try again, as after a dropped connection, in the gateway's
+# own words without llm.py's "HTTP 502: " (_upstream_text), or UPSTREAM_MESSAGE, the gateway's own line, when it
+# gave none. The 429 always says BUSY_MESSAGE: an older gateway's "Loopcut will retry" is no longer true once
+# llm.py's retries are spent.
+UPSTREAM_CODES = frozenset({"upstream_error", "upstream_rejected", "upstream_unavailable", "rate_limited"})
+UPSTREAM_MESSAGE = "Loopcut's AI is having a problem right now; it's not your plan or your request."
+BUSY_MESSAGE = "Loopcut's AI is busy right now; try again in a minute."
 # A reply that wrote its calls out as text and called nothing (_unmade): what goes back as the turn's record
-# correction, what the panel says when it cannot go back, and what the stored reply then says.
+# correction, what the panel says when it cannot go back, and what the stored reply says instead, for this and
+# for a reply the record correction (completion_guard.CORRECTION) sends back.
 UNMADE_PROMPT = ("[Loopcut] Your last reply wrote {calls} out as text instead of calling {them}, so nothing ran and "
                  "nothing it reported was seen or measured; the scene is as it was before that reply. Call the "
                  "tools now, or tell the user plainly that nothing ran.")
 UNMADE_FINAL = ("Stopped: the assistant again wrote out its steps instead of running them, so none of the work "
                 "it described was done or checked.")
-UNMADE_STORED = ("The steps in this reply did not run: I wrote them out instead of calling the tools, so none of that "
-                 "work was done or checked.")
+UNMADE_STORED = context.UNMADE_STORED
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -186,6 +195,10 @@ class Turn:
         self.spec: "LoopSpec | None" = None
         self.job = None              # waves.Job once this turn delegates: budget, checks, JobLog.
         self.delegations: list = []  # Deliverables of each wave this turn started (waves.prepare).
+        self.overlaps_refused: set = set()  # Worker id pairs a delegate refused for overlapping (orchestrator.layout).
+        # The id of the delegate call running now that went unasked only because it could start nothing
+        # (orchestrator.starts_nothing): delegate holds it to the wait or the refusal. None otherwise.
+        self.capped_call: str | None = None
         self.plan_turn = ""         # Identifies this loop's plan attempts, including while a retry is running.
         self.level_first: int | None = None  # Levels inferred from what the model did; see _note_level.
         self.level_max = 0
@@ -303,11 +316,13 @@ def _fresh_images(images: list) -> list:
     return fresh
 
 
-def _approval(name: str, arguments: str, roots) -> str:
+def _approval(name: str, arguments: str, roots, turn=None) -> str:
     """"" when the call runs unasked; "gate" when the user must approve it unless they said
     "Always allow" or auto-run is on; "heavy" for a render, a bake, a simulation, which can hold
     Blender for minutes: it asks unless they said "Always allow renders"; "install" for code that
-    installs packages or downloads code and runs it: it asks every time (tools.INSTALLS); see _asks."""
+    installs packages or downloads code and runs it: it asks every time (tools.INSTALLS); "capped" for a
+    delegate that can start none of the turn's workers (orchestrator.starts_nothing): it is not asked, and
+    run_loop holds it to that (Turn.capped_call); see _asks."""
     from . import files, tools, workspace
     from . import orchestrator
     parsed = _arguments(arguments)
@@ -318,6 +333,8 @@ def _approval(name: str, arguments: str, roots) -> str:
         return "install"
     if tools.is_heavy(name, parsed):
         return "heavy"
+    if orchestrator.starts_nothing(name, parsed, turn) and not orchestrator.waits(name, parsed):
+        return "capped"
     if (name in tools.NEEDS_APPROVAL and not _only_reads(name, parsed) and not orchestrator.waits(name, parsed)
             or files.needs_approval(name, parsed, roots) or workspace.needs_approval(name, parsed, roots)):
         return "gate"
@@ -334,6 +351,8 @@ def _asks(approval: str, name: str, session: dict, cfg) -> bool:
     from . import tools
     if approval == "install":
         return True  # Neither auto-run nor any "Always allow" covers putting third-party code on their machine.
+    if approval == "capped":
+        return False  # It starts nothing, and run_loop holds it to that.
     allowed = cfg.auto_run or session["auto_run"]
     if approval == "heavy":
         return not session["auto_heavy"] or (name in tools.NEEDS_APPROVAL and not allowed)
@@ -715,6 +734,13 @@ def _limit_item(ex: llm.LLMError) -> dict:
     if refill:  # The credits arm's sooner weekly top-up (contract 0.9); absent, the card is 0.2.14's.
         item["refill"] = refill
     return item
+
+
+def _upstream_text(ex: llm.LLMError) -> str:
+    """What the Try again card says when the gateway's vendor failed (UPSTREAM_CODES)."""
+    if ex.code == "rate_limited":
+        return BUSY_MESSAGE
+    return str(ex.details.get("message") or "").strip() or UPSTREAM_MESSAGE
 
 
 def _alike_on_main(a, b) -> bool:
@@ -1186,6 +1212,10 @@ def _look_note(turn: Turn) -> str:
             f"after each change. Finish soon, and say what you could not verify.)")
 
 
+# On the user's message a Try it card sent unedited: the card, so a resumed turn (Try again) is still its turn.
+TRY_IT = "loopcut_try_it"
+
+
 def try_it_card(turn) -> str:
     """The setup Try it card whose unedited request started this turn (Turn.try_it); for a worker's turn, the
     user's turn it works for (Turn.chat). "" for any other turn, a later one in the same conversation included.
@@ -1348,7 +1378,7 @@ def _route(session: dict, turn: Turn) -> None:
     workspace on, a conversation that never delegated and whose turn is a look (router.to_workspace)
     goes to the single agent's workspace loop instead, for this turn and the rest of the conversation:
     no note, the orchestrator's model, WORKSPACE_SPEC (run_loop picks up turn.spec)."""
-    if turn.try_it and turn.tool_steps:
+    if turn.try_it and (turn.tool_steps or turn.executed_tools):
         return  # The card already selected and ran its tool; continue with its result, without routing again.
     from . import router
     roles = getattr(turn, "roles", None)
@@ -1364,7 +1394,10 @@ def _route(session: dict, turn: Turn) -> None:
     if getattr(turn, "diverted", False):
         session["mode"] = "workspace"
         turn.spec = WORKSPACE_SPEC
-        turn.config = _workspace_config(turn.config)
+        # The orchestrator's own limits stay behind: the workspace loop has the main config's step limit.
+        base = getattr(roles, "orchestrator", None)
+        cfg = dataclasses.replace(turn.config, max_steps=base.max_steps) if base is not None else turn.config
+        turn.config = _workspace_config(cfg)
         turn.roots = _on_main(_project_roots, turn.cancel.is_set)  # Relative paths now mean the workspace.
         _workspace_turn(session, turn)
 
@@ -1640,6 +1673,9 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
         except llm.LLMError as ex:
             if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
                 _drop_empty(items, reply)
+            elif ex.code == llm.CONNECTION_LOST or (ex.code in UPSTREAM_CODES and config.on_service(cfg.base_url)):
+                reply["text"] = ""  # Its card's Try again asks for this reply afresh: no fragment of it above the card.
+                _drop_empty(items, reply)
             raise
 
     def record(completion: llm.Completion) -> None:
@@ -1739,9 +1775,9 @@ def _unmade(session: dict, turn: Turn, request: dict, completion: llm.Completion
     p6c: a whole detail pass, nothing but copied records). Its card comes down, so that account is never the
     last word. While the turn has a nudge left (completion_guard.nudges_left, shared with announced steps) and
     has had no record correction, the model is sent back once to call the tools or say plainly that nothing ran:
-    the returned text. Otherwise None, and the stored reply says what happened; run_loop ends the turn on
-    UNMADE_FINAL unless a finish gate sends it on. added: the items this request added. may_retry: False at
-    the step limit or once the turn has an outcome, as for an announced step."""
+    the returned text, and the reply is marked context.UNRUN. Otherwise None, and the stored reply says what
+    happened; run_loop ends the turn on UNMADE_FINAL unless a finish gate sends it on. added: the items this
+    request added. may_retry: False at the step limit or once the turn has an outcome, as for an announced step."""
     items, messages = session["items"], session["messages"]
     one = len(completion.unmade) == 1
     names = ", ".join(completion.unmade[:-1]) + " and " * (not one) + completion.unmade[-1]
@@ -1754,6 +1790,8 @@ def _unmade(session: dict, turn: Turn, request: dict, completion: llm.Completion
         if id(items[index]) in gone:
             del items[index]
     if retry:
+        # The retry reads what is left of the reply; from the next turn on, what happened (send).
+        messages[-1][context.UNRUN] = True
         turn.unrun_claim = request[completion_guard.CORRECTED] = True
         if notice is not None:
             notice["text"] += f" Asked the assistant to run {'it' if one else 'them'}."
@@ -1908,6 +1946,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
     # Keeping them there also preserves them through save/load and checkpoint restoration.
     turn.executed_tools = request.get(completion_guard.EXECUTED, turn.executed_tools)
     turn.unrun_claim = request.get(completion_guard.CORRECTED, turn.unrun_claim)
+    if turn.try_it:  # send() found the card's request unedited; resume() has only this mark.
+        request[TRY_IT] = turn.try_it
+    turn.try_it = request.get(TRY_IT, "")
     scene_action = completion_guard.scene_request(request)
     plan_turn = uuid.uuid4().hex
     consent = None
@@ -1917,7 +1958,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
     try:
         cfg = turn.config or config.load()
         first = None
-        if turn.try_it and not turn.tool_steps:
+        if turn.try_it and not turn.tool_steps and not turn.executed_tools:  # Resumed, the card's call has run.
             from . import try_it
             call = try_it.first_call(turn.try_it, session, _session_schemas(session, spec))
             if call is not None:
@@ -1947,7 +1988,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if spec.on_turn_start:
                     spec.on_turn_start(session, turn)
                     if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
-                        spec = turn.spec
+                        spec, cfg = turn.spec, turn.config or cfg  # With that loop's config (_route).
                 if scene_action is None:
                     scene_action = bool(turn.routed and turn.routed.level > 0)
                 if spec.drive:
@@ -1986,6 +2027,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                             s["function"]["name"] for s in _session_schemas(session, spec)))):
                     turn.unrun_claim = request[completion_guard.CORRECTED] = True
                     bounce = completion_guard.CORRECTION
+                    messages[-1][context.UNRUN] = True  # Read as UNMADE_STORED from the next turn on (send).
                 # Before the finish gates: they stamp Verified records on a reply they let end the turn. Never on
                 # a reply that only wrote its calls out (one nudge per reply), or that stops honestly.
                 if not bounce and not written_out and not honest and _continue_announced(
@@ -2019,6 +2061,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             for number, call in enumerate(completion.tool_calls, 1):
                 if turn.cancel.is_set():
                     raise llm.Cancelled()
+                # Decided before the card's text: worker slots only free up between delegate calls, so a card
+                # titled as the wait never asks.
+                approval = _approval(call.name, call.arguments, turn.roots, turn)
+                # Unasked only because it can start nothing: held to that when it runs, whatever frees by then.
+                capped = spec.asks and approval == "capped" and _asks("gate", call.name, session, cfg)
                 summary, code = _describe(call, spec.schemas)
                 card = state.item_tool(call.name, summary, code)
                 card["turn_id"] = plan_turn  # Keep correction status scoped to this turn, including folded notes.
@@ -2035,11 +2082,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if skip:  # Not run, so not failed: "rejected" is the card of a step that did not run.
                     card["status"], card["output"] = "rejected", skip
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": skip})
-                    if no_progress and no_progress.skip(key):
+                    if no_progress and (no_progress.skip(key) if twice else no_progress.refused(key)):
                         stalled = True
                         break
                     continue
-                approval = _approval(call.name, call.arguments, turn.roots)
                 if approval == "install" and not spec.asks:  # A worker cannot ask, so it cannot install.
                     card["status"] = "rejected"
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": INSTALL_REFUSAL})
@@ -2095,7 +2141,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 with cloud_account.approval_context(consent):
                     turn.executed_tools += 1
                     request[completion_guard.EXECUTED] = turn.executed_tools
-                    result = run_tool(call.name, arguments)
+                    turn.capped_call = call.id if capped else None
+                    try:
+                        result = run_tool(call.name, arguments)
+                    finally:
+                        turn.capped_call = None
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
                 changed = spec.scene_changed(result)
@@ -2135,6 +2185,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 card["output"] = result.text
                 if card.get("plan_turn") and getattr(result, "plan_refused", False):
                     card["plan_repair"] = "needed"
+                elif card.get("plan_turn") and getattr(result, "plan_capped", False):
+                    card["plan_repair"] = "capped"  # The turn's worker limit: a neutral card (ui.layout).
                 consent.finish(result)
                 if getattr(result, "receipt", "") and not consent.rig:
                     card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
@@ -2215,6 +2267,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             if config.on_service(cfg.base_url) and not ex.account:
                 from . import account
                 account.refresh_account()  # Older gateways may omit usage headers on a refusal.
+        elif getattr(ex, "code", "") in UPSTREAM_CODES and config.on_service(cfg.base_url):
+            items.append(state.item_error(_upstream_text(ex), retry=True))
         else:
             items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") in (llm.CONNECTION_LOST,
                                                                                      llm.EMPTY_REPLY)))
@@ -2357,6 +2411,9 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         # A nudge or record correction left last by a Stop or an error; resume() goes on from it, a new message
         # replaces it (it would ask the model to run what the user stopped).
         messages.pop()
+    for message in messages:
+        if message.pop(context.UNRUN, False):  # A reply sent back last turn: its claims are not read as work done.
+            message["content"] = UNMADE_STORED
     if turn.config is not None and config.on_service(turn.config.base_url):
         turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),
                            "messages": deepcopy(session["messages"]), "references": list(session["references"]),
