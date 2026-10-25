@@ -463,6 +463,20 @@ class TryItTest(unittest.TestCase):
             checkpoints.restore(self.session, undo)
         self.assertEqual(self.session["messages"], original)
 
+    def test_a_restored_away_photo_is_no_longer_attached_until_undo(self):
+        """2026-10-25: after a restore the Try it photo stayed attached, and the model used its name for the user's
+        own picture."""
+        self.prepare()
+        self.run_turn()
+        made = {"ref": "job.png", "full": "job.png", "name": "Loopcut job_1 out", "pinned": True}  # In no message.
+        self.session["references"].append(made)
+        attached = list(self.session["references"])
+        with patch.object(checkpoints, "_blocking_job", return_value=""):
+            checkpoints.restore(self.session, self.session["items"][0]["checkpoint"])
+            self.assertEqual(self.session["references"], [made])
+            checkpoints.restore(self.session, self.session["items"][-1]["checkpoint"])
+        self.assertEqual(self.session["references"], [made, attached[0]], "undo attaches it again")
+
 
 if __name__ == "__main__":
     unittest.main()

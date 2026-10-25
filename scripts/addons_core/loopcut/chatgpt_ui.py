@@ -204,6 +204,7 @@ def model_used(account: tuple, requested: str, actual: str) -> None:
 
 
 class LOOPCUT_OT_chatgpt_check(bpy.types.Operator):
+    """Use your ChatGPT plan and check that it is ready."""
     bl_idname = "loopcut.chatgpt_check"
     bl_label = "Check ChatGPT"
     bl_options = {"INTERNAL"}
@@ -267,6 +268,7 @@ class LOOPCUT_OT_chatgpt_sign_in(bpy.types.Operator):
 
 
 class LOOPCUT_OT_chatgpt_cancel(bpy.types.Operator):
+    """Stop signing in with ChatGPT."""
     bl_idname = "loopcut.chatgpt_cancel"
     bl_label = "Cancel"
     bl_options = {"INTERNAL"}

@@ -610,6 +610,7 @@ class LOOPCUT_OT_open_sign_in_page(bpy.types.Operator):
 
 
 class LOOPCUT_OT_cancel_sign_in(bpy.types.Operator):
+    """Stop signing in to Loopcut."""
     bl_idname = "loopcut.cancel_sign_in"
     bl_label = "Cancel"
     bl_options = {"INTERNAL"}

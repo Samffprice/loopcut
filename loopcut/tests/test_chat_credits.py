@@ -66,12 +66,14 @@ class ParsingTest(unittest.TestCase):
                     {"account": "credits"}):
             self.assertEqual(chat_credits.billing(bad, True), "")
 
-    def test_step_label_rounds_per_step_to_a_whole_credit_never_under_one(self):
-        for per_step, label in ((0.84, "≈1 credit / step"), (0.2, "≈1 credit / step"), (2.6, "≈3 credits / step"),
-                                (None, "≈1 credit / step"), ("1", "≈1 credit / step"), (-1, "≈1 credit / step")):
+    def test_step_label_shows_a_tenth_under_one_credit_and_whole_credits_above(self):
+        for per_step, label in ((0.84, "≈0.8 credits / step"), (0.2, "≈0.2 credits / step"), (0.04, "≈0.1 credits / step"),
+                                (1.2, "≈1 credit / step"), (2.6, "≈3 credits / step"), (None, "≈1 credit / step"),
+                                ("1", "≈1 credit / step"), (-1, "≈1 credit / step")):
             with self.subTest(per_step=per_step):
                 self.assertEqual(chat_credits.step_label({"chat_credits": {"per_step": per_step}}), label)
-        self.assertEqual(chat_credits.step_label({"chat_credits": {"per_step": 0.84}}, short=True), "≈1 / step")
+        self.assertEqual(chat_credits.step_label({"chat_credits": {"per_step": 0.84}}, short=True), "≈0.8 / step")
+        self.assertEqual(chat_credits.step_label({"chat_credits": {"per_step": 0.2}}, short=True), "≈0.2 / step")
 
     def test_monthly_names_the_plans_grant_even_in_the_sign_up_month(self):
         self.assertEqual(chat_credits.monthly({"plan": "free", "credits": {"balance": 100, "monthly": 0}}), 100)
@@ -646,7 +648,8 @@ class PanelTest(unittest.TestCase):
 
 
 class LowCreditsTest(unittest.TestCase):
-    """0.2.15 item 5: one quiet heads-up at about 20 credits, from the replies' balance, once a refill period."""
+    """0.2.15 item 5: one quiet heads-up at about 20 credits, from the replies' balance, once a refill period; on Pro
+    and Max only since 0.2.18 (owner: free users meet the out-of-credits offer unwarned)."""
 
     def setUp(self):
         from loopcut import agent, cloud, nudges
@@ -668,7 +671,15 @@ class LowCreditsTest(unittest.TestCase):
                 patch.object(chat_credits.time, "time", return_value=NOW):
             self.agent._warn_low_credits(items, info, None)
 
-    def test_once_per_refill_period_with_the_offer(self):
+    def test_never_on_the_free_plan(self):
+        items = []
+        for balance in (18, 9, 1):
+            self.warn(items, balance)
+        self.assertEqual(items, [])
+        self.assertEqual(self.seen, [])
+
+    def test_once_per_refill_period_with_add_credits_on_pro(self):
+        self.account["plan"] = "pro"
         items = []
         self.warn(items, 21)
         self.assertEqual(items, [])
@@ -676,9 +687,9 @@ class LowCreditsTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         notice = items[0]
         self.assertEqual(notice["kind"], "notice")
-        self.assertEqual(notice["text"], "18 credits left ($0.18)\n25 free credits come back Fri 30 Oct")
-        self.assertEqual(notice["action_label"], "Get Pro · $20 a month")
-        self.assertIn("plan=pro", notice["url"])
+        self.assertTrue(notice["text"].startswith("18 credits left ($0.18)\n"), notice["text"])
+        self.assertEqual(notice["action_label"], "Add credits")
+        self.assertIn("/account?from=app&reason=low_credits", notice["url"])
         self.assertEqual(self.seen, [("low_chat_credits", "2026-10-30T09:12:00Z")])
         self.warn(items, 9)
         self.assertEqual(len(items), 1)  # Once in this refill period.
@@ -688,6 +699,7 @@ class LowCreditsTest(unittest.TestCase):
         self.assertFalse(any(v in " ".join(i["text"] for i in items) for v in VENDORS))
 
     def test_a_reply_in_the_live_chat_brings_it_and_no_window_warning(self):
+        self.account["plan"] = "pro"
         session = state.reset()
         info = {"plan": "free", "billing": "credits", "credits_balance": 18,
                 "session": {"used": 0.95, "resets_at": "2026-10-24T01:00:00Z"}, "week": {"used": 0.97}}

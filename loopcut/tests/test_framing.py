@@ -3,6 +3,7 @@ shift, the look-at rotation, the exact fit and the coverage report. Also how the
 tool: a scene change that asks first, except report_only. The real thing, evaluated vertices checked
 with world_to_camera_view, is loopcut/harness/camera_check.py."""
 
+import contextlib
 import json
 import math
 import random
@@ -508,6 +509,41 @@ class ToolTest(unittest.TestCase):
             self.assertTrue(SAME_WHILE_UNCHANGED("frame_camera", report), "the same report twice is a repeat")
         self.assertTrue(CHANGES_SCENE("frame_camera", '{"report_only": false}'))
         self.assertTrue(CHANGES_SCENE("run_python"), "other tools as before")
+
+    def test_one_undo_push_before_the_change_and_one_after_it_also_when_it_fails_part_way(self):
+        """camera._undo_push (frame_camera, uv_tools, paint_tools) owes the push after the change, and
+        tools.execute makes it when the tool returns or raises; none for a refusal before any push."""
+        push, editor = mock.Mock(), mock.Mock(side_effect=lambda _: contextlib.nullcontext())
+        fake = types.SimpleNamespace(ops=types.SimpleNamespace(ed=types.SimpleNamespace(undo_push=push)))
+
+        def frames(fail=False):
+            camera._undo_push("Before Loopcut: frame camera")
+            if fail:  # A camera it created stays in the scene: in the undo step all the same.
+                raise tools.ToolError("Nothing to frame: the objects have no size.")
+            return tools.ToolResult("framed")
+
+        def refuses():
+            raise tools.ToolError("margin must be between 0 and 0.45")
+
+        pair = [mock.call(message="Before Loopcut: frame camera"), mock.call(message="Loopcut: frame camera")]
+        with mock.patch.object(camera, "bpy", fake), mock.patch.object(tools, "bpy", fake), \
+                mock.patch.object(tools, "_editor_context", editor), \
+                mock.patch.dict(camera.DISPATCH, {"frame_camera": frames, "refuses": refuses}):
+            for arguments, ok in (("{}", True), ('{"fail": true}', False)):
+                push.reset_mock()
+                self.assertEqual(tools.execute("frame_camera", arguments).ok, ok)
+                self.assertEqual(push.call_args_list, pair)
+            self.assertEqual(editor.call_args_list[-2:], [mock.call("")] * 2, "the after push polls in the same editor")
+            push.reset_mock()
+            self.assertFalse(tools.execute("refuses", "{}").ok)
+            push.assert_not_called()
+            frames()  # Called outside execute nothing is owed; the push before it as ever.
+            self.assertEqual(push.call_args_list, pair[:1])
+            push.reset_mock()
+            with mock.patch.object(tools, "UNDO_AFTER", False):  # A worker's child Blender.
+                tools.execute("frame_camera", "{}")
+            self.assertEqual(push.call_args_list, pair[:1])
+        self.assertEqual(tools._undo_owed, [])
 
     def test_card_label(self):
         self.assertEqual(agent._describe(types.SimpleNamespace(name="frame_camera", arguments='{"objects":["Table"]}'))[0],

@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import os
 import re
 import shutil
 import tempfile
@@ -25,6 +26,8 @@ TERMINAL = {"succeeded", "failed", "canceled"}
 STATES = {"queued", "running"} | TERMINAL
 OUTPUT_TYPES = {"image", "model_3d", "material", "audio", "video", "render_frames", "report", "motion", "rig"}
 POLL_SECONDS = .25
+CANCEL_SECONDS = 60  # After a cancel (Stop, the panel), how long the server has to confirm it before the call gives up.
+CANCEL_POLL_SECONDS = 2  # Between asks meanwhile.
 STREAM_TIMEOUT = 2
 STREAM_ATTEMPTS = 2
 MAX_EVENT = 4 * 1024 * 1024
@@ -228,16 +231,35 @@ def _remember(job, title, cancel, inputs=None, apply_args=None, references=None,
     return True
 
 
+def _heard(cancel):
+    """The server answered (an event or its keepalive, a poll, a downloaded chunk): progress for the stall clock of the
+    turn that made the call (cloud._Cancel.heard, agent.check_stall)."""
+    heard = getattr(cancel, "heard", None)
+    if heard is not None:
+        heard()
+
+
+def _unconfirmed(job):
+    return cloud_http.CloudError(f"Cloud job cancel not confirmed in {CANCEL_SECONDS} s; it may still finish and be "
+                                 "charged", "canceled", extra={"job": job})
+
+
 def _wait_known(job_id, cancel, on_progress):
-    """A blocking replay joins the original job without replacing its panel entry."""
+    """A blocking replay joins the original job without replacing its panel entry; the call that started the job
+    follows it (and hears the server)."""
+    canceled_at = None
     while True:
         if cancel.is_set():
             cancel_job(job_id)
+            canceled_at = canceled_at or time.monotonic()
         job = job_status(job_id)
         if on_progress:
             on_progress(_job_progress(job))
         if job["status"] in TERMINAL:
             return job
+        if canceled_at is not None and time.monotonic() - canceled_at >= CANCEL_SECONDS:
+            raise _unconfirmed(job)
+        _heard(cancel)
         time.sleep(POLL_SECONDS)
 
 
@@ -340,6 +362,7 @@ def parse_sse(response, cancel=None):
         raw = response.readline(MAX_EVENT + 1)
         if not raw:
             return
+        _heard(cancel)
         size += len(raw)
         if size > MAX_EVENT:
             raise _invalid("Cloud event is too large")
@@ -378,6 +401,7 @@ def _follow(client, job, cancel, on_progress):
     for _ in range(STREAM_ATTEMPTS):
         if cancel.is_set():
             job = _job(client.request("POST", path + "/cancel"), expected=job)
+            _heard(cancel)
             if job['status'] in TERMINAL:
                 return job
             break  # Cancellation may be acknowledged before the worker stops; keep polling.
@@ -416,12 +440,20 @@ def _follow(client, job, cancel, on_progress):
             if ex.code != "connection_failed":
                 break
         # EOF without done reconnects with the last fully processed event id.
+    canceled_at = None
     while True:
         method, suffix = ("POST", "/cancel") if cancel.is_set() else ("GET", "")
         job = _job(client.request(method, path + suffix), expected=job)
+        _heard(cancel)
         _update(job, on_progress, final=job['status'] in TERMINAL)
         if job["status"] in TERMINAL:
             return job
+        if cancel.is_set():  # Asked again until confirmed, for CANCEL_SECONDS; a set event's wait() returns at once.
+            canceled_at = canceled_at or time.monotonic()
+            if time.monotonic() - canceled_at >= CANCEL_SECONDS:
+                raise _unconfirmed(job)
+            time.sleep(CANCEL_POLL_SECONDS)
+            continue
         cancel.wait(POLL_SECONDS)
 
 
@@ -460,6 +492,7 @@ def _download(client, job, cancel):
                     chunk = response.read(blobs.CHUNK_SIZE)
                     if not chunk:
                         break
+                    _heard(cancel)
                     size += len(chunk)
                     if size > output["size"]:
                         raise cloud_http.CloudError("Cloud output size does not match", "hash_mismatch")
@@ -679,9 +712,22 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
             from . import files
             path = files.check(files.resolve(value))
             if not path.is_file():
-                raise _input_error("Scene reference or file was not found", field)
+                last = attached_last()
+                raise _input_error("Scene reference or file was not found" + (
+                    f". Images the user attached last, newest first: {', '.join(last)}" if last else ""), field)
         found[field] = path
     return found
+
+
+def attached_last() -> list[str]:
+    """The names of the images on the newest message the user attached images to, newest first; a clip's sheets
+    are left out. A name that is not found gets them: given none, a model passed "character reference" to photo→3D,
+    and after a restore the name of a photo no longer attached (2026-10-25)."""
+    from . import context, conversations, state
+    session = state.session()
+    names = {r["ref"]: r["name"] for r in session.get("references") or () if not r.get("video")}
+    message = next((m for m in reversed(session.get("messages") or ()) if m.get(conversations.ATTACHED)), {})
+    return list(dict.fromkeys(names[ref] for ref in reversed(context._image_refs(message)) if ref in names))
 
 
 def attached_image(name: str) -> Path | None:
@@ -897,6 +943,58 @@ def result_summary(handler, job, names=(), reports=()):
     return safe_value(line + ("\n" + "\n".join(reports) if reports else ""))
 
 
+_ASSET_SEARCH = "loopcut.asset_search/1"  # asset_report.SCHEMA, without that module's bpy imports.
+# "full": the model gets an asset search's whole JSON again, not its table (asset_search.report_text), to compare.
+ASSET_REPORT = "LOOPCUT_ASSET_REPORT"
+_LICENSES = {"CC0-1.0": "CC0", "CC-BY-4.0": "CC BY 4.0"}
+
+
+def report_line(label, reports):
+    """Pure: the card's line for attached reports, in place of their JSON (the card's output keeps it whole; an
+    asset search's 12k characters of it read as a "massive wall of text", 0.2.17 walkthrough). reports: each
+    parsed, or None. An asset search's line reads only results[].title, .source and .license.id, and
+    sources[].id and .name, each only when it is there; anything else is how many items a report holds."""
+    shown = lambda value: isinstance(value, str) and 0 < len(value) <= 200 and value.isprintable()
+    report = reports[0] if len(reports) == 1 else None
+    if isinstance(report, dict) and report.get("schema") == _ASSET_SEARCH:
+        rows = report["results"] if isinstance(report.get("results"), list) else []
+        line = f"Searched libraries: {len(rows)} match{'' if len(rows) == 1 else 'es'}"
+        best = rows[0] if rows and isinstance(rows[0], dict) else {}
+        sources = report["sources"] if isinstance(report.get("sources"), list) else []
+        names = {s["id"]: s.get("name") for s in sources if isinstance(s, dict) and isinstance(s.get("id"), str)}
+        source = best.get("source") if isinstance(best.get("source"), str) else None
+        source = names.get(source) if shown(names.get(source)) else source
+        lic = best["license"].get("id") if isinstance(best.get("license"), dict) else None
+        lic = _LICENSES.get(lic, lic) if isinstance(lic, str) else None
+        about = ", ".join(value for value in (source, lic) if shown(value))
+        if shown(best.get("title")):
+            line += f"; best: {best['title']}" + (f" ({about})" if about else "")
+        return line
+    if len(reports) > 1:
+        return f"{label}: {len(reports)} reports attached"
+    if isinstance(report, dict):
+        report = next((report[key] for key in ("results", "items") if isinstance(report.get(key), list)), None)
+    count = f" ({len(report)} item{'' if len(report) == 1 else 's'})" if isinstance(report, list) else ""
+    return f"{label}: report attached{count}"
+
+
+def _report_json(output):
+    try:
+        with Path(output["path"]).open("rb") as handle:
+            return json.loads(handle.read(MAX_REPORT_FILE + 1))
+    except (OSError, ValueError, RecursionError):
+        return None  # A report need not be JSON.
+
+
+def _asset_table(output):
+    """The model's copy of an asset search's report: its table, or None for the JSON (not one, or a row
+    import_asset cannot take)."""
+    from . import asset_search
+    from .cloud import safe_value
+    table = asset_search.report_text(_report_json(output))
+    return None if table is None else safe_value(f"{output['name']}:\n{table}")
+
+
 def _report_text(output):
     path = Path(output["path"])
     with path.open("r", encoding="utf-8") as handle:
@@ -909,7 +1007,6 @@ def _report_text(output):
 
 def _reports(job):
     import bpy
-    from . import conversations, state
     reports = []
     for output in job["outputs"]:
         if output["type"] != "report":
@@ -923,11 +1020,8 @@ def _reports(job):
         text = safe_value(text)
         block = bpy.data.texts.new(f"Loopcut {job['id']} {output['name']}")
         block.write(text)
-        report = _report_text(output)
-        reports.append(report)
-        session = state.session()
-        session["items"].append(state.item_notice(report))
-        conversations.save(session)
+        # Not also a notice in the chat: that was the report's JSON again, unfolded. Its card has a line for it.
+        reports.append(_report_text(output))
     return reports
 
 
@@ -1574,10 +1668,21 @@ def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
     try:
         names = handlers[handler](job)
         reports = _reports(job) if handler not in ("none", "apply_motion", "apply_rig") else []
+        if reports and details is not None:
+            from .cloud import _display, safe_value
+            label = _display(descriptor, "title") or descriptor.get("title") or descriptor.get("name") or "Cloud tool"
+            details["outcome"] = safe_value(report_line(label, [_report_json(o) for o in job["outputs"]
+                                                                 if o["type"] == "report"]))
         if handler == "apply_motion" and job.get("tool") in MOTION_CHECK:
             reports = [MOTION_CHECK[job["tool"]]]
         if descriptor.get("name") == "asset_search" and handler == "attach_report":
             _remember_assets(job)
+            tables = [] if os.environ.get(ASSET_REPORT, "").strip() == "full" else [
+                _asset_table(o) for o in job["outputs"] if o["type"] == "report"]
+            if any(tables):
+                if details is not None:  # The card's output keeps the JSON, behind its line.
+                    details["card_output"] = result_summary(handler, job, names, reports)
+                reports = [table or text for table, text in zip(tables, reports)]
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as ex:
         if isinstance(ex, cloud_http.CloudError):
             raise

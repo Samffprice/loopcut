@@ -129,10 +129,11 @@ def reap(now: float | None = None) -> None:
 # ------------------------------------------------------------------ the job: one turn's waves
 
 def budget_steps_left(*, steps: int, elapsed: float, seconds: float, job_steps: int, usd: float,
-                      max_usd: float, running: int, priced: bool) -> float | None:
+                      max_usd: float, running: int, priced: bool, max_steps: int = 0) -> float | None:
     """Estimate from observed mean seconds/step and shared dollars/step, before the next request.
     No sample on the first request. Unknown prices and zero-cost samples leave only the time estimate;
-    concurrent workers share the dollars remaining. This is a warning estimate, never a step limit."""
+    concurrent workers share the dollars remaining; the account's worker_max_steps (max_steps, the worker's own
+    count to stop at) leaves what it leaves. This is a warning estimate; JobBudget.spent is what stops a worker."""
     if steps < 1:
         return None
     estimates = []
@@ -140,40 +141,49 @@ def budget_steps_left(*, steps: int, elapsed: float, seconds: float, job_steps: 
         estimates.append(max(0, seconds - elapsed) / (elapsed / steps))
     if priced and max_usd > 0 and usd > 0 and job_steps > 0:
         estimates.append(max(0, max_usd - usd) / (usd / job_steps * max(1, running)))
+    if max_steps:
+        estimates.append(max(0, max_steps - steps))
     return min(estimates) if estimates else None
 
 
 class JobBudget:
-    """Shared dollars for one turn and seconds per worker run; worker steps are counted, never capped.
-    prices: the account's own (config.Roles.prices), before pricing.PRICES. reported: the account's terms
-    apply, so a reply's usage.cost is what it is charged (without them, the tokens as in 0.2.15)."""
+    """Shared dollars for one turn and seconds per worker run; worker steps are counted, and capped per run only
+    by the account's worker_max_steps (steps, config.Roles), 0 without it. prices: the account's own
+    (config.Roles.prices), before pricing.PRICES. reported: the account's terms apply, so a reply's usage.cost
+    is what it is charged (without them, the tokens as in 0.2.15)."""
 
-    def __init__(self, usd: float, seconds: float, clock=None, *, prices: dict | None = None, reported=False):
-        self.max_usd, self.seconds = usd, seconds
+    def __init__(self, usd: float, seconds: float, clock=None, *, prices: dict | None = None, reported=False,
+                 steps: int = 0):
+        self.max_usd, self.seconds, self.max_steps = usd, seconds, steps
         self.prices, self.reported = dict(prices or {}), reported
         self.steps, self.usd = 0, 0.0
         self.costed = False  # A reply said what it cost (usage.cost): its dollars count even for an unpriced model.
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
 
-    def spent(self, started: float | None = None) -> str:
-        """Why a worker may not go on, or "". started: when that worker's run began (its seconds)."""
+    def spent(self, started: float | None = None, steps: int | None = None, cap: int | None = None) -> str:
+        """Why a worker may not go on, or "". started: when that worker's run began (its seconds); steps: the
+        requests it has made; cap: the count it stops at (Worker.step_cap, max_steps unless a retry raised it)."""
+        cap = self.max_steps if cap is None else cap
         if self.max_usd and self.usd >= self.max_usd:
             return f"the job's ${self.max_usd:.2f} is used"
         if started is not None and self.clock() - started >= self.seconds:
             return f"its {self.seconds:g} s ran out"
+        if cap and steps is not None and steps >= cap:
+            return f"its {cap} steps are used"
         return ""
 
     def take_step(self, started: float, *, worker_steps: int = 0, running: int = 1,
-                  priced: bool = True) -> float | None:
+                  priced: bool = True, cap: int | None = None) -> float | None:
         """Before a worker's request: check, estimate, then count it. A spent budget raises BudgetStop."""
+        cap = self.max_steps if cap is None else cap
         with self._lock:
-            reason = self.spent(started)
+            reason = self.spent(started, worker_steps, cap)
             if reason:
                 raise agent.BudgetStop(reason)
             left = budget_steps_left(steps=worker_steps, elapsed=self.clock() - started, seconds=self.seconds,
                                      job_steps=self.steps, usd=self.usd, max_usd=self.max_usd,
-                                     running=running, priced=priced)
+                                     running=running, priced=priced, max_steps=cap)
             self.steps += 1
             return left
 
@@ -207,7 +217,7 @@ class Job:
         self.id = f"{turn}-{n}"
         self.folder = jobs_root() / session["id"] / self.id
         self.budget = JobBudget(roles.job_max_usd, roles.worker_max_seconds, prices=dict(getattr(roles, "prices", ())),
-                                reported=getattr(roles, "terms", False))
+                                reported=getattr(roles, "terms", False), steps=getattr(roles, "worker_max_steps", 0))
         self.max_workers = roles.max_workers
         # Workers this turn may start in all (workers_left), and how many it started before a resume (end_turn).
         self.turn_workers = getattr(roles, "turn_workers", 0)
@@ -449,7 +459,7 @@ class _HostRuntime:
                      "checks": brief["checks"], "advisory": brief.get("advisory") or [],
                      "requirements": brief.get("requirements") or [],
                      "defaults": brief.get("defaults") or [], "owns": brief.get("owns") or [],
-                     "boxes": _planned_boxes(brief), "run_timeout": config.run_timeout(),
+                     "boxes": _planned_boxes(brief), "run_timeout": child.run_timeout,
                      "reference": getattr(worker, "reference", None)}
         parent = {name: self._parent_tool(wave, name, worker.cancelled) for name in ("search_assets", "look_at_reference")}
         parent["fetch_asset"] = lambda arguments: wave.on_main(lambda: _fetch_asset(arguments, wave.session))
@@ -578,7 +588,10 @@ class Worker:
         self.crash_error = ""
         self.crashes: list = []   # {tool, error, kept}: each time its child died; kept, its crash kit (worker_host).
         self.retries = self.rollbacks = self.steps = 0
-        self.budget_warned = False  # One warning per run, also across a child crash/retry.
+        # One warning per run, also across a child crash/retry, unless the account's worker_max_steps gave the
+        # retry steps of its own (_work).
+        self.budget_warned = False
+        self.step_cap = wave.job.budget.max_steps  # The count of requests it stops at; 0: no cap.
         self.first_call_cached = None
         self.usage = {"input": 0, "cached": 0, "output": 0, "requests": 0}
         self.usd: float | None = None  # Its dollars as the job's budget counted them (JobBudget.add).
@@ -635,7 +648,7 @@ class Worker:
     def before_request(self, step: int) -> None:
         if self.cancelled():
             raise llm.Cancelled()
-        spent = self.wave.job.budget.spent(self.started)
+        spent = self.wave.job.budget.spent(self.started, self.steps, self.step_cap)
         if spent:  # Before any wait: a spent budget stops the worker now.
             raise agent.BudgetStop(spent)
         if self.index > 0 and not self.wave.first_reply.is_set():
@@ -652,7 +665,7 @@ class Worker:
                 raise llm.Cancelled()
             running = sum(w.thread is not None and w.finished is None for w in job.crew)
         left = job.budget.take_step(self.started, worker_steps=self.steps, running=running,
-                                    priced=job.budget.priced(self.model))
+                                    priced=job.budget.priced(self.model), cap=self.step_cap)
         if not self.budget_warned and left is not None and left <= agent.STEPS_LEFT_NOTICE:
             self.budget_warned = True
             note = self.spec.steps_left_note.format(left=agent.STEPS_LEFT_NOTICE).strip()
@@ -686,6 +699,7 @@ class Worker:
 
     def on_usage(self, usage: dict) -> None:
         self.row["steps"] = self.steps  # A reply has arrived; an outstanding request is not a step yet.
+        self.wave.turn.touch("its workers")  # The user's turn's stall clock (agent.check_stall).
         if self.t["first_reply"] is None:
             self.t["first_reply"] = self._now()
             self.first_call_cached = int(usage.get("cached") or 0)
@@ -881,6 +895,10 @@ class Worker:
                 self.session["messages"].append({"role": "user", context.STEER: True,
                                                  "content": CRASH_NOTE.format(tool=self.crashed)})
                 self.crashed = ""
+                cap = self.wave.job.budget.max_steps
+                if cap:  # The retry builds again from the brief: at least half the account's steps, and a warning.
+                    self.step_cap = self.steps + max(self.step_cap - self.steps, cap // 2)
+                    self.budget_warned = False
                 self.turn = self._new_turn(self.turn.cancel)
             self._end()
         except llm.Cancelled:

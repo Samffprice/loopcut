@@ -3,6 +3,7 @@
 import ast
 import contextlib
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -113,7 +114,7 @@ class HostAreaGuardTest(unittest.TestCase):
     def test_run_restores_host_after_timeout(self):
         clock = N(now=0)
         self.bpy.expire = lambda: setattr(clock, "now", 61)
-        with mock.patch.object(tools, "time", N(monotonic=lambda: clock.now)):
+        with mock.patch.object(tools, "time", N(monotonic=lambda: clock.now, sleep=time.sleep)):
             result = tools.run_python("bpy.context.window.screen.areas[0].type = 'IMAGE_EDITOR'\n"
                                       "bpy.expire()\npass")
         self.assertFalse(result.ok)

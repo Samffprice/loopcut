@@ -12,6 +12,7 @@ configuration, loop selection, HTTP, hosted prompt resolution and panel layout a
 
 import argparse
 from contextlib import contextmanager, ExitStack
+import gzip
 import importlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -46,6 +47,8 @@ class ProductionStub(BaseHTTPRequestHandler):
 
     def dispatch(self):
         body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        if self.headers.get('Content-Encoding') == 'gzip':  # Chat completions, as production takes them.
+            body = gzip.decompress(body)
         self.server.requests.append({'path': self.path, 'method': self.command,
             'headers': {k.lower(): v for k, v in self.headers.items()},
             'body': json.loads(body) if body else None})
@@ -275,10 +278,14 @@ def exercise(url, key, mode, directory, server_requests=None):
 
         def record(transport):
             def send(request, *args, **kwargs):
+                headers = {k.lower(): v for k, v in request.header_items() if k.lower() != 'authorization'}
+                data = request.data
+                if data and headers.get('content-encoding') == 'gzip':  # Hosted chat bodies (llm, 0.2.18).
+                    data = gzip.decompress(data)
                 requests.append({'path': urlsplit(request.full_url).path, 'method': request.get_method(),
                     'auth': any(k.lower() == 'authorization' for k, _ in request.header_items()),
-                    'headers': {k.lower(): v for k, v in request.header_items() if k.lower() != 'authorization'},
-                    'body': json.loads(request.data) if request.data else None})
+                    'headers': headers, 'body': json.loads(data) if data else None,
+                    'gzip': data is not request.data})
                 return transport(request, *args, **kwargs)
             return send
         stack.enter_context(patch.object(m.cloud_http, 'urllib_transport', record(m.cloud_http.urllib_transport)))
@@ -363,6 +370,10 @@ def exercise(url, key, mode, directory, server_requests=None):
                 m.agent.run_loop(session, turn, turn.spec, run_tool=no_tool, ensure_checkpoint=no_tool)
                 check(turn.outcome == 'completed', model + ' completed a hosted turn')
                 chats = [r for r in requests[start:] if r['path'] == '/v1/chat/completions']
+                # A stand-in that refuses gzip (the contract mock, until it takes it as the gateway does) gets the
+                # session's first body twice: gzipped, then uncompressed (llm._gzip_refused). Count it once.
+                chats = [c for i, c in enumerate(chats) if not (c['gzip'] and i + 1 < len(chats)
+                         and not chats[i + 1]['gzip'] and chats[i + 1]['body'] == c['body'])]
                 identities = [r['headers'].get('x-loopcut-prompt') for r in chats]
                 wanted = ([None] if mode == 'prod' else ['single'] if model == 'fast' else ['router', 'orchestrator'])
                 check(identities == wanted, model + ' sent the expected prompt headers')

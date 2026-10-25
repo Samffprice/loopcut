@@ -42,6 +42,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
+from types import SimpleNamespace
 
 MAX_ENTRIES = 2000              # transcript entries per conversation (the schema's cap); the newest are kept.
 FIELD_SIDE = 16 * 1024          # characters kept at each end of a long text field.
@@ -870,6 +871,23 @@ def on_turn_end(session: dict, turn) -> None:
         print(f"Loopcut: conversation log not sent: {type(ex).__name__}")
 
 
+def on_closed(session: dict) -> None:
+    """Main thread, as conversations.load finds a turn that Blender closed before it ended: that conversation goes
+    up now, as cancelled, rather than only once its next turn ends. Its snapshot is made on a thread of its own and
+    queued on the main thread, as a turn's end does (on_turn_end). Never raises."""
+    try:
+        if not sharing_on():
+            return
+        provider, model = _current_route()
+        _first_seen.setdefault(session["id"], time.time())  # Its log: this Blender's lines from here on.
+        closed = SimpleNamespace(conversation_log={"provider": provider, "model": model}, outcome="cancelled",
+                                 error_code="")
+        threading.Thread(target=on_turn_end, args=(session, closed), name="loopcut-conversation-log",
+                         daemon=True).start()
+    except Exception as ex:
+        print(f"Loopcut: conversation log not sent: {type(ex).__name__}")
+
+
 def _sender_context() -> dict | None:
     """Main thread: who sends (install id, the Loopcut bearer if signed in), the request headers, the system and
     what to redact. None without an install id (background processes)."""
@@ -1069,7 +1087,8 @@ def _items_outcome(items: list) -> str:
     tail = [item for item in items[last_user + 1:] if isinstance(item, dict)]
     errors = [item for item in tail if item.get("kind") in ("error", "limit")]
     if errors:
-        return "cancelled" if errors[-1].get("text") == "Stopped." else "error"
+        from .conversations import CLOSED_MESSAGE
+        return "cancelled" if errors[-1].get("text") in ("Stopped.", CLOSED_MESSAGE) else "error"
     if last_user >= 0 and not any(item.get("kind") in ("assistant", "tool") for item in tail):
         return "empty"
     return "ok"

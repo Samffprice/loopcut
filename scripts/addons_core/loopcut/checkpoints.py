@@ -291,7 +291,7 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
     undo = _write_snapshot(store, "pre_restore", "Before restore",
                            message_index=cut_messages, item_index=cut_items)
     tail = {"messages": session["messages"][cut_messages:], "items": session["items"][cut_items:],
-            "input": session["input"]}
+            "input": session["input"], "references": session.get("references") or []}
     store.tail_path(undo["id"]).write_text(json.dumps(tail), encoding="utf-8")
 
     # 2. Load the snapshot. Whichever way it goes, Blender must not end up thinking the snapshot
@@ -318,6 +318,7 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
         raise CheckpointError(f"Restored, but Blender is pointing at {bpy.data.filepath or 'no file'}; use Save As.")
 
     # 3. The conversation.
+    cut = session["messages"][cut_messages:]
     if target["kind"] == "turn":
         removed = session["items"][cut_items:]
         text = target.get("input", next((i["text"] for i in removed if i["kind"] == "user"), ""))
@@ -336,6 +337,10 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
             session["messages"].extend(saved["messages"])
             session["items"].extend(saved["items"])
             session["input"], session["cursor"], session["anchor"] = saved["input"], len(saved["input"]), None
+            known = {r["ref"] for r in session.get("references") or []}
+            session["references"] = [*(session.get("references") or []),
+                                     *(r for r in saved.get("references") or [] if r["ref"] not in known)]
+    _drop_cut_references(session, cut)
     if destination:
         message = f"Restored. You are now working in {destination.name}; your original file was not changed."
     elif open_path:
@@ -350,6 +355,18 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
         conversations.add_project(session, str(destination))  # The chat belongs to the restored file too.
     conversations.save(session)
     return destination
+
+
+def _drop_cut_references(session: dict, cut: list) -> None:
+    """An image attached in a message the restore cut, and in none left, is no longer attached: a restored-away
+    Try it photo stayed in the list, and the model gave its name for the user's own picture (2026-10-25). An
+    undo puts it back with its messages (the tail keeps the list). Images attached outside any message (a
+    cloud job's outputs) stay."""
+    from . import context
+    gone = ({ref for m in cut for ref in context._image_refs(m)}
+            - {ref for m in session["messages"] for ref in context._image_refs(m)})
+    if gone:
+        session["references"] = [r for r in session.get("references") or [] if r["ref"] not in gone]
 
 
 def remove_stale_sessions(now: float | None = None) -> None:

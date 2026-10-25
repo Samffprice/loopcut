@@ -112,11 +112,14 @@ class RolesTest(unittest.TestCase):
                         env["LOOPCUT_MAX_STEPS"] = override
                     roles = self.roles(**env)
                     self.assertEqual(roles.orchestrator.max_steps, expected)
-                    self.assertFalse(hasattr(roles, "worker_max_steps") or hasattr(roles, "job_max_steps"))
+                    # Only an account's agent terms cap a worker's steps (test_agent_terms); none here.
+                    self.assertEqual((roles.worker_max_steps, roles.orchestrator_max_steps), (0, 0))
+                    self.assertFalse(hasattr(roles, "job_max_steps"))
 
     def test_old_worker_and_job_step_env_vars_are_ignored_even_when_invalid(self):
         roles = self.roles(LOOPCUT_WORKER_MAX_STEPS="not a number", LOOPCUT_JOB_MAX_STEPS="-1")
-        self.assertFalse(hasattr(roles, "worker_max_steps") or hasattr(roles, "job_max_steps"))
+        self.assertEqual(roles.worker_max_steps, 0, "the account's terms set it, never the old variable")
+        self.assertFalse(hasattr(roles, "job_max_steps"))
         self.assertEqual((roles.job_max_usd, roles.worker_max_seconds), (0.40, 1800))
 
     def test_invalid_turn_step_limits_are_clear_config_errors(self):
@@ -1896,6 +1899,40 @@ class AdvisoryRepairTest(unittest.TestCase):
                       "miss; they never fail your work):\n- a1: Armchair is flat shaded (at most 5% of faces smooth)\n"
                       "- a2: Armchair has at most 1,000 triangles\n", text)
 
+    def test_dims_copied_from_the_planned_box_are_warned_about_never_refused(self):
+        """2026-10-25 (Luna): a car squeezed into its 6x4x2.1 m slot, the brief's dims being the box's; five
+        briefs that day. The armchair's box is 0.8 x 0.8 x 0.935 m."""
+        plan, _ = self.repair([{"kind": "dims", "name": "Armchair", "size": [0.81, 0.79, 0.94]}])
+        self.assertEqual(orchestrator.dims_warnings(plan), [
+            "workers[0] (armchair).advisory: dims Armchair copied from planned bounds (0.81x0.79x0.94 m); state the "
+            "real object's size"])
+        self.assertEqual(orchestrator.validate_wave(plan, USER, LIVE), [])
+        for size in ([0.75, 0.8, 0.935], [0.8, 0.8, None], [0.7, 0.7, 0.8]):  # One axis 6% off, one any, all off.
+            plan, _ = self.repair([{"kind": "dims", "name": "Armchair", "size": size}])
+            self.assertEqual(orchestrator.dims_warnings(plan), [], size)
+        plan, _ = self.repair([{"kind": "flat_shaded"}])
+        self.assertEqual(orchestrator.dims_warnings(plan), [], "no dims, no warning")
+        plan["workers"][0]["bounds"] = None
+        plan["workers"][0]["advisory"] = [{"kind": "dims", "name": "Armchair", "size": [0.8, 0.8, 0.935]}]
+        self.assertEqual(orchestrator.dims_warnings(plan), [], "no planned box, nothing copied")
+
+    def test_the_dry_run_says_it_as_a_warning(self):
+        session = state.reset()
+        self.addCleanup(state.reset)
+        session["items"].append(state.item_user(USER))
+        cfg = config.Config(api_key="k", base_url=config.SERVICE_BASE_URL, model="fast", reasoning_effort="low",
+                            auto_run=True, auto_look=False, max_steps=0, context_budget=40_000)
+        session["turn"] = agent.Turn()
+        session["turn"].roles = config.Roles(orchestrator=cfg, worker=cfg, orchestrate=True)
+        wave = reference_wave()
+        wave["workers"][0]["advisory"] = [{"kind": "dims", "name": "Armchair", "size": [0.8, 0.8, 0.935]}]
+        with mock.patch.object(orchestrator, "live_facts", lambda plan: json.loads(json.dumps(LIVE))), \
+                mock.patch.object(orchestrator, "project", fake_camera):
+            result = orchestrator.delegate(wave, dry_run=True)
+        self.assertTrue(result.ok, result.text)
+        self.assertIn("- not refused (warning): workers[0] (armchair).advisory: dims Armchair copied from planned "
+                      "bounds (0.8x0.8x0.935 m); state the real object's size", result.text)
+
 
 class WorkerEditTest(unittest.TestCase):
     """P2: the orchestrator's own run_python changed the mesh or materials of an object a worker built:
@@ -2092,7 +2129,7 @@ class ReferencesTest(unittest.TestCase):
         plan, _ = self.repair(["arcane_still.jpg"])
         errors = orchestrator.validate_wave(plan, USER, self.live())
         self.assertEqual(errors, ["workers[0] (armchair).references: 'arcane_still.jpg' not attached; the user "
-                                  "attached ref1.jpg, Ref2.PNG"])
+                                  "attached (newest first) ref1.jpg, Ref2.PNG"])
         plan, _ = self.repair(["ref1.jpg"], live=LIVE)
         self.assertEqual(orchestrator.validate_wave(plan, USER, LIVE),
                          ["workers[0] (armchair).references: 'ref1.jpg' not attached; the user attached no images"])
@@ -2121,6 +2158,22 @@ class ReferencesTest(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertTrue(result.plan_refused)
             self.assertIn("workers[0] (armchair).references: 'ref9' not attached; the user attached ref1.jpg", result.text)
+
+    def test_the_attached_names_go_newest_first(self):
+        """2026-10-25: in attaching order, the picture the user just sent came last."""
+        session = state.reset()
+        self.addCleanup(state.reset)
+        turn = agent.Turn()
+        turn.roles = types.SimpleNamespace(orchestrate=True)
+        session["turn"] = turn
+        session["items"].append(state.item_user(USER))
+        session["references"] = [{"ref": f"loopcut-image:{c * 64}.png", "name": name, "pinned": True}
+                                 for c, name in (("a", "try-it.jpg"), ("b", "mine.png"), ("c", "try-it.jpg"))]
+        wave = reference_wave()
+        wave["workers"][0]["references"] = ["ref9"]
+        with mock.patch.object(orchestrator, "live_facts", lambda plan: json.loads(json.dumps(LIVE))):
+            result = orchestrator.delegate(wave, dry_run=True)
+        self.assertIn("'ref9' not attached; the user attached (newest first) try-it.jpg, mine.png", result.text)
 
     def test_a_brief_sent_back_keeps_its_workers_references_unless_it_names_others(self):
         threads = {"armchair": {"deliverable": "Armchair", "role": "modeling", "prefix": "Armchair", "wave": 1,

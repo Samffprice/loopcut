@@ -16,8 +16,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 
-from loopcut import (agent, asset_common, asset_picks, assets, blenderkit, conversations, polyhaven,  # noqa: E402
-                     state, tools)
+from loopcut import (agent, asset_common, asset_picks, asset_search, assets, blenderkit, conversations,  # noqa: E402
+                     polyhaven, state, tools)
 
 SWORD = "e6518593-7da8-4ae8-91a3-f189dd327d6d"
 TABLE = "1d00af94-b833-43ee-ae6e-53e40a3fb2c1"
@@ -33,6 +33,16 @@ def missing(library):
     def fail(asset_id, *args, **kwargs):
         raise tools.ToolError(f"{library} has no asset {asset_id!r}. Search first and use the id it gives.")
     return fail
+
+
+def index_row(source, asset_id, title, kind="model"):
+    """A row of the raw asset_search tool's report, as asset_report.validate_row takes one."""
+    return {"id": f"{source}:{asset_id}", "dedupe_keys": [f"{source}:{asset_id}"], "source": source,
+            "source_id": asset_id, "kind": kind, "title": title, "score": 0.9,
+            "license": {"id": "CC0-1.0", "name": "CC0 1.0", "url": "https://creativecommons.org/publicdomain/zero/1.0/"},
+            "attribution": {"required": False, "text": f"{title} (CC0).", "authors": ["Someone"]},
+            "page_url": f"https://{source}.test/{asset_id}", "preview_url": f"https://{source}.test/{asset_id}.png",
+            "import": {"source": source, "id": asset_id}, "tags": ["tag"]}
 
 
 class PickTest(unittest.TestCase):
@@ -242,6 +252,58 @@ class PickTest(unittest.TestCase):
         self.assertEqual(asset_picks.near("f" * 36), [])
 
 
+    # ------------------------------------------------------------------ the raw asset_search tool's report
+
+    def table(self):
+        """The raw tool's report as the model reads it (asset_search.report_text): numbered in the same table."""
+        rows = [index_row("polyhaven", "WoodFloor_001", "Wood Floor 001", "material"),
+                index_row("ambientcg", "Wood049", "Wood 049", "material"),
+                index_row("physicallybased", "Aluminum", "Aluminum", "material")]
+        report = {"schema": "loopcut.asset_search/1", "query": "wood floor", "results": rows, "notices": [],
+                  "filters": {"kind": "material", "license": "cc0", "sources": ["polyhaven", "ambientcg",
+                              "physicallybased"], "limit": 10, "max_polycount": None, "min_resolution": None},
+                  "sources": []}
+        return asset_search.report_text(report)
+
+    def test_every_sources_pick_imports_as_its_source_and_id_after_a_raw_report(self):
+        from loopcut import asset_libraries, indexed_assets, polypizza
+        self.blenderkit_search()                                                 # #1-#3
+        asset_picks.number("polypizza", "x1", "Tree")                            # #4, as its search numbers it
+        asset_picks.number("library", "Ess::metals.blend::MATERIAL::Gold", "Gold")  # #5
+        self.assertEqual([r.split(";")[0] for r in self.rows(self.table())],
+                         ["#6 Wood Floor 001 (polyhaven)", "#7 Wood 049 (ambientcg)", "#8 Aluminum (physicallybased)"])
+        for n, source, asset_id, module, function in (
+                (1, "blenderkit", SWORD, blenderkit, "import_blenderkit"),
+                (4, "polypizza", "x1", polypizza, "import_polypizza"),
+                (5, "library", "Ess::metals.blend::MATERIAL::Gold", asset_libraries, "import_asset"),
+                (6, "polyhaven", "WoodFloor_001", polyhaven, "import_polyhaven"),
+                (7, "ambientcg", "Wood049", indexed_assets, "import_indexed"),
+                (8, "physicallybased", "Aluminum", indexed_assets, "import_indexed")):
+            with self.subTest(source=source), mock.patch.object(module, function, autospec=True,
+                                                                return_value=tools.ToolResult("ok")) as imported:
+                self.assertEqual(assets.import_asset(pick=n).text, "ok")
+                self.assertEqual(assets.import_asset(source=source, id=asset_id).text, "ok")
+                first, second = imported.call_args_list
+                self.assertEqual(first, second, "the pick goes where its source and id go")
+                self.assertIn(asset_id, first.kwargs.values())
+
+    def test_a_mistyped_id_is_still_read_as_the_result_it_meant_after_a_raw_report(self):
+        self.blenderkit_search()
+        self.table()
+        with self.blenderkit_import() as imported:
+            result = assets.import_asset(source="blenderkit", id="1d00af94-b833-43e-ae6e-53e40a3f")
+        self.assertEqual([c.kwargs["asset_id"] for c in imported.call_args_list][-1], TABLE)
+        self.assertTrue(result.text.startswith("Read id '1d00af94-b833-43e-ae6e-53e40a3f' as #2 Gaming Table"))
+        with mock.patch.object(polyhaven, "import_polyhaven", autospec=True,
+                               side_effect=lambda asset_id, **k: tools.ToolResult("ok") if asset_id == "WoodFloor_001"
+                               else missing("Poly Haven")(asset_id)) as haven:
+            slip = assets.import_asset(source="polyhaven", id="woodfloor_001")
+            bare = assets.import_asset(id="WoodFloor_001")
+        self.assertEqual(slip.text, "Read id 'woodfloor_001' as #4 Wood Floor 001 (polyhaven id WoodFloor_001).\nok")
+        self.assertEqual(bare.text, "ok", "an id alone: the one result shown with it")
+        self.assertEqual(haven.call_args_list[-1].kwargs, {"asset_id": "WoodFloor_001"})
+
+
 class SafeRescueTest(unittest.TestCase):
     """Review of 8e5bdcc53f2: the rescue must never import a different asset. Only a mangled UUID may be
     off by edits or matched by its first 8 hex characters; any other id must be the same but for case and
@@ -342,6 +404,49 @@ class ReviewFixTest(unittest.TestCase):
             imported.assert_not_called()
             self.assertEqual(tools.execute("import_asset", json.dumps({"pick": 1, "id": SWORD})).text, "imported",
                              "both naming the same result is fine")
+
+    def test_source_and_id_beside_a_pick_that_names_nothing_import_as_given(self):
+        # GPT-6 Luna after a cloud search, whose rows had no numbers (0.2.17): four "No result" refusals.
+        from loopcut import indexed_assets
+        luna = {"pick": 0, "source": "ambientcg", "id": "Metal042A", "resolution": "1k", "apply_to": [], "target_size": 0}
+        with mock.patch.object(indexed_assets, "import_indexed", autospec=True,
+                               return_value=tools.ToolResult("imported")) as imported:
+            for pick in (0, 1):
+                with self.subTest(pick=pick):
+                    result = tools.execute("import_asset", json.dumps({**luna, "pick": pick}))
+                    self.assertEqual(result.text, "imported")
+        self.assertEqual(imported.call_args_list,
+                         [mock.call(asset_id="Metal042A", source="ambientcg", resolution="1k")] * 2)
+        with mock.patch.object(polyhaven, "import_polyhaven", autospec=True,
+                               return_value=tools.ToolResult("imported")) as haven:
+            result = tools.execute("import_asset", json.dumps({**luna, "source": "polyhaven", "id": "rock_01"}))
+        self.assertEqual(result.text, "imported")
+        haven.assert_called_once_with(asset_id="rock_01", resolution="1k")
+        self.assertEqual(assets.describe("import_asset", luna), ("Import ambientcg asset Metal042A", ""))
+        for given in ({"pick": 0}, {"pick": 0, "id": "Metal042A"}, {"pick": 0, "source": "ambientcg"}):
+            with self.subTest(given=given):
+                self.assertEqual(tools.execute("import_asset", json.dumps(given)).text, "No result #0; search again.")
+
+    def test_source_and_id_beside_a_pick_naming_another_asset_win_and_say_so(self):
+        asset_picks.number("blenderkit", SWORD, "Green Snake Sword")
+        asset_picks.number("blenderkit", TABLE, "Gaming Table")
+        with mock.patch.object(blenderkit, "import_blenderkit", autospec=True,
+                               side_effect=lambda *a, **k: tools.ToolResult("imported")) as imported:
+            result = tools.execute("import_asset", json.dumps({"pick": 1, "source": "blenderkit", "id": TABLE}))
+            self.assertEqual(result.text,
+                             f"Imported blenderkit {TABLE} as given, not pick #1 Green Snake Sword.\nimported")
+            imported.assert_called_once_with(asset_id=TABLE)
+            imported.reset_mock()
+            same = tools.execute("import_asset", json.dumps({"pick": 1, "source": "blenderkit", "id": SWORD}))
+            self.assertEqual(same.text, "imported", "both naming the same result is fine")
+            imported.assert_called_once_with(asset_id=SWORD)
+        with mock.patch.object(polyhaven, "import_polyhaven", autospec=True, side_effect=missing("Poly Haven")), \
+                mock.patch.object(blenderkit, "import_blenderkit", autospec=True,
+                                  return_value=tools.ToolResult("imported")) as imported:
+            result = tools.execute("import_asset", json.dumps({"pick": 2, "source": "polyhaven", "id": "no_such"}))
+        self.assertEqual(result.text, "#2 is a blenderkit result, not polyhaven: imported it.\nimported",
+                         "a library with no such id: the pick, as before")
+        imported.assert_called_once_with(asset_id=TABLE)
 
     def test_an_index_pick_from_before_a_restart_says_search_again(self):
         from loopcut import indexed_assets

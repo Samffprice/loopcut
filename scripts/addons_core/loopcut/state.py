@@ -25,6 +25,8 @@ hosts: set[int] = set()  # Pointers of the areas showing the panel. Same lifetim
 # the refused send goes back to the draft and one account notice shows. Only a credits account is ever sent
 # insufficient_credits on chat.
 HOSTED_LIMITS = {"free_daily_limit", "week_limit", "session_limit", "insufficient_credits"}
+# agent.Turn.progress while the turn waits for the model: the one wait the panel calls "no reply" (stall_notice).
+MODEL_REPLY = "the model"
 
 
 def latest_limit(items: list) -> int | None:

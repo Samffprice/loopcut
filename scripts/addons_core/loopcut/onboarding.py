@@ -2001,6 +2001,7 @@ class LOOPCUT_OT_onboarding_own_key(bpy.types.Operator):
 
 
 class LOOPCUT_OT_onboarding_step(bpy.types.Operator):
+    """Go to this step of Loopcut's setup."""
     bl_idname = "loopcut.onboarding_step"
     bl_label = "Continue"
     bl_options = {"INTERNAL"}

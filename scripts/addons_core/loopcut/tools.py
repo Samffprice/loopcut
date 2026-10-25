@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -21,7 +22,8 @@ MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
 NAMES_LIMIT = 400    # Names get_scene_info lists when rows do not fit; past this, narrow the question.
 MAX_SELECTED_ROWS = 40  # Rows for the selection when only names fit.
-DEFAULT_RUN_TIMEOUT = 60.0
+DEFAULT_RUN_TIMEOUT = 30.0
+SLEEP_SLICE = 0.1  # A time.sleep in run_python code wakes this often to check the deadline.
 
 
 class ToolError(Exception):
@@ -47,6 +49,9 @@ class ToolResult:
     plan_refused: bool = False  # Helper arguments/plan validation; raw text still goes to the model and Details.
     plan_capped: bool = False   # delegate refused only by the account's max_workers this turn: a neutral card.
     model_note: str = ""  # Structured continuation details for the model, kept out of the user's result card.
+    outcome: str = ""  # An attached report's line for its card, in place of its JSON (cloud_jobs.report_line).
+    card_output: str = ""  # The card's output in place of text: a report the model gets as a table (cloud_jobs).
+    timed_out: float = 0.0  # run_python stopped at its deadline: those seconds, for its card (ui.layout).
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -431,6 +436,64 @@ def _background_context(editor: str):
         yield
 
 
+# A scene-changing step is two undo steps: "Before Loopcut: <what>" before it and "Loopcut: <what>" after it,
+# failed or stopped too, so one Undo takes back exactly that step and none of its changes sit past the newest
+# push. Blender 5.2.2 crashed on the redraw after Undo (BrushAssetShelf.poll, a freed context.object) when
+# changes sat past the newest push and the two pushes before them held the same state, as a step that changes
+# nothing and the next step's Before push do (0.2.18). Pushed after every step, not only when scene_diff saw a
+# change: keyframes, constraints, custom properties and node groups are not in its snapshot, and one of those
+# left unpushed after a step that changed nothing crashes the same way. run_python pushes both itself; a tool
+# pushes its Before with undo_before right where its change starts (the asset libraries' loads, after the
+# download) and execute the after; a cloud job's output lands in undo_step (cloud._apply); merge_wave and
+# autorig push their own pairs, apply_build's after its settings (workspace._merge).
+# A worker's child Blender turns it off (worker_child.init): nobody presses Undo there, and its rollback
+# pushes the state after a call and undoes once, onto the call's own Before push.
+UNDO_AFTER = True
+_undo_owed: list[str] = []  # Per execute call under way: the "Loopcut: …" push its tool owes, or "".
+
+
+def _undo_after(message: str, editor: str = "") -> None:
+    """The push after a step, in the editor context its Before push had (undo_push polls for a window and its
+    screen). A failure is only logged: the step has run, and its result stands."""
+    if not message or not UNDO_AFTER:
+        return
+    try:
+        with _editor_context(editor):
+            bpy.ops.ed.undo_push(message=message[:60])
+    except Exception as ex:  # noqa: BLE001 - a push is a safety net; it never fails the step it is for.
+        print(f"Loopcut: no undo step after {message!r}: {ex}", flush=True)
+
+
+def undo_before(what: str, editor: str = "") -> bool:
+    """"Before Loopcut: <what>", pushed by a tool right before it changes the scene (frame_camera, uv_tools,
+    paint_tools, the asset libraries' loads, clip_background). "Loopcut: <what>" is then owed: execute (or
+    undo_step) pushes it when the tool returns or raises, so a ToolError part way keeps what it changed so
+    far in that step. False with no editor to push from: the turn's checkpoint still covers the step."""
+    try:
+        with _editor_context(editor):
+            bpy.ops.ed.undo_push(message=f"Before Loopcut: {what}"[:60])
+    except (RuntimeError, ToolError):
+        return False
+    except Exception as ex:  # noqa: BLE001 - nor the change it is for.
+        print(f"Loopcut: no undo step before {what!r}: {ex!r}", flush=True)
+        return False
+    if _undo_owed:
+        _undo_owed[-1] = f"Loopcut: {what}"
+    return True
+
+
+@contextlib.contextmanager
+def undo_step(what: str):
+    """A change made outside an execute call as one undo step, before and after it, returned or raised:
+    cloud._apply, which applies a job's output from the call's continuation or from job_status."""
+    _undo_owed.append("")
+    try:
+        undo_before(what)
+        yield
+    finally:
+        _undo_after(_undo_owed.pop())
+
+
 def _clip(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
@@ -445,11 +508,14 @@ class _RunTimeout(BaseException):
 class _Deadline:
     """sys.settrace hook that stops model-written code which runs too long. It runs on the main
     thread, so an endless loop would otherwise freeze Blender with no way out but killing it.
-    Only lines of the model's own code are checked; one long call into Blender is not interrupted."""
+    Only lines of the model's own code are checked; one long call into Blender is not interrupted,
+    but time.sleep is (sleep)."""
 
     def __init__(self, seconds: float):
         self.seconds = seconds
         self.at = time.monotonic() + seconds
+        self.thread = threading.get_ident()  # None once the run is over.
+        self.real_sleep = time.sleep
 
     def __call__(self, frame, event, arg):
         return self._line if frame.f_code.co_filename == "<loopcut>" else None
@@ -458,6 +524,30 @@ class _Deadline:
         if time.monotonic() > self.at:
             raise _RunTimeout()
         return self._line
+
+    def sleep(self, seconds):
+        """time.sleep while the code runs: on its thread, short slices up to the deadline, then the stop.
+        A thread the code started, or a reference kept after the run, sleeps as usual."""
+        if threading.get_ident() != self.thread or not seconds > 0:  # 0 still yields; a bad value still raises.
+            return self.real_sleep(seconds)
+        end = time.monotonic() + seconds
+        while (now := time.monotonic()) < end:
+            if now >= self.at:
+                raise _RunTimeout()
+            self.real_sleep(min(SLEEP_SLICE, end - now, self.at - now))
+
+
+def _leave_edit_mode(mode_before: str) -> bool:
+    """After a stop: an object the code left in Edit Mode goes back to Object Mode, so its edits are in
+    its mesh and the user is not left in a mode they never chose. One bpy call; a failure is only logged."""
+    try:
+        if mode_before.startswith("EDIT") or not bpy.context.mode.startswith("EDIT"):
+            return False
+        bpy.ops.object.mode_set(mode="OBJECT")
+        return True
+    except Exception as ex:  # The stop is reported either way.
+        print(f"Loopcut: could not leave Edit Mode after a stopped run_python step: {ex}", flush=True)
+        return False
 
 
 def _model_traceback(ex: BaseException, code: str = "") -> str:
@@ -488,7 +578,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
     # Running model-written code is the product; the approval gate lives in agent.py.
     from . import config, contact, cost_guard, live_file, op_notes, scene_diff, shape_key_guard
     stdout = io.StringIO()
-    ok, raised = True, False
+    ok, raised, timed_out = True, False, 0.0
     deadline = _Deadline(config.run_timeout())
     shape_key_guard.install()
     cost_guard.begin()
@@ -500,6 +590,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
         try:
             compiled = compile(code, "<loopcut>", "exec")
             sys.settrace(deadline)
+            time.sleep = deadline.sleep  # Process-wide until finally; it acts on this thread only.
             # The deadline cannot stop one long native call, such as evaluating subdivision level 6;
             # the cost guard checks before each bpy.ops call evaluates the scene.
             # live_file: a save elsewhere is a copy, so the user's open file and their next save stay theirs.
@@ -507,18 +598,24 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
                   live_file.watching_ops()):
                 exec(compiled, _python_namespace())
         except _RunTimeout:
-            ok = False
+            ok, timed_out = False, deadline.seconds
             stdout.write(f"\nStopped: the code ran for more than {deadline.seconds:g} s, which usually means a "
-                         f"loop that never ends. Whatever it changed before that is listed below.")
+                         f"loop that never ends. Whatever it changed before that is listed below. "
+                         "Split the work into smaller run_python calls.")
+            if _leave_edit_mode(before.get("mode", "")):
+                stdout.write(" The object it left in Edit Mode is back in Object Mode.")
         except Exception as ex:
             ok, raised = False, True
             stdout.write("\n" + _model_traceback(ex, code))
         finally:
             sys.settrace(previous_trace)
+            time.sleep, deadline.thread = deadline.real_sleep, None
             shape_key_guard.check()
             notices = shape_key_guard.take() + op_notes.take() + live_file.take()
     notices.extend(host_notices)
     after = scene_diff.snapshot(guard=cost_guard.check)  # The guard runs before it evaluates.
+    # Past the guard, so a redo never brings back a modifier it switched off; before the capture.
+    _undo_after(f"Loopcut: {summary or 'run_python'}", editor)
     guarded, notes = cost_guard.take()
     output = _clip(stdout.getvalue().strip()) or "OK (no output)"
     if notices:
@@ -531,7 +628,7 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
         changes = "The code made these changes before the error; they stay in the scene.\n" + changes
     rig_note = _rig_changes(rig_before)
     result = ToolResult(f"{output}\n\n{guarded}{changes}" + (f"\n{rig_note}" if rig_note else ""), ok=ok,
-                        scene_before=before, scene_after=after, guard_notes=notes)
+                        scene_before=before, scene_after=after, guard_notes=notes, timed_out=timed_out)
     if capture:
         # One request instead of two: the step and the look at what it did. Shaders the code just
         # made compile first, off the main thread (shaders.py); then the look, in its own task.
@@ -1247,17 +1344,47 @@ _DISPATCH = {
 }
 
 
-def forward(fn, arguments: dict, what: str) -> ToolResult:
+def forward(fn, arguments: dict, what: str, properties=(), siblings: dict | None = None) -> ToolResult:
     """Call fn, the implementation behind a merged tool's `what` (a source, an action), with the
-    arguments that tool was given, naming in any complaint the parameters the model sees."""
+    arguments that tool was given, naming in any complaint the parameters the model sees.
+
+    An argument fn does not take that is one of the merged tool's schema `properties` (another
+    source's or action's) is left out and the result says so, naming which of `siblings` ({source or
+    action: its fn}) take it: GPT-6 Luna filled polypizza's category, licence and animated on every
+    search, was refused nine times running and gave up on the libraries (0.2.17). An argument the
+    schema does not have is still refused: it can hide a mistake."""
     parameters = inspect.signature(fn).parameters
-    extra = [key for key in arguments if key not in parameters]
+    ignored = [key for key in arguments if key not in parameters and key in properties]
+    extra = [key for key in arguments if key not in parameters and key not in ignored]
     if extra:
         raise ToolError(f"{what} does not take {', '.join(extra)}")
     missing = [key for key, p in parameters.items() if p.default is p.empty and key not in arguments]
     if missing:
         raise ToolError(f"{what} needs {', '.join(missing)}")
-    return fn(**arguments)
+    result = fn(**{key: value for key, value in arguments.items() if key not in ignored})
+    return _noted(result, _ignored(ignored, what, siblings or {})) if ignored else result
+
+
+def _ignored(keys: list, what: str, siblings: dict) -> str:
+    takers = {tuple(name for name, fn in siblings.items() if key in inspect.signature(fn).parameters) for key in keys}
+    them = "them" if len(keys) > 1 else "it"
+    if len(takers) == 1 and (names := next(iter(takers))):
+        why = f"only {', '.join(names)} {'takes' if len(names) == 1 else 'take'} {them}"
+    else:
+        why = f"not used by {what}"
+    return f"(Ignored {', '.join(keys)}: {why}.)"
+
+
+def _noted(result, note: str):
+    """result with forward's note on its last line: a worker's fetch record carries it to load_fetched,
+    and a call that waits (render_job status) gets it on what the wait returns."""
+    if isinstance(result, dict):
+        return {**result, "note": "\n".join(filter(None, (result.get("note"), note)))}
+    if result.then is not None:
+        then = result.then
+        result.then = lambda *args: _noted(then(*args), note)
+    result.text = f"{result.text.rstrip()}\n{note}"
+    return result
 
 
 def execute(name: str, arguments_json: str) -> ToolResult:
@@ -1288,6 +1415,7 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         inspect.signature(fn).bind(**arguments)
     except TypeError as ex:
         return ToolResult(f"Bad arguments for {name}: {ex}", ok=False, plan_refused=name == "delegate")
+    _undo_owed.append("")
     try:
         return fn(**arguments)
     except TypeError as ex:
@@ -1296,3 +1424,5 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         return ToolResult(f"{name} failed inside the tool, not because of your arguments: TypeError: {ex}", ok=False)
     except ToolError as ex:
         return ToolResult(str(ex), ok=False)
+    finally:
+        _undo_after(_undo_owed.pop())  # What undo_before recorded; run_python pushes its own.

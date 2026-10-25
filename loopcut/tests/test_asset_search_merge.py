@@ -5,7 +5,9 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -21,6 +23,7 @@ sys.path.insert(0, str(REPO / "scripts" / "addons_core"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 from loopcut import asset_common, asset_libraries as libraries, asset_report, asset_search, assets  # noqa: E402
+from loopcut import asset_picks, context  # noqa: E402
 from loopcut import cloud, cloud_http, cloud_jobs, indexed_assets, polyhaven, state, tools  # noqa: E402
 from mock_service import MockTransport  # noqa: E402
 import platform_contract  # noqa: E402
@@ -28,6 +31,12 @@ import platform_contract  # noqa: E402
 
 def fixture(name):
     return json.loads(platform_contract.require('fixtures', 'asset-search-report', name).read_text())
+
+
+def shown(text):
+    """[(pick, source, id)] as the model's copy of a raw report (asset_search.report_text) lists them."""
+    return [(int(n), source, asset_id) for n, source, asset_id in
+            re.findall(r"^#(\d+) .+? \((\w+)\); .+; id (\S+)$", text, re.M)]
 
 
 def inputs_for(report):
@@ -791,12 +800,13 @@ class RawToolTest(FixtureTest):
             def new(self, name):
                 block = types.SimpleNamespace(name=name, write=texts.append)
                 return block
-        from loopcut import conversations, state
+        from loopcut import conversations
+        # The conversation on screen numbers the rows, as search_assets' are: import_asset(pick=N) reads them there.
         with patch.object(sys.modules['bpy'], 'data', types.SimpleNamespace(texts=Texts()), create=True), \
-                patch.object(cloud_jobs, 'stamp_provenance'), \
-                patch.object(state, 'session', return_value=state.new_session()), patch.object(conversations, 'save'):
-            summary = cloud_jobs.apply_result(descriptor, job)
-        self.assertIn('Attached reports', summary)
+                patch.object(cloud_jobs, 'stamp_provenance'), patch.object(conversations, 'save'):
+            self.summary = cloud_jobs.apply_result(descriptor, job)
+        self.assertIn('Attached reports', self.summary)
+        self.text = texts[0]
         return json.loads(texts[0])
 
     def test_ids_from_the_raw_report_import_for_every_source(self):
@@ -807,21 +817,38 @@ class RawToolTest(FixtureTest):
         indexed_assets._rows.clear()  # Nothing from search_assets: only the raw tool ran.
         report = self.raw_search('foam aluminum', 'material')
         found = {(r['import']['source'], r['import']['id']) for r in report['results']}
+        picks = {(source, asset_id): n for n, source, asset_id in shown(self.summary)}
+        self.assertEqual(set(picks), found, "the model's table keeps every row's source and id, and numbers it")
         for row, data in ((ambient, ambient_data), (based, based_data)):
             source, asset_id = row['import']['source'], row['import']['id']
-            with self.subTest(source=source):
-                self.assertIn((source, asset_id), found)
-                with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)), \
-                        patch.object(libraries, 'load_asset', return_value=tools.ToolResult('loaded')) as load:
-                    result = assets.import_asset(source=source, id=asset_id)
-                self.assertEqual(result.text.splitlines()[0], 'loaded', result.text)
-                self.assertEqual(load.call_args.args[0]['name'], row['remote_library']['entries'][0]['name'])
+            # From the table: its pick, or its source and id as before; a remote Blender library's file either way.
+            for given in ({'source': source, 'id': asset_id}, {'pick': picks[source, asset_id]}):
+                with self.subTest(source=source, given=given):
+                    with patch.object(asset_common, 'open_url', return_value=io.BytesIO(data)), \
+                            patch.object(libraries, 'load_asset', return_value=tools.ToolResult('loaded')) as load:
+                        result = assets.import_asset(**given)
+                    self.assertEqual(result.text.splitlines()[0], 'loaded', result.text)
+                    self.assertEqual(load.call_args.args[0]['name'], row['remote_library']['entries'][0]['name'])
         haven = self.raw_search('chair', 'model')
         slug = next(r['import']['id'] for r in haven['results'] if r['source'] == 'polyhaven')
+        pick = next(n for n, source, asset_id in shown(self.summary) if (source, asset_id) == ('polyhaven', slug))
         with patch.object(polyhaven, 'import_polyhaven', autospec=True, return_value=tools.ToolResult('ok')) as imported:
             self.assertEqual(assets.import_asset(source='polyhaven', id=slug).text, 'ok')
-        imported.assert_called_once_with(asset_id=slug)
+            self.assertEqual(assets.import_asset(pick=pick).text, 'ok')
+            self.assertEqual(assets.import_asset(id=slug).text, 'ok', "an id alone: the one row shown with it")
+        self.assertEqual([c.kwargs for c in imported.call_args_list], [{'asset_id': slug}] * 3)
         self.assertEqual(len(self.asset_jobs()), 2, "no second search: the attached report was enough")
+
+    def test_the_model_gets_the_table_and_the_text_block_the_json_or_with_the_switch_both_the_json(self):
+        report = self.raw_search('foam aluminum', 'material')
+        self.assertIn('asset(s) for ', self.summary)
+        self.assertNotIn(self.text, self.summary)
+        self.assertNotIn('"dedupe_keys"', self.summary)
+        self.assertEqual(len(shown(self.summary)), len(report['results']))
+        with patch.dict(os.environ, {cloud_jobs.ASSET_REPORT: 'full'}):
+            self.raw_search('foam aluminum', 'material')
+        self.assertTrue(self.summary.endswith(self.text), "LOOPCUT_ASSET_REPORT=full: the report as before")
+        self.assertEqual(shown(self.summary), [])
 
     def test_a_bad_raw_report_registers_nothing(self):
         rows = [copy.deepcopy(self.rows[0])]
@@ -833,6 +860,61 @@ class RawToolTest(FixtureTest):
         self.assertEqual([r['id'] for r in asset_report.importable_rows(report)], [rows[0]['id']])
         for broken in (None, [], {'schema': 'other'}, {**report, 'filters': {'kind': 'boat'}}, {**report, 'results': {}}):
             self.assertEqual(asset_report.importable_rows(broken), [])
+
+
+class ReportTableTest(unittest.TestCase):
+    """The model's copy of the raw tool's report (asset_search.report_text): every row's import handle and what
+    it chooses by, in a fraction of the JSON's characters. LOOPCUT_ASSET_REPORT=full gives the JSON back."""
+
+    def setUp(self):
+        state.reset()
+        self.addCleanup(state.reset)
+
+    def test_each_contract_fixture_keeps_every_rows_handle_in_a_fraction_of_the_json(self):
+        sizes = {}
+        for path in sorted(platform_contract.require('fixtures', 'asset-search-report').glob('*.json')):
+            raw = path.read_text()
+            report = json.loads(raw)
+            table = asset_search.report_text(report)
+            with self.subTest(fixture=path.name):
+                if path.name == 'cc-by-attributed.json':  # Source "example": nothing imports it but its downloads.
+                    self.assertIsNone(table)
+                    continue
+                rows = shown(table)
+                self.assertEqual(len(rows), len(report['results']))
+                for (n, source, asset_id), row, line in zip(rows, report['results'], table.splitlines()[1:]):
+                    self.assertEqual((source, asset_id), (row['import']['source'], row['import']['id']))
+                    self.assertEqual({k: asset_picks.find(n)[k] for k in ('source', 'id')},
+                                     {'source': source, 'id': asset_id}, "import_asset(pick=N) resolves to it")
+                    self.assertTrue(line.startswith(f"#{n} {row['title']} ({source}); kind: {row['kind']}; "), line)
+                    self.assertIn(f"; {row['license']['id']}; ", line)
+                    self.assertIn(f"score {round(row['score'], 3):g}; ", line)
+                    if row.get('polycount'):
+                        self.assertIn(f"; {row['polycount']} polys; ", line)
+                    if row.get('dimensions_m'):
+                        self.assertIn(asset_common.size_text(row['dimensions_m']), line)
+                    if row['attribution']['required']:
+                        self.assertIn(row['attribution']['text'], line)
+                    for bulk in ('tags:', row['page_url'], row['preview_url'],
+                                 *(d['url'] for d in row.get('downloads', ()))):
+                        self.assertNotIn(bulk, line)
+                for notice in report['notices']:
+                    self.assertIn(notice, table.splitlines())
+                self.assertIn('Sources: ' + json.dumps(report['sources'], ensure_ascii=False), table.splitlines())
+                self.assertNotIn(report['generated_at'], table.replace(json.dumps(report['sources']), ''))
+                sizes[path.name] = len(raw), len(table)
+        # The JSON without its bulk (the fixtures' rows, unindented): about a sixth of its characters.
+        full, table = map(sum, zip(*(size for name, size in sizes.items() if name != 'empty.json')))
+        self.assertLess(table / full, 0.2, sizes)
+        self.assertLess(sizes['fifty-results.json'][1] / sizes['fifty-results.json'][0], 0.2)
+
+    def test_a_ten_result_search_saves_over_three_thousand_tokens(self):
+        report = fixture('fifty-results.json')
+        report['results'], report['filters']['limit'] = report['results'][:10], 10
+        raw, table = json.dumps(report), asset_search.report_text(report)
+        self.assertEqual(len(shown(table)), 10)
+        self.assertGreater((len(raw) - len(table)) / context.CHARS_PER_TOKEN, 3000)
+        self.assertLess(len(table) / len(raw), 0.2)
 
 
 class RowsTest(unittest.TestCase):

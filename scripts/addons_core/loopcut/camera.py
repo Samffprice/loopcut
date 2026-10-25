@@ -244,12 +244,9 @@ def _new_camera(name: str):
 
 
 def _undo_push(message: str) -> None:
-    """One undo step before the change, as run_python pushes one."""
-    try:
-        with tools._editor_context(""):
-            bpy.ops.ed.undo_push(message=message[:60])
-    except (RuntimeError, ToolError):
-        pass  # No editor to push from: the turn's checkpoint still covers this step.
+    """One undo step before the change, as run_python pushes one, and one owed after it (tools.undo_before).
+    Also uv_tools' and paint_tools'."""
+    tools.undo_before(message.removeprefix("Before Loopcut: "))
 
 
 def _direction_words(direction) -> str:

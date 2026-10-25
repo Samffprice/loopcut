@@ -189,15 +189,17 @@ def _import(row):
     return server["import"]["source"], server["import"]["id"], server["title"]
 
 
-def _line(number, row, kit=""):
+def _line(number, row, kit="", score=False):
     """One result row: its pick number (asset_picks), name and origin first, the id last as the
-    per-library rows have it, never as call syntax to copy (import_asset finds an id's source itself)."""
+    per-library rows have it, never as call syntax to copy (import_asset finds an id's source itself).
+    score: the index's, on a row of the raw tool's report (report_text)."""
     entry, server = row["entry"], row["server"]
     _, asset_id, label = _import(row)
     origin = entry.library + (f" + {server['source']}" if server else "") if entry is not None else server["source"]
     kind = server["kind"] if server else INDEX_TYPES.get(entry.id_type, entry.id_type)
     license_name = server["license"]["id"] if server else entry.license or "license unstated"
-    about = "".join(f"{part}; " for part in [*_about(entry, server), kit] if part)
+    scored = f"score {round(server['score'], 3):g}" if score else ""
+    about = "".join(f"{part}; " for part in [*_about(entry, server), kit, scored] if part)
     line = f"#{number} {label} ({origin}); kind: {kind}; {about}{license_name}"
     if server and server["attribution"]["required"]:
         line += "; " + server["attribution"]["text"]
@@ -225,6 +227,32 @@ def _present(query, rows, paths, sources, notes):
         text += "\n" + asset_picks.footer(image, blank=True)
     # Do not _clip: that could remove an import ID, required attribution, or provider credit.
     return ToolResult(text, image_path=image)
+
+
+def report_text(report):
+    """The raw asset_search tool's report as the model reads it (cloud_jobs), in place of its JSON: each
+    result numbered and shown as this search shows the index's rows, with its score and no tags, then the
+    report's notices and sources. Download links, page and preview URLs, dedupe keys and tags were most of
+    ten results' 12k characters; no tool opens a URL (the thumbnails the prompts choose by are this search's
+    sheet), and import_asset takes the pick or the source and id each row keeps. None, for the JSON as
+    before, when a result is not a row import_asset takes: a provider it has no importer for has only the
+    report's direct downloads."""
+    results = report.get("results") if isinstance(report, dict) else None
+    rows = asset_report.importable_rows(report)
+    if not isinstance(results, list) or len(rows) != len(results):
+        return None
+    lines = []
+    for row in rows:
+        row = {"entry": None, "server": {**row, "tags": None}}
+        lines.append(_line(asset_picks.number(*_import(row)), row, score=True))
+    query, notices, sources = report.get("query"), report.get("notices"), report.get("sources")
+    if isinstance(notices, list):
+        lines += [n for n in notices if isinstance(n, str) and n]
+    if sources:
+        lines.append("Sources: " + json.dumps(sources, ensure_ascii=False))
+    if rows:
+        lines.append(asset_picks.HINT)
+    return f"{len(rows)} asset(s)" + (f" for {query!r}" if isinstance(query, str) else "") + ":\n" + "\n".join(lines)
 
 
 def search_assets(query: str, type: str = "", limit: int = asset_libraries.DEFAULT_LIMIT):

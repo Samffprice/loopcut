@@ -251,7 +251,8 @@ class BudgetTest(unittest.TestCase):
             budget.take_step(started=0)
         self.assertEqual(budget.steps, 200)
         self.assertEqual(budget.spent(0), "")
-        self.assertFalse(hasattr(budget, "max_steps"))
+        self.assertEqual(budget.spent(0, 200), "")
+        self.assertEqual(budget.max_steps, 0, "no cap unless the account's worker_max_steps sets one")
 
 
 class WorkerSteerTest(unittest.TestCase):
@@ -2019,6 +2020,41 @@ class WaveTest(unittest.TestCase):
         self.assertIn("not started: the job's $0.40 is used", result.text)
 
     # --- The account's agent terms (config.agent_terms, 2026-10-24; test_agent_terms has the rest) ---------------
+
+    def test_the_accounts_worker_max_steps_warns_then_wraps_up_and_keeps_the_work(self):
+        MODELS.scripts.update(a=[build()] * 5 + [text("Built most of it; the legs are not bevelled.")])
+        wave = self.wave(["a"], worker_max_steps=5, job_max_usd=0)
+        result = self.run_wave(wave)
+        self.assert_budget_stop(wave, result, "its 5 steps are used", 5)
+        self.assert_budget_warning_once(wave, first_request=3)  # With 3 requests left: 3, 4 and 5.
+        self.assertEqual(self.logged()["a"]["usage"]["requests"], 6, "five steps plus the text-only wrap-up")
+
+    def test_a_retry_after_a_crash_near_the_step_cap_gets_half_the_cap_and_its_own_warning(self):
+        """The retry builds again from the brief: max(what is left, cap // 2) more steps, and the steps-left note
+        again (review of 9e5b8af72c6: a crash at step 5 of 6 left the retry one step and no note)."""
+        MODELS.scripts.update(a=[build()] * 4 + [calls(("check_brief", {}))] + [build(), finish("Rebuilt it.")])
+        self.crashes["a"] = ["check_brief", ""]
+        wave = self.wave(["a"], worker_max_steps=6, job_max_usd=0)
+        result = self.run_wave(wave)
+        worker, = wave.job.crew
+        self.assertEqual((worker.retries, worker.turn.outcome, worker.status, worker.steps), (1, "completed", "done", 7))
+        self.assertEqual(worker.step_cap, 8, "5 used, then max(1 left, 6 // 2) more")
+        note = agent.WORKER_STEPS_LEFT_NOTE.format(left=3).strip()
+        messages = worker.session["messages"]
+        crash = next(i for i, m in enumerate(messages) if "crashed during" in str(m.get("content")))
+        self.assertEqual([m.get("content") == note for m in messages[:crash]].count(True), 1, "before the crash")
+        self.assertEqual([m.get("content") == note for m in messages[crash:]].count(True), 1, "and in the retry")
+        self.assertEqual(self.merges, [["a"]])
+        self.assertIn("[a] A · modeling · done · 7 steps", result.text)
+        self.assertFalse(self.logged()["a"]["cap_hit"])
+
+    def test_a_retry_with_more_than_half_the_cap_left_keeps_what_is_left(self):
+        MODELS.scripts.update(a=[calls(("check_brief", {}))] + [build(), finish()])
+        self.crashes["a"] = ["check_brief", ""]
+        wave = self.wave(["a"], worker_max_steps=10, job_max_usd=0)
+        self.run_wave(wave)
+        worker, = wave.job.crew
+        self.assertEqual((worker.step_cap, worker.status), (10, "done"), "9 left of 10 is more than half: as it was")
 
     def test_with_terms_a_reported_cost_is_charged_over_the_token_price(self):
         with mock.patch.dict(USAGE["usage"], {"cost": 0.25}):  # The gateway's usage.cost, in USD.

@@ -771,6 +771,14 @@ class StreamTest(Base):
         completion, _ = self.stream()
         self.assertEqual((completion.text, completion.finish_reason, completion.tool_calls), ("All done.", "stop", []))
 
+    def test_every_event_of_the_response_is_progress_for_the_stall_clock(self):
+        payload = reply("Making it red.", calls=[("call_9", "run_python", '{"code": "x"}', "loopcut")])
+        FakeResponses.script, progress = [(200, payload)], []
+        llm.stream_chat(base_url=config.CHATGPT_PLAN_BASE_URL, api_key="unused", model="gpt-6.1-sol",
+                        messages=conversation(), tools=TOOLS, reasoning_effort="high", on_text=lambda _: None,
+                        is_cancelled=lambda: False, on_progress=lambda: progress.append(1))
+        self.assertEqual(len(progress), payload.count(b"event: response."))
+
     def test_stream_chat_keeps_local_correlation_but_sends_no_loopcut_headers(self):
         FakeResponses.script = [(200, reply("Done."))]
         completion = llm.stream_chat(
@@ -1066,6 +1074,64 @@ class StreamTest(Base):
         completion, _ = self.stream()
         self.assertEqual(completion.text, "ok")
 
+    def test_an_error_object_nested_in_the_error_event_is_read(self):
+        nested = sse({"type": "error", "sequence_number": 3, "error": {
+            "type": "server_error", "code": "server_error", "message": "try again"}})
+        FakeResponses.script = [(200, nested), (200, reply("ok"))]
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(FakeResponses.requests)), ("ok", 2))
+        FakeResponses.script = [(200, sse({"type": "error", "error": {"code": "invalid_prompt", "message": "boom"}}))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual((caught.exception.code, str(caught.exception)), ("invalid_prompt", "boom (request req_3)"))
+
+    def test_an_error_without_a_code_is_retried(self):
+        """0.2.14 logs (2026-10-25): an error event with no code or message ended a turn as 'ChatGPT request
+        failed', twice in a row, with no Try again and nothing in the console log."""
+        FakeResponses.script = [(200, sse({"type": "error"})), (200, reply("ok"))]
+        with mock.patch("builtins.print") as printed:
+            completion, _ = self.stream()
+        self.assertEqual((completion.text, len(FakeResponses.requests)), ("ok", 2))
+        lines = [str(call.args[0]) for call in printed.call_args_list]
+        self.assertIn('Loopcut: ChatGPT\'s stream sent an error event: {"type":"error"}', lines)
+
+    def test_an_error_that_keeps_coming_says_what_happened_and_what_to_do(self):
+        for failure in (sse({"type": "error"}), sse({"type": "response.failed", "response": {"status": "failed"}})):
+            with self.subTest(failure=failure[:40]):
+                FakeResponses.requests = []
+                FakeResponses.script = [(200, failure)] * (len(llm.RETRY_DELAYS) + 1)
+                with self.assertRaises(llm.LLMError) as caught:
+                    self.stream()
+                self.assertEqual(len(FakeResponses.requests), len(llm.RETRY_DELAYS) + 1)
+                self.assertEqual(caught.exception.code, llm.STREAM_FAILED)
+                self.assertEqual(str(caught.exception), (
+                    "ChatGPT stopped the reply with an error, again when Loopcut retried. Nothing was lost: press Try "
+                    "again in a minute, or check your ChatGPT plan's usage if it keeps failing: "
+                    f"{chatgpt_auth.USAGE_URL} (request req_4)"))
+                self.assertNotIn("connection", str(caught.exception))
+                self.assertEqual(caught.exception.details["request_id"], "req_4")
+
+    def test_a_retried_failure_with_words_of_its_own_keeps_them_with_try_again(self):
+        failed = sse({"type": "response.failed", "response": {"status": "failed", "error": {
+            "code": "subscription_sharing_usage_unavailable", "message": "try later"}}})
+        FakeResponses.script = [(200, failed)] * (len(llm.RETRY_DELAYS) + 1)
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(caught.exception.code, llm.STREAM_FAILED)
+        self.assertEqual(caught.exception.details["error_code"], "subscription_sharing_usage_unavailable")
+        self.assertEqual(str(caught.exception), "ChatGPT could not check your plan's usage just now. Try again in a "
+                                                "little while. (request req_4)")
+
+    def test_an_error_after_text_is_retried_once_then_said_plainly(self):
+        partial = sse({"type": "response.output_text.delta", "output_index": 0, "delta": "hello"}, {"type": "error"})
+        FakeResponses.script = [(200, partial)] * 2
+        restarted = []
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream(on_retry=lambda: restarted.append(True))
+        self.assertEqual((caught.exception.code, len(FakeResponses.requests), restarted),
+                         (llm.STREAM_FAILED, 2, [True]))
+        self.assertIn("again when Loopcut retried", str(caught.exception))
+
     def _drops(self, *failures):
         """chatgpt_responses._post raising each failure in turn, then the fake server as usual."""
         real, calls = chatgpt_responses._post, []
@@ -1196,6 +1262,19 @@ class StreamTest(Base):
             chatgpt_responses.stream(model="m", messages=conversation(), tools=TOOLS, reasoning_effort="low",
                                      on_text=lambda _: None, is_cancelled=lambda: time.monotonic() - started > 0.3)
         self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_stop_while_the_status_line_is_withheld_returns_at_once(self):
+        """The stall tester (2026-10-25): a stand-in that accepted and sent nothing kept a Stop waiting for the 600 s
+        read timeout on the ChatGPT plan. llm.opened leaves the open at once."""
+        from test_llm import Silent
+        silent = Silent()
+        self.addCleanup(silent.close)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"LOOPCUT_CHATGPT_API_URL": silent.url}), self.assertRaises(llm.Cancelled):
+            chatgpt_responses.stream(model="m", messages=conversation(), tools=TOOLS, reasoning_effort="low",
+                                     on_text=lambda _: None, is_cancelled=lambda: time.monotonic() - started > 0.3)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(len(silent.held), 1)
 
     def test_wall_clock_limit_ends_like_a_capped_reply(self):
         FakeResponses.script = [(200, (sse({"type": "response.created", "response": {}}), 3.0))]

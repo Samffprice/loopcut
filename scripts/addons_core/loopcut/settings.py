@@ -342,7 +342,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
                     "short step records; over this, the current turn's older steps are too, and then the "
                     "earlier conversation is summarized. Lower is cheaper; higher remembers more")
     run_timeout: bpy.props.IntProperty(
-        name="Stop code after (s)", default=60, min=1, max=3600, update=_changed,
+        name="Stop code after (s)", default=30, min=1, max=3600, update=_changed,
         description="A step that runs longer is stopped, so an endless loop cannot freeze Blender")
     checkpoint_budget_mb: bpy.props.IntProperty(
         name="Checkpoints (MB)", default=2048, min=1, max=1_000_000, update=_changed,
@@ -687,6 +687,7 @@ class LOOPCUT_OT_use_provider(bpy.types.Operator):
 
 
 class LOOPCUT_OT_pick_model(bpy.types.Operator):
+    """Use this model for Loopcut's chat."""
     bl_idname = "loopcut.pick_model"
     bl_label = "Use Model"
     bl_options = {"INTERNAL"}
@@ -709,6 +710,7 @@ class LOOPCUT_MT_models(bpy.types.Menu):
 
 
 class LOOPCUT_OT_pick_tier(bpy.types.Operator):
+    """Use this model for Loopcut's chat."""
     bl_idname = "loopcut.pick_tier"
     bl_label = "Use Model"
     bl_options = {"INTERNAL"}

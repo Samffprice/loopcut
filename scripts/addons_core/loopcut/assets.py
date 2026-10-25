@@ -106,13 +106,42 @@ def _native(source: str, arguments: dict) -> dict:
     return arguments
 
 
+# Optional values that mean "not given", per parameter: GPT-6 Luna fills every optional field and sent
+# apply_to [] and target_size 0 with every import (0.2.17). Where a library takes one it is that
+# library's default (animated false, limit 0) or names nothing; booleans and numbers not listed stay.
+UNSET = {"source": ("",), "type": ("",), "limit": (0,), "category": ("",), "licence": ("",), "animated": (False,),
+         "resolution": ("",), "apply_to": ([],), "target_size": (0,)}
+
+
+def _given(arguments: dict) -> dict:
+    return {key: value for key, value in arguments.items()
+            if key not in UNSET or value is not None and value not in UNSET[key]}
+
+
+def _properties(name: str) -> dict:
+    return next(s["function"]["parameters"]["properties"] for s in SCHEMAS if s["function"]["name"] == name)
+
+
+def _searches() -> dict:
+    """source: its search function, for forward to name which sources take an argument."""
+    return {source: getattr(module, search) for source, (module, search, _, _) in SOURCES.items()}
+
+
+def _imports() -> dict:
+    return {source: getattr(module, import_) for source, (module, _, import_, _) in IMPORT_SOURCES.items()}
+
+
 def search_assets(source: str | None = None, **arguments) -> tools.ToolResult:
+    arguments = _given({"source": source, **arguments})
+    source = arguments.pop("source", None)
     if source is None:
-        return tools.forward(asset_search.search_assets, arguments, "combined asset search")
+        return tools.forward(asset_search.search_assets, arguments, "combined asset search",
+                             _properties("search_assets"), _searches())
     if not isinstance(source, str) or source not in SOURCES:
         raise ToolError(f"search source must be one of {', '.join(SOURCES)}, or omitted")
     module, search, _, _ = _source(source)
-    return tools.forward(getattr(module, search), _native(source, arguments), f"source {source}")
+    return tools.forward(getattr(module, search), _native(source, arguments), f"source {source}",
+                         _properties("search_assets"), _searches())
 
 
 def _then(text: str, more: str) -> str:
@@ -164,11 +193,33 @@ def _picked(source, asset_id, pick):
     return row["source"], row["id"], note, row
 
 
+def _explicit(source, asset_id) -> bool:
+    """Both a source and an id that is not a pick number ("#9")."""
+    return (isinstance(source, str) and source in IMPORT_SOURCES and isinstance(asset_id, str)
+            and bool(asset_id.strip()) and asset_picks.parse(asset_id) is None)
+
+
 def _meant(source, asset_id, pick, call):
     """call(source, id) for the asset the model means, and a line saying how its words were read when
     that was not as written. An id the library has no asset for (_unknown_id), shown by a search under
     another source or a near miss of one recent result (asset_picks.near: a mangled UUID, or a case or
-    spacing slip), is retried as that result; nearly matching several, the error names them by number."""
+    spacing slip), is retried as that result; nearly matching several, the error names them by number.
+
+    Beside a source and an id, a pick that names no result is left out, and one that names another
+    asset gives way to them unless that library has no such id: GPT-6 Luna sent pick 0 with a cloud
+    search result's source and id and was told four times to search again (0.2.17)."""
+    if pick is not None and pick != "" and _explicit(source, asset_id):
+        number = asset_picks.parse(pick)
+        row = asset_picks.find(number) if number is not None else None
+        if row is None:
+            pick = None
+        elif (row["source"], row["id"]) != (source, asset_id):
+            try:
+                note = f"Imported {source} {asset_id} as given, not pick #{number} {row['name']}."
+                return call(source, asset_id), note
+            except ToolError as ex:
+                if not _unknown_id(ex):
+                    raise  # The id is right; what failed was not the id.
     source, asset_id, note, row = _picked(source, asset_id, pick)
     if row is not None:
         try:
@@ -204,10 +255,13 @@ def _meant(source, asset_id, pick, call):
 
 
 def import_asset(source: str = "", id: str = "", pick=None, **arguments) -> tools.ToolResult:  # noqa: A002
+    arguments = _given(arguments)
+
     def call(source, asset_id):
         module, _, import_, id_name = _source(source)
         extra = {"source": source} if module is indexed_assets else {}
-        return tools.forward(getattr(module, import_), {**arguments, **extra, id_name: asset_id}, f"source {source}")
+        return tools.forward(getattr(module, import_), {**arguments, **extra, id_name: asset_id}, f"source {source}",
+                             _properties("import_asset"), _imports())
     result, note = _meant(source, id, pick, call)
     if note:
         result.text = f"{note}\n{result.text}"
@@ -219,14 +273,16 @@ def fetch_asset(source: str = "", id: str = "", pick=None, **arguments) -> dict:
     load_fetched needs, JSON-able (paths and credits, never a key). Takes import_asset's arguments
     and refuses what that source would refuse. Main thread: some libraries read the live scene or
     the preferences."""
+    arguments = _given(arguments)
+
     def call(source, asset_id):
         module, _, _, id_name = _source(source)
         extra = {"source": source} if module is indexed_assets else {}
         fetched = tools.forward(getattr(module, SPLIT[source][0]), {**arguments, **extra, id_name: asset_id},
-                                f"source {source}")
+                                f"source {source}", _properties("import_asset"), _imports())
         return {**fetched, "source": source}
     fetched, note = _meant(source, id, pick, call)
-    return {**fetched, "note": note} if note else fetched
+    return {**fetched, "note": "\n".join(filter(None, (note, fetched.get("note"))))} if note else fetched
 
 
 def load_fetched(fetched: dict, **arguments) -> tools.ToolResult:
@@ -250,10 +306,12 @@ DISPATCH = {"search_assets": search_assets, "import_asset": import_asset}
 def describe(name: str, arguments: dict):
     """The step's label in the chat: the library's own, like job_tools.describe. A pick is labelled
     with its number and name."""
-    source = arguments.get("source")
+    source = arguments.get("source") or None
     number = asset_picks.parse(arguments.get("pick")) if name == "import_asset" else None
     if name == "import_asset" and number is None and isinstance(arguments.get("id"), (str, int)):
         number = asset_picks.parse(arguments.get("id"))
+    if name == "import_asset" and _explicit(source, arguments.get("id")):
+        number = None  # Source and id are what is imported (_meant).
     if number is not None:
         row = asset_picks.find(number)
         if row is None:

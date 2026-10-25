@@ -175,16 +175,60 @@ class ConversationsTest(unittest.TestCase):
         session["items"] += [reply, card]
         session["messages"].append({"role": "assistant", "content": None, "tool_calls": [call("c1")]})
         cv.save(session)
-        loaded = cv.load(session["id"])
-        self.assertFalse(loaded["items"][1]["streaming"])
-        self.assertEqual(loaded["items"][2]["status"], "rejected")
-        self.assertEqual(loaded["messages"][-1]["tool_call_id"], "c1")
+        with mock.patch("loopcut.session_logs.on_closed") as uploaded:
+            loaded = cv.load(session["id"])
+            self.assertFalse(loaded["items"][1]["streaming"])
+            self.assertEqual(loaded["items"][2]["status"], "rejected")
+            self.assertEqual(loaded["messages"][-1]["tool_call_id"], "c1")
+            self.assertEqual(loaded["items"][3], state.item_error("Blender was closed before this turn finished.",
+                                                                  retry=True))
+            hits = layout.build(loaded, 420, 700, 1.0, lambda f, s, t: len(t) * s * 0.5, "m", {}, {})["hits"]
+            self.assertEqual(next(h for h in hits if h["id"] == "item3.error.retry")["action"], ("resume", 3))
+            uploaded.assert_called_once_with(loaded)  # Its log goes up now (session_logs.on_closed).
+            cv.save(loaded)  # Its next save (another chat opened, Blender quitting) keeps it settled.
+            self.assertEqual(cv.load(session["id"])["items"], loaded["items"], "no second card")
+            uploaded.assert_called_once()
+
+    def test_a_closed_chat_opened_again_before_its_next_save_is_closed_and_sent_once(self):
+        """History loads the chat it opens before the one on screen is saved (host._switch, then lifecycle.switch_to):
+        the same chat reopened that way, or after another crash, must not close (and upload) its turn again."""
+        session = self.session("/work/desk.blend", "go")
+        session["items"].append(state.item_assistant())  # Streaming when Blender quit.
+        cv.save(session)
+        with mock.patch("loopcut.session_logs.on_closed") as uploaded:
+            first = cv.load(session["id"])  # The launch's resume; nothing saves it before History opens it again.
+            again = cv.load(session["id"])
+        self.assertEqual(again["items"], first["items"])
+        self.assertEqual([i.get("text") for i in again["items"]].count(cv.CLOSED_MESSAGE), 1)
+        uploaded.assert_called_once_with(first)
+
+    def test_a_turn_another_blender_never_finished_is_closed_on_load(self):
+        """A kill or a crash while the turn waits on the model leaves only what its last save had: no streaming reply,
+        no running card. The mark of a save while busy says it never ended; this Blender's own is a turn running here."""
+        session = self.session("/work/desk.blend", "go")
+        session["busy"] = True  # A save mid-turn (a tool step, Blender's own save, quitting).
+        cv.save(session)
+        with mock.patch("loopcut.session_logs.on_closed") as uploaded:
+            self.assertEqual(cv.load(session["id"])["items"], session["items"], "opened from History mid-turn")
+            uploaded.assert_not_called()
+            with mock.patch.object(cv, "_LAUNCH", "0" * 32):  # The next launch.
+                loaded = cv.load(session["id"])
+            self.assertEqual(loaded["items"][-1], state.item_error(cv.CLOSED_MESSAGE, retry=True))
+            uploaded.assert_called_once_with(loaded)
+            session["busy"] = False
+            cv.save(session)  # The turn's last save, made once busy is cleared.
+            with mock.patch.object(cv, "_LAUNCH", "0" * 32):
+                self.assertEqual(cv.load(session["id"])["items"], session["items"], "a turn that ended is not cut")
+            uploaded.assert_called_once()
+        cv.save(session, running=True)  # agent._launch's, before busy is set.
+        self.assertEqual(json.loads((cv.root() / session["id"] / "conversation.json").read_text())["turn_running"],
+                         cv._LAUNCH)
 
     def test_a_conversation_from_before_the_tools_were_merged_restores(self):
         session = self.session("/work/desk.blend", "a chair")
         card = state.item_tool("import_polyhaven", "Import Poly Haven asset chair_01 (1k)", "")
         card["status"] = "done"
-        session["items"] += [state.item_assistant(), card]
+        session["items"] += [{**state.item_assistant(), "streaming": False}, card]  # A turn that ended.
         old = {"id": "c1", "type": "function",
                "function": {"name": "import_polyhaven", "arguments": json.dumps({"asset_id": "chair_01"})}}
         session["messages"] += [{"role": "assistant", "content": None, "tool_calls": [old]},

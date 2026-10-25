@@ -1,6 +1,7 @@
 """The account's agent terms (config.agent_terms, contract agreed with the gateway 2026-10-24): the manifest's optional
-account.agent sets how many workers a turn may start, the job's worker dollars, the prices those are counted at (and
-whether a reply's usage.cost is charged), and the showcase's typical build. Every field is optional; without one, from
+account.agent sets how many workers a turn may start, a worker's and the orchestrator's step limits, the job's worker
+dollars, the prices those are counted at (and whether a reply's usage.cost is charged), and the showcase's typical
+build. Every field is optional; without one, from
 an older server, signed out, on BYOK, on the ChatGPT plan, through a harness stand-in for the gateway or with
 LOOPCUT_AGENT_TERMS=off, every limit is 0.2.15's. No Blender.
 
@@ -166,11 +167,26 @@ class RolesTest(unittest.TestCase):
         self.assertEqual(older, none)
         self.assertEqual(limits(older), TODAY)
 
-    def test_every_term_is_applied_but_the_step_limits(self):
+    def test_every_term_is_applied(self):
         roles = self.roles(TERMS)
         self.assertEqual(limits(roles), (2, 2, 0.20, 1800, True, tuple(sorted(PRICES.items()))))
-        self.assertFalse(hasattr(roles, "worker_max_steps") or hasattr(roles, "orchestrator_max_steps"))
-        self.assertEqual((roles.orchestrator.max_steps, roles.worker.max_steps), (0, 0), "read and checked, not enforced")
+        self.assertEqual((roles.worker_max_steps, roles.orchestrator_max_steps), (24, 36))
+        self.assertEqual(roles.orchestrator.max_steps, 0, "the orchestrated loop takes its steps (agent._configure)")
+        self.assertEqual(roles.worker.max_steps, 0, "a worker's cap is the job budget's, never its loop's")
+
+    def test_without_step_terms_nothing_is_capped(self):
+        for agent_ in (None, {"max_workers": 2}):
+            with self.subTest(agent=agent_):
+                roles = self.roles(agent_)
+                self.assertEqual((roles.worker_max_steps, roles.orchestrator_max_steps), (0, 0))
+
+    def test_an_explicit_step_limit_still_wins(self):
+        roles = self.roles(TERMS, LOOPCUT_MAX_STEPS="50")
+        self.assertEqual((roles.orchestrator.max_steps, roles.orchestrator_max_steps, roles.worker_max_steps),
+                         (50, 0, 24), "no setting names a worker's")
+        self.assertEqual(self.roles(TERMS, LOOPCUT_MAX_STEPS="0").orchestrator_max_steps, 0, "0 is explicit too")
+        self.assertEqual(limits(self.roles(TERMS, LOOPCUT_AGENT_TERMS="off"))[:2], (3, 0))
+        self.assertEqual(self.roles(TERMS, LOOPCUT_AGENT_TERMS="off").worker_max_steps, 0)
 
     def test_each_term_alone(self):
         for key, value, expected in (("max_workers", 2, {"max_workers": 2, "turn_workers": 2}),
@@ -179,7 +195,8 @@ class RolesTest(unittest.TestCase):
                                      ("job_max_usd", 0, {"job_max_usd": 0.0}),
                                      ("prices", {"fast": [0.435, 0.0036, 0.87]},
                                       {"prices": (("fast", (0.435, 0.0036, 0.87)),)}),
-                                     ("worker_max_steps", 24, {}), ("orchestrator_max_steps", 36, {})):
+                                     ("worker_max_steps", 24, {"worker_max_steps": 24}),
+                                     ("orchestrator_max_steps", 36, {"orchestrator_max_steps": 36})):
             with self.subTest(key=key, value=value):
                 roles = self.roles({key: value})
                 self.assertEqual({k: getattr(roles, k) for k in expected}, expected)
@@ -258,7 +275,16 @@ class TurnTest(unittest.TestCase):
         turn = self.configure()
         self.assertIs(turn.spec, agent.ORCH_SPEC)
         self.assertEqual(limits(turn.roles), (2, 2, 0.20, 1800, True, tuple(sorted(PRICES.items()))))
-        self.assertEqual(turn.config.max_steps, 0, "the step terms are not enforced")
+        self.assertEqual((turn.config.max_steps, turn.carry_steps), (36, True))
+        self.assertEqual(turn.roles.orchestrator.max_steps, 0, "the main config's, for a divert")
+        self.assertEqual((turn.roles.worker_max_steps, turn.roles.worker.max_steps), (24, 0))
+
+    def test_the_orchestrators_steps_are_for_the_orchestrated_loop_only(self):
+        with self.runtime.lock:
+            del self.runtime.manifest["prompts"]  # No prompt index yet: the open single loop.
+        turn = self.configure()
+        self.assertIs(turn.spec, agent.SINGLE_SPEC)
+        self.assertEqual((turn.config.max_steps, turn.carry_steps), (0, False))
 
     def test_a_refresh_mid_turn_applies_to_the_next_turn(self):
         session = {"id": "c", "turn_number": 1, "jobs": []}
@@ -270,13 +296,15 @@ class TurnTest(unittest.TestCase):
                          (2, 2, 0.20, True), "this turn keeps what it started with")
         self.assertEqual(job.budget.prices, PRICES)
         self.assertEqual(waves.workers_left(job, turn.roles), 2)
+        self.assertEqual(job.budget.max_steps, 24)
         later = self.configure()
         self.assertEqual(limits(later.roles), (3, 4, 0.40, 1800, True, ()))
+        self.assertEqual((later.config.max_steps, later.roles.worker_max_steps), (0, 0))
 
     def test_a_divert_to_the_workspace_takes_the_main_configs_step_limit(self):
         """router.to_workspace mid-turn: the workspace loop runs with the base max_steps, never the orchestrator's."""
         turn = self.configure()
-        turn.config = dataclasses.replace(turn.config, max_steps=36)  # As an orchestrator's own limit would set it.
+        self.assertEqual(turn.config.max_steps, 36)  # The orchestrator's own, from the terms.
         turn.may_divert = True
         session = state.new_session()
 
@@ -288,7 +316,7 @@ class TurnTest(unittest.TestCase):
             agent._route(session, turn)
         self.assertIs(turn.spec, agent.WORKSPACE_SPEC)
         self.assertEqual(turn.config.max_steps, turn.roles.orchestrator.max_steps)
-        self.assertEqual(turn.config.max_steps, 0)
+        self.assertEqual((turn.config.max_steps, turn.carry_steps), (0, False))
         self.assertTrue(turn.config.keep_context)
 
 
@@ -358,13 +386,38 @@ class JobBudgetTest(unittest.TestCase):
         self.assertFalse(budget.priced("mimo-v3"))
         self.assertAlmostEqual(budget.usd, 0.065)
 
+    def test_the_worker_step_cap_stops_each_run_at_its_own_count(self):
+        budget = waves.JobBudget(0, 1800, clock=lambda: 1, steps=5)
+        for n in range(5):
+            budget.take_step(0, worker_steps=n)
+        with self.assertRaises(agent.BudgetStop) as stop:
+            budget.take_step(0, worker_steps=5)
+        self.assertEqual(str(stop.exception), "its 5 steps are used")
+        self.assertEqual((budget.spent(0, 4), budget.spent(0, 5)), ("", "its 5 steps are used"))
+        self.assertEqual(budget.spent(), "", "a queued worker has all its steps still")
+        self.assertEqual(budget.spent(0, 5, cap=8), "", "a retry's raised count")
+        self.assertEqual(budget.spent(0, 8, cap=8), "its 8 steps are used")
+        budget.take_step(0, worker_steps=5, cap=8)
+        budget.take_step(0, worker_steps=0)  # Another worker of the job starts at its own zero.
+
+    def test_the_steps_left_estimate_counts_the_cap(self):
+        sample = dict(elapsed=21, seconds=1800, job_steps=21, usd=0, max_usd=0, running=1, priced=True)
+        self.assertEqual(waves.budget_steps_left(steps=21, max_steps=24, **sample), 3)
+        self.assertGreater(waves.budget_steps_left(steps=21, **sample), 3, "no cap: time alone")
+        budget = waves.JobBudget(0, 1800, clock=lambda: 21, steps=24)
+        self.assertEqual(budget.take_step(0, worker_steps=21), 3)
+        self.assertEqual(budget.take_step(0, worker_steps=21, cap=36), 15)
+
     def test_the_job_follows_the_roles(self):
         session = {"id": "c", "turn_number": 1, "jobs": []}
         with tempfile.TemporaryDirectory() as data, mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": data}):
             plain = waves.Job(session, config.Roles(None, None, True))
             hosted = waves.Job(session, config.Roles(None, None, True, terms=True, prices=tuple(MIMO.items())))
-        self.assertEqual((plain.budget.reported, plain.budget.prices), (False, {}))
+        self.assertEqual((plain.budget.reported, plain.budget.prices, plain.budget.max_steps), (False, {}, 0))
         self.assertEqual((hosted.budget.reported, hosted.budget.prices), (True, MIMO))
+        with tempfile.TemporaryDirectory() as data, mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": data}):
+            capped = waves.Job(session, config.Roles(None, None, True, worker_max_steps=24))
+        self.assertEqual(capped.budget.max_steps, 24)
 
 
 class TurnWorkersTest(unittest.TestCase):
@@ -471,6 +524,12 @@ class TurnWorkersTest(unittest.TestCase):
                 self.assertNotIn("this turn can start", line, "not a fact about the turn to pass on")
                 self.assertNotIn("don't mention", line, "the limit is real and shown; nothing to hide")
         self.assertEqual(orchestrator.budget_line(plan, config.Roles(None, None, True)), head + ".", "as in 0.2.15")
+        self.assertEqual(orchestrator.budget_line(plan, config.Roles(None, None, True, worker_max_steps=24)),
+                         "Budget: $0.400 of $0.40 left for this turn's workers; 1800 s and 24 steps per worker run.")
+        self.assertEqual(orchestrator.budget_line(plan, config.Roles(None, None, True, turn_workers=2,
+                                                                     worker_max_steps=24)),
+                         "Budget: $0.400 of $0.40 left for this turn's workers; 1800 s and 24 steps per worker run"
+                         + after + ".")
 
     def test_the_routing_note_names_the_limit_before_planning(self):
         decision = router.Decision(3, [("Chair", "a chair"), ("Table", "a table")])

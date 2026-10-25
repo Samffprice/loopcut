@@ -203,10 +203,11 @@ class InterfaceLanguageTest(unittest.TestCase):
 
     def test_line_says_which_language_to_answer_in(self):
         line = sc.language_line("Japanese", starter=False)
-        self.assertTrue(line.startswith("interface language: Japanese."))
-        self.assertIn("language the user writes in", line)
+        self.assertTrue(line.startswith("interface language: Japanese, a fallback only"))
         self.assertIn("romaji", line)
-        self.assertTrue(line.endswith("reply in Japanese."))
+        # Luna followed a closing "reply in Russian" for English writers (2026-10-25): the user's language is last.
+        self.assertTrue(line.endswith("reply in the language the user writes in, English included."), line)
+        self.assertNotIn("reply in Japanese", line)
         starter = sc.language_line("Japanese", starter=True)
         self.assertIn("starter Loopcut wrote", starter)
         self.assertTrue(starter.endswith("reply in Japanese."))

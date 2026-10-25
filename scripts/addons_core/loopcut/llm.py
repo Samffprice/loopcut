@@ -3,9 +3,12 @@
 Stdlib only, so the extension ships without wheels. Blocking; call from a worker thread.
 """
 
+import http.client
 import json
 import math
+import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -37,11 +40,20 @@ RETRY_DELAYS = (1.0, 3.0, 8.0)
 MAX_RETRY_AFTER = 30.0
 CONNECTION_LOST = "connection_lost"  # LLMError.code when the connection kept dropping: the panel offers Try again.
 EMPTY_REPLY = "empty_reply"  # LLMError.code: the model answered with nothing to show or run, twice (agent._request).
+STREAM_FAILED = "stream_failed"  # LLMError.code: the reply kept ending in an error after the retries: Try again.
 CONTENT_FILTER = "content_filter"  # LLMError.code: the provider's own filter stopped the reply (agent._request).
 # finish_reason values some providers send when their content filter stops a reply: z.ai's GLM API ends the
 # stream with "sensitive" (and no usage), OpenAI-compatible servers with "content_filter". Measured 2026-10-20 on
 # glm-5.3-flash, a request that names Taiwan's flag or Tiananmen Square stops this way, with no text.
 FILTERED_FINISHES = frozenset({"sensitive", "content_filter"})
+# Loopcut's gateway takes a gzipped chat body (Content-Encoding: gzip, at most 12 MiB decoded) since 2026-10-25:
+# hosted requests of tens to hundreds of KB died on the way, with no trace on the server, while small ones from the
+# same computers arrived (4 of the 5 users had a Russian interface, which fits ISPs freezing a connection to a
+# foreign host after about 16 KB; not proven). JSON text compresses several times over. A 400 or 415 to a gzipped
+# body is sent once more uncompressed; when that one is not refused the same way, the rest of this Blender session
+# sends uncompressed (_gzip_refused). Never to another provider or a LOOPCUT_SERVICE_URLS stand-in.
+GZIP_REFUSED = (400, 415)
+_gzip_refused = False
 
 
 def dropped_connection(ex) -> bool:
@@ -76,6 +88,27 @@ def short_cause(ex) -> str:
     reason = getattr(ex, "reason", None)
     detail = reason if isinstance(reason, str) and reason else getattr(ex, "strerror", None) or str(ex)
     return f"{type(ex).__name__}: {str(detail)[:80]}" if detail else type(ex).__name__
+
+
+# Every try at Loopcut's gateway died before a status line came back, though the connection opened. On 2026-10-25
+# such requests (tens to hundreds of KB) had left no trace on the server while small ones from the same computers
+# arrived; "press Try again" only repeated it. The card says what is in the way instead (still with Try again, for
+# after the user has changed it); the cause follows in brackets as on connection_lost's card.
+NETWORK_DROPPED = ("Your network dropped the request before it reached Loopcut. A VPN, proxy, antivirus web filter "
+                   "or your internet provider can do this, most often to large requests.")
+
+
+def network_dropped(cause=None) -> LLMError:
+    """NETWORK_DROPPED's card (CONNECTION_LOST, so it still offers Try again), the technical cause last."""
+    tail = f" ({short_cause(cause)})" if cause is not None else ""
+    return LLMError(NETWORK_DROPPED + tail, code=CONNECTION_LOST)
+
+
+def _never_connected(ex) -> bool:
+    """A failure before any connection opened (the name lookup, a refused connection): offline or blocked
+    outright, not a request dropped on its way."""
+    reason = ex.reason if isinstance(ex, urllib.error.URLError) else ex
+    return isinstance(reason, (socket.gaierror, ConnectionRefusedError))
 
 
 def connection_lost(service: str, cause=None, while_replying: bool = False) -> LLMError:
@@ -176,55 +209,151 @@ def _wait(seconds: float, is_cancelled: Callable[[], bool]) -> None:
 
 
 def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: float,
-          is_cancelled: Callable[[], bool], on_drop: Callable[[], bool] = lambda: False):
+          is_cancelled: Callable[[], bool], on_drop: Callable[[], bool] = lambda: False,
+          retry_delays: tuple[float, ...] | None = None, unanswered: Callable[..., LLMError] | None = None):
     """Open the stream, retrying failures that are likely to pass. Nothing has been streamed to
     the user yet at this point, so a retry is invisible apart from the wait. urlopen wraps an
     OSError from connecting and sending as URLError, but not one from waiting for the status line
     (getresponse): a read timeout, a reset, a TLS alert, or the bare FileNotFoundError(2) Windows
     raised there after ~19s (0.2.14 logs). That is retried the same way, unless it is a refused
-    certificate, which fails the same way every time. The request is built again for each try:
+    certificate, which fails the same way every time. retry_delays (RETRY_DELAYS when None) are the
+    waits before each further try. The request is built again for each try:
     after a dropped connection or a 413, on_drop (image_budget.Sized.tighten) has made its images
-    smaller."""
-    for attempt in range(len(RETRY_DELAYS) + 1):
-        last = attempt == len(RETRY_DELAYS)
+    smaller, and after a gzipped body was refused (GZIP_REFUSED) it goes uncompressed (_uncompressed).
+    unanswered(cause), when given, is the error when no try got a status line, though a connection opened
+    (network_dropped for Loopcut's gateway)."""
+    delays = RETRY_DELAYS if retry_delays is None else retry_delays
+    answered = False
+    for attempt in range(len(delays) + 1):
+        last = attempt == len(delays)
         request = build()
         try:
-            return urllib.request.urlopen(request, timeout=timeout)
+            return opened(lambda: urllib.request.urlopen(request, timeout=timeout), is_cancelled)
         except urllib.error.HTTPError as ex:
+            answered = True
             if request.get_header("X-loopcut-prompt"):
                 from . import cloud
                 cloud.note_prompt_version(ex.headers.get("x-loopcut-prompt-version"))
             with ex:
                 body = ex.read()
                 retry_after = ex.headers.get("Retry-After", "")
+            if ex.code in GZIP_REFUSED and request.get_header("Content-encoding") == "gzip" and not _gzip_refused:
+                return _uncompressed(ex.code, lambda: _open(build, base_url, timeout, is_cancelled, on_drop, delays))
             # 413: too large for the server (Loopcut's gateway, on Vercel, takes 4.5 MB): retried with smaller images.
             if last or (ex.code not in RETRY_STATUSES and not (ex.code == 413 and on_drop())):
                 error = _error_payload(body)
                 raise LLMError(f"HTTP {ex.code}: {_error_detail(body)}", ex.code,
                                str(error.get("code") or error.get("type") or ""), error,
                                account_from_headers(ex.headers)) from ex
-            delay = RETRY_DELAYS[attempt]
+            delay = delays[attempt]
             if retry_after.replace(".", "", 1).isdigit():
                 delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)
-            print(f"Loopcut: retrying the request after HTTP {ex.code} ({attempt + 1}/{len(RETRY_DELAYS)}, "
+            print(f"Loopcut: retrying the request after HTTP {ex.code} ({attempt + 1}/{len(delays)}, "
                   f"waiting {delay:g}s)")
         except urllib.error.URLError as ex:
+            if last and unanswered and not answered and dropped_connection(ex) and not _never_connected(ex):
+                raise unanswered(ex) from ex
             if last:
                 raise LLMError(f"Could not reach {base_url}: {ex.reason}", code=CONNECTION_LOST) from ex
             on_drop()  # A broken pipe or a reset as the body went up: large uploads are cut that way.
-            delay = RETRY_DELAYS[attempt]
-            print(f"Loopcut: retrying the request after {ex.reason!r} ({attempt + 1}/{len(RETRY_DELAYS)}, "
+            delay = delays[attempt]
+            print(f"Loopcut: retrying the request after {ex.reason!r} ({attempt + 1}/{len(delays)}, "
                   f"waiting {delay:g}s)")
         except OSError as ex:  # From getresponse, which urlopen does not wrap (see above).
             if isinstance(ex, ssl.SSLCertVerificationError):
                 raise
+            if last and unanswered and not answered:
+                raise unanswered(network_cause(ex) or ex) from ex
             if last:
                 raise connection_lost("the model", network_cause(ex) or ex) from ex
             on_drop()
-            delay = RETRY_DELAYS[attempt]
-            print(f"Loopcut: retrying the request after {ex!r} ({attempt + 1}/{len(RETRY_DELAYS)}, waiting {delay:g}s)")
+            delay = delays[attempt]
+            print(f"Loopcut: retrying the request after {ex!r} ({attempt + 1}/{len(delays)}, waiting {delay:g}s)")
         _wait(delay, is_cancelled)
     raise AssertionError("unreachable")
+
+
+def _uncompressed(status: int, again: Callable[[], object]):
+    """The gateway answered `status` to a gzipped body: again() is the same request uncompressed, since build()
+    reads _gzip_refused, which stays set for the session. When that one is refused the same way the body was at
+    fault, not its encoding (a request too long for the model, say), so later requests are gzipped again."""
+    global _gzip_refused
+    _gzip_refused = True
+    print(f"Loopcut: the service refused a gzipped request (HTTP {status}); sending it uncompressed")
+    try:
+        return again()
+    except LLMError as ex:
+        if ex.status in GZIP_REFUSED:
+            _gzip_refused = False
+        raise
+
+
+def opened(open_fn: Callable[[], object], is_cancelled: Callable[[], bool]):
+    """open_fn()'s response (urlopen's, here and in the ChatGPT and Anthropic adapters), unless the turn is cancelled
+    first: then Cancelled at once. _Watchdog's job before there is a stream: urlopen gives no socket to shut until it
+    returns, while it can block for timeout= in the name lookup, the TLS handshake, sending the body or waiting for
+    the status line. A stall tester's stand-in that accepted and sent nothing kept Stop (pressed at 3.5 s) waiting
+    120 s here, 300 s on Anthropic, 600 s on the ChatGPT plan. So the open runs on its own thread while this one
+    checks is_cancelled every 0.2 s, as _Watchdog does; after a Stop it goes on alone until it ends, at most
+    timeout=, and a response it still gets is closed."""
+    if is_cancelled():
+        raise Cancelled()
+    done, lock, box = threading.Event(), threading.Lock(), {}
+
+    def run():
+        try:
+            box["response"] = open_fn()
+        except BaseException as ex:  # Raised again on the caller's thread, an HTTPError with its body.
+            box["error"] = ex
+        with lock:
+            done.set()
+            left = box.get("left", False)
+        if left:  # Nobody waits for it: free the connection.
+            try:
+                (box.get("response") or box.get("error")).close()
+            except Exception:
+                pass
+
+    threading.Thread(target=run, name="loopcut-llm-open", daemon=True).start()
+    while not done.wait(0.2):
+        if is_cancelled():
+            with lock:
+                if not done.is_set():
+                    box["left"] = True
+                    raise Cancelled()
+    if "error" in box:
+        raise box["error"]
+    return box["response"]
+
+
+class _Watchdog:
+    """Shuts the stream's socket when the turn is cancelled, so a read blocked on a silent stream (each line may
+    take timeout= seconds) returns at once and Stop ends the turn in under a second, as the ChatGPT and Anthropic
+    adapters' own watchdogs do. Before the status line, opened() does the same for the open."""
+
+    def __init__(self, response, is_cancelled: Callable[[], bool]):
+        self.response, self.is_cancelled = response, is_cancelled
+        self.fired = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="loopcut-llm-watchdog", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(0.2):
+            if self.is_cancelled():
+                self.fired = True
+                try:
+                    sock = getattr(getattr(getattr(self.response, "fp", None), "raw", None), "_sock", None)
+                    if sock is not None:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    else:
+                        self.response.close()
+                except OSError:
+                    pass
+                return
+
+    def stop(self):
+        self._stop.set()
 
 
 class _ReadInterrupted(Exception):
@@ -239,11 +368,12 @@ class _ReadInterrupted(Exception):
 
 
 def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
-         deadline: float | None = None) -> Completion:
+         deadline: float | None = None, on_progress: Callable[[], None] | None = None) -> Completion:
     """One stream, start to finish, into a Completion. Raises _ReadInterrupted(streamed) for an
     OSError from the socket (a read timeout, a reset, a TLS alert, Windows' bare FileNotFoundError(2);
-    not a refused certificate); everything else (a malformed chunk, an error object in the stream,
-    Cancelled) is unrelated to the connection and is not retryable here.
+    not a refused certificate) or a body cut short (http.client's IncompleteRead); everything else (a
+    malformed chunk, an error object in the stream, Cancelled) is unrelated to the connection and is
+    not retryable here. A Stop shuts the socket (_Watchdog), and whatever that reads as is Cancelled.
 
     deadline: a time.monotonic() past which the stream is cut short like a normal finish, not an
     error -- finish_reason is set to "length" (and timed_out=True) so a caller that already retries
@@ -255,6 +385,7 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                             prompt_version=response.headers.get("x-loopcut-prompt-version"))
     calls: dict[int, ToolCall] = {}
     streamed = False
+    watchdog = _Watchdog(response, is_cancelled)
     try:
         with response:
             for raw in response:
@@ -288,6 +419,9 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         completion.usage["cost"] = float(cost)
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
+                    if on_progress and (delta.get("content") or delta.get("tool_calls")
+                                        or delta.get("reasoning_content") or delta.get("reasoning")):
+                        on_progress()
                     text = delta.get("content")
                     if text:
                         completion.text += text
@@ -305,10 +439,16 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         call.arguments += function.get("arguments") or ""
                     if choice.get("finish_reason"):
                         completion.finish_reason = choice["finish_reason"]
-    except OSError as ex:  # socket.timeout is TimeoutError since Python 3.10.
+    except (OSError, http.client.HTTPException) as ex:  # socket.timeout is TimeoutError since Python 3.10.
+        if watchdog.fired or is_cancelled():
+            raise Cancelled() from None
         if isinstance(ex, ssl.SSLCertVerificationError):
             raise
         raise _ReadInterrupted(streamed) from ex
+    finally:
+        watchdog.stop()
+    if watchdog.fired:  # The socket it shut can also read as the stream's end.
+        raise Cancelled()
     completion.tool_calls = [calls[i] for i in sorted(calls)]
     return completion
 
@@ -346,6 +486,26 @@ def wire_tools(schemas: list[dict]) -> list[dict]:
             if isinstance(schema.get("function"), dict) else schema for schema in schemas]
 
 
+def _on_openrouter(base_url: str) -> bool:
+    """Whether base_url is OpenRouter's API: the OpenRouter provider's https://openrouter.ai/api/v1, or a Custom
+    one pointed there."""
+    try:
+        return urlparse(base_url).hostname == "openrouter.ai"
+    except ValueError:
+        return False
+
+
+def _non_strict(tools: list[dict]) -> list[dict]:
+    """OpenRouter serves OpenAI's GPT-6 models with a reasoning effort through OpenAI's Responses API, where a
+    function tool without strict is strict: every property becomes required, so the model fills each optional one
+    with a placeholder. On 2026-10-25 Luna sent search_assets polypizza's fields on every source and import_asset
+    pick 0 beside source and id, apply_to [] and target_size 0. strict false gives only what the call needs; the
+    gateway does the same for hosted users (web repo, gateway/upstream.ts) and chatgpt_responses.to_tools for the
+    ChatGPT plan. A tool that already says strict keeps it."""
+    return [{**tool, "function": {**tool["function"], "strict": False}}
+            if isinstance(tool.get("function"), dict) and "strict" not in tool["function"] else tool for tool in tools]
+
+
 def stream_chat(
     *,
     base_url: str,
@@ -362,6 +522,8 @@ def stream_chat(
     headers: dict | None = None,
     prompt_id: str | None = None,
     on_retry: Callable[[], None] | None = None,
+    on_progress: Callable[[], None] | None = None,
+    retry_delays: tuple[float, ...] | None = None,
 ) -> Completion:
     """`headers` adds to (never replaces) Authorization/Content-Type/Accept -- for Loopcut's own
     gateway, the caller passes correlation_headers()'s x-loopcut-conversation / x-loopcut-role so a
@@ -386,9 +548,17 @@ def stream_chat(
     only when on_retry is given: it is the caller saying it can undo what on_text already did (drop
     the partial reply card's text) before the retried request's own deltas start arriving. Without
     on_retry, or after that one retry also breaks, the error surfaces as it did before this existed.
+    retry_delays (RETRY_DELAYS when None) bounds both: the waits before each further try, on the chat
+    completions route (the router's are shorter: router.RETRY_DELAYS).
+
+    on_progress, when given, is called for everything the model streams (text, a tool call's arguments, reasoning;
+    never a keepalive): the turn's stall clock (agent.Turn.touch).
 
     Every provider sends the messages through image_budget.Sized: their inline images stay under a
     byte budget, and a try after the connection dropped as the request went up sends them smaller.
+    Loopcut's own gateway (config.SERVICE_BASE_URL) gets the body gzipped, unless it refused that this
+    session (GZIP_REFUSED). When no try at the gateway (or a stand-in) got a status line back, the error
+    is network_dropped's, which says the network is in the way rather than "press Try again".
 
     The ChatGPT plan provider (base URL chatgpt_auth.CHATGPT_PLAN_BASE_URL) is not chat completions:
     chatgpt_responses.stream speaks the Responses API with the signed-in account's token instead,
@@ -397,7 +567,11 @@ def stream_chat(
 
     The Anthropic provider (base URL config.ANTHROPIC_BASE_URL, anthropic://...) is not chat completions either:
     anthropic_messages.stream speaks Anthropic's Messages API with the user's key and prompt caching, and returns
-    the same Completion. It never sends the x-loopcut-* headers."""
+    the same Completion. It never sends the x-loopcut-* headers.
+
+    An OpenAI model on OpenRouter (openai/*, _on_openrouter) gets each function tool with strict false
+    (_non_strict); every other route sends the tools as wire_tools leaves them. On the wire only: the prompt's
+    token estimate (context.fixed_tokens) counts wire_tools."""
     if prompt_id is not None and prompt_id not in ("single", "orchestrator", "worker", "router"):
         raise ValueError(f"Unknown Loopcut prompt_id: {prompt_id!r}")
     tools = wire_tools(tools)
@@ -405,13 +579,17 @@ def stream_chat(
         from . import chatgpt_responses
         return chatgpt_responses.stream(
             model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort, on_text=on_text,
-            is_cancelled=is_cancelled, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry)
+            is_cancelled=is_cancelled, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry,
+            on_progress=on_progress)
     if base_url.startswith("anthropic://"):
         from . import anthropic_messages
         return anthropic_messages.stream(
             base_url=base_url, api_key=api_key, model=model, messages=messages, tools=tools,
             reasoning_effort=reasoning_effort, on_text=on_text, is_cancelled=is_cancelled, timeout=timeout,
-            max_tokens=max_tokens, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry)
+            max_tokens=max_tokens, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry,
+            on_progress=on_progress)
+    if _on_openrouter(base_url) and model.startswith("openai/"):
+        tools = _non_strict(tools)
     body = {
         "model": model,
         "messages": messages,
@@ -443,27 +621,29 @@ def stream_chat(
         "Accept": "text/event-stream",
     })
     sized = image_budget.Sized(messages)
+    gateway = base_url.strip().rstrip("/") == config.SERVICE_BASE_URL  # Gzipped bodies: see GZIP_REFUSED.
 
     def build() -> urllib.request.Request:
-        return urllib.request.Request(
-            f"{base_url}/chat/completions",
-            data=json.dumps({**body, "messages": sized.messages()}).encode("utf-8"),
-            headers=request_headers,
-            method="POST",
-        )
+        data, sent = json.dumps({**body, "messages": sized.messages()}).encode("utf-8"), request_headers
+        if gateway and not _gzip_refused:
+            import gzip
+            data, sent = gzip.compress(data, 6, mtime=0), {**request_headers, "Content-Encoding": "gzip"}
+        return urllib.request.Request(f"{base_url}/chat/completions", data=data, headers=sent, method="POST")
     deadline = (time.monotonic() + call_max_seconds
                 if call_max_seconds and not _is_loopback(base_url) else None)
     # Two separate, small budgets: before any content this attempt, the same capped backoff as a
-    # connect failure (bounded by RETRY_DELAYS); once content has streamed, exactly one further
+    # connect failure (bounded by retry_delays); once content has streamed, exactly one further
     # retry, regardless of how much of the first budget that used.
-    before_content = 0
+    before_content, delays = 0, RETRY_DELAYS if retry_delays is None else retry_delays
     retried_partial = False
     while True:
-        response = _open(build, base_url, timeout, is_cancelled, sized.tighten)
+        first = before_content == 0 and not retried_partial  # After that a try has had its status line.
+        response = _open(build, base_url, timeout, is_cancelled, sized.tighten, delays,
+                         network_dropped if service and first else None)
         if service and prompt_id is not None:
             cloud.note_prompt_version(response.headers.get("x-loopcut-prompt-version"))
         try:
-            return _read(response, on_text, is_cancelled, deadline)
+            return _read(response, on_text, is_cancelled, deadline, on_progress)
         except _ReadInterrupted as ex:
             cause = ex.__cause__
             shown = network_cause(cause) or repr(cause)
@@ -475,10 +655,10 @@ def stream_chat(
                 print(f"Loopcut: retrying once from scratch after the stream broke mid-reply ({cause!r})")
                 on_retry()
                 continue
-            if before_content == len(RETRY_DELAYS):
+            if before_content == len(delays):
                 raise LLMError(f"Connection lost before any reply arrived: {shown}", code=CONNECTION_LOST) from cause
-            delay = RETRY_DELAYS[before_content]
-            print(f"Loopcut: retrying the request after {cause!r} ({before_content + 1}/{len(RETRY_DELAYS)}, "
+            delay = delays[before_content]
+            print(f"Loopcut: retrying the request after {cause!r} ({before_content + 1}/{len(delays)}, "
                   f"waiting {delay:g}s)")
             before_content += 1
             _wait(delay, is_cancelled)

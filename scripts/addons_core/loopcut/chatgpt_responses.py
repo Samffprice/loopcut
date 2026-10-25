@@ -68,7 +68,8 @@ _NO_RETRY = {
     "chatpass_v2_invalid_authorization_context",
 }
 # Failures inside a stream that are worth the same bounded retries as a broken stream (the docs: retry
-# usage_unavailable and user_unavailable with backoff; server_error is the API's own transient one).
+# usage_unavailable and user_unavailable with backoff; server_error is the API's own transient one). One with no
+# code at all is retried too: twice in a row on 2026-10-25 (0.2.14 logs) it ended a turn as "ChatGPT request failed".
 _RETRY_IN_STREAM = {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable", "server_error"}
 _MESSAGES = {
     "subscription_sharing_usage_limit_exceeded":
@@ -516,8 +517,9 @@ def _open(build: Callable[[], dict], is_cancelled: Callable[[], bool], transcrip
         except chatgpt_auth.ChatGPTAuthError as ex:
             raise llm.LLMError(str(ex), ex.status or 401, ex.code or "chatgpt_not_signed_in") from None
         transcript.request(body)
-        try:
-            return _post(body, token, 15.0 if probe else read_timeout(), turn_state(), session)
+        timeout, state = 15.0 if probe else read_timeout(), turn_state()
+        try:  # llm.opened: a Stop before the status line ends the turn at once, not after the 600 s read timeout.
+            return llm.opened(lambda: _post(body, token, timeout, state, session), is_cancelled)
         except urllib.error.HTTPError as ex:
             headers = ex.headers
             try:
@@ -644,7 +646,29 @@ def _events(response):
             pass
 
 
-def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, meta: dict) -> llm.Completion:
+def _shape(value) -> str:
+    """A failure as ChatGPT sent it, for the console (and so the conversation log): compact, capped."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text[:400]
+
+
+def _stream_failed(error: llm.LLMError) -> llm.LLMError:
+    """A failure inside the stream that came back on every retry: what happened and what to do, with Try again on
+    the card (llm.STREAM_FAILED). The plan's own reason when Loopcut has words for it; the request id last."""
+    request_id = error.details.get("request_id", "")
+    text = _MESSAGES.get(error.code) or (
+        "ChatGPT stopped the reply with an error, again when Loopcut retried. Nothing was lost: press Try again in "
+        f"a minute, or check your ChatGPT plan's usage if it keeps failing: {chatgpt_auth.USAGE_URL}")
+    if request_id:
+        text += f" (request {request_id})"
+    return llm.LLMError(text, None, llm.STREAM_FAILED, {**error.details, "error_code": error.code, "message": text})
+
+
+def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, meta: dict,
+          on_progress=None) -> llm.Completion:
     completion = llm.Completion()
     started = time.monotonic()
     items: dict[int, dict] = {}
@@ -664,6 +688,8 @@ def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, me
                 if first_byte is None:
                     first_byte = time.monotonic() - started
                 events[kind] = events.get(kind, 0) + 1
+                if on_progress and kind.startswith("response."):  # The model's own events (llm.stream_chat).
+                    on_progress()
                 index = event.get("output_index")
                 if is_cancelled():
                     raise llm.Cancelled()
@@ -695,8 +721,12 @@ def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, me
                     break
                 elif kind == "error":
                     terminal = kind
-                    error = _error(None, str(event.get("code") or ""), str(event.get("message") or ""),
-                                   {k: event.get(k) for k in ("code", "message", "param")}, meta.get("request_id", ""))
+                    # The Responses API puts code and message on the event; an error object under "error" is read too.
+                    raw = {**(event.get("error") if isinstance(event.get("error"), dict) else {}),
+                           **{k: event[k] for k in ("code", "message", "param") if event.get(k)}}
+                    error = _error(None, str(raw.get("code") or raw.get("type") or ""), str(raw.get("message") or ""),
+                                   {k: raw.get(k) for k in ("code", "message", "param")}, meta.get("request_id", ""))
+                    print(f"Loopcut: ChatGPT's stream sent an error event: {_shape(event)}")
                     break
     except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as ex:
         if watchdog.fired == "cancelled" or is_cancelled():
@@ -719,10 +749,11 @@ def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, me
         raw = final_response.get("error") or {}
         error = _error(None, str(raw.get("code") or ""), str(raw.get("message") or "response.failed"),
                        raw if isinstance(raw, dict) else {}, meta.get("request_id", ""))
+        print(f"Loopcut: ChatGPT's stream ended in response.failed: {_shape(raw)}")
     if error is not None:
         _log_response(transcript, meta, started, first_byte, events, items, order, final_response, completion,
                       summaries, error=error.details)
-        if error.code in _RETRY_IN_STREAM:
+        if error.code in _RETRY_IN_STREAM or not error.code:
             raise _Interrupted(streamed) from error
         raise error
     if not items and isinstance(final_response.get("output"), list):
@@ -777,7 +808,7 @@ def _log_response(transcript, meta, started, first_byte, events, items, order, f
 def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_effort: str,
            on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
            call_max_seconds: float | None = None, headers: dict | None = None,
-           on_retry: Callable[[], None] | None = None) -> llm.Completion:
+           on_retry: Callable[[], None] | None = None, on_progress: Callable[[], None] | None = None) -> llm.Completion:
     """llm.stream_chat for the ChatGPT plan: same arguments that matter, same Completion, same retry
     rules for a stream that breaks (before any text: capped backoff; after some: once, from scratch,
     only with on_retry)."""
@@ -801,19 +832,22 @@ def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_ef
         meta = {"model": model, "effort": reasoning_effort, "request_id": _request_id(response.headers),
                 "headers": _headers(response.headers)}
         try:
-            return _read(response, on_text, is_cancelled, deadline, transcript, meta)
+            return _read(response, on_text, is_cancelled, deadline, transcript, meta, on_progress)
         except _Interrupted as ex:
             cause = ex.__cause__ or EOFError("the stream ended before response.completed")
             shown = llm.network_cause(cause) or cause
+            failed = cause if isinstance(cause, llm.LLMError) else None  # ChatGPT said it failed: no dropped line.
             if ex.streamed:
                 if retried_partial or on_retry is None:
+                    if failed:
+                        raise _stream_failed(failed) from cause
                     raise llm.connection_lost("ChatGPT", shown, while_replying=True) from cause
                 retried_partial = True
                 print(f"Loopcut: retrying the ChatGPT request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
             if before_content == len(llm.RETRY_DELAYS):
-                raise llm.connection_lost("ChatGPT", shown) from cause
+                raise (_stream_failed(failed) if failed else llm.connection_lost("ChatGPT", shown)) from cause
             delay = llm.RETRY_DELAYS[before_content]
             print(f"Loopcut: retrying the ChatGPT request after {cause!r} ({before_content + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")

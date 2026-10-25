@@ -2,6 +2,7 @@
 downloads (over file:// so no network), listing parsing, refs, index metadata. Real libraries are
 covered by harness/asset_libraries_check.py."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -65,6 +67,44 @@ class RankAndDownloadTest(unittest.TestCase):
             with self.assertRaises(tools.ToolError):
                 asset_common.download((Path(tmp) / "nope").as_uri(), Path(tmp) / "x")
 
+    def test_a_body_that_breaks_off_is_the_tools_error_not_the_turns(self):
+        # 2026-10-25: a BlenderKit thumbnail's read timed out, escaped thumbnail() and ended the turn as
+        # "the connection to the model dropped".
+        import http.client
+        from unittest import mock
+
+        class Breaking:
+            def __init__(self, error):
+                self.error, self.sent = error, False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size=-1):
+                if not self.sent and size > 0:  # A download's first chunk arrives; a whole-body read breaks.
+                    self.sent = True
+                    return b"RIFF"
+                raise self.error
+
+        for error in (TimeoutError("The read operation timed out"), ConnectionResetError(54, "Connection reset by peer"),
+                      http.client.IncompleteRead(b"x", 10)):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                dest = Path(tmp) / "thumbs" / "a.webp"
+                with mock.patch.object(asset_common.urllib.request, "urlopen", lambda *a, **k: Breaking(error)):
+                    with self.assertRaises(tools.ToolError) as caught:
+                        asset_common.download("https://www.blenderkit.com/thumbs/a.webp", dest)
+                    self.assertTrue(str(caught.exception).startswith(
+                        "Lost the connection to www.blenderkit.com while reading its answer ("
+                        f"{type(error).__name__}: "), str(caught.exception))
+                    self.assertFalse(dest.exists() or dest.with_suffix(".webp.part").exists(), "no half file left")
+                    self.assertIsNone(asset_common.thumbnail("https://www.blenderkit.com/thumbs/a.webp", dest))
+                    with self.assertRaises(tools.ToolError) as caught:
+                        asset_common.get_json("https://www.blenderkit.com/api/v1/search/")
+                    self.assertIn("Lost the connection to www.blenderkit.com", str(caught.exception))
+
 
 class ListingTest(unittest.TestCase):
     def test_page_entries_keep_scene_assets_in_blend_files_only(self):
@@ -112,6 +152,38 @@ class ListingTest(unittest.TestCase):
         result = tools.execute("search_assets", json.dumps({"source": "library", "query": "x", "type": "BRUSH"}))
         self.assertFalse(result.ok)
         self.assertIn("OBJECT, COLLECTION", result.text)
+
+
+
+class UndoStepTest(unittest.TestCase):
+    def test_an_import_is_one_undo_step_from_after_its_download_also_when_its_load_fails_part_way(self):
+        """0.2.18: a read-only step, then import_asset, then Undo crashed Blender: nothing pushed after the
+        import. Every library's load pushes its Before (tools.undo_before) and execute the one after."""
+        order = []
+        push = mock.Mock(side_effect=lambda message: order.append(message))
+        ref = "Kit::kit.blend::OBJECT::Stool"
+        fetched = {"ref": ref, "library": "Kit", "blend": "/nowhere/kit.blend", "id_type": "OBJECT", "name": "Stool",
+                   "link": False, "reuse": False, "license": "CC0", "author": ""}
+
+        def fetch(ref, apply_to=None):
+            order.append("download")
+            return fetched
+
+        load = mock.Mock(side_effect=tools.ToolError("Blender could not load 'Stool' from kit.blend"))
+        with mock.patch.object(tools, "bpy", types.SimpleNamespace(ops=types.SimpleNamespace(
+                    ed=types.SimpleNamespace(undo_push=push)))), \
+                mock.patch.object(tools, "_editor_context", side_effect=lambda _: contextlib.nullcontext()), \
+                mock.patch.object(asset_libraries, "bpy", types.SimpleNamespace(data=types.SimpleNamespace(
+                    objects=[], libraries=types.SimpleNamespace(load=load)))):
+            with mock.patch.object(asset_libraries, "fetch_asset", side_effect=fetch):
+                result = tools.execute("import_asset", json.dumps({"source": "library", "id": ref}))
+            self.assertFalse(result.ok)
+            self.assertEqual(order, ["download", "Before Loopcut: import asset", "Loopcut: import asset"])
+            order.clear()
+            with mock.patch.object(asset_libraries, "fetch_asset", side_effect=tools.ToolError("download failed")):
+                self.assertFalse(tools.execute("import_asset", json.dumps({"source": "library", "id": ref})).ok)
+            self.assertEqual(order, [], "a failed download changed nothing: no undo step")
+        self.assertEqual(tools._undo_owed, [])
 
 
 if __name__ == "__main__":

@@ -74,6 +74,7 @@ class DeliveryPersistenceTest(unittest.TestCase):
         conversations.store_image(self.session, scratch, other)
         reply = {'kind': 'assistant', 'text': self.text, 'streaming': False}
         markdown.finish_reply(reply, self.base)
+        card['status'] = other['status'] = 'done'  # A turn that ended: nothing in flight for load to settle.
         self.session['items'] = [card, other, reply]
         conversations.save(self.session)
         self.file.unlink()

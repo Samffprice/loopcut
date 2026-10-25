@@ -4,6 +4,8 @@ Fast transports remain useful when the shared contract checkout is absent. Loopb
 exercise the mock's real ETag, flags, skills and error envelopes; no vendor/service traffic.
 """
 
+import contextlib
+import gzip
 import hashlib
 import io
 import json
@@ -1120,6 +1122,51 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(len(threads), 1)
         self.assertNotEqual(threads[0], threading.get_ident())
 
+    def test_an_attached_report_s_line_is_for_its_card_and_the_model_keeps_the_text(self):
+        line = 'Searched libraries: 1 match; best: Treasure Chest (Poly Haven, CC0)'
+        text = 'Attached reports: report. Job job_1; provenance recorded.\nreport:\n{"results": [{}]}'
+        whole = text + '\n{"results": [{"title": "Treasure Chest"}]}'  # An asset search's: its card keeps the JSON.
+        def apply(descriptor, job, *, details):
+            details.update(outcome=line, card_output=whole)
+            return text
+        job = {'id': 'job_1', 'status': 'succeeded', 'outputs': [{'type': 'report', 'name': 'report'}]}
+        result = cloud._apply(types.SimpleNamespace(apply_result=apply), {'apply': 'attach_report'}, job)
+        self.assertEqual((result.text, result.outcome, result.card_output), (text, line, whole))
+        cloud._jobs['job_1'] = {'module': self.module, 'result': result, 'descriptor': {'apply': 'attach_report'}}
+        again = cloud._job_status({'job_id': 'job_1'})
+        self.assertEqual((again.text, again.outcome, again.card_output), (text, line, whole),
+                         "a later job_status of it, the same")
+        plain = cloud._apply(types.SimpleNamespace(apply_result=lambda descriptor, job: 'Added the sound.'),
+                             {'apply': 'add_audio_strip'}, {'id': 'job_2', 'outputs': [{'type': 'audio'}]})
+        self.assertEqual((plain.text, plain.outcome), ('Added the sound.', ''), "no report, no line")
+
+    def test_an_output_that_changes_the_scene_is_one_undo_step_and_reports_and_rigs_push_none_of_ours(self):
+        from loopcut import tools
+        order = []
+        push = unittest.mock.Mock(side_effect=lambda message: order.append(message))
+
+        def apply(descriptor, job, **_):
+            order.append("apply")
+            if descriptor.get("fail"):
+                raise tools.ToolError("Blender could not read the GLB")
+            return "Added."
+
+        module, job = types.SimpleNamespace(apply_result=apply), {'id': 'job_3', 'outputs': [{'type': 'model_3d'}]}
+        with patch.object(tools, 'bpy', types.SimpleNamespace(ops=types.SimpleNamespace(
+                    ed=types.SimpleNamespace(undo_push=push)))), \
+                patch.object(tools, '_editor_context', side_effect=lambda _: contextlib.nullcontext()):
+            self.assertTrue(cloud._apply(module, {'apply': 'import_model', 'display': {'title': 'Photo to 3D'}}, job).ok)
+            self.assertEqual(order, ['Before Loopcut: Photo to 3D', 'apply', 'Loopcut: Photo to 3D'])
+            order.clear()
+            self.assertFalse(cloud._apply(module, {'apply': 'apply_motion', 'name': 'motion_from_text', 'fail': True},
+                                          job).ok)
+            self.assertEqual(order, ['Before Loopcut: motion_from_text', 'apply', 'Loopcut: motion_from_text'],
+                             "a failed apply's partial changes are in the step too")
+            for handler in ('attach_report', 'none', 'apply_rig'):  # autorig.apply pushes its own pair.
+                order.clear()
+                cloud._apply(module, {'apply': handler}, job)
+                self.assertEqual(order, ['apply'], handler)
+
     def test_detached_verification_failure_uses_the_same_refund_receipt_flow(self):
         value = {'id': 'job_test', 'credits': {'reserved': 20, 'charged': 20, 'refunded': 0}}
         failure = cloud_http.CloudError('Corrupt rig', 'hash_mismatch',
@@ -1231,6 +1278,29 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(cloud.execute('loopcut_cloud__job_status', {'job_id': handle}).text, 'Imported result.')
         self.assertEqual([c[0] for c in self.calls].count('apply'), 1)
 
+    def test_a_calls_server_answers_touch_only_the_turn_that_made_it(self):
+        """agent.check_stall: each answer of the server is progress for the call's own turn; a long job detached from
+        it touches no turn after, in this chat or another."""
+        from loopcut import agent, state
+        self.ready(latency='long')
+        cancels = []
+
+        def run(*args, cancel=None, **kwargs):
+            cancels.append(cancel)
+            cancel.heard()  # The server answered a poll.
+            return {'id': 'job_1', 'status': 'running', 'progress': {'pct': 0, 'message': 'Queued'}}
+        self.module.run = self.quoting(run)
+        caller, later = agent.Turn(), agent.Turn()
+        caller.progress_at = later.progress_at = 0.0
+        session = state.session()
+        self.addCleanup(session.__setitem__, 'turn', session.get('turn'))
+        session['turn'] = caller
+        self.run_step(cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'prop'}))
+        self.assertGreater(caller.progress_at, 0.0)
+        session['turn'] = later
+        self.assertIsNone(cancels[-1].heard, "detached with the job: its own thread's polls touch nothing")
+        self.assertEqual(later.progress_at, 0.0)
+
     @patch.object(config, 'billing_open', lambda: True)
     def test_long_error_keeps_extras_and_reports_to_originating_card_once(self):
         self.ready(latency='long')
@@ -1274,6 +1344,74 @@ class DispatchTest(RuntimeFixture):
         self.assertTrue(result.ok)
         self.assertEqual([c[0] for c in self.calls], ['resolve', 'byok', 'apply'])
         self.assertEqual(self.calls[1][2][0][1], {'prompt': 'test'})
+
+
+def encoded(data: bytes, encoding='gzip', status=200, headers=None):
+    """A reply whose body is data as sent, with that Content-Encoding."""
+    reply = Reply(status=status, headers={'Content-Encoding': encoding, **(headers or {})})
+    reply.write(data)
+    reply.seek(0)
+    return reply
+
+
+class EncodingTest(RuntimeFixture):
+    """JSON GETs ask for gzip (loopcut.org gzips GET /v1/manifest, 21.7 KB raw); _read decodes by the reply's
+    Content-Encoding, and its size limit is on the decoded bytes."""
+
+    def client(self, *replies):
+        self.transport = Transport(*replies)
+        return cloud_http.Client(base_url='https://service.test', api_key='lc_demo', transport=self.transport)
+
+    def test_a_json_get_asks_for_gzip_and_reads_the_gzipped_reply(self):
+        payload = manifest(tool())
+        client = self.client(encoded(gzip.compress(json.dumps(payload).encode())), Reply({}), Reply({}))
+        self.assertEqual(client.request('GET', '/v1/manifest'), payload)
+        self.assertEqual(self.transport.calls[0]['headers']['accept-encoding'], 'gzip')
+        client.request('POST', '/v1/jobs', {'tool': 'x'})
+        self.assertNotIn('accept-encoding', self.transport.calls[1]['headers'])
+        with client.stream('/v1/jobs/1/events'):
+            pass
+        self.assertNotIn('accept-encoding', self.transport.calls[2]['headers'], 'never on SSE')
+
+    def test_identity_and_no_encoding_read_as_before_and_several_members_join(self):
+        body = json.dumps({'ok': True}).encode()
+        client = self.client(encoded(body, 'identity'), Reply({'ok': True}),
+                             encoded(gzip.compress(body[:5]) + gzip.compress(body[5:]), 'GZIP'))
+        for _ in range(3):
+            self.assertEqual(client.request('GET', '/v1/me'), {'ok': True})
+
+    def test_a_small_gzip_cannot_expand_past_the_limit(self):
+        bomb = gzip.compress(b'{"a": "' + b'x' * (cloud_http.MAX_RESPONSE + 10) + b'"}')
+        self.assertLess(len(bomb), 10_000)
+        client = self.client(encoded(bomb))
+        with patch.object(cloud_http.zlib, 'decompressobj', wraps=cloud_http.zlib.decompressobj) as made:
+            with self.assertRaises(cloud_http.CloudError) as caught:
+                client.request('GET', '/v1/manifest')
+        self.assertEqual((caught.exception.code, str(caught.exception)), ('invalid_response', 'Loopcut response is too large'))
+        self.assertEqual(made.call_count, 1)
+        at_limit = b'{"a": "' + b'x' * (cloud_http.MAX_RESPONSE - 9) + b'"}'
+        self.assertEqual(len(at_limit), cloud_http.MAX_RESPONSE)
+        data = self.client(encoded(gzip.compress(at_limit))).request('GET', '/v1/manifest')
+        self.assertEqual(len(data['a']), cloud_http.MAX_RESPONSE - 9, 'exactly the limit decoded still reads')
+
+    def test_another_encoding_a_cut_gzip_or_bad_gzip_is_an_invalid_response(self):
+        whole = gzip.compress(json.dumps({'ok': True}).encode())
+        for reply, message in ((encoded(b'{}', 'br'), 'Loopcut response has an unknown encoding'),
+                               (encoded(b'{}', 'gzip, br'), 'Loopcut response has an unknown encoding'),
+                               (encoded(whole[:-6]), 'Loopcut response was cut short'),
+                               (encoded(b'not gzip at all'), 'Loopcut response is not valid gzip')):
+            with self.subTest(message=message):
+                with self.assertRaises(cloud_http.CloudError) as caught:
+                    self.client(reply).request('GET', '/v1/me')
+                self.assertEqual((caught.exception.code, str(caught.exception)), ('invalid_response', message))
+
+    def test_a_gzipped_error_keeps_its_code(self):
+        refusal = json.dumps({'error': {'code': 'credits_exhausted', 'message': 'No credits left'}}).encode()
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            self.client(encoded(gzip.compress(refusal), status=402)).request('GET', '/v1/me')
+        self.assertEqual((caught.exception.status, caught.exception.code), (402, 'credits_exhausted'))
+        empty = self.client(encoded(b'', status=304)).request_response('GET', '/v1/manifest')
+        self.assertEqual((empty.status, empty.data), (304, None), 'a 304 has no body to decode')
 
 
 class MockTest(unittest.TestCase):

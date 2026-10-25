@@ -330,7 +330,13 @@ def _pick_mention(session: dict, index: int) -> None:
 
 
 def _submit(session: dict) -> None:
-    if agent.send(session["input"]):
+    from .. import version_guard
+    try:
+        sent = agent.send(session["input"])
+    except version_guard.RestartNeeded as ex:  # Updated under this Blender; the input stays for after the restart.
+        session["items"].append(state.item_error(str(ex)))
+        return
+    if sent:
         from .. import onboarding
         onboarding.dismiss_hints()
         textedit.set_text(session, "")
@@ -980,6 +986,7 @@ class LOOPCUT_OT_focus(bpy.types.Operator):
 
 
 class LOOPCUT_OT_scroll(bpy.types.Operator):
+    """Scroll the Loopcut panel."""
     bl_idname = "loopcut.scroll"
     bl_label = "Scroll Loopcut"
     bl_options = {"INTERNAL"}

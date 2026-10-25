@@ -297,17 +297,18 @@ class UpFrontFacts(unittest.TestCase):
                 patch.object(cloud, '_runtime', self.runtime()), patch('loopcut.tools._editor_context'):
             result = json.loads(autorig.tool('inspect').text)
         self.assertTrue(result['price_note'].startswith('Before rigging, tell the user the total'))
-        for words in ('experimental rig', 'no ready-made motions', 'bone keyframes', 'bend check works'):
+        for words in ('person rig', 'no ready-made walks', 'keyframes', 'for free'):  # R13: the user's words.
             self.assertIn(words, rig_inspect.SHAPE_WARNING)
 
     def test_the_rig_results_tell_the_model_what_comes_next(self):
         steps = rig_experimental.describe([{'name': 'bone_0', 'parent': None}, {'name': 'bone_1', 'parent': 0}],
                                           'Character Rig')['next_steps']
-        self.assertEqual(steps[0], 'Hide Character Rig before showing the user the result; its bones draw over the mesh.')
-        self.assertIn('check_deformation: it checks the whole animation', steps[2])
-        self.assertIn('check_deformation: it checks the whole animation', rig_experimental.MOTION_NOTE)
+        # R13: the turn's end runs the check (rig_gate), and show hides the bones.
+        self.assertIn('hides Character Rig (its bones draw over the mesh)', steps[2])
+        self.assertEqual(steps[1], 'Loopcut checks how it moves and bends when your reply ends.')
+        self.assertIn('Loopcut checks how it moves and bends when your reply ends', rig_experimental.MOTION_NOTE)
         description = autorig.SCHEMAS[0]['function']['description']
-        self.assertIn('on an animated one, its whole animation', description)
+        self.assertIn('bend check (a whole animation too)', description)
         self.assertLess(len(json.dumps(autorig.SCHEMAS)), 1100, 'the model pays for every word')
 
 
@@ -343,9 +344,9 @@ class NeutralResults(unittest.TestCase):
             described = autorig.describe_rig(dog)
         self.assertEqual((described['tier'], described['bone_count'], described['meshes']),
                          ('experimental', 33, ['Cube.001']))
-        self.assertEqual(described['message'], 'Already rigged by Loopcut (experimental, 33 bones): no ready-made '
-                         'motions, so animate it with bone keyframes (free); check_deformation checks the current '
-                         'pose. It needs no new rig.')
+        self.assertEqual(described['message'], 'Already rigged by Loopcut (33 bones, not a person rig, so no '
+                         'ready-made walks): animate it with keyframes, for free; check_deformation checks the current '
+                         'pose. It needs no new rig.')  # R13: plain words.
         robe = FakeRig('Character Rig', 34, 'standard')
         with patch.dict(sys.modules, {'bpy': fake}), \
                 patch.object(autorig, 'motion_price', return_value='2 credits a second (10 for 5 s)'), \
@@ -378,11 +379,11 @@ class WeightFact(unittest.TestCase):
 
     def test_changed_weights_point_at_the_check(self):
         before = ({'Mesh': ('a', 'Character Rig')}, {'Character Rig': 'walk'})
+        # R13: the turn's end runs the check itself (rig_gate); the line says so.
         self.assertEqual(self.changes(before, ({'Mesh': ('b', 'Character Rig')}, {'Character Rig': 'walk'})),
-                         'Weights changed on Mesh: before telling the user it is fixed, run character_rig '
-                         'check_deformation: it checks the whole animation.')
+                         'Weights changed on Mesh: Loopcut checks how it bends when your reply ends.')
         still = ({'Mesh': ('a', 'Character Rig')}, {'Character Rig': None})
-        self.assertIn('run character_rig preview with pose stress (free)',
+        self.assertIn('Loopcut checks how it bends when your reply ends',
                       self.changes(still, ({'Mesh': ('b', 'Character Rig')}, {'Character Rig': None}),
                                    {'Character Rig': FakeRig('Character Rig', 34, 'standard')}))
         self.assertIn('pose its bones and run character_rig check_deformation',
@@ -393,8 +394,8 @@ class WeightFact(unittest.TestCase):
     def test_new_or_changed_keys_point_at_the_animation_check(self):
         before = ({}, {'Character Rig': None})
         self.assertEqual(self.changes(before, ({}, {'Character Rig': 'gallop'})),
-                         'Animation changed on Character Rig: run character_rig check_deformation before telling the '
-                         'user it works.')
+                         'Animation changed on Character Rig: Loopcut checks how it moves and bends when your reply '
+                         'ends.')  # R13: rig_gate runs it.
         self.assertEqual(self.changes(({}, {'Character Rig': 'gallop'}), ({}, {'Character Rig': None})), '',
                          'animation cleared: nothing to check')
 
@@ -407,8 +408,8 @@ class WeightFact(unittest.TestCase):
 
 class SmallHints(unittest.TestCase):
     def test_root_travel_says_how_far_and_how_to_keep_it_in_view(self):
-        self.assertEqual(motion_retarget.travel_note(5.5), 'it travels 5.5 m from where it starts, so view it from '
-                                                           'the side or follow it to keep it in view')
+        self.assertEqual(motion_retarget.travel_note(5.5), "it travels 5.5 m from where it starts; character_rig show "
+                                                           "(free) sets up the user's view to follow it")  # R13
         self.assertEqual(motion_retarget.travel_note(.4), '', 'a dance that drifts a little says nothing')
 
 

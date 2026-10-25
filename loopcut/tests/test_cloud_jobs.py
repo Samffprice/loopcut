@@ -197,6 +197,68 @@ class JobsTest(unittest.TestCase):
         self.assertTrue(cancel.is_set())
         self.assertTrue(any(method == "POST" and url.endswith("/cancel") for method, url, _ in transport.calls))
 
+    def test_a_cancel_the_server_never_confirms_ends_60_s_after_stop(self):
+        class Unconfirmed(Transport):  # Takes the cancel, but the job stays running.
+            def __call__(self, request, *, timeout):
+                if request.full_url.endswith("/cancel"):
+                    self.calls.append((request.method, request.full_url, {}))
+                    if len(self.calls) > 100:
+                        raise AssertionError("still asking: the call never gave up")
+                    return Reply(job("running"))
+                return super().__call__(request, timeout=timeout)
+
+        cancel, now, stopped = threading.Event(), [1000.0], []
+        transport = Unconfirmed([event("progress", {"pct": 10, "message": "Working"}, 1)])
+
+        def monotonic():  # A poll every 5 s of the fake clock.
+            now[0] += 5
+            return now[0]
+
+        def stop(value):
+            if not cancel.is_set():
+                cancel.set()
+                stopped.append(now[0])
+        slept = []
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=monotonic, sleep=slept.append)), \
+                self.assertRaises(cloud_http.CloudError) as caught:
+            self.run_job(transport, cancel=cancel, on_progress=stop)
+        self.assertEqual(caught.exception.code, "canceled")
+        self.assertEqual(caught.exception.extra["job"]["status"], "running", "not claimed as canceled or refunded")
+        self.assertTrue(60 <= now[0] - stopped[0] <= 75, now[0] - stopped[0])
+        self.assertGreater(sum(url.endswith("/cancel") for _, url, _ in transport.calls), 5, "asked again meanwhile")
+        self.assertEqual(set(slept), {cloud_jobs.CANCEL_POLL_SECONDS}, "every 2 s, not every poll's 0.25 s")
+
+    def test_a_replay_of_a_job_whose_cancel_is_never_confirmed_ends_60_s_after_stop(self):
+        cloud_jobs._remember(job("running"), "Generate image", threading.Event())  # Its own call follows it.
+        cancel, now, slept = threading.Event(), [1000.0], []
+        cancel.set()
+
+        def monotonic():
+            now[0] += 5
+            return now[0]
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if len(slept) > 1000:
+                raise AssertionError("still waiting: the replay never gave up")
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=monotonic, sleep=sleep)), \
+                self.assertRaises(cloud_http.CloudError) as caught:
+            cloud_jobs._wait_known("job_test", cancel, None)
+        self.assertEqual((caught.exception.code, caught.exception.extra["job"]["status"]), ("canceled", "running"))
+        self.assertTrue(cloud_jobs._registry["job_test"]["cancel"].is_set(), "the job itself was asked to cancel")
+        self.assertLessEqual(len(slept), 60 / 5 + 1)
+
+    def test_every_answer_of_the_server_is_heard_events_keepalives_and_downloads(self):
+        """cloud._Cancel.heard: progress for the stall clock of the turn that made the call (agent.check_stall), so a
+        queued, long or downloading job never stalls while the server answers."""
+        stream = b": ping\n\n" + event("status", {"status": "running"}, 1) + event("output", output(), 2)
+        stream += event("done", job(), 3)
+        cancel, heard = threading.Event(), []
+        cancel.heard = lambda: heard.append(1)
+        result = self.run_job(Transport([stream]), cancel=cancel)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(len(heard), stream.count(b"\n") + 1, "each line read, then the output's one chunk")
+
     def test_precanceled_call_makes_no_http(self):
         cancel, transport = threading.Event(), Transport()
         cancel.set()
@@ -425,7 +487,7 @@ class ApplyTest(unittest.TestCase):
         for block in new:
             self.assertEqual(json.loads(block["loopcut_provenance"]), job()["provenance"])
 
-    def test_report_handler_keeps_text_and_conversation_and_returns_report(self):
+    def attach(self, descriptor, details=None):
         texts = []
         def new(name):
             text = Block(name)
@@ -442,15 +504,110 @@ class ApplyTest(unittest.TestCase):
         session = state.new_session()
         with patch.dict(sys.modules, {"bpy": fake}), patch.object(state, "session", return_value=session), \
                 patch.object(conversations, "save") as save:
-            summary = cloud_jobs.apply_result({"apply": "attach_report"}, self.local_job())
+            summary = cloud_jobs.apply_result(descriptor, self.local_job(), details=details)
+        # Not a notice in the chat as well: that was the whole report again, unfolded (0.2.17's "wall of text").
+        self.assertEqual(session["items"], [])
+        save.assert_not_called()
+        return summary, texts
+
+    def test_report_handler_keeps_text_and_returns_report(self):
+        summary, texts = self.attach({"apply": "attach_report"})
         self.assertIn('"ok": true', summary)
         self.assertIn("QA report", summary)
         self.assertEqual(texts[0]["content"], self.path.read_text())
         self.assertEqual(json.loads(texts[0]["loopcut_provenance"])["backend"], "byok")
-        self.assertEqual(session["items"][0]["kind"], "notice")
-        # A full notice item: the panel's notice layout reads its button fields (KeyError 'checkpoint' before).
-        self.assertEqual(session["items"][0], state.item_notice(session["items"][0]["text"]))
-        save.assert_called_once_with(session)
+
+    def search_report(self):
+        from loopcut import asset_report
+        row = lambda title, source="polyhaven": {
+            "id": f"{source}:{title.lower().replace(' ', '_')}",
+            "dedupe_keys": [f"{source}:{title.lower().replace(' ', '_')}"],
+            "source": source, "source_id": title.lower().replace(" ", "_"), "kind": "model", "title": title,
+            "license": {"id": "CC0-1.0", "name": "CC0 1.0", "url": "https://creativecommons.org/publicdomain/zero/1.0/"},
+            "attribution": {"required": False, "text": f"{title} by Someone (CC0).", "authors": ["Someone"]},
+            "page_url": "https://polyhaven.com/a/x", "preview_url": "https://cdn.polyhaven.com/x.png",
+            "import": {"source": source, "id": title.lower().replace(" ", "_")}, "score": 1.0,
+            "tags": ["wood", "box"], "downloads": [{"label": "blend", "url": "https://dl.polyhaven.org/x.blend",
+                                                     "format": "blend", "size": 1000}]}
+        return {"schema": asset_report.SCHEMA, "query": "treasure chest", "mode": "hybrid",
+                "generated_at": "2026-10-24T12:00:00Z",
+                "filters": {"kind": "model", "license": "cc0", "sources": ["polyhaven", "ambientcg"], "limit": 10,
+                            "max_polycount": None, "min_resolution": None},
+                "results": [row("Treasure Chest"), *(row(f"Crate {i}", "ambientcg") for i in range(9))],
+                "sources": [{"id": "polyhaven", "name": "Poly Haven", "url": "https://polyhaven.com",
+                             "credit": "Powered by Poly Haven", "credit_required": True, "license_ids": ["CC0-1.0"]}],
+                "notices": []}
+
+    SEARCH = {"name": "asset_search", "apply": "attach_report", "title": "Search assets"}
+    HEAD = "Attached reports: QA report. Job byok_test; provenance recorded.\nQA report:\n"
+
+    def test_an_asset_search_report_s_card_line_is_its_count_and_best_match_and_the_model_gets_its_table(self):
+        # The owner, 0.2.17 walkthrough: a search's report, 10 rows of about 18 fields, as a "massive wall of text".
+        report = json.dumps(self.search_report(), indent=2)
+        self.path.write_text(report)
+        details = {}
+        summary, texts = self.attach(self.SEARCH, details)
+        self.assertEqual(details["outcome"], "Searched libraries: 10 matches; best: Treasure Chest (Poly Haven, CC0)")
+        self.assertNotIn("{", details["outcome"])
+        self.assertEqual(details["card_output"], self.HEAD + report, "the JSON, behind the card's toggle")
+        self.assertEqual(texts[0]["content"], report, "and in its Text datablock")
+        # The model's copy: numbered rows as search_assets shows them, each with its import handle.
+        rows = summary.removeprefix(self.HEAD).splitlines()
+        self.assertEqual(rows[0], "10 asset(s) for 'treasure chest':")
+        self.assertEqual(rows[1], "#1 Treasure Chest (polyhaven); kind: model; score 1; CC0-1.0; id treasure_chest")
+        self.assertEqual(rows[10], "#10 Crate 8 (ambientcg); kind: model; score 1; CC0-1.0; id crate_8")
+        self.assertTrue(rows[11].startswith('Sources: [{"id": "polyhaven", "name": "Poly Haven", '), rows[11])
+        self.assertEqual(rows[12:], ["Import by number: import_asset(pick=N)."])
+        for bulk in ("page_url", "preview_url", "/a/x", "x.png", "x.blend", "dedupe", "wood", "generated_at"):
+            self.assertNotIn(bulk, summary)
+        self.assertLess(len(summary), len(report) / 4)
+
+    def test_loopcut_asset_report_full_or_a_row_import_asset_cannot_take_gives_the_model_the_json(self):
+        unknown = self.search_report()
+        unknown["results"][4].update(source="example", id="example:crate_3", dedupe_keys=["example:crate_3"],
+                                     **{"import": {"source": "example", "id": "crate_3"}})
+        for env, report in (({cloud_jobs.ASSET_REPORT: "full"}, self.search_report()),
+                            ({cloud_jobs.ASSET_REPORT: " full\n"}, self.search_report()), ({}, unknown)):
+            with self.subTest(env=env), patch.dict(os.environ, env):
+                report = json.dumps(report, indent=2)
+                self.path.write_text(report)
+                details = {}
+                summary, _ = self.attach(self.SEARCH, details)
+                self.assertEqual(summary, self.HEAD + report, "the report as it was before the table")
+                self.assertNotIn("card_output", details)
+                self.assertTrue(details["outcome"].startswith("Searched libraries: 10 matches"))
+
+    def test_an_asset_search_line_reads_only_the_fields_that_are_there(self):
+        report = self.search_report()
+        line = lambda report: cloud_jobs.report_line("Search assets", [report])
+        best = report["results"][0]
+        self.assertEqual(line({**report, "sources": None}), "Searched libraries: 10 matches; best: Treasure Chest "
+                                                            "(polyhaven, CC0)")
+        best.pop("license")
+        self.assertEqual(line(report), "Searched libraries: 10 matches; best: Treasure Chest (Poly Haven)")
+        best.update(source=["polyhaven"], license={"id": None})
+        self.assertEqual(line(report), "Searched libraries: 10 matches; best: Treasure Chest")
+        for broken in ({}, {"title": ""}, {"title": "Two\nlines"}, {"title": {"en": "Chest"}}):
+            report["results"][0] = broken
+            self.assertEqual(line(report), "Searched libraries: 10 matches", broken)
+        self.assertEqual(line({**report, "results": [None]}), "Searched libraries: 1 match")
+        self.assertEqual(line({"schema": report["schema"]}), "Searched libraries: 0 matches")
+
+    def test_another_report_s_card_line_names_the_tool_and_counts_its_items_never_its_json(self):
+        descriptor = {"name": "render", "apply": "attach_report", "title": "Render scene",
+                      "display": {"title": "Cloud rendering"}}
+        for report, line in (('{"checks": {"frames": 2}, "passed": true}', "Cloud rendering: report attached"),
+                             ('{"schema": "loopcut.qa/2", "results": [1, 2, 3]}',
+                              "Cloud rendering: report attached (3 items)"),
+                             ('[{"frame": 1}]', "Cloud rendering: report attached (1 item)"),
+                             ("Frames 1-2 rendered.", "Cloud rendering: report attached")):
+            with self.subTest(report=report):
+                self.path.write_text(report)
+                details = {}
+                summary, _ = self.attach(descriptor, details)
+                self.assertEqual(details["outcome"], line)
+                self.assertTrue(summary.endswith(f"QA report:\n{report}"))
+        self.assertEqual(cloud_jobs.report_line("Cloud rendering", [{}, None]), "Cloud rendering: 2 reports attached")
 
     def test_summary_none_and_unimplemented_material(self):
         with patch.dict(sys.modules, {"bpy": types.SimpleNamespace(data=types.SimpleNamespace())}):
@@ -500,6 +657,28 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(found["c"], self.path.resolve())
         export.assert_called_once_with(found["b"], [ob, "child"])
         self.assertEqual((image.filepath_raw, image.file_format, copied), ("original", "JPEG", []))
+
+    def test_a_name_not_found_gets_the_images_attached_last_newest_first(self):
+        """2026-10-25: Luna passed "character reference" to photo→3D, and after a restore an old photo's name."""
+        from loopcut import conversations, files
+        attached = lambda *refs: {"role": "user", conversations.ATTACHED: True, "content": [
+            {"type": "text", "text": "go"}, *({"type": "image_url", "image_url": {"url": r}} for r in refs)]}
+        session = {"id": "c1", "messages": [attached("old"), {"role": "assistant", "content": "ok"},
+                                            attached("hero", "sheet", "cape")],
+                   "references": [{"ref": r, "name": f"{r}.png", "pinned": True, **({"video": {"id": "clip"}} if r == "sheet" else {})}
+                                  for r in ("old", "hero", "sheet", "cape")]}
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(images={}, objects={}))
+        descriptor = {"file_inputs": [{"field": "image", "required": True, "accept": ["image/png"]}]}
+        with patch.object(state, "_session", session), patch.dict(sys.modules, {"bpy": fake}), \
+                patch.object(files, "resolve", return_value=Path(self.temp.name) / "character reference"):
+            with self.assertRaises(cloud_http.CloudError) as raised:
+                cloud_jobs.resolve_files(descriptor, {"image": "character reference"}, Path(self.temp.name))
+            self.assertEqual(str(raised.exception), "Scene reference or file was not found. Images the user attached "
+                                                    "last, newest first: cape.png, hero.png")
+            session["messages"] = session["references"] = []
+            with self.assertRaises(cloud_http.CloudError) as raised:
+                cloud_jobs.resolve_files(descriptor, {"image": "character reference"}, Path(self.temp.name))
+            self.assertEqual(str(raised.exception), "Scene reference or file was not found")
 
 
 def remove_identical(items, block):

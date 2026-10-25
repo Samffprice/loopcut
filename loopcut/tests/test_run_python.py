@@ -2,7 +2,11 @@
 
 import contextlib
 import copy
+import io
+import os
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -17,13 +21,16 @@ from loopcut import config, contact, cost_guard, live_file, op_notes, scene_diff
 
 N = types.SimpleNamespace
 KEPT_CHANGES = "The code made these changes before the error; they stay in the scene."
+RUN_TIMEOUT = config.run_timeout  # The real reader, for LOOPCUT_RUN_TIMEOUT; setUp stands in a constant.
+SPLIT = "Split the work into smaller run_python calls."
 
 
 class RunPythonTest(unittest.TestCase):
     def setUp(self):
         # Stock Blender has no WindowManager undo-group API. Only the existing undo push is needed.
         self.bpy = N(values={"object": {"location": 3, "material": "original"}, "user_edit": 7},
-                     context=N(window_manager=N()), ops=N(ed=N(undo_push=mock.Mock())))
+                     context=N(window_manager=N(), mode="OBJECT"), ops=N(ed=N(undo_push=mock.Mock())))
+        self.bpy.ops.object = N(mode_set=mock.Mock(side_effect=lambda mode: setattr(self.bpy.context, "mode", mode)))
         self.enterContext(mock.patch.object(tools, "bpy", self.bpy))
         self.enterContext(mock.patch.object(tools, "_editor_context", side_effect=lambda _: contextlib.nullcontext()))
         self.enterContext(mock.patch.object(tools, "_preserve_host_areas", side_effect=lambda: contextlib.nullcontext([])))
@@ -81,7 +88,62 @@ class RunPythonTest(unittest.TestCase):
         result = tools.run_python("bpy.values['new'] = 4", summary="Add value")
         self.assertTrue(result.ok, result.text)
         self.assertEqual(self.bpy.values["new"], 4)
-        self.bpy.ops.ed.undo_push.assert_called_once_with(message="Before Loopcut: Add value")
+        self.assertEqual(self.bpy.ops.ed.undo_push.call_args_list,
+                         [mock.call(message="Before Loopcut: Add value"), mock.call(message="Loopcut: Add value")])
+
+    def test_every_step_pushes_the_state_after_it_changed_something_or_not(self):
+        # 0.2.18: a step that changed nothing, then one that added an object, then Undo crashed Blender 5.2.2 on
+        # the next redraw: two pushes in a row held the same state, and the added object sat past the newest.
+        push = self.bpy.ops.ed.undo_push
+        with mock.patch.object(config, "run_timeout", return_value=0.05):
+            for summary, code in (("Look", "print(len(bpy.values))"), ("Nothing", "pass"),
+                                  ("Fail", "raise ValueError('bad')"),
+                                  ("Fail part way", "bpy.values['half'] = 1\nraise ValueError('bad')"),
+                                  ("Stop", "while True:\n    pass"),
+                                  ("Stop part way", "bpy.values['loop'] = 1\nwhile True:\n    pass"),
+                                  ("", "bpy.values['plain'] = 1"), ("Long " * 20, "pass")):
+                with self.subTest(summary=summary):
+                    push.reset_mock()
+                    tools.run_python(code, summary=summary)
+                    what = summary or "run_python"
+                    self.assertEqual(push.call_args_list, [mock.call(message=f"Before Loopcut: {what}"[:60]),
+                                                           mock.call(message=f"Loopcut: {what}"[:60])])
+
+    def test_the_push_after_follows_the_guard_and_precedes_the_capture_in_the_same_editor(self):
+        from loopcut import shaders
+        push, seen = self.bpy.ops.ed.undo_push, []
+
+        def snapshot(**kwargs):
+            seen.append(("snapshot", "guard" in kwargs, push.call_count))
+            return copy.deepcopy(self.bpy.values)
+
+        def capture(**kwargs):
+            seen.append(("capture", push.call_count))
+            return tools.ToolResult("Image attached")
+
+        with mock.patch.object(scene_diff, "snapshot", side_effect=snapshot), \
+                mock.patch.object(tools, "capture_viewport", side_effect=capture), \
+                mock.patch.object(shaders, "before_look", side_effect=lambda fn, *a, **kw: fn()):
+            result = tools.run_python("bpy.values['new'] = 4", summary="Add value", capture="front",
+                                      editor="ShaderNodeTree")
+        self.assertIn("Image attached", result.text)
+        # A switch the cost guard makes while it snapshots is in the push, so a redo cannot bring the modifier back.
+        self.assertEqual(seen, [("snapshot", False, 0), ("snapshot", True, 1), ("capture", 2)])
+        self.assertEqual(tools._editor_context.call_args_list, [mock.call("ShaderNodeTree")] * 2)
+
+    def test_the_push_after_can_be_off_and_a_failed_one_is_only_logged(self):
+        push = self.bpy.ops.ed.undo_push
+        with mock.patch.object(tools, "UNDO_AFTER", False):  # As in a worker's child Blender.
+            tools.run_python("bpy.values['new'] = 4", summary="Add value")
+        push.assert_called_once_with(message="Before Loopcut: Add value")
+        push.reset_mock()
+        push.side_effect = [None, RuntimeError("Operator bpy.ops.ed.undo_push.poll() failed, context is incorrect")]
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            result = tools.run_python("bpy.values['more'] = 5", summary="Add more")
+        self.assertTrue(result.ok, result.text)
+        self.assertEqual(self.bpy.values["more"], 5)
+        self.assertIn("Loopcut: no undo step after 'Loopcut: Add more'", log.getvalue())
 
     def test_timeout_keeps_changes_and_restores_trace_hook(self):
         before = copy.deepcopy(self.bpy.values)
@@ -91,12 +153,83 @@ class RunPythonTest(unittest.TestCase):
                 mock.patch.object(tools.time, "monotonic", side_effect=lambda: next(calls, 2)):
             result = tools.run_python("bpy.values.clear()\nwhile True:\n    pass")
         self.assertFalse(result.ok)
+        self.assertEqual(result.timed_out, 1)
         self.assertIn("Stopped:", result.text)
-        self.assertIn("Whatever it changed before that is listed below.", result.text)
+        self.assertIn("Whatever it changed before that is listed below. " + SPLIT, result.text)
         self.assertEqual(self.bpy.values, {})
         self.assertEqual(result.scene_before, before)
         self.assertEqual(result.scene_after, {})
         self.assertIs(sys.gettrace(), old_trace)
+        self.bpy.ops.object.mode_set.assert_not_called()
+
+    def test_a_long_sleep_stops_at_the_deadline_and_a_sleep_on_another_thread_does_not(self):
+        self.bpy.naps = []
+        code = ("import threading, time\n"
+                "def nap():\n    start = time.monotonic()\n    time.sleep(1.5)\n"
+                "    bpy.naps.append(time.monotonic() - start)\n"
+                "bpy.nap = threading.Thread(target=nap)\nbpy.nap.start()\n"
+                "bpy.values['slept'] = 0\ntime.sleep(5)\nbpy.values['slept'] = 5")
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, LOOPCUT_RUN_TIMEOUT="1"), mock.patch.object(config, "run_timeout", RUN_TIMEOUT):
+            result = tools.run_python(code)
+        took = time.monotonic() - started
+        self.bpy.nap.join(5)
+        self.assertGreaterEqual(took, 0.9)
+        self.assertLess(took, 2)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.timed_out, 1)
+        self.assertIn("Stopped: the code ran for more than 1 s", result.text)
+        self.assertIn(SPLIT, result.text)
+        self.assertEqual(self.bpy.values["slept"], 0)  # Its changes so far stay.
+        self.assertEqual(len(self.bpy.naps), 1, "the other thread's sleep was cut")
+        self.assertGreaterEqual(self.bpy.naps[0], 1.4)
+
+    def test_time_sleep_is_restored_after_a_stop_an_error_and_a_success(self):
+        sleep = time.sleep
+        self.bpy.seen = []
+        with mock.patch.object(config, "run_timeout", return_value=0.2):
+            for code, ok in (("time.sleep(5)", False), ("while True:\n    pass", False),
+                             ("raise ValueError('bad')", False), ("time.sleep(0.01)", True)):
+                with self.subTest(code=code):
+                    result = tools.run_python("import time\nbpy.seen.append(time.sleep)\n" + code)
+                    self.assertEqual(result.ok, ok, result.text)
+                    self.assertIsNot(self.bpy.seen[-1], sleep)
+                    self.assertIs(time.sleep, sleep)
+                    self.assertEqual(bool(result.timed_out), "Stopped:" in result.text)
+        # A reference the code kept sleeps as usual once its run is over, past its deadline or not.
+        started = time.monotonic()
+        self.bpy.seen[0](0.05)
+        self.assertGreaterEqual(time.monotonic() - started, 0.04)
+
+    def test_a_stop_puts_an_object_the_code_left_in_edit_mode_back_in_object_mode(self):
+        mode_set = self.bpy.ops.object.mode_set
+        with mock.patch.object(config, "run_timeout", return_value=0.05):
+            result = tools.run_python("bpy.context.mode = 'EDIT_MESH'\nwhile True:\n    pass")
+            mode_set.assert_called_once_with(mode="OBJECT")
+            self.assertEqual(self.bpy.context.mode, "OBJECT")
+            self.assertTrue(result.timed_out)
+            self.assertIn("The object it left in Edit Mode is back in Object Mode.", result.text)
+            # An error is not a stop: the mode is the code's to fix, as before.
+            result = tools.run_python("bpy.context.mode = 'EDIT_MESH'\nraise ValueError('bad')")
+            self.assertEqual(mode_set.call_count, 1)
+            self.assertFalse(result.timed_out)
+            # Already in Edit Mode before the step: the user's mode stays.
+            self.bpy.values["mode"] = self.bpy.context.mode = "EDIT_MESH"
+            result = tools.run_python("while True:\n    pass")
+            self.assertEqual(mode_set.call_count, 1)
+            self.assertNotIn("Object Mode", result.text)
+            # A failed switch is logged, never raised; the stop is reported as ever.
+            self.bpy.values["mode"] = "OBJECT"
+            self.bpy.context.mode = "OBJECT"
+            mode_set.side_effect = RuntimeError("context is incorrect")
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                result = tools.run_python("bpy.context.mode = 'EDIT_MESH'\nwhile True:\n    pass")
+        self.assertEqual(mode_set.call_count, 2)
+        self.assertTrue(result.timed_out)
+        self.assertIn(SPLIT, result.text)
+        self.assertNotIn("Object Mode", result.text)
+        self.assertIn("could not leave Edit Mode", log.getvalue())
 
     def test_errors_without_changes_do_not_claim_changes_remain(self):
         for code, error in (("if:", "SyntaxError"), ("raise ValueError('bad')", "ValueError: bad")):
@@ -137,6 +270,60 @@ class RunPythonTest(unittest.TestCase):
         self.assertIn("Image attached", result.text)
         self.assertEqual(result.guard_notes, [])
         shot.assert_called_once_with(angle="front")
+
+
+
+class UndoStepTest(unittest.TestCase):
+    """tools.undo_before and undo_step: a change as one undo step, a push before it and one after it."""
+
+    def setUp(self):
+        self.push = mock.Mock()
+        self.enterContext(mock.patch.object(tools, "bpy", N(ops=N(ed=N(undo_push=self.push)))))
+        self.enterContext(mock.patch.object(tools, "_editor_context", side_effect=lambda _: contextlib.nullcontext()))
+
+    def pushed(self):
+        return [c.kwargs["message"] for c in self.push.call_args_list]
+
+    def test_undo_step_pushes_before_and_after_also_when_the_change_raises(self):
+        with tools.undo_step("Photo to 3D"):
+            self.assertEqual(self.pushed(), ["Before Loopcut: Photo to 3D"])
+        self.assertEqual(self.pushed(), ["Before Loopcut: Photo to 3D", "Loopcut: Photo to 3D"])
+        self.push.reset_mock()
+        with self.assertRaises(ValueError), tools.undo_step("Photo to 3D"):
+            raise ValueError("the import stopped half way")
+        self.assertEqual(self.pushed(), ["Before Loopcut: Photo to 3D", "Loopcut: Photo to 3D"])
+        self.assertEqual(tools._undo_owed, [])
+
+    def test_in_a_tool_call_each_change_owes_its_own_push_after(self):
+        def tool():
+            tools.undo_before("import asset")
+            with tools.undo_step("Text to motion"):
+                pass
+            return tools.ToolResult("done")
+
+        with mock.patch.dict(tools._DISPATCH, {"undo_probe": tool}):
+            self.assertTrue(tools.execute("undo_probe", "{}").ok)
+        self.assertEqual(self.pushed(), ["Before Loopcut: import asset", "Before Loopcut: Text to motion",
+                                         "Loopcut: Text to motion", "Loopcut: import asset"])
+
+    def test_no_push_after_a_failed_one_before_and_none_owed_outside_a_call(self):
+        self.push.side_effect = [RuntimeError("Operator bpy.ops.ed.undo_push.poll() failed"), None]
+        with tools.undo_step("Photo to 3D"):
+            pass
+        self.assertEqual(self.pushed(), ["Before Loopcut: Photo to 3D"], "the failed attempt only")
+        self.push.reset_mock()
+        self.push.side_effect = None
+        self.assertTrue(tools.undo_before("import asset"))  # A worker's child loads an asset this way.
+        self.assertEqual(self.pushed(), ["Before Loopcut: import asset"])
+        self.assertEqual(tools._undo_owed, [])
+
+    def test_an_unexpected_failure_to_push_is_logged_and_the_change_still_runs(self):
+        self.push.side_effect = AttributeError("'Context' object has no attribute 'window_manager'")
+        changed, log = False, io.StringIO()
+        with contextlib.redirect_stdout(log), tools.undo_step("Photo to 3D"):
+            changed = True
+        self.assertTrue(changed)
+        self.assertIn("Loopcut: no undo step before 'Photo to 3D'", log.getvalue())
 
 
 if __name__ == "__main__":

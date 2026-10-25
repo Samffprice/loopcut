@@ -754,15 +754,18 @@ def transcript(messages: list) -> str:
     return "\n\n".join(lines)
 
 
-def summarize(cfg, messages: list, is_cancelled: Callable[[], bool], session: dict, try_it: str = "") -> str:
-    """try_it: the Try it card of the turn this summary is made in (llm.correlation_headers); "" for any other."""
+def summarize(cfg, messages: list, is_cancelled: Callable[[], bool], session: dict, try_it: str = "",
+              on_progress: Callable[[], None] | None = None) -> str:
+    """try_it: the Try it card of the turn this summary is made in (llm.correlation_headers); "" for any other.
+    on_progress: the turn's stall clock (agent.Turn.touch), as for its other requests."""
     completion = llm.stream_chat(
         base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
         messages=[{"role": "system", "content": SUMMARY_PROMPT},
                   {"role": "user", "content": transcript(messages) + "\n\nSummarize the conversation above as instructed."}],
         tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
         max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-        headers=llm.correlation_headers(session["id"], "summary", try_it), on_retry=lambda: None)
+        headers=llm.correlation_headers(session["id"], "summary", try_it), on_retry=lambda: None,
+        on_progress=on_progress)
     return completion.text.strip()
 
 

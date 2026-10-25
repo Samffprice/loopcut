@@ -24,6 +24,7 @@ background_work = ""
 
 def run_on_main(fn: Callable) -> Future:
     future: Future = Future()
+    future.loopcut_queued = time.monotonic()  # What _pump holds off the turn's stall clock.
     _jobs.put((fn, future))
     return future
 
@@ -80,6 +81,7 @@ def _pump() -> float:
     if _pumped_at and late >= SLOW_SECONDS and _turn_running():
         during = f", while {background_work}" if background_work else ""
         note_slow(f"Blender's main thread outside Loopcut's tasks{during} (the pump ran late)", late)
+    first = None  # When the oldest task run below was queued: its wait and the runs never count (agent.check_stall).
     while True:
         try:
             fn, future = _jobs.get_nowait()
@@ -93,6 +95,11 @@ def _pump() -> float:
         except BaseException as ex:  # Delivered to the waiting worker, which reports it.
             future.set_exception(ex)
         note_slow(task_name(fn), time.monotonic() - started)
+        queued = getattr(future, "loopcut_queued", started)
+        first = queued if first is None else min(first, queued)
+    if _turn_running():
+        from . import agent
+        agent.check_stall(time.monotonic() - first if first is not None else 0.0)
     now = time.monotonic()
     period = _animating()
     if _redraw_requested or (period is not None and now - _animated_at >= period):

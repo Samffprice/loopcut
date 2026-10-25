@@ -134,6 +134,15 @@ class SharedNudgeTest(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(g.nudges_left(request), left)
 
+    def test_the_motion_nudge_spends_from_it_too(self):
+        # agent._motion_claim's one nudge (test_agent_loop.MotionClaimTest).
+        g = completion_guard
+        for request, left in (({g.MOTION_CHECKED: True}, 1), ({g.MOTION_CHECKED: True, g.CONTINUED: 1}, 0),
+                              ({g.MOTION_CHECKED: True, g.CORRECTED: True}, 0),
+                              ({g.MOTION_CHECKED: True, g.RIG_CHECKED: True}, 0)):  # An animated rig's turn.
+            with self.subTest(request=request):
+                self.assertEqual(g.nudges_left(request), left)
+
     def test_a_plain_stop_or_nothing_ran_is_the_honest_exit_for_both(self):
         for text in ("Nothing ran: I only described the steps.", "Nothing has run yet.", "Nothing was run.",
                      "No tool ran, so the scene is as it was.", "No tools were run this turn.",

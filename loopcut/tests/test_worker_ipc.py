@@ -378,6 +378,24 @@ class ChildEnv(unittest.TestCase):
         self.assertEqual(path, self.job / "child.env")
         self.assertEqual(path.read_text(), "LOOPCUT_RUN_TIMEOUT=45\n")
 
+    def test_run_python_stops_after_30_s_unset_and_a_worker_after_at_least_60(self):
+        with mock.patch.dict(os.environ, clear=True), mock.patch.object(config, "_find_env_file", return_value=None), \
+                mock.patch.object(config, "_preference_values", return_value={}):
+            self.assertEqual(config.run_timeout(), 30.0)
+        from loopcut import waves, worker_host
+        brief = {"role": "modeling", "prefix": "W1_", "owned": [], "deliverable": "chair", "checks": []}
+        wave = types.SimpleNamespace(job=types.SimpleNamespace(folder=self.job),
+                                     spawn=types.SimpleNamespace(path=self.job / "w1" / "spawn.blend"))
+        worker = types.SimpleNamespace(brief=brief, id="w1", cancelled=lambda: False)
+        for preference, seconds in ((30, 60.0), (300, 300.0)):
+            with self.subTest(preference=preference), mock.patch.object(config, "run_timeout", return_value=preference), \
+                    mock.patch.object(worker_host, "_binary", return_value=sys.executable), \
+                    mock.patch.object(worker_host, "WorkerRuntime") as runtime:
+                host = waves._HostRuntime(wave, worker)
+                child = runtime.call_args.args[0]
+                self.assertEqual(child.run_timeout, seconds)
+                self.assertEqual(host.init["run_timeout"], seconds)
+
     def test_config_in_the_child_finds_no_key(self):
         """With the child's environment, config reads child.env and never walks up to a .env with keys."""
         ipc.write_env_file(self.job, 30)
@@ -921,10 +939,16 @@ class AssetSplit(unittest.TestCase):
             fetched = self.assets.fetch_asset(source="polyhaven", id="oak_01", resolution="2k", apply_to=["Seat"])
         fetch.assert_called_once_with(asset_id="oak_01", resolution="2k", apply_to=["Seat"])
         self.assertEqual(fetched, {"id": "oak", "source": "polyhaven"})
+        with self.mock.patch.object(self.modules["library"], "fetch_asset", autospec=True,
+                                    return_value={"ref": "L::f.blend::WORLD::City"}) as fetch:
+            fetched = self.assets.fetch_asset(source="library", id="L::f.blend::WORLD::City", target_size=1)
+        fetch.assert_called_once_with(ref="L::f.blend::WORLD::City")
+        self.assertEqual(fetched, {"ref": "L::f.blend::WORLD::City", "source": "library",
+                                   "note": "(Ignored target_size: only polypizza takes it.)"}, "load_fetched shows it")
         from loopcut.tools import ToolError
         with self.assertRaises(ToolError) as refused:
-            self.assets.fetch_asset(source="library", id="L::f.blend::WORLD::City", target_size=1)
-        self.assertEqual(str(refused.exception), "source library does not take target_size")
+            self.assets.fetch_asset(source="library", id="L::f.blend::WORLD::City", size=1)
+        self.assertEqual(str(refused.exception), "source library does not take size")
         with self.assertRaises(ToolError):
             self.assets.fetch_asset(source="nope", id="x")
 

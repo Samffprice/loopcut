@@ -5,6 +5,7 @@
     Blender --factory-startup --enable-event-simulate <tmp>/project/kitchen.blend \
         --python harness/persistence_check.py -- resume <tmp>/project
 """
+import base64
 import json
 import os
 import sys
@@ -17,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checkout  # noqa: E402
 checkout.use()
 import loopcut  # noqa: E402
-from loopcut import checkpoints, conversations, state, tools  # noqa: E402
+from loopcut import agent, checkpoints, conversations, state, tools  # noqa: E402
 from loopcut.ui import host  # noqa: E402
 
 PHASE, PROJECT_DIR = sys.argv[sys.argv.index("--") + 1], Path(sys.argv[sys.argv.index("--") + 2])
@@ -66,10 +67,10 @@ def turn(text: str, name: str, x: float, capture: bool = False) -> None:
     checkpoints.ensure_for_turn(session)
     code = f"bpy.ops.mesh.primitive_cube_add(size=1, location=({x}, 3, 0))\nbpy.context.active_object.name = {name!r}"
     assert tools.execute("run_python", json.dumps({"summary": text, "code": code})).ok
-    if capture:
+    if capture:  # As run_loop adds a tool's image: stored compact, on a capture message (context.CAPTURE).
         shot = tools.execute("capture_viewport", "{}")
-        session["messages"].append({"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": conversations.store_image(session, shot.image_path)}}]})
+        session["messages"].append(agent._image_message(conversations.store_image(session, shot.image_path),
+                                                        agent._image_what(shot.text)))
     reply = state.item_assistant()
     reply.update(text="Done.", streaming=False)
     session["items"].append(reply)
@@ -130,10 +131,16 @@ def resumed_on_startup():
     assert session["id"] == notes["id"], "the file's conversation was not resumed"
     assert len(session["items"]) == notes["items"] and meshes() >= {"A", "B"}
     assert [i.get("checkpoint") is not None for i in session["items"] if i["kind"] == "user"] == [True, True]
+    # The newest capture stays sent whatever came after it (context.kept_messages), byte for byte as stored: JPEG
+    # since 1209b32ec1c unless PNG is smaller (image_budget.compact), so its type is what its bytes say.
+    [stored] = [part["image_url"]["url"] for m in session["messages"] if isinstance(m["content"], list)
+                for part in m["content"] if part.get("type") == "image_url"]
+    data = conversations.image_path(session["id"], stored).read_bytes()
+    expected = f"data:{conversations.media_type(data)};base64,{base64.b64encode(data).decode('ascii')}"
+    assert conversations.media_type(data, "") in ("image/jpeg", "image/png"), data[:8]
     wired = conversations.wire_messages(session["id"], session["messages"])
-    assert any(part.get("image_url", {}).get("url", "").startswith("data:image/png")
-               for m in wired if isinstance(m["content"], list) for part in m["content"]), \
-        "the stored capture did not come back for the API"
+    assert [part["image_url"]["url"] for m in wired if isinstance(m["content"], list) for part in m["content"]
+            if part.get("type") == "image_url"] == [expected], "the stored capture did not come back for the API"
 
 
 @step("resume")

@@ -159,8 +159,8 @@ class RoutingTest(unittest.TestCase):
         self.assert_routes("import_asset", blenderkit, "import_blenderkit",
                            {"source": "blenderkit", "id": "abc"}, {"asset_id": "abc"})
         self.assert_routes("import_asset", asset_libraries, "import_asset",
-                           {"source": "library", "id": "L::f.blend::WORLD::City", "apply_to": []},
-                           {"ref": "L::f.blend::WORLD::City", "apply_to": []})
+                           {"source": "library", "id": "L::f.blend::WORLD::City", "apply_to": ["Cube"]},
+                           {"ref": "L::f.blend::WORLD::City", "apply_to": ["Cube"]})
         self.assert_routes("import_asset", polypizza, "import_polypizza",
                            {"source": "polypizza", "id": "abc", "target_size": 2.0}, {"model_id": "abc", "target_size": 2.0})
 
@@ -191,20 +191,85 @@ class RoutingTest(unittest.TestCase):
         launch.assert_not_called()
 
     def test_mistakes_are_named_in_the_words_the_model_sees(self):
-        cases = [(("search_assets", {"source": "", "query": "oak"}),
+        cases = [(("search_assets", {"source": "cloud", "query": "oak"}),
                   "search source must be one of blenderkit, polyhaven, library, polypizza, or omitted"),
                  (("search_assets", {"source": "polyhaven", "query": "oak"}), "source polyhaven needs type"),
-                 (("search_assets", {"source": "polyhaven", "query": "oak", "type": "model", "category": "Nature"}),
-                  "source polyhaven does not take category"),
-                 (("import_asset", {"source": "library", "id": "L::f::WORLD::City", "target_size": 1}),
-                  "source library does not take target_size"),
+                 (("search_assets", {"source": "polyhaven", "query": "oak", "category": "Nature"}),
+                  "source polyhaven needs type"),
+                 (("search_assets", {"source": "polyhaven", "query": "oak", "type": "model", "colour": "red",
+                                     "category": "Nature"}), "source polyhaven does not take colour"),
+                 (("search_assets", {"query": "oak", "catgory": "Nature"}), "combined asset search does not take catgory"),
+                 (("import_asset", {"source": "library", "id": "L::f::WORLD::City", "size": 1}),
+                  "source library does not take size"),
                  (("render_job", {}), "action must be one of start, status, cancel, resume"),
                  (("render_job", {"action": "start", "frames": [1]}), "render_job start needs budget_seconds"),
-                 (("render_job", {"action": "status", "output_dir": "/out"}), "render_job status does not take output_dir")]
+                 (("render_job", {"action": "status", "output": "/out"}), "render_job status does not take output")]
         for (name, arguments), expected in cases:
             result = execute(name, **arguments)
             self.assertFalse(result.ok, name)
             self.assertEqual(result.text, expected)
+
+    def test_another_source_s_arguments_are_left_out_and_named(self):
+        # GPT-6 Luna fills every optional field: polypizza's filters on every search were refused nine times (0.2.17).
+        filters = {"category": "Nature", "licence": "CC0", "animated": True}
+        note = "(Ignored category, licence, animated: only polypizza takes them.)"
+        search, imports = "search_assets", "import_asset"
+        cases = [(search, blenderkit, "search_blenderkit", {"source": "blenderkit", "type": "model", **filters},
+                  {"type": "model"}, note),
+                 (search, polyhaven, "search_polyhaven", {"source": "polyhaven", "type": "model", **filters},
+                  {"type": "models"}, note),
+                 (search, asset_libraries, "search_assets", {"source": "library", "limit": 4, **filters},
+                  {"limit": 4}, note),
+                 (search, assets.asset_search, "search_assets", {"category": "Nature"}, {},
+                  "(Ignored category: only polypizza takes it.)"),
+                 (search, polypizza, "search_polypizza", {"source": "polypizza", "type": "model", **filters}, filters,
+                  "(Ignored type: only blenderkit, polyhaven, library take it.)"),
+                 (imports, blenderkit, "import_blenderkit", {"source": "blenderkit", "id": "abc", "target_size": 2.0},
+                  {"asset_id": "abc"}, "(Ignored target_size: only polypizza takes it.)"),
+                 (imports, asset_libraries, "import_asset", {"source": "library", "id": "L::f::WORLD::City",
+                                                             "target_size": 1},
+                  {"ref": "L::f::WORLD::City"}, "(Ignored target_size: only polypizza takes it.)"),
+                 (imports, polypizza, "import_polypizza", {"source": "polypizza", "id": "abc", "resolution": "2k",
+                                                           "apply_to": ["Cube"]},
+                  {"model_id": "abc"}, "(Ignored resolution, apply_to: not used by source polypizza.)")]
+        for name, module, function, arguments, expected, line in cases:
+            query = {"query": "oak"} if name == search else {}
+            with mock.patch.object(module, function, autospec=True, return_value=tools.ToolResult("found")) as target:
+                result = execute(name, **query, **arguments)
+            self.assertTrue(result.ok, result.text)
+            self.assertEqual(result.text, f"found\n{line}")
+            target.assert_called_once_with(**query, **expected)
+
+    def test_empty_optional_values_are_not_given(self):
+        # GPT-6 Luna fills every optional field (0.2.17): apply_to [] and target_size 0 on every import.
+        empty = {"category": "", "licence": None, "animated": False, "limit": 0}
+        self.assert_routes("search_assets", assets.asset_search, "search_assets",
+                           {"source": "", "query": "oak", "type": "", **empty}, {"query": "oak"})
+        self.assert_routes("search_assets", blenderkit, "search_blenderkit",
+                           {"source": "blenderkit", "query": "oak", "type": "model", **empty, "limit": None},
+                           {"query": "oak", "type": "model"})
+        self.assert_routes("search_assets", polypizza, "search_polypizza",
+                           {"source": "polypizza", "query": "oak", **empty}, {"query": "oak"})
+        nothing = {"resolution": "", "apply_to": [], "target_size": 0}
+        self.assert_routes("import_asset", polypizza, "import_polypizza", {"source": "polypizza", "id": "abc", **nothing},
+                           {"model_id": "abc"})
+        self.assert_routes("import_asset", polyhaven, "import_polyhaven",
+                           {"source": "polyhaven", "id": "oak_01", **nothing, "target_size": 0.0, "apply_to": None},
+                           {"asset_id": "oak_01"})
+        with mock.patch.object(polypizza, "fetch_polypizza", autospec=True, return_value={"id": "abc"}) as fetch:
+            fetched = assets.fetch_asset(source="polypizza", id="abc", **nothing)
+        self.assertEqual(fetched, {"id": "abc", "source": "polypizza"})
+        fetch.assert_called_once_with(model_id="abc")
+
+    def test_another_render_job_action_s_arguments_are_left_out_and_named(self):
+        waited = tools.ToolResult("finished")
+        queued = tools.ToolResult("queued", then=lambda is_cancelled, on_main: waited)
+        target = mock.create_autospec(job_tools.ACTIONS["status"], return_value=queued)
+        with mock.patch.dict(job_tools.ACTIONS, {"status": target}):
+            result = execute("render_job", action="status", job_id="a", wait=30, frames=[1], budget_seconds=60)
+        target.assert_called_once_with(job_id="a", wait=30)
+        self.assertEqual(result.text, "queued\n(Ignored frames, budget_seconds: only start takes them.)")
+        self.assertEqual(result.then(None, None).text, "finished\n(Ignored frames, budget_seconds: only start takes them.)")
 
     def test_old_names_are_not_dispatched(self):
         for old in set(tools.RENAMED) - {"search_assets", "import_asset"}:

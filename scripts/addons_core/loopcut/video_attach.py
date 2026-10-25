@@ -277,6 +277,7 @@ def clip_background(name: str, camera: str = "", start_frame: int | None = None,
     backgrounds = target.data.background_images
     if str(remove).lower() == "true":
         gone = [b for b in backgrounds if clip is not None and b.source == "MOVIE_CLIP" and b.clip == clip]
+        tools.undo_before("clip background")
         for background in gone:
             backgrounds.remove(background)
         return ToolResult(f"Removed {len(gone)} background{'s' * (len(gone) != 1)} of {record['name']} "
@@ -288,6 +289,7 @@ def clip_background(name: str, camera: str = "", start_frame: int | None = None,
         start = scene.frame_start if start_frame is None else int(start_frame)
     except (TypeError, ValueError) as ex:
         raise ToolError("opacity is a number from 0 to 1 and start_frame a frame number.") from ex
+    tools.undo_before("clip background")  # One undo step with the push after it (tools.execute).
     if clip is None:
         if not Path(record["source"]).is_file():
             raise ToolError(f"The clip is no longer at {record['source']}.")

@@ -10,13 +10,16 @@ NOTICE = "This reply describes work, but no step ran, so nothing in your scene c
 # Sent back after a reply that announced a step and called no tool (announces_step); never shown in the panel.
 CONTINUE = "[Loopcut] Go ahead: do that now with your tools, or say plainly that you are stopping and why."
 # Per user turn, and never two without a tool run in between. The turn's one record correction (CORRECTED:
-# CORRECTION, or agent's copied-records retry) spends from the same budget (nudges_left).
+# CORRECTION, or agent's copied-records retry), rig_gate's one bounce (RIG_CHECKED) and the one motion nudge
+# (MOTION_CHECKED) spend from the same budget (nudges_left).
 MAX_CONTINUES = 2
 # Private scalar markers on the original user message: saved, restored and never sent to the model.
 EXECUTED = "loopcut_executed_tools"
 CORRECTED = "loopcut_unrun_corrected"
+MOTION_CHECKED = "loopcut_motion_check_sent"  # agent._motion_claim sent the turn back once (motion_claims.nudge).
 CONTINUED = "loopcut_step_continues"        # How many CONTINUE nudges this user turn has had.
 CONTINUED_AT = "loopcut_step_continued_at"  # EXECUTED when the last one was sent.
+RIG_CHECKED = "loopcut_rig_check_sent"      # rig_gate sent the turn back once on its own rig check's problem.
 
 _ACTIONS = (r"create|make|build|add|model|move|rotate|scale|resize|delete|remove|duplicate|rename|"
             r"parent|bevel|extrude|assign|apply|change|edit|fix|repair|replace|position|align|"
@@ -27,7 +30,8 @@ _REQUEST = re.compile(
 _INFORMATION = re.compile(r"^(?:how|what|why|when|where|explain|describe|tell me|plan|write)\b", re.I)
 _DELIVERABLE = re.compile(r"\s+(?:[\w-]+\s+){0,3}(?:plan|script|code|example|tutorial|guide|list)\b", re.I)
 _UI_RECORD = re.compile(
-    r"^(?:Verified by Loopcut on this scene:\s*\d+ of \d+ checks\.?|"
+    r"^(?:(?:Verified by Loopcut on this scene|(?:Placement measured|Rig checked|Checked again) this turn):"
+    r"\s*\d+ of \d+ checks\.?|"
     r"Scene changes(?:\s*[:(].*)?|"
     r"\d+ (?:added|removed|changed)(?:,\s*\d+ (?:added|removed|changed))*\.?|"
     r"\d+ added\s*/\s*(?:\d+\s+)?changed(?:\s*/\s*\d+ removed)?\.?)$", re.I)
@@ -171,9 +175,11 @@ _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 
 def nudges_left(request: dict) -> int:
-    """What is left of the user turn's MAX_CONTINUES: the announced-step nudges sent (CONTINUED) and the one
-    record correction (CORRECTED), counted on the user's message so a resumed turn keeps the count."""
-    return MAX_CONTINUES - request.get(CONTINUED, 0) - bool(request.get(CORRECTED))
+    """What is left of the user turn's MAX_CONTINUES: the announced-step nudges sent (CONTINUED), the one
+    record correction (CORRECTED), rig_gate's one bounce (RIG_CHECKED) and the one motion nudge (MOTION_CHECKED),
+    counted on the user's message so a resumed turn keeps the count."""
+    return (MAX_CONTINUES - request.get(CONTINUED, 0) - bool(request.get(CORRECTED))
+            - bool(request.get(RIG_CHECKED)) - bool(request.get(MOTION_CHECKED)))
 
 
 # The whole reply stopping, or nothing having run: "I'm stopping here.", "I'll stop now, since...", "Nothing ran.",

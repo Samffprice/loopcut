@@ -27,6 +27,12 @@ STATUS_GLYPH = {
 }
 
 CODE_TOOLS = {"run_python", "run_blender"}
+# Internal tools whose failure is schema talk for the model (orchestrator.checks refusing a malformed add): the card
+# says so plainly, the output stays behind its toggle. A free-plan beginner read one as "i think something broke?".
+INTERNAL_FAILURES = {"checks": "Loopcut's internal check didn't take; the agent adjusted and went on."}
+# The running turn's stall clock (agent.check_stall) this long with nothing new: a muted line under "Thinking…".
+STALL_NOTICE_SECONDS = 120
+STALL_NOTICE = "No reply for 2 minutes. You can Stop and try again."
 
 
 def wrap(text: str, font: str, size: int, max_width: float, measure) -> list[tuple[int, str]]:
@@ -232,6 +238,18 @@ def starter_waiting(items: list) -> str:
     return next((card.get("waiting", "") for card in try_it.CARDS if card["prompt"] == text), "")
 
 
+def stall_notice(session: dict, now) -> str:
+    """STALL_NOTICE once the running turn has waited STALL_NOTICE_SECONDS for the model with nothing new, or "": never
+    for a tool or a paid job it waits on, nor once it is stopping. Its clock waits while a card waits for the user, and
+    is off where the turn has none (Turn.stall_seconds 0: the evals, the bridge)."""
+    turn = session.get("turn")
+    since = getattr(turn, "progress_at", None)
+    if (not getattr(turn, "stall_seconds", 0) or since is None or not now
+            or getattr(turn, "progress", "") != state.MODEL_REPLY or turn.cancel.is_set()):
+        return ""
+    return STALL_NOTICE if now - since >= STALL_NOTICE_SECONDS else ""
+
+
 def thinking(f: Frame, id: str, x, y, size, word: str = "Thinking") -> int:
     """The waiting line, animated the way people expect: a highlight sweeps along the word and the
     ellipsis after it pulses (a still frame reads "Working…", never "Working."). Driven by ui["now"];
@@ -362,6 +380,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     code_failure = (status == "failed" and item["name"] in CODE_TOOLS
                     and not item.get("output", "").startswith("Not run."))
     code_repair = item.get("code_repair") if code_failure else None
+    internal = INTERNAL_FAILURES.get(item["name"]) if status == "failed" else None
     if plan_repair in {"resolved", "retried"}:
         glyph, glyph_color = "✓", T.TEXT_MUTED
     elif plan_repair == "adjusting":
@@ -370,6 +389,8 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         glyph, glyph_color = "–", T.TEXT_MUTED
     if code_repair:
         glyph, glyph_color = ("–" if code_repair == "continued" else "↻"), T.TEXT_MUTED
+    if internal:
+        glyph, glyph_color = "–", T.TEXT_MUTED
     awaiting = status == "awaiting"
     expanded = awaiting or item.get("expanded", False)
     mark = len(f.prims)
@@ -408,7 +429,10 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         reports = re.findall(r"(?m)^Scene changes(: none\.| \(\+ added)", output)
         effect = (" and didn't change the scene" if reports and reports[-1] == ": none."
                   else "; some scene changes remain" if reports else "")
-        if code_repair == "continued":
+        if item.get("timed_out"):  # Stopped at the run_python deadline (tools._Deadline): no mistake to fix.
+            note = (f"Stopped after {item['timed_out']:g} s because this step kept Blender frozen. "
+                    "Its changes so far stay; Undo removes them.")
+        elif code_repair == "continued":
             note = ("This step changed the scene before failing; Loopcut carried on."
                     if reports and reports[-1] != ": none."
                     else "This step had a mistake; Loopcut carried on.")
@@ -439,11 +463,15 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
             f.button(f'item{n}.tool.cancel', inner_x, cursor, 'Cancel', T.BUTTON_GHOST, T.TEXT,
                      ('cloud_job_cancel', job['id']))
             cursor += f.px(24)
-    if status == "failed" and not expanded and not plan_repair and not code_failure and not rig:
+    if internal and not expanded:
+        cursor += f.paragraph(f"item{n}.tool.reason", inner_x, cursor, inner_w, internal, small, T.TEXT_MUTED)
+    elif status == "failed" and not expanded and not plan_repair and not code_failure and not rig:
         reason = failure_reason(item.get("output") or "", item.get("exit_code"))
         f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
                small, T.TEXT_MUTED)
         cursor += f.line_height(small)
+    if item.get("outcome") and not rig:  # A cloud report's line (cloud_jobs.report_line); its JSON is the output's.
+        cursor += f.paragraph(f"item{n}.tool.outcome", inner_x, cursor, inner_w, item["outcome"], small, T.TEXT_MUTED)
 
     # Provider credit must remain visible beside the search summary when its card is collapsed.
     if "Powered by Poly Haven" in item.get("output", "") and item["name"] in {
@@ -496,7 +524,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.output", inner_x, cursor, inner_w, item["output"],
                               f.px(T.FONT_SIZE_CODE),
-                              T.ERROR if status == "failed" and not code_repair
+                              T.ERROR if status == "failed" and not code_repair and not internal
                               and plan_repair not in {"resolved", "retried", "adjusting", "capped"}
                               else T.TEXT_MUTED, "mono")
     if expanded and not rig and (item.get("cloud_error") or {}).get("message"):
@@ -570,8 +598,9 @@ def _item_error(f: Frame, n: int, item: dict, x, y, width) -> int:
     mark = len(f.prims)
     height = f.paragraph(f"item{n}.error", x + pad, y + pad, width - 2 * pad, item["text"], size, T.ERROR) + 2 * pad
     # A dropped connection, the gateway's vendor failing: Try again sends the same request (agent.resume), while
-    # only cards about the stopped turn follow (what it changed, a notice), so never on an older error.
-    if (item.get("retry") and not f.session.get("busy")
+    # only cards about the stopped turn follow (what it changed, a notice), so never on an older error, nor where
+    # resume would refuse (the history ends on a reply: a Codex turn stopped after its last message).
+    if (item.get("retry") and state.can_resume(f.session)
             and all(later.get("kind") in _AFTER_RETRY for later in f.session["items"][n + 1:])):
         height += _button_row(f, x + pad, y + height - pad, width - 2 * pad,
                               [(f"item{n}.error.retry", "Try again", T.BUTTON_GHOST, T.TEXT, ("resume", n))]) + f.px(4)
@@ -1728,6 +1757,9 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
         if waiting:
             cursor += f.paragraph("chat.starter_waiting", x, cursor, width, waiting, f.px(T.FONT_SIZE_SMALL),
                                   T.TEXT_MUTED) + gap
+        quiet = stall_notice(session, f.ui.get("now"))
+        if quiet:
+            cursor += f.paragraph("chat.stall", x, cursor, width, quiet, f.px(T.FONT_SIZE_SMALL), T.TEXT_MUTED) + gap
 
     empty = not items and not f.ui.get("cloud_jobs") and not session["busy"]
     if empty:

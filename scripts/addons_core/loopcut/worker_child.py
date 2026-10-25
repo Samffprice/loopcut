@@ -183,7 +183,7 @@ class Worker:
                 _leave(0)
 
     def init(self, payload: dict) -> dict:
-        from loopcut import scene_diff, state, worker_capture
+        from loopcut import scene_diff, state, tools, worker_capture
         started = time.monotonic()
         self.role = payload.get("role", "modeling")
         self.aspects = list(payload.get("aspects") or [])
@@ -202,6 +202,7 @@ class Worker:
         self.spawn_tokens = ownership.stamp_all()
         state.session()["scene_turn_start"] = scene_diff.snapshot()
         self.undo = self._probe_undo()
+        tools.UNDO_AFTER = False  # The tools push nothing after a call here: _after_call's one undo relies on it.
         self.warnings = _compatibility()
         capture = payload.get("capture") or {}
         # The look's size is the child's (worker_capture.WIDTH): the parent's "width" is the live
@@ -462,8 +463,9 @@ class Worker:
             return None, []
         restored = False
         if saved and self.undo == "undo":
-            # The call's own push (run_python, frame_camera) came before its change, as ours did:
-            # one undo from a push of the state after it lands on the state before it.
+            # The call's own push (run_python, frame_camera) came before its change, as ours did, and
+            # none after it (tools.UNDO_AFTER is off here): one undo from a push of the state after it
+            # lands on the state before it.
             restored = _undo_op("undo_push", message="Loopcut worker: after call") and _undo_op("undo")
         elif saved and self.undo == "save":
             bpy.ops.wm.open_mainfile(filepath=str(self.folder / "percall.blend"), load_ui=False)

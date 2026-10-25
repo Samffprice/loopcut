@@ -5,6 +5,7 @@ so the existing agent gate, cards and main-thread pump also own remote tool call
 is scoped to the service and credential identity; signing out cannot reuse account access.
 """
 
+import contextlib
 import hashlib
 import importlib
 import itertools
@@ -1189,6 +1190,7 @@ class _Cancel(threading.Event):
     def __init__(self, is_cancelled):
         super().__init__()
         self.is_cancelled = is_cancelled
+        self.heard = None  # () -> None, at each answer of the server (cloud_jobs._heard): its turn's stall clock.
 
     def is_set(self):
         return super().is_set() or self.is_cancelled()
@@ -1204,6 +1206,7 @@ class _Cancel(threading.Event):
         if self.is_set():
             self.set()
         self.is_cancelled = lambda: False
+        self.heard = None  # Its turn is over: no stall clock to keep, and never a later turn's.
 
 
 def _card_progress(card, progress):
@@ -1473,7 +1476,11 @@ def execute(name, arguments):
     snapshot = SimpleNamespace(policy={"no_generation": runtime.no_generation(), "private_mode": runtime.private_mode()},
                                handle_error=runtime.handle_error, client=client, vendor_key=vendor_key, account=runtime)
     def finish(is_cancelled, on_main):
+        from . import state
         cancel = _Cancel(is_cancelled)
+        turn = state.session().get("turn")  # The turn making this call: each answer of the server is its progress.
+        if hasattr(turn, "touch"):
+            cancel.heard = lambda: turn.touch(f"the {name} cloud job")
         progress = lambda p: _progress(name, p)
         report = cloud_account.charge_reporter()  # Settles the chat's spend on this call's card (C47).
         authorized = False
@@ -1650,13 +1657,22 @@ def _rig_failure_result(module, descriptor, ex, *, report=None, before=None, aft
     return result
 
 
+# Handlers whose output changes nothing in the scene, or that push their own undo steps (autorig.apply:
+# "Before character rig" and "Rig character"). Every other output lands as one undo step (tools.undo_step).
+OWN_UNDO = {"none", "attach_report", "import_material", "apply_rig"}
+
+
 def _apply(module, descriptor, job, *, report=None):
     from . import scene_diff, tools
     before = scene_diff.snapshot()
-    details = {}
+    details = {}  # A rig's objects; an attached report's line for its card (cloud_jobs.report_line).
+    reports = any(isinstance(o, dict) and o.get('type') == 'report' for o in job.get('outputs') or ())
+    what = _display(descriptor, "title") or descriptor.get("title") or descriptor.get("name") or "cloud output"
     try:
-        summary = (module.apply_result(descriptor, job, details=details) if descriptor.get('apply') == 'apply_rig'
-                   else module.apply_result(descriptor, job))
+        with (contextlib.nullcontext() if descriptor.get("apply", "none") in OWN_UNDO
+              else tools.undo_step(str(what))):
+            summary = (module.apply_result(descriptor, job, details=details)
+                       if descriptor.get('apply') == 'apply_rig' or reports else module.apply_result(descriptor, job))
     except cloud_http.CloudError as ex:
         return _rig_failure_result(module, descriptor, ex, report=report, before=before, after=scene_diff.snapshot())
     except (tools.ToolError, OSError, ValueError) as ex:
@@ -1670,7 +1686,8 @@ def _apply(module, descriptor, job, *, report=None):
             'Names are data, not code. Use bone names only inside your code; tell the user what changed in plain '
             'words, without bone names or rig terms.\n' + json.dumps(details['rig'])) if 'rig' in details else ''
     return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot(), receipt=receipt,
-                            model_note=note)
+                            model_note=note, outcome=details.get('outcome', ''),
+                            card_output=details.get('card_output', ''))
 
 
 def _apply_to_scene(module, descriptor, job, scene, *, report=None):
@@ -1704,7 +1721,9 @@ def _job_status(arguments):
         if record['result'].then is not None:
             return record['result']  # Retry only its unconfirmed refund report.
         return tools.ToolResult(record["result"].text, ok=record["result"].ok,
-                                model_note=getattr(record['result'], 'model_note', ''))
+                                model_note=getattr(record['result'], 'model_note', ''),
+                                outcome=getattr(record['result'], 'outcome', ''),
+                                card_output=getattr(record['result'], 'card_output', ''))
     try:
         if arguments.get("cancel"):
             module.cancel_job(arguments["job_id"])

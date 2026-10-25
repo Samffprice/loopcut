@@ -302,11 +302,10 @@ def cases() -> None:
     print(f"CAMERA report_only, clipped: Left {share:.1%} inside (exact {inside:.1%}), margins L {reported[0]:.3f}")
     print(f"CAMERA report_only example:\n{result.text}")
 
-    # One undo step: undo puts the camera back.
+    # One undo step: the tool pushes the state after it too (tools.undo_before), so undo puts the camera back.
     before, name = cam.matrix_world.copy(), cam.name
     frame(objects=["Left", "Right"], direction="front")
     assert cam.matrix_world != before
-    bpy.ops.ed.undo_push(message="After frame_camera")  # What the next user operation would push.
     bpy.ops.ed.undo()  # Reloads the scene: references from before are gone.
     back = bpy.data.objects[name].matrix_world
     assert all((a - b).length < 1e-6 for a, b in zip(back.col, before.col)), f"undo: {back} vs {before}"

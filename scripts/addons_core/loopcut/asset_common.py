@@ -6,6 +6,7 @@ number (asset_picks): the model chooses by look, which is the point of a library
 """
 
 import hashlib
+import http.client
 import json
 import re
 import shutil
@@ -50,12 +51,23 @@ def open_url(url: str, headers: dict | None = None, timeout: float = TIMEOUT):
         raise ToolError(f"Could not reach {url.split('/')[2]}: {getattr(ex, 'reason', ex)}") from ex
 
 
+def _broke_off(url: str, ex: BaseException) -> ToolError:
+    """A body read that failed after the answer began (a read timeout, a reset, a reply cut short): the tool's own
+    failed step. Uncaught, a library's thumbnail timing out ended a turn as "the connection to the model dropped"
+    (2026-10-25)."""
+    from . import llm
+    return ToolError(f"Lost the connection to {url.split('/')[2]} while reading its answer ({llm.short_cause(ex)}); "
+                     "try again")
+
+
 def get_json(url: str, headers: dict | None = None):
     with open_url(url, headers) as response:
         try:
             return json.load(response)
         except ValueError as ex:
             raise ToolError(f"{url.split('/')[2]} sent something that is not JSON") from ex
+        except (OSError, http.client.HTTPException) as ex:
+            raise _broke_off(url, ex) from ex
 
 
 def digest_of(path: Path, algorithm: str) -> str:
@@ -85,8 +97,20 @@ def download(url: str, dest: Path, expected: str | None = None, size: int = 0,
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
-    with open_url(url, headers, timeout=max(TIMEOUT, size / 200_000)) as response, open(partial, "wb") as out:
-        shutil.copyfileobj(response, out, 1 << 20)
+    response = open_url(url, headers, timeout=max(TIMEOUT, size / 200_000))
+    try:
+        with response, open(partial, "wb") as out:
+            while True:
+                try:
+                    chunk = response.read(1 << 20)
+                except (OSError, http.client.HTTPException) as ex:
+                    raise _broke_off(url, ex) from ex
+                if not chunk:
+                    break
+                out.write(chunk)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
     if not matches(partial, expected):
         partial.unlink(missing_ok=True)
         raise ToolError(f"Download of {dest.name} did not match its published checksum; try again")

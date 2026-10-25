@@ -17,6 +17,14 @@ sys.modules.setdefault("bpy", fake_bpy)
 from loopcut import agent, config, contact, llm, nudges, orchestrator, state  # noqa: E402
 
 
+def blender_object(name, kind="MESH", parent=None, action=None, rig=None):
+    """What animated() and named() read of a Blender object."""
+    return types.SimpleNamespace(
+        name=name, type=kind, parent=parent, constraints=[], children_recursive=[],
+        modifiers=[types.SimpleNamespace(type="ARMATURE", object=rig)] if rig else [],
+        animation_data=types.SimpleNamespace(action=action, nla_tracks=[], drivers=[]) if action else None)
+
+
 class FreshChecksTest(unittest.TestCase):
     def setUp(self):
         self.session = state.reset()
@@ -25,12 +33,13 @@ class FreshChecksTest(unittest.TestCase):
         self.pair = {"a": "Socket", "relation": "touches", "b": "Haft"}
         self.scene = {name: types.SimpleNamespace(name=name, labels=[name], note="", fingerprint=1)
                       for name in ("Socket", "Haft", "Chest")}
+        self.objects = {}  # Blender's objects, by name, for animated() and named(); none by default.
         self.distance = 0
         self.depth = 0
         self.shapes = types.SimpleNamespace(of=lambda name: self.scene.get(name, contact.Unavailable("missing " + name)),
                                             fingerprint=lambda name: self.scene[name].fingerprint if name in self.scene
                                             else contact.Unavailable("missing " + name),
-                                            free=mock.Mock())
+                                            object=self.objects.get, free=mock.Mock())
         for patcher in (mock.patch.object(contact, "_Shapes", return_value=self.shapes),
                         mock.patch.object(agent, "_on_main", side_effect=lambda fn, *_: fn())):
             patcher.start()
@@ -255,6 +264,30 @@ class FreshChecksTest(unittest.TestCase):
                    {"status": "pass", "detail": "1.0 mm"}) for i in range(12)]
         self.assertEqual(orchestrator.verified_block(checks), "Verified by Loopcut on this scene: 12 of 12 checks.")
 
+    def test_a_later_block_in_the_turn_is_headed_by_what_it_measured(self):
+        """2026-10-25: "Verified … 1 of 1" then "Verified … 9 of 18" in one turn, and the user asked "did you glitch?"."""
+        from loopcut import completion_guard, router
+        results = [{"a": "Socket", "relation": "touches", "b": "Haft", "status": status, "line": "gap 1.0 mm",
+                    "details": []} for status in ("pass", "fail")]
+        checks = [("c1", {"kind": "exists", "name": "Socket"}, {"status": "pass", "detail": ""})]
+        self.turn.contact_checks = [{"pair": self.pair}]
+        for turn in (1, 2):
+            self.session["messages"].append({"role": "user", "content": "put the socket on the haft"})
+            completion = self.reply("Placed.")
+            if turn == 1:
+                orchestrator._append_to_reply(self.session, completion, orchestrator.verified_block(
+                    checks, head=orchestrator.block_head(self.session, "Checked again this turn")))
+            self.assertIsNone(contact.finish_gate(self.session, self.turn, completion, lambda: (results, [])))
+            heads = [b.split("\n")[0] for b in self.session["items"][-1]["verification"].split("\n\n")]
+            self.assertEqual(heads, ["Verified by Loopcut on this scene: 1 of 1 checks.",
+                                     "Placement measured this turn: 1 of 2 checks."] if turn == 1 else
+                             ["Verified by Loopcut on this scene: 1 of 2 checks."], "a new turn starts over")
+        later = self.session["messages"][1]["content"]
+        self.assertEqual(orchestrator.block_head(self.session, "Checked again this turn"), "Checked again this turn")
+        self.assertTrue(completion_guard._UI_RECORD.fullmatch("Placement measured this turn: 1 of 2 checks."))
+        self.assertEqual(router._last_reply([{"role": "assistant", "content": "Oak or walnut?\n\n" + later.split("\n\n")[-1]}]),
+                         "Oak or walnut?")
+
     def test_stopped_turn_reports_fresh_failure_without_bouncing(self):
         for outcome in ("budget", "step_limit", "no_progress"):
             self.check()
@@ -301,6 +334,58 @@ class FreshChecksTest(unittest.TestCase):
         self.assertEqual(len(feedback), 1)
         self.assertIn("34.0 mm", feedback[0]["content"])
         self.assertIn("0 of 1 checks", self.session["messages"][-1]["content"])
+
+    def rigged(self):
+        """The dog of the auto-rig persona run: a default-named mesh deformed by a rig with a gallop
+        action, on a static ground, judged mid-gallop (frame 12) with its paws in the air."""
+        rig = blender_object("Character Rig", "ARMATURE", action="Gallop")
+        self.objects.update({"Character Rig": rig, "Ground": blender_object("Ground"),
+                             "Cube.001": blender_object("Cube.001", parent=rig, rig=rig)})
+        self.scene.update({name: types.SimpleNamespace(name=name, labels=[name], note="", fingerprint=1)
+                           for name in ("Cube.001", "Ground")})
+        self.pair = {"a": "Cube.001", "relation": "rests_on", "b": "Ground"}
+        self.distance = 0.05
+        patcher = mock.patch.object(sys.modules["bpy"], "context", create=True,
+                                    new=types.SimpleNamespace(scene=types.SimpleNamespace(frame_current=12)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_animated_pair_is_not_checked_on_one_frame_at_the_final_reply(self):
+        self.rigged()
+        text = self.check().text
+        self.assertIn("FAIL: Cube.001 rests_on Ground (Cube.001 moves in its animation; this result is for frame 12)",
+                      text, "the model's own check still judges the frame it asked for")
+        self.scene["Cube.001"].fingerprint += 1  # The scene moved on a frame since: the geometry changed.
+        self.assertIsNone(self.finish(), "never a bounce")
+        self.assertEqual(self.measured.call_count, 1, "not measured again on one frame")
+        self.assertEqual(self.session["items"][-1]["text"],
+                         "Connected and verified.\n\nNot checked: the character rig's mesh moves in its animation, "
+                         "so whether it rests on ground isn't judged on one frame.")
+        self.assertEqual(self.turn.contact_checks[0]["result"]["status"], "skipped")
+
+    def test_an_animated_pass_does_not_bounce_when_a_later_frame_fails(self):
+        self.rigged()
+        self.distance = 0
+        self.check()
+        self.scene["Cube.001"].fingerprint += 1
+        self.distance = 0.05
+        self.assertIsNone(self.finish())
+        self.assertFalse(self.turn.contact_bounced)
+        self.assertIn("\n\nNot checked: the character rig's mesh moves", self.session["items"][-1]["text"])
+
+    def test_a_static_failure_beside_an_animated_pair_still_fails_and_alone_is_counted(self):
+        self.rigged()
+        table = blender_object("Table", "EMPTY")
+        self.objects.update({"Cube.002": blender_object("Cube.002", parent=table), "Table": table})
+        self.scene["Cube.002"] = types.SimpleNamespace(name="Cube.002", labels=["Cube.002"], note="", fingerprint=1)
+        contact.check_contact([{"a": "Cube.002", "relation": "touches", "b": "Ground"}, self.pair])
+        self.assertIsNone(self.finish())
+        self.assertEqual(self.session["items"][-1]["text"],
+                         "Connected and verified.\n\nVerified by Loopcut on this scene: 0 of 1 checks.\n"
+                         "Failed: the mesh under table does not meet the required contact with ground. "
+                         "It is too far from ground.\n"
+                         "Not checked: the character rig's mesh moves in its animation, "
+                         "so whether it rests on ground isn't judged on one frame.")
 
     def test_unrelated_acceptance_pass_does_not_list_contact_coverage(self):
         block = orchestrator.verified_block([("typewriter c1", {"kind": "exists", "name": "Typewriter"},

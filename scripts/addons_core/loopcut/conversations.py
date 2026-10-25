@@ -23,6 +23,7 @@ from pathlib import Path
 from . import checkpoints, context, image_budget, state
 
 IMAGE_SCHEME = "loopcut-image:"
+CLOSED_MESSAGE = "Blender was closed before this turn finished."  # load's card for a turn that never ended.
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
 _AUDIO_SUFFIXES = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".bin")  # aud reads by content.
@@ -38,6 +39,9 @@ _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
               "mode", "codex_thread", "spend", "asset_picks")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
+# This Blender's mark ("turn_running") on a chat saved while its turn runs (save), left out by that turn's last save.
+# Another Blender's mark on load: the turn never reached its end (Blender quit, crashed or was killed mid-turn).
+_LAUNCH = os.urandom(16).hex()
 # Conversations kept somewhere other than root(): a worker's transcript and captures live in its
 # job folder (waves.py). Keyed by conversation id; set before the first save.
 FOLDERS: dict[str, Path] = {}
@@ -68,9 +72,11 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def save(session: dict) -> None:
+def save(session: dict, *, running: bool = False) -> None:
     """Safe from any thread. A conversation nobody has written in is not worth a folder. Offer cards
-    (state.item_offer) are left out: they belong to the moment, and older add-ons refuse unknown items."""
+    (state.item_offer) are left out: they belong to the moment, and older add-ons refuse unknown items.
+    running: its turn is about to start (agent._launch); a busy session's saves are marked running too, until the
+    turn's last save, made once busy is cleared."""
     items = [i for i in session["items"] if i.get("kind") != "offer"]
     if not items:
         return
@@ -87,6 +93,8 @@ def save(session: dict) -> None:
             body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
         body["asset_picks"] = asset_picks.snapshot(session)  # Search results' numbers still import after a reload.
         body["items"] = items
+        if running or session.get("busy"):  # Read under the lock: the turn's last save is written after any of these.
+            body["turn_running"] = _LAUNCH
         meta = {"id": session["id"], "projects": session["projects"], "title": session["title"],
                 "created": session["created"], "updated": time.time(),
                 "turns": sum(1 for i in session["items"] if i["kind"] == "user")}
@@ -219,19 +227,33 @@ def load(conversation_id: str) -> dict:
     session["usage"] = {key: int(body.get("usage", {}).get(key, 0)) for key in _USAGE}
     from . import spending
     session["spend"] = {key: body.get("spend", {}).get(key, value) for key, value in spending.new_ledger().items()}
-    # Whatever was in flight when Blender closed is over.
+    # Whatever was in flight when Blender closed is over. While a turn waits on the model, its file holds only what
+    # the last save had (no streaming reply, no running card): another Blender's mark says it never ended. This
+    # Blender's own is a turn still running or ending here (a chat reopened from History mid-turn), not cut.
+    running = body.get("turn_running")
+    cut = bool(running) and running != _LAUNCH
     for item in session["items"]:
         if item.get("streaming"):
-            item["streaming"] = False
+            item["streaming"], cut = False, True
         if item.get("status") in ("awaiting", "running"):
-            item["status"] = "rejected"
+            item["status"], cut = "rejected", True
         for row in item.get("rows", []) if item["kind"] == "wave" else ():
             if row["status"] in state.WAVE_RUNNING:
-                row["status"] = "stopped"
+                row["status"], cut = "stopped", True
     session["turn_number"] = sum(1 for i in session["items"] if i["kind"] == "user")
-    close_open_tool_calls(session["messages"], "Blender was closed before this ran.")
+    cut = close_open_tool_calls(session["messages"], "Blender was closed before this ran.") or cut
     rename_merged_tools(session["messages"])
     session["cursor"] = len(session["input"])
+    if cut:  # Its turn never reached its end: say so, and its log goes up now rather than after the next turn.
+        session["items"].append(state.item_error(CLOSED_MESSAGE, retry=state.can_resume(session)))
+        try:
+            # Settled on disk at once: loaded again before its next save (History reopens a chat before the one on
+            # screen is saved, host._switch; another crash), it is neither closed nor sent a second time.
+            save(session)
+        except OSError as ex:
+            print(f"Loopcut: could not save the closed conversation: {ex}")
+        from . import session_logs
+        session_logs.on_closed(session)
     return session
 
 
@@ -255,9 +277,10 @@ def rename_merged_tools(messages: list) -> None:
                 function["name"], function["arguments"] = name, json.dumps(current)
 
 
-def close_open_tool_calls(messages: list, reason: str) -> None:
+def close_open_tool_calls(messages: list, reason: str) -> bool:
     """The API rejects a history where a tool call has no result. Wherever a turn was cut short,
-    answer the unanswered calls so the conversation can continue."""
+    answer the unanswered calls so the conversation can continue. Whether there were any."""
+    closed = False
     position = 0
     while position < len(messages):
         message = messages[position]
@@ -273,6 +296,8 @@ def close_open_tool_calls(messages: list, reason: str) -> None:
             if call["id"] not in answered:
                 messages.insert(position, {"role": "tool", "tool_call_id": call["id"], "content": reason})
                 position += 1
+                closed = True
+    return closed
 
 
 def list_for(project: str) -> list[dict]:

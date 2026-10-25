@@ -16,6 +16,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -130,10 +131,37 @@ def _unreachable(error, request):
 
 
 def _read(response):
+    """The body decoded by its Content-Encoding, gzip (which JSON GETs ask for) or identity; any other is an
+    invalid response. MAX_RESPONSE bounds the decoded bytes as well as the wire's, so a small gzip cannot expand
+    past it: it is never decompressed further than that."""
     body = response.read(MAX_RESPONSE + 1)
     if len(body) > MAX_RESPONSE:
         raise CloudError("Loopcut response is too large", "invalid_response", response.status)
+    headers = getattr(response, "headers", None) or {}
+    encoding = next((v for k, v in headers.items() if k.lower() == "content-encoding"), None) or "identity"
+    encoding = encoding.strip().lower()
+    if encoding == "gzip":
+        return _gunzip(body, response.status)
+    if encoding != "identity":
+        raise CloudError("Loopcut response has an unknown encoding", "invalid_response", response.status)
     return body
+
+
+def _gunzip(data, status):
+    """A gzip body (one member or several) decoded, never past MAX_RESPONSE + 1 bytes."""
+    out = bytearray()
+    while data:
+        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            out += inflater.decompress(data, MAX_RESPONSE + 1 - len(out))
+        except zlib.error:
+            raise CloudError("Loopcut response is not valid gzip", "invalid_response", status) from None
+        if len(out) > MAX_RESPONSE:
+            raise CloudError("Loopcut response is too large", "invalid_response", status)
+        if not inflater.eof:
+            raise CloudError("Loopcut response was cut short", "invalid_response", status)
+        data = inflater.unused_data
+    return bytes(out)
 
 
 def _redact(value, secrets):
@@ -236,6 +264,8 @@ class Client:
             raise ValueError("Contract headers cannot be overridden")
         supplied.update(self.version_headers())
         supplied["Accept"] = accept
+        if method == "GET" and accept == "application/json":  # _read decodes it; never on SSE or a download.
+            supplied["Accept-Encoding"] = "gzip"
         if auth:
             key = self.api_key if self.api_key is not None else credentials.api_key(f"{self.base_url}/v1")
             if (not isinstance(key, str) or not key.startswith("lc_") or len(key) <= 3

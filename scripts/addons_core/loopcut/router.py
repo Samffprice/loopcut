@@ -27,6 +27,12 @@ from . import context, llm, orchestrator
 
 ROUTED = "loopcut_routed"   # On the user message a turn was routed from: its level, or -1 for no decision.
 TIMEOUT = 30.0              # Seconds for the call; a slow router is no router.
+# The router's tries: one more, a second later, for a failure likely to pass (a 429 or 5xx, a dropped connection,
+# a stream that broke before its reply), not a turn's own three (llm.RETRY_DELAYS, 1, 3 and 8 s) and no second
+# go after part of a reply. A failed router is no routing note, never a failed turn, while each try the gateway
+# answers is charged and each stalled one waits TIMEOUT: on 2026-10-25 a router whose reply stalled went four
+# times, 2.5 minutes and four router charges before the turn began; the same stall now costs two and a minute.
+RETRY_DELAYS = (1.0,)
 MAX_DELIVERABLES = 8
 MAX_NAME, MAX_QUOTE, MAX_WHY = 32, 80, 160
 ROLES = (*orchestrator.ROLES, "shot")  # delegate's roles and shot (a camera with its lighting), for the skeleton.
@@ -35,7 +41,9 @@ SHARED_SETUP = "palette, supports, render and output settings"
 STYLE = "look, parts, detail, finish"  # A brief's art direction; prompt served by Loopcut (contract 0.3).
 # The scene_context lines that say nothing about the work: the build, engines, editors.
 _NOISE = ("Blender ", "media type:")
-_VERIFIED = re.compile(r"\n\s*\n(?:Not )?[Vv]erified by Loopcut.*\Z", re.S)
+# Loopcut's blocks: its first head, or a later block's (orchestrator.block_head) on a reply after the turn's first.
+_VERIFIED = re.compile(r"\n\s*\n(?:(?:Not )?[Vv]erified by Loopcut|(?:Placement measured|Rig checked|Checked again) "
+                       r"this turn:).*\Z", re.S)
 
 
 @dataclass
@@ -171,17 +179,51 @@ def _previous(session: dict) -> tuple[str, str, dict | None]:
     return (user_request(messages[starts[-2]], 120), _last_reply(messages[starts[-2]:starts[-1]]), entry)
 
 
+def _stopped_build(session: dict) -> int | None:
+    """The newest earlier turn routed for workers (level 2 or 3) and stopped before any started, when no
+    turn since has acted: the scene does not hold that build, so it is still to do. Its turn number."""
+    number = session.get("turn_number") or 1
+    for entry in reversed(session.get("turn_levels") or []):
+        if entry.get("turn", number) >= number:
+            continue
+        if entry.get("stopped") and (entry.get("routed") or 0) >= 2 and entry.get("final", 0) < 2:
+            return entry["turn"]
+        if entry.get("final", 0):
+            return None
+    return None
+
+
 def previous_note(session: dict) -> str:
-    """One line about the previous turn: what the user asked, the level it ran at, how the reply ended."""
+    """One line about the previous turn: what the user asked, the level it ran at, how the reply ended;
+    last, a routed build an earlier Stop left undone (_stopped_build). On 2026-10-25 a tower stopped before
+    its workers ran was followed by "make the roof walkable", routed level 1 on an empty scene."""
     request, reply, entry = _previous(session)
+    tail = _stopped_line(session, bool(request))
     if not request and not reply:
-        return "none"
+        return tail or "none"
     parts = [f"the user asked \"{_one_line(request, 120)}\""] if request else []
     if entry:
         parts.append(f"Loopcut worked at level {entry.get('final', 0)}")
     if reply:
         parts.append(f"its reply ended \"{_one_line(_last_line(reply), 160)}\"")
-    return "; ".join(parts)[:MAX_PREVIOUS]
+    head = "; ".join(parts)
+    if not tail:
+        return head[:MAX_PREVIOUS]
+    return f"{head[:MAX_PREVIOUS - len(tail) - 2]}; {tail}"  # What is cut comes before the stopped build.
+
+
+def _stopped_line(session: dict, previous_asked: bool) -> str:
+    """The clause for _stopped_build's turn, or "" (also when the turn starts in messages no longer count
+    the turns, after a checkpoint restore or a reload). The previous turn's request is said already."""
+    stopped = _stopped_build(session)
+    starts = _turn_starts(session["messages"])
+    number = session.get("turn_number") or 1
+    if stopped is None or len(starts) != number:
+        return ""
+    if stopped == number - 1 and previous_asked:
+        return "that build was stopped before it ran"
+    request = _one_line(user_request(session["messages"][starts[stopped - 1]], 120), 120)
+    return f"an earlier build was stopped before it ran: \"{request}\"" if request else ""
 
 
 def parked(session: dict) -> Decision | None:
@@ -322,7 +364,7 @@ def ask(cfg, message: dict, session: dict, is_cancelled, stream=None) -> tuple[D
                             tools=[], reasoning_effort=cfg.reasoning_effort, on_text=lambda _: None,
                             is_cancelled=is_cancelled, timeout=TIMEOUT,
                             max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-                            headers=llm.correlation_headers(session["id"], "router"), on_retry=lambda: None)
+                            headers=llm.correlation_headers(session["id"], "router"), retry_delays=RETRY_DELAYS)
     except llm.Cancelled:
         raise
     except Exception as ex:  # A router that fails is no router, never a failed turn.

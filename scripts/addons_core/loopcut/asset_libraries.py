@@ -24,7 +24,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, asset_picks
+from . import asset_common, asset_picks, tools
 from .asset_common import download, get_json, rank, sheet
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -397,8 +397,11 @@ def fetch_entry(library: Library, entry: Entry) -> dict:
 
 
 def load_asset(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
-    """import_asset's scene half (a worker's child runs it): append or link from the file, no network."""
+    """import_asset's scene half (a worker's child runs it): append or link from the file, no network.
+    Every library's import loads here or in load_polyhaven, load_blenderkit, load_polypizza: one undo step,
+    before the load and after it (tools.undo_before), the download outside it."""
     apply_to = _check_apply_to(apply_to)
+    tools.undo_before("import asset")
     library_name, id_type, name = fetched["library"], fetched["id_type"], fetched["name"]
     license_name, author = fetched.get("license") or "", fetched.get("author") or ""
     blend = Path(fetched["blend"])

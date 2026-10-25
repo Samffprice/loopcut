@@ -4,6 +4,7 @@
 """
 
 import dataclasses
+import io
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -24,8 +26,10 @@ fake_bpy = types.ModuleType("bpy")
 fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
-from loopcut import agent, checkpoints, config, context, conversations, llm, state, tools, waves, workspace  # noqa: E402
+from loopcut import (agent, checkpoints, config, context, conversations, llm, motion_claims, state,  # noqa: E402
+                     tools, waves, workspace)
 from loopcut.ui import layout  # noqa: E402
+from test_motion_claims import moons as motion_scene  # noqa: E402
 
 
 def sse(*chunks: dict) -> bytes:
@@ -63,6 +67,13 @@ class Hang:
 
     def __init__(self, prefix: bytes = b"", delay: float = 0.25):
         self.prefix, self.delay = prefix, delay
+
+
+class Trickle:
+    """A reply whose text deltas come `interval` seconds apart: slow, but always coming."""
+
+    def __init__(self, pieces: list[str], interval: float):
+        self.pieces, self.interval = pieces, interval
 
 
 class Script:
@@ -104,6 +115,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             time.sleep(reply.delay)
             return
+        if isinstance(reply, Trickle):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for piece in reply.pieces:
+                self.wfile.write(sse({"choices": [{"delta": {"content": piece}}]})[:-len(b"data: [DONE]\n\n")])
+                self.wfile.flush()
+                time.sleep(reply.interval)
+            self.wfile.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         for name, value in SCRIPT.headers.items():
@@ -135,11 +156,12 @@ class AgentLoopTest(unittest.TestCase):
         # Put back after the class: test_workspace measures the real _tool_schemas.
         cls.replaced = {name: getattr(agent, name) for name in (
             "_scene_snapshot", "_addons_line", "_project_roots", "_alike_on_main", "_update_account",
-            "_keeps_context", "_redraw", "_tool_schemas", "_changes_scene")}
+            "_keeps_context", "_redraw", "_tool_schemas", "_changes_scene", "_motion_on_main")}
         agent._scene_snapshot = lambda: None
         agent._addons_line = lambda: ""  # Reads bpy; the prompt test sets its own line.
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
         agent._alike_on_main = lambda a, b: False  # Needs Blender to read pixels; tests pass their own.
+        agent._motion_on_main = lambda text, is_cancelled: None  # Steps the scene's frames; MotionClaimTest's own.
         agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
         agent._keeps_context = lambda cfg: False  # account.py needs bpy.
         agent._redraw = lambda: None
@@ -299,7 +321,8 @@ class AgentLoopTest(unittest.TestCase):
         # A record correction or a written-out call's retry too (review of the port): left last, it would ask
         # the model to run what the user stopped.
         for content in (agent.completion_guard.CONTINUE, agent.completion_guard.CORRECTION,
-                        agent.UNMADE_PROMPT.format(calls="loopcut_cloud__motion_from_text", them="it")):
+                        agent.UNMADE_PROMPT.format(calls="loopcut_cloud__motion_from_text", them="it"),
+                        motion_claims.nudge({"names": ["Moon_1"], "move": "orbits", "frames": (1, 125)})):
             with self.subTest(content=content[:40]):
                 SCRIPT.replies.clear()
                 SCRIPT.requests.clear()
@@ -410,6 +433,37 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn(item, self.session["items"], "the next turn reuses the note and its helper receipts")
         self.assertNotIn("queued", item)
         self.assertFalse(self.session["busy"])
+
+    def test_the_message_after_a_stop_tells_the_model_the_user_stopped_it(self):
+        """0.2.14 logs (ChatGPT plan): Stop pressed by mistake, then a message saying so and asking to continue; with
+        nothing in the history about the Stop, the model read it as a mistaken press of continue and stopped. The
+        next message's scene context says the user stopped the last turn, and leaves the decision to the message."""
+        SCRIPT.replies.append(tool_reply("run_python", {"code": "x", "summary": "x"}))
+        turn = self.start("light the chalice")
+        self.awaiting()
+        agent.stop()
+        turn.thread.join(5)
+        self.assertEqual(self.session["turn_outcome"], "cancelled")
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\nfile: unsaved\n"
+                                                                                     "</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+
+        def sent(text, **kwargs):
+            SCRIPT.requests.clear()
+            SCRIPT.replies.append(text_reply("OK."))
+            self.assertTrue(agent.send(text, **kwargs))
+            self.session["turn"].thread.join(5)
+            return [m for m in SCRIPT.requests[0]["messages"] if m["role"] == "user"][-1]["content"]
+        stopped = f"<scene_context>\nfile: unsaved\n{agent.STOPPED_LINE}\n</scene_context>\n\n"
+        self.assertEqual(sent("I pressed it by accident, sorry, continue"),
+                         stopped + "I pressed it by accident, sorry, continue")
+        self.assertNotIn(agent.STOPPED_LINE, sent("Make it red"), "only right after the Stop")
+        self.session["turn_outcome"] = "cancelled"  # And a real stop: the same plain fact, nothing more.
+        self.assertEqual(sent("No, stop, leave it as it is"), stopped + "No, stop, leave it as it is")
+        self.assertEqual(self.session["items"][-1]["text"], "OK.")
+        self.session["turn_outcome"] = "cancelled"  # "Send now" stops helpers to send the user's waiting notes.
+        self.assertNotIn(agent.STOPPED_LINE, sent("and blue", note_items=[state.item_user("and blue")]))
 
     def test_a_note_left_over_after_a_stop_goes_back_to_the_input(self):
         restored = []
@@ -913,6 +967,268 @@ class AgentLoopTest(unittest.TestCase):
         self.assert_bare_stop(self.limited(1, tool_reply("get_scene_info", {})), 2)
         self.assertEqual(len(self.ran), 1)
 
+    # ------------------------------------------------------------------ the stall clock (agent.check_stall)
+
+    def pump(self, turn, seconds: float) -> None:
+        """mainthread's pump as far as the stall clock goes: check_stall every 30 ms while the turn runs."""
+        deadline = time.monotonic() + seconds
+        while turn.thread.is_alive() and time.monotonic() < deadline:
+            agent.check_stall()
+            time.sleep(0.03)
+
+    def test_a_silent_stream_past_the_stall_limit_ends_with_try_again_and_is_logged(self):
+        from loopcut import mainthread, session_logs
+        SCRIPT.replies.append(Hang(delay=10))  # The status line and headers, then nothing.
+        uploads = []
+        with mock.patch.object(session_logs, "env_off", return_value=False), \
+                mock.patch.object(mainthread, "run_on_main", side_effect=lambda fn: fn()), \
+                mock.patch.object(session_logs, "queue_uploads", side_effect=uploads.append), \
+                mock.patch.object(sys, "stdout", new=io.StringIO()) as console:
+            turn = self.start("go")
+            turn.conversation_log = {"provider": "own_key", "model": "other"}  # _launch's, when sharing is on.
+            turn.stall_seconds = 1
+            started = time.monotonic()
+            self.pump(turn, 5)
+            turn.thread.join(2)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertLess(time.monotonic() - started, 3, "at the limit, the stream's socket shut, not at its end")
+        self.assertEqual(self.session["items"][-1],
+                         state.item_error("Loopcut stopped waiting: nothing came back for 1 second.", retry=True),
+                         "the turn's own limit (LOOPCUT_STALL_SECONDS), not the default's 15 minutes")
+        self.assertEqual((turn.outcome, turn.error_code, turn.stop_reason), ("error", "stalled", "stalled"))
+        self.assertTrue(state.can_resume(self.session), "Try again asks for the reply afresh")
+        self.assertIn("Loopcut: turn stalled: nothing new for 1 s, waiting for the model\n", console.getvalue())
+        [snapshot] = uploads
+        self.assertEqual(snapshot[0]["meta"]["outcome"], "error")
+        self.assertEqual(snapshot[0]["transcript"][-1],
+                         {"role": "event", "error": agent.stall_message(1), "data": {"kind": "error", "retry": True}})
+
+    def test_a_card_waiting_for_the_user_never_stalls(self):
+        SCRIPT.replies += [tool_reply("run_python", {"code": "x", "summary": "x"}), text_reply("Done.")]
+        turn = self.start("go")
+        turn.stall_seconds = 1
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
+        self.pump(turn, 3)  # Three times the limit.
+        self.assertFalse(turn.cancel.is_set())
+        agent.decide(True)
+        self.pump(turn, 3)
+        turn.thread.join(2)
+        self.assertEqual((turn.outcome, self.session["items"][-1]["text"]), ("completed", "Done."))
+        self.assertEqual([name for name, _ in self.ran], ["run_python"])
+
+    def test_workers_within_their_own_time_hold_the_stall_clock(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        scheduler = threading.Thread(target=release.wait, daemon=True)
+        scheduler.start()
+        worker = types.SimpleNamespace(thread=scheduler, finished=None, started=time.monotonic())
+        turn = agent.Turn()
+        turn.stall_seconds = 1
+        turn.job = types.SimpleNamespace(scheduler=scheduler, crew=[worker], budget=waves.JobBudget(0.40, 1800))
+        self.session["busy"], self.session["turn"] = True, turn
+        now = time.time()
+        turn.progress_at = now - 5
+        agent.check_stall(now=now)
+        self.assertFalse(turn.cancel.is_set(), "a worker within its 1800 s")
+        self.assertEqual(turn.progress_at, now, "the clock waited")
+        worker.started -= 1800 + waves.HARD_GRACE  # Past its time and grace: the job's thread stops it now.
+        agent.check_stall(now=now + 2)
+        self.assertEqual((turn.cancel.is_set(), turn.stop_reason), (True, "stalled"))
+        turn = agent.Turn()  # And once the job's thread has ended, whatever its workers' rows say.
+        turn.stall_seconds = 1
+        worker.started = time.monotonic()
+        turn.job = types.SimpleNamespace(scheduler=scheduler, crew=[worker], budget=waves.JobBudget(0.40, 1800))
+        self.session["turn"] = turn
+        release.set()
+        scheduler.join(2)
+        turn.progress_at = now - 5
+        agent.check_stall(now=now)
+        self.assertTrue(turn.cancel.is_set())
+
+    def test_a_workspace_process_past_the_limit_is_not_a_stall(self):
+        """run_blender and shell wait on the agent thread for a child that has its own time limit and that Stop kills
+        (workspace.run_process): the clock waits while one runs."""
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            folder = Path(self.data_dir.name)
+            code, _, _ = workspace.run_process([sys.executable, "-c", "import time; time.sleep(2)"], folder,
+                                               dict(os.environ), 60, folder / "child.log",
+                                               lambda: self.session["turn"].cancel.is_set())
+            return types.SimpleNamespace(text=f"exit {code}", ok=True, image_path=None)
+
+        self.run_tool = run_tool
+        SCRIPT.replies += [tool_reply("get_scene_info", {}), text_reply("Done.")]
+        turn = self.start("render it")
+        turn.stall_seconds = 1
+        self.pump(turn, 6)
+        turn.thread.join(2)
+        self.assertEqual((turn.outcome, self.session["items"][-1]["text"]), ("completed", "Done."))
+        self.assertEqual(self.session["items"][-2]["output"], "exit 0")
+
+    def test_a_running_codex_command_holds_the_stall_clock(self):
+        card = state.item_tool("shell", "$ make", "make")  # Codex's own shell: its card runs until Codex says.
+        turn = agent.Turn()
+        turn.stall_seconds = 1
+        self.session["items"].append(card)
+        self.session["busy"], self.session["turn"] = True, turn
+        now = time.time()
+        turn.progress_at = now - 5
+        agent.check_stall(now=now)
+        self.assertFalse(turn.cancel.is_set())
+        card["status"] = "done"
+        agent.check_stall(now=now + 2)
+        self.assertTrue(turn.cancel.is_set())
+
+    def test_a_slow_summary_streaming_past_the_limit_is_not_a_stall(self):
+        os.environ["LOOPCUT_CONTEXT_BUDGET"] = "16000"
+        self.addCleanup(os.environ.pop, "LOOPCUT_CONTEXT_BUDGET")
+        SCRIPT.replies.append(text_reply("Read it."))
+        self.start("first: " + "x" * 60_000).thread.join(5)  # A pasted document, summarized at the next turn.
+        SCRIPT.replies += [Trickle(["Turn 1 ", "was a ", "long ", "paste."], 0.5), text_reply("Sure.")]
+        turn = self.start("second")
+        turn.stall_seconds = 1
+        self.pump(turn, 6)
+        turn.thread.join(2)
+        self.assertEqual((turn.outcome, self.session["items"][-1]["text"]), ("completed", "Sure."))
+        self.assertIn("Summarized 2 earlier messages", self.session["items"][-2]["text"])
+
+    def test_the_router_and_reference_card_requests_are_progress_too(self):
+        from loopcut import router
+
+        def start_turn(session, turn, cfg, is_cancelled, stream=None, divert=None):  # As router.ask calls it.
+            stream(headers=llm.correlation_headers(session["id"], "router"), prompt_id="router")
+
+        def stream_chat(**kwargs):
+            kwargs["on_progress"]()  # A delta arrived.
+            return llm.Completion(text="{}")
+        cfg = config.Config("k", os.environ["LOOPCUT_BASE_URL"], "m", "low", True, False, 25, 40_000)
+        picture = Path(self.data_dir.name) / "reference.png"
+        picture.write_bytes(b"\x89PNG reference")
+        ref = conversations.store_image(self.session, picture)
+        self.session["references"] = [{"ref": ref, "full": ref, "name": "reference.png", "pinned": True}]
+        message = {"role": "user", "content": [{"type": "text", "text": "like this"},
+                                               {"type": "image_url", "image_url": {"url": ref}}]}
+        turn = agent.Turn()
+        turn.roles = types.SimpleNamespace(router=cfg)
+        with mock.patch.object(router, "start_turn", start_turn), mock.patch.object(llm, "stream_chat", stream_chat), \
+                mock.patch.object(agent, "_hosted_reply", lambda *a, **k: None):
+            for request in (lambda: agent._route(self.session, turn),
+                            lambda: agent._reference_card(self.session, cfg, message, lambda: False, "single", turn)):
+                turn.progress_at, turn.progress = 0.0, "the run_python tool"
+                request()
+                self.assertGreater(turn.progress_at, 0.0)
+                self.assertEqual(turn.progress, state.MODEL_REPLY)
+
+    def test_a_long_main_thread_task_does_not_stall_the_turn_when_it_returns(self):
+        """The real pump (mainthread._pump): a task's wait for Blender's thread and its run never count."""
+        import queue
+        from loopcut import mainthread
+
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            result = agent._on_main(lambda: time.sleep(1.5) or types.SimpleNamespace(text="baked", ok=True,
+                                                                                      image_path=None))
+            time.sleep(0.2)  # The tool's own bookkeeping after Blender's part: the pump looks before the loop touches.
+            return result
+
+        self.run_tool = run_tool
+        SCRIPT.replies += [tool_reply("get_scene_info", {}), text_reply("Done.")]
+        with mock.patch.object(mainthread, "_jobs", queue.Queue()), \
+                mock.patch.object(mainthread, "_animating", return_value=None), \
+                mock.patch.object(mainthread, "_redraw_requested", False), \
+                mock.patch.object(mainthread, "_pumped_at", 0.0):
+            turn = self.start("bake it")
+            turn.stall_seconds = 1
+            deadline = time.monotonic() + 6
+            while turn.thread.is_alive() and time.monotonic() < deadline:
+                mainthread._pump()
+                time.sleep(0.03)
+        turn.thread.join(2)
+        self.assertEqual((turn.outcome, turn.cancel.is_set()), ("completed", False), self.session["items"])
+        self.assertEqual(self.session["items"][-1]["text"], "Done.")
+
+    def test_a_sleep_that_jumps_the_wall_clock_ends_a_silent_turn_on_wake(self):
+        """The clock is time.time(), which counts a laptop's sleep (time.monotonic() does not, on a Mac): after
+        waking, and a minute for what was in flight (a cloud job's poll) to land, the turn ends at the default 15
+        minutes too."""
+        SCRIPT.replies.append(Hang(delay=10))
+        turn = self.start("go")
+        turn.stall_seconds = config.DEFAULT_STALL_SECONDS
+        self.assertAlmostEqual(turn.progress_at, time.time(), delta=5)
+        agent.check_stall()
+        self.assertFalse(turn.cancel.is_set())
+        woke = time.time() + 8 * 3600  # Eight hours asleep.
+        agent.check_stall(now=woke)
+        self.assertFalse(turn.cancel.is_set(), "a minute's grace first, for a poll in flight to land")
+        agent.check_stall(now=woke + agent.WAKE_SECONDS)
+        turn.thread.join(2)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(self.session["items"][-1],
+                         state.item_error("Loopcut stopped waiting: nothing came back for 15 minutes.", retry=True))
+
+    def test_the_stall_card_names_the_turns_own_limit(self):
+        for seconds, limit in ((config.DEFAULT_STALL_SECONDS, "15 minutes"), (60, "1 minute"), (90, "90 seconds"),
+                               (1, "1 second"), (7200, "2 hours"), (5400, "90 minutes")):
+            self.assertEqual(agent.stall_message(seconds), f"Loopcut stopped waiting: nothing came back for {limit}.")
+
+    def test_the_stall_clock_is_off_with_zero_seconds_and_for_the_bridge(self):
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        for seconds, loopback, expected in (("", False, config.DEFAULT_STALL_SECONDS), ("60", False, 60),
+                                            ("0", False, 0), ("60", True, 0)):
+            with self.subTest(seconds=seconds, loopback=loopback):
+                SCRIPT.replies.append(text_reply("Done."))
+                with mock.patch.dict(os.environ, {"LOOPCUT_STALL_SECONDS": seconds}), \
+                        mock.patch.object(llm, "_is_loopback", return_value=loopback):
+                    self.assertTrue(agent.send("hi"))
+                    turn = self.session["turn"]
+                    turn.thread.join(5)
+                self.assertEqual(turn.stall_seconds, expected)
+
+    def test_a_turn_is_saved_as_running_until_its_last_save_so_a_killed_blender_still_closes_it(self):
+        """A SIGKILL or a crash while the turn waits on the model leaves only send's save on disk (no streaming reply,
+        no running card): its mark is what the next launch's load reads, as for a normal quit. Resume marks it too."""
+        from loopcut import session_logs
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        path = conversations._folder(self.session["id"]) / "conversation.json"
+
+        def on_disk():
+            return json.loads(path.read_text(encoding="utf-8"))
+        uploads = mock.patch.object(session_logs, "on_closed")
+        closed = uploads.start()
+        self.addCleanup(uploads.stop)
+        for again in (False, True):
+            SCRIPT.replies.append(Hang(delay=10))
+            self.assertTrue(agent.resume() if again else agent.send("make a cube"))
+            turn = self.session["turn"]
+            self.wait_for(lambda: len(SCRIPT.requests) == 1 + again, "the silent request")
+            killed = path.read_text(encoding="utf-8")
+            self.assertEqual(on_disk().get("turn_running"), conversations._LAUNCH)
+            self.assertFalse([i for i in on_disk()["items"] if i.get("streaming") or i.get("status") == "running"],
+                             "nothing else on disk says the turn was cut")
+            self.assertNotIn(conversations.CLOSED_MESSAGE, [i.get("text") for i in conversations.load(self.session["id"])["items"]],
+                             "this Blender's own turn, opened from History mid-turn")
+            agent.stop()
+            turn.thread.join(5)
+            self.assertNotIn("turn_running", on_disk(), "the turn's last save leaves the mark out")
+            with mock.patch.object(conversations, "_LAUNCH", "0" * 32):  # The next launch.
+                self.assertEqual(conversations.load(self.session["id"])["items"][-1], state.item_error("Stopped."))
+                closed.assert_not_called()
+                path.write_text(killed, encoding="utf-8")  # As Blender left it when killed mid-turn.
+                loaded = conversations.load(self.session["id"])
+            self.assertEqual(loaded["items"][-1], state.item_error(conversations.CLOSED_MESSAGE, retry=True))
+            closed.assert_called_once_with(loaded)
+            closed.reset_mock()
+        SCRIPT.replies.append(text_reply("Done."))
+        self.assertTrue(agent.send("thanks"))
+        self.session["turn"].thread.join(5)
+        with mock.patch.object(conversations, "_LAUNCH", "0" * 32):
+            self.assertEqual(conversations.load(self.session["id"])["items"][-1]["text"], "Done.", "a finished turn")
+        closed.assert_not_called()
+
     def test_cancelled_main_thread_job_never_executes_after_worker_stops(self):
         from concurrent.futures import Future
         from unittest.mock import patch
@@ -1000,6 +1316,22 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(items[card + 1]["action_label"], "Show anyway")
         self.assertIn(line, next(m for m in self.session["messages"] if m["role"] == "tool")["content"])
 
+    def test_a_timed_out_step_s_card_keeps_its_seconds_and_another_failure_s_does_not(self):
+        from unittest.mock import patch
+        results = iter([tools.ToolResult("Stopped: the code ran for more than 30 s", ok=False, timed_out=30.0),
+                        tools.ToolResult("ValueError: bad", ok=False)])
+        self.run_tool = lambda name, arguments: next(results)
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "false", "LOOPCUT_AUTO_RUN": "true"}):
+            SCRIPT.replies += [tool_reply("run_python", {"code": "while True: pass", "summary": "Loop"}),
+                               tool_reply("run_python", {"code": "raise ValueError('bad')", "summary": "Fail"}),
+                               text_reply("Done.")]
+            turn = self.start("loop")
+            turn.thread.join(5)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual([c["status"] for c in cards], ["failed", "failed"])
+        self.assertEqual(cards[0]["timed_out"], 30.0)
+        self.assertNotIn("timed_out", cards[1])
+
     def test_a_refused_render_keeps_its_guard_notice_and_gets_the_step_budget_s_note(self):
         from unittest.mock import patch
         refusal = ("Render refused by the cost guard: at render settings this is over its limit of 4M faces per "
@@ -1026,7 +1358,7 @@ class AgentLoopTest(unittest.TestCase):
         items = self.session["items"]
         cards = [n for n, i in enumerate(items) if i["kind"] == "tool"]
         self.assertEqual([items[n + 1] for n in cards], [state.item_guard(refusal, [])] * 3, "and in the panel")
-        self.assertIn("This approach is not working", items[cards[2]]["output"])
+        self.assertNotIn("This approach is not working", items[cards[2]]["output"], "the ledger's note is the model's")
 
     def test_a_huge_step_result_is_folded_not_summarized_at_the_next_turn(self):
         os.environ["LOOPCUT_CONTEXT_BUDGET"] = "16000"
@@ -1558,6 +1890,41 @@ class AgentLoopTest(unittest.TestCase):
         self.assertTrue(any("Loopcut showed you a viewport capture: the view through Camera" in (m.get("content") or "")
                             for m in sent))
 
+    def test_after_frame_camera_the_automatic_look_goes_through_the_scene_camera(self):
+        # 2026-10-25: after frame_camera the automatic looks stayed at three_quarter, and the model went on to
+        # its own camera math (about 15 tries).
+        os.environ["LOOPCUT_AUTO_LOOK"] = "true"
+        self.addCleanup(os.environ.__setitem__, "LOOPCUT_AUTO_LOOK", "false")
+        self.session["auto_run"] = True
+        shot = Path(self.data_dir.name) / "viewport.png"
+        empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
+                 "scene": {}, "mode": "OBJECT"}
+
+        def run_tool(name, arguments):
+            parsed = json.loads(arguments)
+            self.ran.append((name, parsed))
+            if name == "capture_viewport":
+                shot.write_bytes(b"\x89PNG look %d" % len(self.ran))
+                return types.SimpleNamespace(text="Image attached: the scene.", ok=True, image_path=shot)
+            if parsed.get("report_only"):
+                return types.SimpleNamespace(text="Camera: 98% inside", ok=True, image_path=None,
+                                             scene_before=empty, scene_after=empty)
+            text = "Framed." + (" Not the scene camera (Camera)." if parsed.get("camera") == "Side" else "")
+            return types.SimpleNamespace(text=text, ok=True, image_path=None,
+                                         scene_before=empty, scene_after={**empty, "object_count": len(self.ran)})
+
+        SCRIPT.replies += [tool_reply("frame_camera", {"report_only": True}), tool_reply("run_python", {"code": "a()"}),
+                           tool_reply("frame_camera", {"camera": "Side"}), tool_reply("frame_camera", {}),
+                           tool_reply("run_python", {"code": "b()"}), text_reply("Done.")]
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("frame it"))
+        self.session["messages"].append({"role": "user", "content": "frame it"})
+        self.session["busy"], self.session["turn"] = True, turn
+        agent._run(self.session, turn, run_tool, self.ensure_checkpoint)
+        self.assertEqual([a.get("angle") for n, a in self.ran if n == "capture_viewport"],
+                         ["three_quarter", "three_quarter", "camera", "camera"],
+                         "a measure or another camera keeps the angle; framing the scene camera looks through it")
+
     def _looking_tools(self):
         shot = Path(self.data_dir.name) / "viewport.png"
         empty = {"too_many": False, "objects": {}, "object_count": 0, "materials": {}, "collections": {},
@@ -1957,6 +2324,58 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("not working", SCRIPT.requests[3]["messages"][-1]["content"], "the model sees it")
         self.assertEqual([c["status"] for c in self.session["items"] if c["kind"] == "tool"], ["failed"] * 3)
 
+    def test_a_repeated_failure_s_note_is_on_the_model_s_copy_not_the_card(self):
+        # A free-plan persona, 2026-10-24: "(Same error as before. Already tried: step 14 ...)" on a failed card
+        # read as "i think something broke?".
+        self.session["auto_run"] = True
+        self.failing_run(["AttributeError: 'NoneType' object has no attribute 'inputs'"] * 2)
+        SCRIPT.replies += [tool_reply("run_python", {"code": f"try_{i}()", "summary": f"Try {i}"}) for i in (1, 2)]
+        SCRIPT.replies.append(text_reply("This is not working; here is why."))
+        after = lambda session, name, result: "\n\nAfter the tool."
+        self.start("scatter spheres", spec=dataclasses.replace(agent.SINGLE_SPEC, after_tool=after)).thread.join(5)
+        note = '\n\n(Same error as before. Already tried: step 1 "Try 1".)'
+        results = self.results()
+        cards = [c for c in self.session["items"] if c["kind"] == "tool"]
+        self.assertTrue(results[1].endswith("Scene changes: none" + note + "\n\nAfter the tool."),
+                        "the model's copy as before")
+        self.assertEqual(cards[1]["output"], results[1].replace(note, ""), "the card: the tool's output, then the rest")
+        self.assertEqual(cards[0]["output"], results[0])
+        self.assertEqual(SCRIPT.requests[2]["messages"][-1]["content"], results[1], "the model sees it")
+
+    def test_a_cloud_report_s_card_gets_its_line_and_the_model_the_whole_report(self):
+        # The owner, 0.2.17 walkthrough: an asset search's report JSON, about 12k characters, as a "massive wall of
+        # text" on its card. The line is the card's; the model's copy stays the whole result.
+        text = ("Attached reports: report. Job job_1; provenance recorded.\nreport:\n"
+                + json.dumps({"schema": "loopcut.asset_search/1", "results": [{"title": "Treasure Chest"}] * 10}))
+        line = "Searched libraries: 10 matches; best: Treasure Chest (Poly Haven, CC0)"
+        self.session["auto_run"] = True
+        self.run_tool = lambda name, arguments: tools.ToolResult(text, outcome=line)
+        SCRIPT.replies += [tool_reply("loopcut_cloud__asset_search", {"query": "treasure chest"}),
+                           text_reply("Found a chest.")]
+        self.start("find a treasure chest").thread.join(5)
+        card = next(i for i in self.session["items"] if i["kind"] == "tool")
+        self.assertEqual((card["status"], card["outcome"]), ("done", line))
+        self.assertEqual(card["output"], text, "the whole result, behind the card's toggle")
+        self.assertEqual(self.results(), [text], "the model's copy, unchanged")
+        self.assertEqual(SCRIPT.requests[1]["messages"][-1]["content"], text, "the model sees it")
+        self.assertFalse(any(line in str(m.get("content")) for m in SCRIPT.requests[1]["messages"]), "nor the line")
+
+    def test_an_asset_search_s_card_keeps_the_report_s_json_and_the_model_gets_its_table(self):
+        # About 3k of a search's tokens were download links, URLs, dedupe keys and tags (cloud_jobs._asset_table).
+        report = json.dumps({"schema": "loopcut.asset_search/1", "results": [{"title": "Treasure Chest"}]})
+        whole = f"Attached reports: report. Job job_1; provenance recorded.\nreport:\n{report}"
+        table = ("Attached reports: report. Job job_1; provenance recorded.\nreport:\n1 asset(s) for 'chest':\n"
+                 "#1 Treasure Chest (polyhaven); kind: model; score 1; CC0-1.0; id treasure_chest")
+        self.session["auto_run"] = True
+        self.run_tool = lambda name, arguments: tools.ToolResult(table, outcome="Searched libraries: 1 match",
+                                                                 card_output=whole)
+        SCRIPT.replies += [tool_reply("loopcut_cloud__asset_search", {"query": "chest"}), text_reply("Found one.")]
+        self.start("find a treasure chest").thread.join(5)
+        card = next(i for i in self.session["items"] if i["kind"] == "tool")
+        self.assertEqual((card["status"], card["output"]), ("done", whole), "the JSON, behind the card's toggle")
+        self.assertEqual(SCRIPT.requests[1]["messages"][-1]["content"], table, "the model's copy, the table")
+        self.assertFalse(any(report in str(m.get("content")) for m in SCRIPT.requests[1]["messages"]))
+
     def test_failing_runs_in_a_row_get_a_nudge_whatever_the_errors(self):
         self.session["auto_run"] = True
         self.failing_run(["NameError: name 'plane' is not defined", "KeyError: 'Scatter'",
@@ -1997,6 +2416,35 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("Gone."))
         self.start("and now").thread.join(5)
         self.assertEqual(SCRIPT.requests[3]["messages"][1]["content"][1]["type"], "text", "unpinned: dropped")
+
+    def test_a_failed_reference_card_still_names_the_attached_images(self):
+        """2026-10-25: the card request failed, the model never got a name and passed "character reference" to
+        photo→3D."""
+        from loopcut import conversations, context
+        picture = Path(self.data_dir.name) / "hero.png"
+        picture.write_bytes(b"\x89PNG hero photo")
+        session = self.session
+        note = '\n\n<reference_card images="hero.png">(not described: the description request failed)</reference_card>'
+        for card in ((400, {"error": {"message": "image too large"}}), text_reply("")):
+            with self.subTest(card=type(card).__name__):
+                session["attachments"] = [{"ref": conversations.store_image(session, picture),
+                                           "full": conversations.store_image(session, picture), "name": "hero.png"}]
+                SCRIPT.replies += [card, text_reply("Making it.")]
+                agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+                self.assertTrue(agent.send("make him 3d"))
+                session["turn"].thread.join(5)
+                message = session["messages"][-2]
+                self.assertTrue(message["content"][0]["text"].endswith(note))
+                self.assertIn(note, SCRIPT.requests[-1]["messages"][-1]["content"][0]["text"], "in the real request")
+                self.assertFalse(message.get(context.REFERENCE_CARD), "a resumed turn asks again")
+                self.assertNotIn("notice", [i["kind"] for i in session["items"][-2:]])
+        cfg = types.SimpleNamespace(base_url="http://model", api_key="k", model="m", max_output_tokens=100,
+                                    call_max_seconds=10)
+        with mock.patch.object(agent.llm, "stream_chat", return_value=types.SimpleNamespace(text="A hero in a red cape.")), \
+                mock.patch.object(agent, "_correlation_headers", return_value={}):
+            self.assertEqual(agent._reference_card(session, cfg, message, lambda: False), ["hero.png"])
+        self.assertNotIn("not described", message["content"][0]["text"], "the card replaces the note")
+        self.assertIn('<reference_card images="hero.png">\nA hero in a red cape.', message["content"][0]["text"])
 
     def test_the_workspace_agent_gets_attached_images_without_a_reference_card(self):
         from loopcut import conversations, context
@@ -2454,6 +2902,55 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("Try again", item["text"])
         self.assertTrue(item.get("retry"))
 
+    def test_a_tools_dropped_connection_is_that_steps_failure_and_the_turn_goes_on(self):
+        """2026-10-25: a BlenderKit thumbnail's read timed out inside search_assets, escaped the tool and ended the
+        turn as "The connection to the model dropped before it could answer", which it had not."""
+        def run_tool(name, arguments):
+            self.ran.append((name, arguments))
+            raise TimeoutError("The read operation timed out")
+        self.run_tool = run_tool
+        SCRIPT.replies += [tool_reply("get_scene_info", {}), text_reply("Searched without the thumbnails.")]
+        turn = self.start("find a chair")
+        turn.thread.join(5)
+        card = next(i for i in self.session["items"] if i["kind"] == "tool")
+        self.assertEqual(card["status"], "failed")
+        self.assertTrue(card["output"].startswith("get_scene_info failed: its network connection dropped "
+                                                  "(TimeoutError: The read operation timed out)."), card["output"])
+        self.assertEqual(self.session["items"][-1]["text"], "Searched without the thumbnails.")
+        self.assertNotEqual(turn.outcome, "error")
+        self.assertFalse(any(i["kind"] == "error" for i in self.session["items"]))
+        told = [m["content"] for m in SCRIPT.requests[1]["messages"] if m["role"] == "tool"]
+        self.assertIn("its network connection dropped", told[0], "the model hears the step failed")
+
+    def test_a_reply_that_kept_ending_in_an_error_offers_try_again_without_its_fragment(self):
+        """chatgpt_responses._stream_failed: the ChatGPT stream said it failed on every retry (0.2.14 logs). The card
+        offers Try again, which asks for the reply afresh, so no fragment of it stays above the card."""
+        def stream_chat(**kwargs):
+            kwargs["on_text"]("I'll now light the")
+            raise llm.LLMError("ChatGPT stopped the reply with an error, again when Loopcut retried. ...", None,
+                               llm.STREAM_FAILED)
+        with mock.patch.object(llm, "stream_chat", side_effect=stream_chat):
+            turn = self.start("hi")
+            turn.thread.join(5)
+        item = self.session["items"][-1]
+        self.assertEqual((item["kind"], turn.error_code), ("error", llm.STREAM_FAILED))
+        self.assertTrue(item.get("retry"))
+        self.assertFalse(any("I'll now light the" in str(i.get("text")) for i in self.session["items"][:-1]))
+
+    def test_a_module_from_an_update_installed_under_blender_asks_for_a_restart(self):
+        """0.2.15 logs (2026-10-25): an update installed while Blender was open, the first ChatGPT request loaded
+        the new version's module against the old ones and the turn ended in 'Internal error: AttributeError(...)'.
+        version_guard refuses that import; the card says what to do instead."""
+        from loopcut import version_guard
+        failure = version_guard.RestartNeeded(version_guard.MESSAGE, name="loopcut.chatgpt_responses")
+        with mock.patch.object(llm, "stream_chat", side_effect=failure):
+            turn = self.start("hi")
+            turn.thread.join(5)
+        item = self.session["items"][-1]
+        self.assertEqual((item["kind"], item["text"], turn.error_code),
+                         ("error", version_guard.MESSAGE, "restart_needed"))
+        self.assertFalse(item.get("retry"), "Try again would load the same file")
+
     def test_a_bare_oserror_waiting_for_the_reply_is_retried_then_a_try_again_card(self):
         """0.2.14 logs, 3 users on Windows: 'Internal error: FileNotFoundError(2, ...)' with no Try again, raised by
         getresponse while urlopen waited for the status line. llm.py retries it, then the card offers Try again."""
@@ -2462,7 +2959,7 @@ class AgentLoopTest(unittest.TestCase):
         def urlopen(request, timeout=None):
             sent.append(request)
             raise FileNotFoundError(2, "No such file or directory")
-        with self.on_gateway(), mock.patch.object(llm.urllib.request, "urlopen", urlopen):
+        with self.on_gateway(hosted=False), mock.patch.object(llm.urllib.request, "urlopen", urlopen):
             turn = self.start("hi")
             turn.thread.join(5)
         item = self.session["items"][-1]
@@ -2471,6 +2968,25 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(item["text"], "The connection to the model dropped before it could answer. "
                                        "Nothing was lost: press Try again. (network error, errno 2)")
         self.assertNotRegex(item["text"], "Internal error|FileNotFoundError|No such file")
+
+    def test_a_hosted_request_that_never_got_an_answer_says_the_network_dropped_it(self):
+        """2026-10-25: 5 of 15 hosted users' large requests died on the way, with no trace on the server, and the card
+        said "press Try again", which sent them the same way. Nothing came back on any try: the card says why."""
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request)
+            raise urllib.error.URLError(TimeoutError("The write operation timed out"))
+        with self.on_gateway(), mock.patch.object(llm.urllib.request, "urlopen", urlopen):
+            turn = self.start("hi")
+            turn.thread.join(5)
+        item = self.session["items"][-1]
+        self.assertEqual((item["kind"], len(sent), turn.error_code), ("error", 4, llm.CONNECTION_LOST))
+        self.assertEqual(item["text"], "Your network dropped the request before it reached Loopcut. A VPN, proxy, "
+                                       "antivirus web filter or your internet provider can do this, most often to "
+                                       "large requests. (TimeoutError: The write operation timed out)")
+        self.assertNotIn("press Try again", item["text"])
+        self.assertTrue(item.get("retry"), "Try again is still there, for after the network is changed")
 
     def test_a_read_timeout_mid_reply_retries_once_without_doubling_the_card(self):
         """Content already reached the reply card (reply["text"]) before the stream broke; the
@@ -2707,6 +3223,45 @@ class AgentLoopTest(unittest.TestCase):
             self.session["turn"].thread.join(5)
             self.assertEqual(len(SCRIPT.requests), 2)
             self.assertNotIn("allowance_notice", state.ui)
+
+    def test_with_the_accounts_orchestrator_steps_a_resume_goes_on_counting(self):
+        """Roles.orchestrator_max_steps (agent._configure: max_steps and carry_steps): the turn's steps are kept on
+        its message (agent.STEPS_TAKEN), so a resume after an error goes on from them; the failed request is made
+        again, so it does not count. Without the account's limit nothing is written."""
+        schemas = [{"type": "function", "function": {"name": "get_scene_info", "parameters": {}}}]
+
+        def go(text=None):  # A turn as send() makes it, or (no text) as resume() does: a new Turn, no message.
+            if text:
+                self.session["items"].append(state.item_user(text))
+                self.session["messages"].append({"role": "user", "content": text})
+            turn = agent.Turn()
+            turn.config, turn.carry_steps = dataclasses.replace(config.load(), max_steps=4), True
+            self.session["busy"], self.session["turn"] = True, turn
+            turn.thread = threading.Thread(target=agent._run, daemon=True,
+                                           args=(self.session, turn, lambda *a: self.run_tool(*a), self.ensure_checkpoint))
+            turn.thread.start()
+            turn.thread.join(5)
+            return turn
+
+        SCRIPT.replies += [tool_reply("get_scene_info", {"name_contains": "part0"}),
+                           tool_reply("get_scene_info", {"name_contains": "part1"}),
+                           (402, {"error": {"message": "Used up.", "code": "week_limit", "plan": "free"}}),
+                           tool_reply("get_scene_info", {"name_contains": "part2"}),
+                           tool_reply("get_scene_info", {"name_contains": "part3"}),
+                           text_reply("Done: four parts read.")]
+        with mock.patch.object(agent, "_tool_schemas", lambda: schemas):
+            first = go("read the parts")
+            message = self.session["messages"][0]
+            self.assertEqual((first.outcome, message[agent.STEPS_TAKEN]), ("error", 2))
+            self.assertTrue(state.can_resume(self.session))
+            resumed = go()
+        self.assertEqual(resumed.outcome, "step_limit")
+        self.assertEqual((len(self.ran), len(SCRIPT.requests), message[agent.STEPS_TAKEN]), (4, 6, 4))
+        self.assertIn(state.item_error("Stopped after 4 steps without finishing."), self.session["items"])
+        self.assertNotIn(agent.STEPS_TAKEN, SCRIPT.requests[-1]["messages"][1], "never sent")
+        SCRIPT.replies += [text_reply("Hello.")]
+        self.start("hello").thread.join(5)
+        self.assertNotIn(agent.STEPS_TAKEN, self.session["messages"][-2], "a turn without the limit writes nothing")
 
     def test_resume_makes_the_request_again_without_adding_a_message(self):
         SCRIPT.replies += [(402, {"error": {"message": "Used up.", "code": "week_limit", "plan": "free"}}),
@@ -4190,7 +4745,8 @@ class UnrunCompletionTest(unittest.TestCase):
     def run_replies(self, replies, request="Build a prop", *, previous=False, reject=False,
                     checkpoint_error=False, max_steps=0, role="single", routed=None, on_final=None,
                     session=None, resume=False, base_url="https://example.invalid/v1",
-                    tool_names=("run_python", "capture_viewport", "delegate")):
+                    tool_names=("run_python", "capture_viewport", "delegate"), motion=None):
+        """motion: agent._motion_on_main's stand-in (MotionClaimTest); by default no reply's objects are checked."""
         from loopcut import nudges
         session = session if session is not None else state.new_session()
         if previous:
@@ -4232,7 +4788,8 @@ class UnrunCompletionTest(unittest.TestCase):
         checkpoint = mock.Mock(side_effect=checkpoints.CheckpointError("No checkpoint"))
         with mock.patch.object(agent, "_request", side_effect=reply) as model, \
                 mock.patch.object(agent, "_redraw"), mock.patch.object(nudges, "flush"), \
-                mock.patch.object(agent, "_wait_for_approval", return_value=False):
+                mock.patch.object(agent, "_wait_for_approval", return_value=False), \
+                mock.patch.object(agent, "_motion_on_main", motion or (lambda text, is_cancelled: None)):
             if resume:
                 cfg = turn.config
                 def configure(fresh, session):
@@ -4782,6 +5339,107 @@ class UnmadeCallsTest(unittest.TestCase):
         self.assertEqual(self.sent_back(session), [agent.UNMADE_PROMPT.format(calls="run_python", them="it"),
                                                    "[Loopcut] Workers reported back."])
         self.assertFalse(any(agent.UNMADE_FINAL in str(i.get("text")) for i in session["items"]))
+
+
+class MotionClaimTest(unittest.TestCase):
+    """A reply that would end the turn saying scene objects move when they do not (agent._motion_claim): the real
+    loop with scripted completions, and motion_claims.check on a stand-in scene (test_motion_claims.moons) in this
+    thread instead of the main thread."""
+
+    run_replies = UnrunCompletionTest.run_replies
+    call = staticmethod(UnrunCompletionTest.call)
+    saved_session = UnrunCompletionTest.saved_session
+    guard = agent.completion_guard
+    CLAIM = "Here's the scene:\n- **Planet**, banded, with rings\n- 5 moons orbiting it"
+    NUDGE = ("[Loopcut] Your reply says Moon_1, Moon_2, Moon_3, Moon_4 and Moon_5 orbiting, but they do not move "
+             "between frames 1 and 125: animate them now, or say plainly that they don't move yet.")
+    NOTICE = "Moon_1, Moon_2, Moon_3, Moon_4 and Moon_5 don't move yet."
+
+    @staticmethod
+    def on(scene):
+        return mock.Mock(side_effect=lambda text, is_cancelled: scene.check(text))
+
+    @staticmethod
+    def sent_back(session):
+        return [m["content"] for m in session["messages"] if m.get(context.STEP_LIMIT)]
+
+    @staticmethod
+    def notices(session):
+        return [i["text"] for i in session["items"] if i["kind"] == "notice"]
+
+    def test_a_still_claim_goes_back_once_then_the_user_is_told(self):
+        for role in ("single", "orchestrator"):
+            with self.subTest(role=role):
+                scene = motion_scene()
+                session, turn, requests, ran = self.run_replies(
+                    [self.call(), llm.Completion(text=self.CLAIM), llm.Completion(text=self.CLAIM)],
+                    role=role, motion=self.on(scene))
+                self.assertEqual((requests, ran, turn.outcome), (3, 1, "completed"))
+                self.assertEqual(self.sent_back(session), [self.NUDGE])
+                self.assertEqual(session["items"][-1], state.item_notice(self.NOTICE))
+                self.assertEqual(self.notices(session), [self.NOTICE])
+                self.assertFalse(any(self.NUDGE in str(i.get("text", "")) for i in session["items"]))
+                self.assertIs(session["messages"][0][self.guard.MOTION_CHECKED], True)
+                wired = conversations.wire_messages(session["id"], session["messages"])
+                self.assertEqual(wired[0], {"role": "user", "content": "Build a prop"})
+                self.assertEqual((scene.frame_current, scene.frame_subframe), (42, 0.5), "the frame is put back")
+
+    def test_moons_that_move_are_left_alone(self):
+        for how in ("keyed", "keyed pivot", "pivot on a path", "path", "scene time"):
+            with self.subTest(how=how):
+                motion = self.on(motion_scene(how))
+                session, _, requests, _ = self.run_replies([self.call(), llm.Completion(text=self.CLAIM)],
+                                                           motion=motion)
+                self.assertEqual((requests, motion.call_count, self.sent_back(session), self.notices(session)),
+                                 (2, 1, [], []))
+
+    def test_conditional_future_or_unrelated_replies_are_not_checked(self):
+        for text, read in (("I built the planet and 5 moons. Want me to animate the orbit next?", 0),
+                           ("The moons could orbit.", 0), ("The moons don't move yet.", 0),
+                           ("Built a planet and five moons.", 0), ("The script runs fine.", 1)):
+            with self.subTest(text=text):
+                motion = self.on(motion_scene())
+                session, _, requests, _ = self.run_replies([self.call(), llm.Completion(text=text)], motion=motion)
+                self.assertEqual((requests, motion.call_count, self.sent_back(session), self.notices(session)),
+                                 (2, read, [], []))
+
+    def test_never_for_a_worker_or_after_a_stop(self):
+        def stopped(turn):
+            turn.cancel.set()
+            return llm.Completion(text=self.CLAIM)
+        for replies, role, outcome in (([self.call(), llm.Completion(text=self.CLAIM)], "worker", "completed"),
+                                       ([self.call(), stopped], "single", "cancelled")):
+            with self.subTest(role=role, outcome=outcome):
+                motion = self.on(motion_scene())
+                session, turn, requests, _ = self.run_replies(replies, role=role, motion=motion)
+                self.assertEqual((requests, turn.outcome, motion.call_count), (2, outcome, 0))
+                self.assertEqual((self.sent_back(session), self.notices(session)), ([], []))
+
+    def test_the_nudge_shares_the_turns_budget(self):
+        announced, claim = llm.Completion(text=ANNOUNCED[0]), llm.Completion(text=self.CLAIM)
+        # Two announced steps spent it, so no nudge: the user is told.
+        session, _, requests, _ = self.run_replies(
+            [self.call(), announced, self.call(), announced, self.call(), claim], motion=self.on(motion_scene()))
+        self.assertEqual((requests, self.sent_back(session)), (6, [self.guard.CONTINUE] * 2))
+        self.assertEqual(self.notices(session), [self.NOTICE])
+        self.assertNotIn(self.guard.MOTION_CHECKED, session["messages"][0])
+        # The nudge first leaves one announced step.
+        session, _, requests, _ = self.run_replies(
+            [self.call(), claim, self.call(), announced, self.call(), announced], motion=self.on(motion_scene()))
+        self.assertEqual((requests, self.sent_back(session), self.notices(session)),
+                         (6, [self.NUDGE, self.guard.CONTINUE], []))
+        # At the step limit the turn cannot go on: told, not sent back.
+        session, _, requests, _ = self.run_replies([self.call(), claim], max_steps=2, motion=self.on(motion_scene()))
+        self.assertEqual((requests, self.sent_back(session), self.notices(session)), (2, [], [self.NOTICE]))
+
+    def test_a_resumed_turn_keeps_its_one_nudge(self):
+        claim = llm.Completion(text=self.CLAIM)
+        session, _, _, _ = self.run_replies([self.call(), claim, llm.LLMError("Connection lost")],
+                                            motion=self.on(motion_scene()))
+        self.assertEqual(self.sent_back(session), [self.NUDGE])
+        session, _, requests, _ = self.run_replies([claim], session=self.saved_session(session), resume=True,
+                                                   motion=self.on(motion_scene()))
+        self.assertEqual((requests, self.sent_back(session), self.notices(session)), (1, [self.NUDGE], [self.NOTICE]))
 
 
 class TurnEndTest(unittest.TestCase):

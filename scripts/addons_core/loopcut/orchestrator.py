@@ -32,6 +32,7 @@ MAX_REFERENCES = 3   # The user's images one brief shows its worker (context.KEE
 TOLERANCE = 0.005    # Metres: planned boxes may touch or overlap this much; a support's top may be off this much.
 Z0_SNAP = 0.05       # Metres: a bounds.z0 off its support's top_z by up to this much is snapped, not refused.
 OVERLAP_WARN = 0.02  # Metres: two modeling boxes overlapping by less than this is a warning, not a refusal.
+COPIED_DIMS = 0.02   # Share of each axis: an advisory dims this close to its planned box copied the box.
 MAX_BOUNCES = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
@@ -992,8 +993,8 @@ def validate_wave(wave: dict, words: str, live: dict) -> list[str]:
 
 
 def _reference_errors(references, label: str, attached: list) -> list[str]:
-    """A brief's references: names of images the user attached (live_facts' "references"), at most
-    MAX_REFERENCES. None (not given) is none."""
+    """A brief's references: names of images the user attached (delegate's live "references", newest first), at
+    most MAX_REFERENCES. None (not given) is none."""
     if references is None:
         return []
     if not isinstance(references, list) or any(not isinstance(r, str) for r in references):
@@ -1002,7 +1003,7 @@ def _reference_errors(references, label: str, attached: list) -> list[str]:
     unknown = [r for r in references if r not in attached]
     if unknown:
         errors.append(f"{label}.references: {', '.join(map(repr, unknown))} not attached; the user attached "
-                      + (', '.join(attached) if attached else "no images"))
+                      + ("(newest first) " if len(attached) > 1 else "") + (', '.join(attached) or "no images"))
     if len(references) > MAX_REFERENCES:
         errors.append(f"{label}.references: at most {MAX_REFERENCES}, got {len(references)}")
     return errors
@@ -1145,6 +1146,27 @@ def role_warnings(wave: dict) -> list[str]:
                                 f"{'with aspects ' + ', '.join(aspects) + ' ' if aspects else ''}can't create (the "
                                 f"merge would quarantine it); give it aspect {aspect}, or brief that part to the "
                                 f"worker that has it")
+    return warnings
+
+
+def dims_warnings(wave: dict) -> list[str]:
+    """An advisory dims that is a planned box's size on every axis (within COPIED_DIMS): the slot copied as
+    the object's size, which the worker then builds to (Luna squeezed a car into its 6x4x2.1 m slot; five
+    briefs did it on 2026-10-25). Said by the dry run and when a wave starts, never refused."""
+    warnings = []
+    for index, worker in enumerate(wave["workers"]):
+        if not isinstance(worker, dict) or not isinstance(worker.get("advisory"), list):
+            continue
+        sizes = [[high - low for low, high in zip(*box)] for box in _boxes(worker.get("bounds")) or ()]
+        label = f"workers[{index}]" + (f" ({worker.get('id')})" if isinstance(worker.get("id"), str) else "")
+        for check in worker["advisory"]:
+            size = check.get("size") if isinstance(check, dict) and check.get("kind") == "dims" else None
+            if not (isinstance(size, list) and len(size) == 3
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in size)):
+                continue  # A null axis (any size) is no copy of the box.
+            if any(all(abs(v - s) <= COPIED_DIMS * s for v, s in zip(size, box)) for box in sizes):
+                warnings.append(f"{label}.advisory: dims {check.get('name')} copied from planned bounds "
+                                f"({'x'.join(f'{v:g}' for v in size)} m); state the real object's size")
     return warnings
 
 
@@ -1387,13 +1409,14 @@ def _repairs_line(repairs: list) -> str:
 
 
 def budget_line(wave: dict, roles, job=None) -> str:
-    """The shared dollars still available this turn, each new worker's own time limit, and, when the account
-    limits a turn's workers, how many more it can start after these."""
+    """The shared dollars still available this turn, each new worker's own time (and step) limit, and, when the
+    account limits a turn's workers, how many more it can start after these."""
     from . import waves
     roles = roles or config.Roles
     cap = job.budget.max_usd if job is not None else roles.job_max_usd
     left = max(0, cap - (job.budget.usd if job is not None else 0))
     seconds = job.budget.seconds if job is not None else roles.worker_max_seconds
+    steps = getattr(job.budget, "max_steps", 0) if job is not None else getattr(roles, "worker_max_steps", 0)
     more = waves.workers_left(job, roles)
     if more is not None:
         more = max(0, more - len(wave.get("workers") or ()))
@@ -1404,7 +1427,7 @@ def budget_line(wave: dict, roles, job=None) -> str:
     else:  # Said as what to do, not a fact for the model to pass on.
         after = f"; after these, start no more workers this turn and do any further work yourself ({FOR_PLANNING})"
     return ("Budget: " + (f"${left:.3f} of ${cap:.2f} left for this turn's workers; " if cap else "")
-            + f"{seconds:g} s per worker run{after}.")
+            + f"{seconds:g} s" + (f" and {steps} steps" if steps else "") + f" per worker run{after}.")
 
 
 def schedule_line(wave: dict, roles, busy: dict) -> str:
@@ -1575,7 +1598,9 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
     live["threads"] = threads_of(session)
     live["busy"] = waves.busy(job)
     live["overlaps_refused"] = getattr(turn, "overlaps_refused", None)  # Each overlapping pair refused once a turn.
-    live["references"] = [r["name"] for r in session.get("references") or ()]  # What the user attached.
+    # What the user attached, newest first, as cloud_jobs.attached_last lists them: the picture they just sent leads,
+    # not one from early in the conversation (2026-10-25 transcripts).
+    live["references"] = list(dict.fromkeys(r["name"] for r in reversed(session.get("references") or ())))
     plan, repairs = repair_wave(plan, words, live)  # Small mistakes fixed before validation ever sees them.
     repairs = argument_repairs + repairs
     errors = snapshot_errors + validate_wave(plan, words, live)
@@ -1592,7 +1617,7 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         return tools.ToolResult("\n".join(lines), ok=False, **refused)
     problems, layout_repairs, layout_warnings, notes = layout(plan, live, project)
     repairs = repairs + layout_repairs
-    warnings = role_warnings(plan) + tool_warnings(plan) + layout_warnings
+    warnings = role_warnings(plan) + tool_warnings(plan) + dims_warnings(plan) + layout_warnings
     budget = f"{budget_line(plan, roles, getattr(turn, 'job', None))}\n{schedule_line(plan, roles, live['busy'])}"
     if dry_run:
         return tools.ToolResult(dry_run_report(problems, repairs, warnings, notes, budget=budget),
@@ -1963,13 +1988,30 @@ def coverage_lines(entries: list[dict]) -> list[str]:
                     f"{e['evidence'][:160]}" for e in counted if e["status"] in ("partly", "unverified")]
 
 
+# The head of the turn's first block (verified_block, rig_gate.stamp, contact.finish_gate). On the turn's user message,
+# BLOCKS counts the blocks _append_to_reply put on its replies: a later one is headed by what it measured (block_head),
+# as "1 of 1" then "9 of 18" under one head read as a glitch ("did you glitch?", 2026-10-25).
+VERIFIED = "Verified by Loopcut on this scene"
+BLOCKS = "loopcut_verified_blocks"
+
+
+def _turn_request(session: dict) -> dict:
+    return next((m for m in reversed(session.get("messages") or ()) if context.is_turn_start(m)), {})
+
+
+def block_head(session: dict, later: str) -> str:
+    """VERIFIED for the turn's first block, else later ("Placement measured this turn"). completion_guard's
+    _UI_RECORD knows each."""
+    return later if _turn_request(session).get(BLOCKS) else VERIFIED
+
+
 def verified_block(results: list[tuple[str, dict, dict]], retired: list[tuple[str, dict, str]] = (),
-                   requirements: list[str] = ()) -> str:
+                   requirements: list[str] = (), head: str = VERIFIED) -> str:
     """results: (label, check, acceptance result); retired: (label, check, reason); requirements: the
     briefs' quotes. The block Loopcut appends to the final reply: the checks, then how much of what
-    the user asked for they cover (coverage), so "32 of 32" never stands for all of it."""
+    the user asked for they cover (coverage), so "32 of 32" never stands for all of it. head: block_head's."""
     passed = sum(1 for _, _, r in results if r.get("status") == "pass")
-    lines = [f"Verified by Loopcut on this scene: {passed} of {len(results)} checks."]
+    lines = [f"{head}: {passed} of {len(results)} checks."]
     lines += coverage_lines(coverage(list(requirements), results, retired))
     for _, check, result in results:
         if result.get("status") != "pass":
@@ -1983,15 +2025,21 @@ def verified_block(results: list[tuple[str, dict, dict]], retired: list[tuple[st
 def _append_to_reply(session: dict, completion, block: str) -> None:
     """The block goes on the reply the user sees and on the message the model sees next turn."""
     items, messages = session["items"], session["messages"]
+    request = _turn_request(session)
+    if request:
+        request[BLOCKS] = request.get(BLOCKS, 0) + 1
     reply = items[-1] if items and items[-1].get("kind") == "assistant" and completion and completion.text.strip() else None
     if reply is None:
         reply = state.item_assistant()
         reply["streaming"] = False
         items.append(reply)
+    earlier = reply.get("verification")
     reply["text"] = f"{reply['text'].rstrip()}\n\n{block}" if reply["text"].strip() else block
     # Only the runtime sets this field. Text from the model (including an identical line)
-    # stays ordinary prose; old conversations without provenance do too.
-    reply["verification"] = block
+    # stays ordinary prose; old conversations without provenance do too. A second gate's block (rig_gate's,
+    # then contact's) joins the first, so both stay in the one muted footer the panel draws.
+    joined = isinstance(earlier, str) and earlier and reply["text"].endswith(f"{earlier}\n\n{block}")
+    reply["verification"] = f"{earlier}\n\n{block}" if joined else block
     last = messages[-1] if messages else {}
     if last.get("role") == "assistant" and not last.get("tool_calls") and completion is not None:
         last["content"] = f"{(last.get('content') or '').rstrip()}\n\n{block}".lstrip()
@@ -2060,7 +2108,8 @@ def finish_gate(session: dict, turn, completion, run_checks):
         return bounce.format(lines="\n".join(f"- id \"{label}\": {result_line('', check, result).strip()}"
                                              for label, check, result in failed))
     requirements = _requirements(job)
-    _append_to_reply(session, completion, verified_block(rows, retired, requirements))
+    _append_to_reply(session, completion, verified_block(rows, retired, requirements,
+                                                         block_head(session, "Checked again this turn")))
     if isinstance(getattr(job, "log", None), dict):  # For the evals: what the block said of each requirement.
         job.log["coverage"] = [{k: e[k] for k in ("quote", "status", "checks")}
                                for e in coverage(requirements, rows, retired)]

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, asset_picks
+from . import asset_common, asset_picks, tools
 from .asset_common import NotFound, download, get_json, rank, sheet, valid_slug  # noqa: F401  (re-exported for tests)
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -221,6 +221,7 @@ def fetch_polyhaven(asset_id: str, resolution: str = "1k", apply_to: list[str] |
 
 def load_polyhaven(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
     """import_polyhaven's scene half (a worker's child runs it): files already on disk, no network."""
+    tools.undo_before("import asset")
     asset_id, info, resolution = fetched["id"], fetched.get("info") or {}, fetched["resolution"]
     if fetched["kind"] == "hdris":
         return _import_hdri(asset_id, info, resolution, Path(fetched["hdr"]))

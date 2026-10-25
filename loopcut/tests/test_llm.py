@@ -4,6 +4,7 @@ Retry-After is honoured and capped, not obeyed verbatim. No Blender needed.
     python3 -m unittest discover -s loopcut/tests
 """
 
+import gzip
 import io
 import json
 import os
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_imbuf  # noqa: E402
-from loopcut import image_budget, llm  # noqa: E402
+from loopcut import config, image_budget, llm  # noqa: E402
 
 
 def sse(*chunks: dict) -> bytes:
@@ -42,6 +43,14 @@ class Hang:
 
     def __init__(self, prefix: bytes = b"", delay: float = 0.25, reset: bool = False):
         self.prefix, self.delay, self.reset = prefix, delay, reset
+
+
+class MidChunk:
+    """A chunked reply cut inside a chunk: its size line promises more than arrives, then nothing for `delay`. A socket
+    shut there reads as http.client's IncompleteRead, not as an OSError or the stream's end."""
+
+    def __init__(self, prefix: bytes, delay: float = 5):
+        self.prefix, self.delay = prefix, delay
 
 
 class Trickle:
@@ -72,6 +81,30 @@ class Breaks(io.BytesIO):
         raise self.error
 
 
+class Silent:
+    """A server that accepts each connection and never answers, not even a status line: the stall tester's stand-in
+    (2026-10-25), where a Stop waited for the socket's timeout. close() lets the held connections go."""
+
+    def __init__(self):
+        import socket
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.held = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                self.held.append(self.listener.accept()[0])
+            except OSError:
+                return
+
+    def close(self):
+        self.listener.close()
+        for connection in self.held:
+            connection.close()
+
+
 class Script:
     def __init__(self):
         self.replies: list = []
@@ -83,11 +116,12 @@ SCRIPT = Script()
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        body = json.loads(gzip.decompress(raw) if self.headers.get("Content-Encoding") == "gzip" else raw)
         # self.headers stays an email.message.Message (case-insensitive .get), not a plain dict:
         # Request.add_header capitalizes only the header's first letter, so "x-loopcut-role"
         # arrives as "X-loopcut-role", not the title-cased form a naive dict compare would expect.
-        SCRIPT.requests.append({"body": body, "headers": self.headers})
+        SCRIPT.requests.append({"body": body, "headers": self.headers, "wire": len(raw)})
         reply = SCRIPT.replies.pop(0)
         if isinstance(reply, tuple):
             status, payload, extra_headers = reply
@@ -110,6 +144,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
                 self.connection.close()
                 return
+            time.sleep(reply.delay)
+            return
+        if isinstance(reply, MidChunk):
+            self.protocol_version = "HTTP/1.1"  # Chunked bodies are HTTP/1.1's.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"%x\r\n%s" % (len(reply.prefix) + 20, reply.prefix))
+            self.wfile.flush()
             time.sleep(reply.delay)
             return
         if isinstance(reply, Trickle):
@@ -221,6 +265,64 @@ class LLMTest(unittest.TestCase):
                          r"^loopcut-addon/\d+\.\d+\.\d+ blender/\S+ os/(mac|windows|linux) arch/(arm64|x86_64|other)$")
         self.assertNotIn("x-loopcut-client", {k.lower() for k in other})
 
+    # ------------------------------------------------------------------ gzip to Loopcut's gateway
+
+    def gateway(self):
+        """The test server as Loopcut's own gateway (config.SERVICE_BASE_URL), with gzip not yet refused."""
+        for patch in (mock.patch.object(config, "SERVICE_BASE_URL", self.base_url),
+                      mock.patch.object(llm, "_gzip_refused", False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_the_gateway_gets_a_gzipped_body_and_nothing_else_does(self):
+        # 2026-10-25: hosted requests of tens of KB died on the way while small ones arrived.
+        self.gateway()
+        filler = [{"role": "user", "content": f"filler message {n}: " + "the chair by the window " * 40}
+                  for n in range(40)]
+        SCRIPT.replies += [text_reply("hosted"), text_reply("stand-in"), text_reply("own key")]
+        self.assertEqual(llm.stream_chat(
+            base_url=self.base_url, api_key="secret", model="fast", messages=filler, tools=[],
+            reasoning_effort="low", on_text=lambda _: None, is_cancelled=lambda: False).text, "hosted")
+        hosted = SCRIPT.requests[0]
+        self.assertEqual(hosted["headers"].get("Content-Encoding"), "gzip")
+        self.assertEqual(hosted["body"]["messages"], filler, "the same JSON, compressed")
+        self.assertLess(hosted["wire"] * 5, len(json.dumps(hosted["body"])))
+        stand_in = f"http://localhost:{self.server.server_port}"
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": stand_in}):
+            self.assertEqual(llm.stream_chat(
+                base_url=stand_in, api_key="secret", model="fast", messages=[{"role": "user", "content": "hi"}],
+                tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=lambda: False).text, "stand-in")
+        with mock.patch.object(config, "SERVICE_BASE_URL", "https://loopcut.org/v1"):
+            self.assertEqual(self.call().text, "own key")
+        for request in SCRIPT.requests[1:]:
+            self.assertIsNone(request["headers"].get("Content-Encoding"))
+
+    def test_a_refused_gzipped_body_goes_once_uncompressed_and_later_requests_skip_gzip(self):
+        for status in llm.GZIP_REFUSED:
+            with self.subTest(status=status):
+                SCRIPT.requests.clear()
+                self.gateway()
+                SCRIPT.replies += [(status, {"error": {"message": "Unsupported Content-Encoding"}}, None),
+                                   text_reply("ok"), text_reply("again")]
+                with mock.patch.object(llm, "_wait", lambda s, c: self.fail("no backoff for this retry")):
+                    self.assertEqual(self.call().text, "ok")
+                    self.assertEqual(self.call().text, "again")
+                self.assertEqual([r["headers"].get("Content-Encoding") for r in SCRIPT.requests], ["gzip", None, None])
+                self.assertEqual(SCRIPT.requests[0]["body"], SCRIPT.requests[1]["body"])
+                self.assertTrue(llm._gzip_refused)
+
+    def test_a_body_refused_uncompressed_too_was_not_refused_for_its_gzip(self):
+        # A 400 for the request itself (too long for the model, say) comes back without gzip as well.
+        self.gateway()
+        refusal = (400, {"error": {"message": "context length exceeded", "code": "invalid_request"}}, None)
+        SCRIPT.replies += [refusal, refusal, text_reply("ok")]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.call()
+        self.assertEqual((caught.exception.status, caught.exception.code), (400, "invalid_request"))
+        self.assertFalse(llm._gzip_refused)
+        self.assertEqual(self.call().text, "ok")
+        self.assertEqual([r["headers"].get("Content-Encoding") for r in SCRIPT.requests], ["gzip", None, "gzip"])
+
     def test_extra_headers_never_override_the_api_key_or_content_type(self):
         SCRIPT.replies.append(text_reply("hi"))
         self.call(headers={"Authorization": "Bearer nope", "Content-Type": "text/plain", "Accept": "*/*"})
@@ -328,6 +430,23 @@ class LLMTest(unittest.TestCase):
         self.assertIn("Connection lost before any reply arrived", str(cm.exception))
         self.assertEqual(len(SCRIPT.requests), 4, "the same 1-retry budget as a 429/5xx: 4 tries total")
 
+    def test_retry_delays_bound_both_the_open_and_a_stream_broken_before_content(self):
+        # The router's (router.RETRY_DELAYS): on 2026-10-25 a stalled router read went four times, 2.5 minutes.
+        SCRIPT.replies += [Hang(), Hang(), text_reply("never reached")]
+        with self.assertRaises(llm.LLMError) as cm:
+            self.hung(on_text=lambda _: None, retry_delays=(0.01,))
+        self.assertIn("Connection lost before any reply arrived", str(cm.exception))
+        self.assertEqual(len(SCRIPT.requests), 2, "one retry, not three")
+        SCRIPT.replies.clear()
+        with self.assertRaises(llm.LLMError) as cm:
+            self.flaky(*[windows_drop() for _ in range(3)], retry_delays=(0.01,))
+        self.assertEqual((cm.exception.code, self.opens), (llm.CONNECTION_LOST, 2))
+        SCRIPT.requests.clear()
+        SCRIPT.replies += [(503, {"error": {"message": "busy"}}, None), text_reply("ok")]
+        with self.assertRaises(llm.LLMError) as cm:
+            self.flaky(retry_delays=())
+        self.assertEqual((cm.exception.status, len(SCRIPT.requests)), (503, 1), "() is a single try")
+
     def test_a_read_timeout_after_content_streamed_is_not_retried_without_on_retry(self):
         SCRIPT.replies.append(Hang(prefix=b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'))
         SCRIPT.replies.append(text_reply("ok"))  # Never reached: no on_retry means no retry.
@@ -357,6 +476,77 @@ class LLMTest(unittest.TestCase):
         self.assertIn("Connection lost while streaming the reply", str(cm.exception))
         self.assertEqual(len(SCRIPT.requests), 2, "one retry used, then the second break surfaced as today")
 
+    def test_stop_inside_a_chunk_of_a_chunked_stream_is_cancelled_too(self):
+        SCRIPT.replies.append(MidChunk(b'data: {"choices":[{"delta":{"content":"so far"}}]}\n\n'))
+        stopped = threading.Event()
+        threading.Timer(0.3, stopped.set).start()
+        started = time.monotonic()
+        with self.assertRaises(llm.Cancelled):
+            llm.stream_chat(base_url=self.base_url, api_key="secret", model="fast",
+                            messages=[{"role": "user", "content": "hi"}], tools=[], reasoning_effort="low",
+                            on_text=lambda _: None, is_cancelled=stopped.is_set, timeout=30)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_progress_is_text_tool_calls_and_reasoning_never_a_keepalive(self):
+        SCRIPT.replies.append(b": keepalive\n\n" + sse(
+            {"choices": [{"delta": {"reasoning_content": "thinking"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                                                    "function": {"name": "x", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+        progress = []
+        self.call(on_progress=lambda: progress.append(1))
+        self.assertEqual(len(progress), 3, "the agent loop's stall clock (agent.Turn.touch)")
+
+    def test_stop_during_a_silent_stream_returns_at_once(self):
+        """Stop while the stream sends nothing: the watchdog shuts the socket, so the call ends within a second,
+        not when the next line arrives (or the read timeout, 120 s by default, runs out)."""
+        SCRIPT.replies.append(Hang(prefix=b'data: {"choices":[{"delta":{"content":"so far"}}]}\n\n', delay=5))
+        stopped = threading.Event()
+        threading.Timer(0.3, stopped.set).start()
+        started = time.monotonic()
+        with self.assertRaises(llm.Cancelled):
+            llm.stream_chat(base_url=self.base_url, api_key="secret", model="fast",
+                            messages=[{"role": "user", "content": "hi"}], tools=[], reasoning_effort="low",
+                            on_text=lambda _: None, is_cancelled=stopped.is_set, timeout=30)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_stop_while_the_status_line_is_withheld_returns_at_once(self):
+        """The stall tester (2026-10-25): an HTTPS stand-in that accepted and sent nothing; Stop at 3.5 s, the turn
+        ended at 120.15 s, when the socket timed out. urlopen holds no socket to shut until it returns: llm.opened."""
+        silent = Silent()
+        self.addCleanup(silent.close)
+        stopped = threading.Event()
+        threading.Timer(0.3, stopped.set).start()
+        started = time.monotonic()
+        with self.assertRaises(llm.Cancelled):
+            llm.stream_chat(base_url=silent.url, api_key="secret", model="fast",
+                            messages=[{"role": "user", "content": "hi"}], tools=[], reasoning_effort="low",
+                            on_text=lambda _: None, is_cancelled=stopped.is_set, timeout=30)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(len(silent.held), 1, "the request went up once and was left there")
+
+    def test_an_open_left_after_a_stop_closes_the_response_it_still_gets(self):
+        closed, gate = threading.Event(), threading.Event()
+        late = mock.Mock(close=closed.set)
+
+        def open_late():
+            gate.wait(5)
+            return late
+        answers = iter([False])  # Not yet stopped as the open starts; stopped from the first check after.
+        with self.assertRaises(llm.Cancelled):
+            llm.opened(open_late, lambda: next(answers, True))
+        self.assertFalse(closed.is_set())
+        gate.set()  # The open ends after the Stop.
+        self.assertTrue(closed.wait(2), "nobody waits for it: its connection is freed")
+        self.assertIs(llm.opened(lambda: late, lambda: False), late, "unstopped, the response itself")
+        with self.assertRaises(llm.Cancelled):
+            llm.opened(lambda: self.fail("not opened after a Stop"), lambda: True)
+        refusal = urllib.error.HTTPError("https://x.test", 429, "busy", {}, io.BytesIO(b"{}"))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            llm.opened(mock.Mock(side_effect=refusal), lambda: False)
+        self.assertIs(caught.exception, refusal, "raised again on the caller's thread")
+
     # ------------------------------------------------------------------ bare OSErrors (Windows)
 
     def flaky(self, *failures, **kw) -> llm.Completion:
@@ -377,6 +567,35 @@ class LLMTest(unittest.TestCase):
             return llm.stream_chat(base_url=self.base_url, api_key="secret", model="fast",
                                    messages=[{"role": "user", "content": "hi"}], tools=[], reasoning_effort="low",
                                    is_cancelled=lambda: False, **{"on_text": lambda _: None, **kw})
+
+    def test_a_hosted_request_no_try_got_an_answer_for_says_the_network_dropped_it(self):
+        # 2026-10-25: large hosted requests died on the way, no trace on the server; "press Try again" repeated it.
+        import socket
+        drop = lambda: urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))  # noqa: E731
+        with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": self.base_url}):
+            for failures, cause in (([drop() for _ in range(4)], "BrokenPipeError: Broken pipe"),
+                                    ([windows_drop() for _ in range(4)], "network error, errno 2")):
+                with self.subTest(cause=cause), self.assertRaises(llm.LLMError) as cm:
+                    self.flaky(*failures)
+                self.assertEqual((str(cm.exception), cm.exception.code),
+                                 (f"{llm.NETWORK_DROPPED} ({cause})", llm.CONNECTION_LOST))
+            # Something did answer (a 503), or the connection never opened (no name lookup): the cards as before.
+            from email.message import Message
+            busy = urllib.error.HTTPError(self.base_url, 503, "busy", Message(), io.BytesIO(b"{}"))
+            with self.assertRaises(llm.LLMError) as cm:
+                self.flaky(busy, drop(), drop(), drop())
+            self.assertTrue(str(cm.exception).startswith("Could not reach"), str(cm.exception))
+            offline = urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided"))
+            with self.assertRaises(llm.LLMError) as cm:
+                self.flaky(*[offline] * 4)
+            self.assertTrue(str(cm.exception).startswith("Could not reach"))
+            SCRIPT.replies += [Hang(), Hang(), Hang(), Hang()]
+            with self.assertRaises(llm.LLMError) as cm:
+                self.hung(on_text=lambda _: None)
+            self.assertIn("Connection lost before any reply arrived", str(cm.exception), "a status line came back")
+        with self.assertRaises(llm.LLMError) as cm:
+            self.flaky(*[drop() for _ in range(4)])
+        self.assertTrue(str(cm.exception).startswith("Could not reach"), "another provider: as before")
 
     def test_a_bare_oserror_from_urlopen_is_retried_like_a_dropped_connection(self):
         """0.2.14 logs: on Windows the status line never came and getresponse raised FileNotFoundError(2), which
@@ -454,6 +673,70 @@ class LLMTest(unittest.TestCase):
         SCRIPT.replies.append(text_reply("ok"))
         self.call(max_tokens=0)
         self.assertNotIn("max_tokens", SCRIPT.requests[0]["body"])
+
+    # ------------------------------------------------------------------ strict false (OpenAI models on OpenRouter)
+
+    TOOLS = [{"type": "function", "function": {
+                 "name": "import_asset", "title": "Importing an asset", "description": "Import one asset.",
+                 "parameters": {"type": "object", "properties": {"pick": {"type": "integer"}, "target_size": {
+                     "type": "number"}}, "required": []}}},
+             {"type": "function", "function": {"name": "search_assets",
+                                               "parameters": {"type": "object", "properties": {}}}}]
+
+    def sent(self, base_url: str, model: str, tools: list | None = None) -> bytes:
+        """The request body stream_chat sends to base_url for model, read off urlopen (ungzipped): no network."""
+        bodies = []
+
+        def urlopen(request, timeout=None):
+            gzipped = request.get_header("Content-encoding") == "gzip"  # Loopcut's gateway.
+            bodies.append(gzip.decompress(request.data) if gzipped else request.data)
+            response = io.BytesIO(text_reply("ok"))
+            response.headers = {}
+            return response
+        with mock.patch.object(llm.urllib.request, "urlopen", urlopen):
+            llm.stream_chat(base_url=base_url, api_key="secret", model=model,
+                            messages=[{"role": "user", "content": "hi"}], tools=tools or self.TOOLS,
+                            reasoning_effort="low", on_text=lambda _: None, is_cancelled=lambda: False)
+        return bodies[0]
+
+    def test_openai_models_on_openrouter_send_every_function_tool_non_strict(self):
+        """2026-10-25: Luna on OpenRouter filled every optional argument (import_asset pick 0 beside source and id,
+        target_size 0), the Responses API's default strict at work. The gateway sends strict false; so does BYOK."""
+        for base_url in ("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/"):
+            for model in ("openai/gpt-6-luna", "openai/gpt-6.1-sol"):
+                with self.subTest(base_url=base_url, model=model):
+                    tools = json.loads(self.sent(base_url, model))["tools"]
+                    self.assertEqual(tools, [{**tool, "function": {**tool["function"], "strict": False}}
+                                             for tool in llm.wire_tools(self.TOOLS)])
+                    self.assertNotIn("title", tools[0]["function"])
+        self.assertFalse(any("strict" in tool["function"] for tool in self.TOOLS), "the caller's schemas are not changed")
+        asked = [{"type": "function", "function": {"name": "x", "strict": True}}]
+        self.assertEqual(json.loads(self.sent("https://openrouter.ai/api/v1", "openai/gpt-6-luna", asked))["tools"], asked)
+
+    def test_every_other_route_sends_the_tools_as_before(self):
+        """Byte for byte: hosted Loopcut (the gateway adds strict itself), other models on OpenRouter, OpenAI direct
+        (chat completions' own default is non-strict), another provider, the Claude Code bridge."""
+        from loopcut import config
+        wire = json.dumps(llm.wire_tools(self.TOOLS)).encode()
+        for base_url, model in (("https://openrouter.ai/api/v1", "z-ai/glm-5.3-flash"),
+                                ("https://openrouter.ai/api/v1", "anthropic/claude-opus-5.5"),
+                                (config.SERVICE_BASE_URL, "fast"),
+                                (config.SERVICE_BASE_URL, "openai/gpt-6.1-sol"),
+                                ("https://api.openai.com/v1", "gpt-6-luna"),
+                                ("https://api.example.com/v1", "openai/gpt-6-luna"),
+                                ("https://openrouter.ai.example.com/v1", "openai/gpt-6-luna"),
+                                ("http://127.0.0.1:8765/v1", "openai/gpt-6-luna")):
+            with self.subTest(base_url=base_url, model=model):
+                data = self.sent(base_url, model)
+                self.assertIn(b'"tools": ' + wire, data)
+                self.assertNotIn(b'"strict"', data)
+
+    def test_on_openrouter_matches_openrouter_ai_only(self):
+        self.assertTrue(llm._on_openrouter("https://openrouter.ai/api/v1"))
+        self.assertTrue(llm._on_openrouter("https://OpenRouter.ai/api/v1/"))
+        self.assertFalse(llm._on_openrouter("https://openrouter.ai.example.com/v1"))
+        self.assertFalse(llm._on_openrouter("https://api.openai.com/v1"))
+        self.assertFalse(llm._on_openrouter("not-a-url::::"))
 
     # ------------------------------------------------------------------ image budget (image_budget.py)
 

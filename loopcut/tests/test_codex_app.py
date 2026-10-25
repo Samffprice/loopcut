@@ -336,6 +336,26 @@ class CodexAppTest(unittest.TestCase):
                 self.assertTrue(message[context.CAPTURE])
                 self.assertTrue(message["content"][0]["text"].startswith(prefix))
 
+    def test_an_asset_search_s_card_keeps_the_report_s_json_and_codex_gets_its_table(self):
+        table, whole = "1 asset(s) for 'chest':\n#1 Treasure Chest (polyhaven); id treasure_chest", '{"results": []}'
+        result = tools.ToolResult(table, outcome="Searched libraries: 1 match", card_output=whole)
+        driver = codex_app.CodexTurn(self.session, agent.Turn(), config.load(), None, self.ws, None,
+                                     lambda name, arguments: result, lambda session: None)
+        reply = driver.tool_call({"tool": "search_assets", "arguments": {"query": "chest"}, "callId": "c1"})
+        self.assertEqual(reply["contentItems"][0]["text"], table)
+        self.assertEqual(self.session["messages"][-1]["content"], table)
+        card = self.session["items"][-1]
+        self.assertEqual((card["output"], card["outcome"]), (whole, "Searched libraries: 1 match"))
+        self.assertNotIn("card_output", card)
+
+    def test_whatever_codex_sends_is_progress_for_the_stall_clock(self):
+        turn = agent.Turn()
+        driver = codex_app.CodexTurn(self.session, turn, config.load(), None, self.ws, None, None, None)
+        turn.progress_at, turn.progress = 0.0, "the model"
+        driver.handle({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {"last": {}}}})
+        self.assertEqual(turn.progress, "Codex")
+        self.assertAlmostEqual(turn.progress_at, time.time(), delta=5)
+
     def test_a_tool_image_goes_back_as_a_data_url(self):
         image = Path(self.tmp.name) / "capture.png"
         image.write_bytes(b"\x89PNG\r\n")

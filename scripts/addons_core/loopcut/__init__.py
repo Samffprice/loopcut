@@ -8,7 +8,7 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 2, 17),
+    "version": (0, 2, 18),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
@@ -16,6 +16,8 @@ bl_info = {
 
 
 def register() -> None:
+    from . import version_guard
+    version_guard.register(__name__, os.path.dirname(__file__), bl_info["version"])  # First: before any lazy import.
     try:
         from . import session_logs
         session_logs.register()  # First: the console lines conversation logs and problem reports carry.
@@ -76,3 +78,5 @@ def unregister() -> None:
     mainthread.unregister()
     support.unregister()
     settings.unregister()
+    from . import version_guard
+    version_guard.unregister(__name__)

@@ -2026,7 +2026,7 @@ class OnboardingTest(unittest.TestCase):
             for title in ("AI agent", "Asset libraries", "Photo → 3D", "Motion", "Auto-rig", "Cloud renders",
                           "Sound and voice", "Retopology"):
                 self.assertIn(title, labels)
-            for price in ("≈1 / step", "Free", "80", "2 / sec", "Soon", "from 5", "from 4", "5"):
+            for price in ("≈0.8 / step", "Free", "80", "2 / sec", "Soon", "from 5", "from 4", "5"):
                 self.assertIn(price, labels)  # Live estimates (80 a model, 10 for 5 s), the rest as priced today.
             self.assertIn("100", labels)
             self.assertIn("free credits every month for anything above,", labels)
@@ -2039,7 +2039,7 @@ class OnboardingTest(unittest.TestCase):
             self.assertEqual(on._state["step"], "connect")
             splash, labels, texts = self.arm_screen("connect")
             self.assertIn("Already pay for AI? Chat for 0 credits", labels)
-            for line in ("ChatGPT Plus or Pro", "Your own API key", "Use Loopcut's AI", "≈1 credit / step",
+            for line in ("ChatGPT Plus or Pro", "Your own API key", "Use Loopcut's AI", "≈0.8 credits / step",
                          "Sign in once. Chat uses your ChatGPT plan.",
                          "Any OpenAI-compatible provider, or a local model.",
                          "Nothing to set up. Chat comes out of your monthly credits."):
@@ -2092,8 +2092,8 @@ class OnboardingTest(unittest.TestCase):
             # The modelling card runs on Loopcut's AI, which the arm serves on the house for a tagged Try it card
             # (server TRY_IT_CARDS, 0.2.15): "Free", like the other cards' "0 credits".
             self.assertEqual(labels[-1], "Free")
-            self.assertNotIn("≈1 credit / step", labels)
-            self.assertIn("You have 100 credits. Loopcut's AI uses ≈1 credit / step.", labels)
+            self.assertNotIn("≈0.8 credits / step", labels)
+            self.assertIn("You have 100 credits. Loopcut's AI uses ≈0.8 credits / step.", labels)
 
     def test_the_weekly_top_up_names_25_a_week_on_the_account_step_and_the_showcase(self):
         """0.2.15: account.chat_credits.refill (the weekly top-up to 25) replaces the monthly line; without it the

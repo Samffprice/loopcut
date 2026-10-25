@@ -23,7 +23,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, asset_picks, credentials
+from . import asset_common, asset_picks, credentials, tools
 from .asset_common import NotFound, download, get_json, sheet, valid_slug
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -286,6 +286,7 @@ def fetch_blenderkit(asset_id: str, resolution: str = DEFAULT_RESOLUTION, apply_
 def load_blenderkit(fetched: dict, apply_to: list[str] | None = None) -> ToolResult:
     """import_blenderkit's scene half (a worker's child runs it): the downloaded file, no network."""
     apply_to = _check_apply_to(apply_to)
+    tools.undo_before("import asset")
     kind, name, file_type, asset = fetched["kind"], fetched["name"], fetched["file_type"], fetched["asset"]
     path = Path(fetched["path"])
     if kind == "hdr":

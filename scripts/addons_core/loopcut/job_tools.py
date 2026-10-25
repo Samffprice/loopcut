@@ -326,7 +326,8 @@ ACTIONS = {"start": start_render_job, "status": render_job_status, "cancel": can
 def render_job(action: str = "", **arguments) -> ToolResult:
     if not isinstance(action, str) or action not in ACTIONS:
         raise ToolError(f"action must be one of {', '.join(ACTIONS)}")
-    return tools.forward(ACTIONS[action], arguments, f"render_job {action}")
+    return tools.forward(ACTIONS[action], arguments, f"render_job {action}",
+                         SCHEMAS[0]["function"]["parameters"]["properties"], ACTIONS)
 
 
 DISPATCH = {"render_job": render_job}

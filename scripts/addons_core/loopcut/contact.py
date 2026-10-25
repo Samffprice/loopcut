@@ -29,7 +29,9 @@ inside is against b's convex hull: what a bowl, a shelf or a glass holds.
 Nothing is ever moved: a failure gives the move that would fix it. Pairs checked with watch=true are
 measured again after every run_python (recheck), and a change of status joins its Scene changes.
 Every turn also retains its measurements for the final reply: only changed geometry is re-measured,
-and a pass invalidated by later edits can bounce the reply once (finish_gate).
+and a pass invalidated by later edits can bounce the reply once (finish_gate). A pair with an object
+that moves in its animation is not judged there on the one frame the scene is at (animated): it is
+listed as not checked, neither pass nor fail.
 The top half is pure and tested in tests/test_contact.py; harness/contact_check.py runs the rest.
 """
 
@@ -343,6 +345,13 @@ def inside(pair: dict, measure: dict, tolerance: float) -> dict:
 
 def unavailable(pair: dict, reason: str) -> dict:
     return {**pair, "status": "unavailable", "line": reason, "fixes": [], "fingerprint": None}
+
+
+def skipped(pair: dict, mover: str) -> dict:
+    """A final re-check of a pair whose object mover moves in its animation: neither pass nor fail,
+    since the frame the scene is at says nothing of the others (a galloping dog's paws leave the ground)."""
+    return {**pair, "status": "skipped", "reason": "animated", "moving": mover,
+            "line": f"not judged on one frame: {mover} moves in its animation", "fixes": [], "fingerprint": None}
 
 
 def title(pair: dict) -> str:
@@ -826,6 +835,11 @@ class _Shapes(dict):
         except Unavailable as ex:
             return ex
 
+    def object(self, name: str):
+        """The scene's object of that name, or None: for animated() and named(), which read no geometry."""
+        import bpy
+        return bpy.context.scene.objects.get(name)
+
     def fingerprint(self, name: str):
         if name not in self.prints:
             self.prints[name] = self._read(name, _fingerprint)
@@ -873,9 +887,21 @@ def _evaluate(pair: dict, shapes: _Shapes, tolerance: float, previous: dict | No
 def evaluate(pairs: list, tolerance: float) -> list[dict]:
     shapes = _Shapes()
     try:
-        return [_evaluate(pair, shapes, tolerance) for pair in parse(pairs)]
+        results = [_evaluate(pair, shapes, tolerance) for pair in parse(pairs)]
+        for result in results:  # Judged on the frame asked for; the note says which, when there are others.
+            mover = _mover(result, shapes) if result["status"] != "unavailable" else ""
+            if mover:
+                import bpy
+                result["notes"] = [*result["notes"], f"{mover} moves in its animation; this result is for "
+                                                     f"frame {bpy.context.scene.frame_current}"]
+        return results
     finally:
         shapes.free()
+
+
+def _mover(pair: dict, shapes) -> str:
+    """The first of a and b that moves in the scene's animation, or ""."""
+    return next((pair[key] for key in ("a", "b") if animated(shapes.object(pair[key]))), "")
 
 
 def _watch(results: list, tolerance: float) -> str:
@@ -947,6 +973,61 @@ def _remember(results: list, tolerance: float) -> None:
         turn.contact_checks.append({"pair": pair, "tolerance": tolerance, "result": result})
 
 
+def animated(obj) -> bool:
+    """Whether obj moves in the scene's animation: it, a parent, a constraint target or the armature
+    deforming it (and so on up their own links) has an action, NLA tracks or drivers. An object with
+    no geometry of its own stands for its children, so they count too. Links only; no frame is evaluated."""
+    if obj is None:
+        return False
+    seen = set()
+    stands_for = [obj, *(getattr(obj, "children_recursive", ()) if obj.type not in _GEOMETRY else ())]
+    return any(_animated(part, seen) for part in stands_for)
+
+
+def _animated(obj, seen: set) -> bool:
+    if obj is None or obj.name in seen:
+        return False
+    seen.add(obj.name)
+    ad = getattr(obj, "animation_data", None)
+    if ad is not None and (ad.action or len(ad.nla_tracks) or len(ad.drivers)):
+        return True
+    links = [getattr(obj, "parent", None)]
+    links += [m.object for m in getattr(obj, "modifiers", ()) if m.type == "ARMATURE"]
+    for con in getattr(obj, "constraints", ()):
+        links += [getattr(con, "target", None), *(t.target for t in getattr(con, "targets", ()))]
+    return any(_animated(link, seen) for link in links)
+
+
+# Blender's names for a new primitive, empty or armature, spaces and case aside: "Cube.001" says what
+# an object is, not which, so the reply names it by what it belongs to (named).
+DEFAULT_NAMES = frozenset({"cube", "plane", "sphere", "uvsphere", "icosphere", "cylinder", "cone", "torus",
+                           "circle", "empty", "armature"})
+
+
+def _default_name(name: str) -> bool:
+    return re.sub(r"\.\d+$", "", name).replace(" ", "").replace("_", "").lower() in DEFAULT_NAMES
+
+
+def named(obj) -> str:
+    """A default-named object in plain words: by the armature deforming it, else its nearest parent,
+    whichever comes first without a default name itself ("the character rig's mesh", "the mesh under
+    dog"). "" for any other name, or when nothing it belongs to has a name of its own."""
+    if obj is None or not _default_name(obj.name):
+        return ""
+    owners = [m.object for m in getattr(obj, "modifiers", ()) if m.type == "ARMATURE"]
+    parent = getattr(obj, "parent", None)
+    while parent is not None:
+        owners.append(parent)
+        parent = getattr(parent, "parent", None)
+    owner = next((o for o in owners if o is not None and not _default_name(o.name)), None)
+    if owner is None:
+        return ""
+    name, kind = _plain_name(owner.name), "mesh" if obj.type == "MESH" else "object"
+    if owner.type == "ARMATURE":
+        return f"the {name if name == 'rig' or name.endswith(' rig') else name + ' rig'}'s {kind}"
+    return f"the {kind} under {name}"
+
+
 def _plain_name(name: str) -> str:
     """Object names as words, including CamelCase and separated names."""
     name = re.sub(r"([A-Z])([A-Z][a-z])", r"\1 \2", name)
@@ -955,9 +1036,16 @@ def _plain_name(name: str) -> str:
 
 
 def _plain_check(result: dict) -> str:
-    a, b = (_plain_name(result[key]) for key in ("a", "b"))
+    names = result.get("names", {})  # refresh's named(), for a default-named object.
+    a, b = (names.get(result[key]) or _plain_name(result[key]) for key in ("a", "b"))
+    if a == b:  # Two meshes of one rig: their own names tell them apart.
+        a, b = (_plain_name(result[key]) for key in ("a", "b"))
     relation = result["relation"]
     verb = {"touches": "touches", "rests_on": "rests on", "clear_of": "clears", "inside": "sits inside"}
+    if result["status"] == "skipped":
+        mover, a, b = (a, "it", b) if result["moving"] == result["a"] else (b, a, "it")
+        return (f"Not checked: {mover} moves in its animation, so whether {a} {verb[relation]} {b} isn't judged "
+                f"on one frame.")
     if result["status"] == "unavailable":
         return f"Could not check: whether {a} {verb[relation]} {b}."
     if result["status"] == "fail":
@@ -987,7 +1075,8 @@ def refresh(turn) -> tuple[list, list]:
     """On the main thread at a final reply. Reuse unchanged measurements; never capture or render.
 
     Fail open per pair (including missing objects), but never count an old pass as fresh on error.
-    Failures that replace passes are returned separately for the turn's one correction bounce.
+    Failures that replace passes are returned separately for the turn's one correction bounce. A pair
+    with an object that moves in its animation is skipped, not measured on this one frame.
     """
     entries = turn.contact_checks
     results, regressed, shapes = [], [], None
@@ -996,11 +1085,13 @@ def refresh(turn) -> tuple[list, list]:
     try:
         shapes = _Shapes()
         for entry in entries:
-            previous = entry["result"]
+            previous, pair = entry["result"], entry["pair"]
             try:
-                result = _evaluate(entry["pair"], shapes, entry["tolerance"], previous)
+                mover = _mover(pair, shapes)
+                result = skipped(pair, mover) if mover else _evaluate(pair, shapes, entry["tolerance"], previous)
+                result["names"] = {pair[key]: named(shapes.object(pair[key])) for key in ("a", "b")}
             except Exception as ex:
-                result = unavailable(entry["pair"], f"could not re-check: {ex}")
+                result = unavailable(pair, f"could not re-check: {ex}")
             results.append(result)
             if previous["status"] == "pass" and result["status"] == "fail":
                 regressed.append(result)
@@ -1037,15 +1128,18 @@ def finish_gate(session: dict, turn, completion, run_refresh):
                 + "\n".join(pair_line(r) for r in regressed)
                 + "\nUse these fresh measurements. Correct the placement and check it, or clearly state what "
                   "still fails; do not claim it is connected or verified. This reminder runs once per turn.")
-    passed = sum(r["status"] == "pass" for r in results)
-    lines = [f"Verified by Loopcut on this scene: {passed} of {len(results)} checks."]
+    checked = [r for r in results if r["status"] != "skipped"]  # Skipped ones are listed, never counted.
+    passed = sum(r["status"] == "pass" for r in checked)
+    head = orchestrator.block_head(session, "Placement measured this turn")  # After another block: not one count.
+    lines = [f"{head}: {passed} of {len(checked)} checks."] if checked else []
     if results:
         extra = len(results) - 3
         more = f" Plus {extra} other check{'s' if extra != 1 else ''}." if extra > 0 else ""
         lines.extend(_plain_check(r) for r in results[:3])
         if more:
             lines.append(more.strip())
-    orchestrator._append_to_reply(session, completion, "\n".join(lines))
+    if lines:
+        orchestrator._append_to_reply(session, completion, "\n".join(lines))
     return None
 
 

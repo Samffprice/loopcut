@@ -204,16 +204,31 @@ class FitTest(Fake):
         ib.fit(copy.deepcopy(messages))
         self.assertEqual(len(fake_imbuf.written), written)
 
-    def test_each_dropped_upload_halves_the_budget_down_to_the_least(self):
+    def test_each_dropped_upload_sends_much_less_and_the_last_try_no_image(self):
+        # 2026-10-25: hosted requests of tens to hundreds of KB died on the way while small ones arrived.
         sized = ib.Sized(self.conversation())
         sizes = [sum(map(len, urls(sized.messages())))]
         while sized.tighten():
             sizes.append(sum(map(len, urls(sized.messages()))))
-        self.assertEqual(sized.budget, ib.MIN_BYTES)
-        self.assertEqual(len(sizes), 3, "2 MB, 1 MB, 0.5 MB")
+        self.assertEqual(sized.budget, 0)
+        self.assertEqual(len(sizes), 4, "2 MB, 400 KB, 100 KB, none")
         self.assertEqual(sizes, sorted(sizes, reverse=True))
-        self.assertLessEqual(sizes[-1], ib.MIN_BYTES)
-        self.assertEqual(urls(sized.messages())[-1], urls(sized.source)[-1], "the newest still as stored at 0.5 MB")
+        for size, budget in zip(sizes[1:], ib.DROPPED_BUDGETS):
+            self.assertLessEqual(size, budget)
+        fitted = sized.messages()
+        self.assertEqual(urls(fitted), [], "the newest is left out too")
+        self.assertEqual(len(omitted(fitted)), 6, "each with what it showed")
+        self.assertIn("[earlier image omitted to keep the request small: three_quarter view of the chair, look 4]",
+                      omitted(fitted))
+        self.assertTrue(any(t.startswith(cv.context.CAPTURE_LABEL) for t in texts(fitted)), "the looks' lines stay")
+
+    def test_a_tighten_skips_the_budgets_the_images_already_fit(self):
+        sized = ib.Sized([capture(fake_imbuf.make(512, 288, kind="JPEG", quality=60))])
+        self.assertLess(sum(map(len, urls(sized.messages()))), ib.DROPPED_BUDGETS[1])
+        self.assertTrue(sized.tighten())
+        self.assertEqual((sized.budget, urls(sized.messages())), (0, []))
+        self.assertFalse(sized.tighten(), "nothing left to make smaller")
+        self.assertFalse(ib.Sized([{"role": "user", "content": "hi"}]).tighten())
 
 
 if __name__ == "__main__":

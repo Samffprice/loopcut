@@ -138,6 +138,23 @@ class PlanTest(unittest.TestCase):
         self.assertIn("scene est. 6.2M", G.line(switches[0]))
         self.assertEqual(G.plan(views, [])[0], [], "the user's own scene is never touched")
 
+    def test_small_modifiers_stay_on_when_the_weight_is_in_the_meshes(self):
+        # 0.2.8 logs: a large build came to 8.9M faces, almost all in its meshes, and the guard switched off 371
+        # small bevels one by one (a cube with a two-segment angle bevel: 34 faces), lightening nothing.
+        views = {f"Box {i}": mesh(mod("BEVEL", "Bevel", segments=2, affect="EDGES", limit_method="ANGLE"),
+                                    faces=6, verts=8) for i in range(400)}
+        views["Ground"] = mesh(mod("WEIGHTED_NORMAL"), faces=8_900_000, verts=8_900_000)
+        self.assertEqual(G.estimate(views["Box 0"])[0], 34)
+        self.assertEqual(G.plan(views, list(views)), ([], []))
+        # One heavy modifier among them still goes, and only it.
+        views["Fence"] = mesh(mod("ARRAY", fit_type="FIXED_COUNT", count=1000, cap_faces=0), faces=1500)
+        switches, _ = G.plan(views, list(views))
+        self.assertEqual([(s["object"], s["modifier"]) for s in switches], [("Fence", "Array")])
+
+    def test_an_object_over_the_limit_keeps_a_modifier_that_saves_almost_nothing(self):
+        views = {"Scan": mesh(mod("ARRAY", fit_type="FIXED_COUNT", count=1, cap_faces=500), faces=2_500_000)}
+        self.assertEqual(G.plan(views, ["Scan"]), ([], []))
+
     def test_hidden_objects_do_not_count(self):
         views = {"Hidden": mesh(mod("SUBSURF", levels=8, render_levels=8), shown=False)}
         self.assertEqual(G.plan(views, ["Hidden"]), ([], []))
@@ -354,6 +371,25 @@ class TakeTest(unittest.TestCase):
         self.assertTrue(text.endswith("\n\n"))
         self.assertEqual(notes[0]["modifiers"], [["Chair_Seat", "Subsurf"]])
         self.assertEqual(G.take(), ("", []), "taken once")
+
+    def test_many_switches_are_one_panel_notice_and_a_capped_list_for_the_model(self):
+        # 0.2.8 logs: one build switched 373 modifiers and the chat got 373 notices in a row.
+        lines = [f"Bevel on Box {i}, est. 40K faces, scene est. 8.9M: viewport display off; use fewer segments"
+                 for i in range(28)] + ["Solidify on Plate, est. 30K faces: viewport display off; simplify what "
+                                        "comes before it"] * 2
+        names = [[f"Box {i}", "Bevel"] for i in range(28)] + [["Plate", "Solidify"], ["Plate.001", "Solidify"]]
+        refusal = "Render refused by the cost guard: object.bake ..."
+        G._notes[:] = [{"text": t, "modifiers": [m]} for t, m in zip(lines, names)]
+        G._notes.append({"text": refusal, "modifiers": []})
+        text, notes = G.take()
+        self.assertEqual(notes, [
+            {"text": "Viewport display off for 30 modifiers to keep Blender responsive: Bevel on Box 0, "
+                     "Bevel on Box 1, Bevel on Box 2 and 27 more.", "modifiers": names},
+            {"text": refusal, "modifiers": []}])
+        listed = [line for line in text.splitlines() if line.startswith("- ")]
+        self.assertEqual(listed[:G.MAX_LISTED], [f"- {line}" for line in lines[:G.MAX_LISTED]])
+        self.assertEqual(listed[G.MAX_LISTED:], ["- and 10 more: Bevel on 8 objects, Solidify on 2 objects"])
+        self.assertIn(refusal, text)
 
 
 if __name__ == "__main__":

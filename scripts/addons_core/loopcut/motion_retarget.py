@@ -1477,7 +1477,9 @@ def travel_note(metres):
     5.5 m out of view, and from the front he "just gets bigger"."""
     if metres < TRAVEL_NOTE:
         return ""
-    return f"it travels {metres:.1f} m from where it starts, so view it from the side or follow it to keep it in view"
+    # R6-D3/B2: told to "follow it", the model made a camera and told the user to press Numpad 0.
+    return (f"it travels {metres:.1f} m from where it starts; character_rig show (free) sets up the user's view to "
+            "follow it")
 
 
 def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_start=None, scene=None):
@@ -1504,6 +1506,8 @@ def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_
                     or len(o.animation_data.nla_tracks)) for o in scene.objects)
     report = retarget(source, target, rig, scene=scene, frame_start=start, in_place=in_place, fingers=fingers,
                       name=action_name(title))
+    from . import rig_gate
+    rig_gate.mark([target.name], "motion")  # The turn's end checks how it moves and bends (Loopcut rigs only).
     first, last = report["frames"]
     if empty:
         scene.frame_start, scene.frame_end = first, last

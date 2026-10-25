@@ -1158,13 +1158,14 @@ def _number(spawn: Spawn) -> str:
 # ------------------------------------------------------------------ the wave
 
 def merge_wave(spawn: Spawn, results: list[dict], checkpoint: Callable[[], str],
-               keep_spawn: bool = False) -> MergeReport:
+               keep_spawn: bool = False, push_after: bool = True) -> MergeReport:
     """Main thread, one call: checkpoint, one undo step, each worker's result merged in order, the
     scene pointers, quarantine, then the temporary files deleted (every result, and spawn.blend
     unless keep_spawn: more of the wave's workers merge later), whether or not the merge succeeded.
     results[i] = {"brief": normalised brief (id, prefix, role, aspects), "manifest": the child's
     manifest (ownership.write_result), "shared"?: the wave's shared part (its notes may name a
-    collection, _asked)}. Raises MergeError, recording whether the scene is unchanged."""
+    collection, _asked)}. Raises MergeError, recording whether the scene is unchanged. push_after False
+    leaves the undo push after the merge to the caller, which changes more first (workspace._merge)."""
     t0 = time.time()
     report = MergeReport()
     try:
@@ -1191,7 +1192,8 @@ def merge_wave(spawn: Spawn, results: list[dict], checkpoint: Callable[[], str],
                      f"the scene may be partly merged: restore checkpoint {report.checkpoint}")
             raise MergeError(f"Merge failed: {type(ex).__name__}: {ex}; {where}.", scene_unchanged=rolled) from ex
         spawn.moved = moved
-        _undo("push", f"Loopcut: merge wave {number}")
+        if push_after:
+            _undo("push", f"Loopcut: merge wave {number}")
     finally:
         _cleanup(spawn, results, keep_spawn)
     report.seconds = round(time.time() - t0, 3)

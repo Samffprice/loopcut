@@ -395,8 +395,10 @@ class CodexTurn:
         method, params = message.get("method"), message.get("params") or {}
         if not method:
             return  # The answer to a request not waited for (turn/interrupt).
+        self.turn.touch("Codex")  # Whatever Codex sends is progress for the turn's stall clock (agent.check_stall).
         if "id" in message:
             self.answer(message["id"], method, params)
+            self.turn.touch("Codex")
         elif method == "item/agentMessage/delta":
             reply = self.replies.get(params.get("itemId"))
             if reply is not None:
@@ -554,7 +556,7 @@ class CodexTurn:
         text, ok, image, file_image = self.run_dynamic(card, name, arguments)
         if card["status"] != "rejected":
             card["status"] = "done" if ok else "failed"
-        card["output"] = text
+        card["output"] = card.pop("card_output", "") or text
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
         if image is not None:
             self.messages.append(agent._image_message(conversations.store_image(self.session, image, card),
@@ -594,6 +596,10 @@ class CodexTurn:
             self.items.append(state.item_guard(guard["text"], guard["modifiers"]))
         if getattr(result, "receipt", ""):
             card["cost"] = result.receipt  # What the paid call used, in place of its estimate (C47).
+        if getattr(result, "outcome", ""):
+            card["outcome"] = result.outcome  # An attached report's line (agent.run_loop).
+        if getattr(result, "card_output", ""):
+            card["card_output"] = result.card_output  # Its JSON for the card; Codex gets the table (tool_call).
         image = getattr(result, "image_path", None)
         return (result.text, result.ok, Path(image) if image and Path(image).is_file() else None,
                 getattr(result, "file_image", False))

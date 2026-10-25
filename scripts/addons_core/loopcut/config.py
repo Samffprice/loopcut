@@ -40,6 +40,11 @@ MAX_OUTPUT_TOKENS_CEILING = 200_000
 # (llm.py): the Claude Code bridge (harness/cc_bridge.py) legitimately takes minutes.
 DEFAULT_CALL_MAX_SECONDS = 0
 CALL_MAX_SECONDS_CEILING = 7_200
+# A turn with nothing new for this long stops with Try again (agent.check_stall): above every slow but healthy step
+# measured (a GLM worker's first reply, ~820 s, is paused for anyway; silent xhigh reasoning, 600 s). 0 turns it off,
+# as the evals do (LOOPCUT_STALL_SECONDS); never for the Claude Code bridge on 127.0.0.1.
+DEFAULT_STALL_SECONDS = 900
+STALL_SECONDS_CEILING = 86_400
 # LOOPCUT_CODEX_APP (codex_app.py): the Codex CLI the ChatGPT app ships on macOS, else `codex` on PATH.
 CODEX_APP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 CODEX_SUMMARIES = ("auto", "concise", "detailed", "none")
@@ -137,6 +142,10 @@ class Roles:
     terms: bool = False
     turn_workers: int = 0
     prices: tuple = ()
+    # Also from the terms, 0 without them: one worker run's requests before it wraps up (waves.JobBudget; a retry
+    # after a crash gets at least half again), and the orchestrated loop's steps per turn (agent._configure).
+    worker_max_steps: int = 0
+    orchestrator_max_steps: int = 0
     # The router (router.py): a cheap call naming each turn's level and deliverables before the
     # orchestrator's first request. None = off. Its provider, model and key default to the worker's;
     # it runs only on the gateway.
@@ -339,7 +348,7 @@ def service_backends(keys_set=None) -> dict[str, str]:
 def run_timeout() -> float:
     """Seconds one run_python call may take before it is stopped. Readable without an API key."""
     _, get = _getter()
-    value = get("LOOPCUT_RUN_TIMEOUT", "60")
+    value = get("LOOPCUT_RUN_TIMEOUT", "30")
     try:
         seconds = float(value)
     except ValueError:
@@ -347,6 +356,12 @@ def run_timeout() -> float:
     if not 1 <= seconds <= 3600:
         raise ConfigError(f"LOOPCUT_RUN_TIMEOUT must be 1-3600 seconds, got {value!r}")
     return seconds
+
+
+def stall_seconds() -> int:
+    """Seconds a turn may go with nothing new before it stops; 0 = never. Readable without an API key."""
+    _, get = _getter()
+    return _whole(get, "LOOPCUT_STALL_SECONDS", DEFAULT_STALL_SECONDS, 0, STALL_SECONDS_CEILING)
 
 
 def _check_base_url(base_url: str, key: str) -> None:
@@ -458,8 +473,9 @@ def _whole(get, key: str, default: int, low: int, high: int) -> int:
 # 2026-10-24). Every field is optional and replaces the default it names; a missing one, an older server that sends
 # none, signing out, BYOK, the ChatGPT plan, a harness stand-in for the gateway and LOOPCUT_AGENT_TERMS=off keep
 # today's. A value of the wrong type or outside its range is ignored with a console note. Prices are USD per million
-# tokens (input, cached input, output) of the model actually serving that alias for the account. worker_max_steps
-# and orchestrator_max_steps are read and checked, and not enforced.
+# tokens (input, cached input, output) of the model actually serving that alias for the account. The step limits sit
+# above the gateway's soft budgets on purpose: its wrap-up notes come first, and the client's steps-left note and
+# wrap-up are the backstop.
 AGENT_TERMS = {"max_workers": (1, 6), "worker_max_steps": (5, 200), "orchestrator_max_steps": (5, 200),
                "job_max_usd": (0, 100), "typical_build": (1, 1000)}
 MAX_WORKERS_AT_ONCE = 3  # The account's max_workers is the turn's total; at most this many of them run at once.
@@ -535,8 +551,8 @@ def load_roles() -> Roles:
 
     With both roles on Loopcut's own gateway (SERVICE_BASE_URL, never a LOOPCUT_SERVICE_URLS stand-in) the
     account's agent terms (agent_terms) replace the defaults of the limits they name, unless LOOPCUT_AGENT_TERMS is
-    off; an explicit LOOPCUT_MAX_WORKERS or LOOPCUT_JOB_MAX_USD (evals, dev runs) still wins, as today. Read per
-    turn (agent._configure): a manifest refreshed mid-turn applies from the next one."""
+    off; an explicit LOOPCUT_MAX_WORKERS, LOOPCUT_JOB_MAX_USD or LOOPCUT_MAX_STEPS (evals, dev runs) still wins, as
+    today. Read per turn (agent._configure): a manifest refreshed mid-turn applies from the next one."""
     base = load()
     _, get = _getter()
     plan = chatgpt_plan(base.base_url)
@@ -576,4 +592,6 @@ def load_roles() -> Roles:
                                   else "LOOPCUT_WAVE_MAX_SECONDS", 1800, 60, 7200),
         terms=bool(terms),
         prices=tuple(sorted(terms.get("prices", {}).items())),
+        worker_max_steps=terms.get("worker_max_steps", 0),
+        orchestrator_max_steps=0 if get("LOOPCUT_MAX_STEPS") else terms.get("orchestrator_max_steps", 0),
     )

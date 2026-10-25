@@ -596,7 +596,7 @@ _FINISH = {"tool_use": "tool_calls", "end_turn": "stop", "stop_sequence": "stop"
            "max_tokens": "length", "model_context_window_exceeded": "length", "refusal": "stop"}
 
 
-def _read(response, on_text, is_cancelled, deadline, meta: dict) -> llm.Completion:
+def _read(response, on_text, is_cancelled, deadline, meta: dict, on_progress=None) -> llm.Completion:
     completion = llm.Completion()
     blocks: dict[int, dict] = {}
     order: list[int] = []
@@ -624,6 +624,8 @@ def _read(response, on_text, is_cancelled, deadline, meta: dict) -> llm.Completi
             for kind, event in _events(response):
                 if is_cancelled():
                     raise llm.Cancelled()
+                if on_progress and kind != "ping":  # Anthropic's keepalive is not the model's (llm.stream_chat).
+                    on_progress()
                 if kind == "message_start":
                     usage.update({k: v for k, v in ((event.get("message") or {}).get("usage") or {}).items()
                                   if v is not None})
@@ -742,8 +744,8 @@ def _open(build: Callable[[], tuple[dict, list[str]]], url: str, api_key: str, t
     attempt, refused = 0, set()
     while True:
         body, betas = build()
-        try:
-            return _post(url, body, betas, api_key, timeout)
+        try:  # llm.opened: a Stop before the status line ends the turn at once, not after the read timeout.
+            return llm.opened(lambda: _post(url, body, betas, api_key, timeout), is_cancelled)
         except urllib.error.HTTPError as ex:
             with ex:
                 raw = ex.read(200_000)
@@ -787,7 +789,8 @@ def _open(build: Callable[[], tuple[dict, list[str]]], url: str, api_key: str, t
 def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict],
            reasoning_effort: str, on_text: Callable[[str], None], is_cancelled: Callable[[], bool],
            timeout: float = 120.0, max_tokens: int | None = None, call_max_seconds: float | None = None,
-           headers: dict | None = None, on_retry: Callable[[], None] | None = None) -> llm.Completion:
+           headers: dict | None = None, on_retry: Callable[[], None] | None = None,
+           on_progress: Callable[[], None] | None = None) -> llm.Completion:
     """llm.stream_chat for Anthropic: same arguments, same Completion, same retry rules for a stream that
     breaks (before any text: capped backoff; after some: once, from scratch, only with on_retry).
     `headers` (Loopcut's x-loopcut-* correlation headers) are for Loopcut's gateway and never sent here."""
@@ -805,7 +808,7 @@ def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], too
         response = _open(build, url, api_key, read_timeout(timeout), host, model, state, is_cancelled, sized.tighten)
         meta = {"model": model, "request_id": _request_id(response.headers)}
         try:
-            return _read(response, on_text, is_cancelled, deadline, meta)
+            return _read(response, on_text, is_cancelled, deadline, meta, on_progress)
         except _Interrupted as ex:
             cause = ex.__cause__ or "the stream ended before message_stop"
             shown = llm.network_cause(cause) or repr(cause)

@@ -7,6 +7,7 @@ What needs a real Blender (decoding frames through the sequencer, the tracker an
 sheets with imbuf and blf, the camera background) is loopcut/harness/video_reference_check.py.
 All media here are made up in the test."""
 
+import contextlib
 import importlib.util
 import json
 import math
@@ -630,6 +631,20 @@ class ClipToolsTest(Folder):
             gone = video_attach.clip_background("take.mp4", remove=True)
             self.assertEqual(len(camera.data.background_images), 0)
             self.assertIn("Removed 1 background", gone.text)
+
+    def test_clip_background_is_one_undo_step_and_a_refusal_none(self):
+        blender, push = self.fake_blender(), mock.Mock()
+        with mock.patch.object(video_attach, "bpy", blender), mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch.object(tools, "bpy", SimpleNamespace(ops=SimpleNamespace(ed=SimpleNamespace(undo_push=push)))), \
+                mock.patch.object(tools, "_editor_context", side_effect=lambda _: contextlib.nullcontext()):
+            for arguments in ({"name": "take.mp4"}, {"name": "take.mp4", "remove": True}):
+                push.reset_mock()
+                self.assertTrue(tools.execute("clip_background", json.dumps(arguments)).ok)
+                self.assertEqual([c.kwargs["message"] for c in push.call_args_list],
+                                 ["Before Loopcut: clip background", "Loopcut: clip background"])
+            push.reset_mock()
+            self.assertFalse(tools.execute("clip_background", json.dumps({"name": "take.mp4", "camera": "Nope"})).ok)
+            push.assert_not_called()
 
     def test_clip_frames_for_compare_and_look(self):
         blender = self.fake_blender()

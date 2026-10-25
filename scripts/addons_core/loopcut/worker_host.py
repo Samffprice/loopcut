@@ -46,6 +46,8 @@ UNAVAILABLE_NOTE = ("New workers are unavailable on this machine because startup
 CRASH_KIT = "crash-{n}"   # In the worker's folder, one per crash: what Child._keep saves.
 CRASH_BLEND_MB = 200      # The last .blend is copied into the kit up to this size; a bigger one is only named.
 LOG_TAIL = 80             # Lines of worker.log kept beside the crash report.
+# run_python's limit in a child is at least this: a long step there freezes nobody's interface.
+WORKER_RUN_TIMEOUT = 60.0
 
 _live = set()        # Children started and not yet reaped: what shutdown_all kills.
 _live_lock = threading.Lock()
@@ -83,7 +85,7 @@ class Child:
         self.script = Path(script or CHILD_SCRIPT)
         if run_timeout is None:
             from . import config
-            run_timeout = config.run_timeout()
+            run_timeout = max(WORKER_RUN_TIMEOUT, config.run_timeout())
         self.run_timeout = float(run_timeout)
         self.process: subprocess.Popen | None = None
         self.channel: worker_ipc.Channel | None = None

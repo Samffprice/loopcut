@@ -19,7 +19,7 @@ from pathlib import Path
 
 import bpy
 
-from . import asset_common, asset_picks, blenderkit, credentials, polyhaven
+from . import asset_common, asset_picks, blenderkit, credentials, polyhaven, tools
 from .asset_common import NotFound, download, get_json, sheet, valid_slug
 from .tools import ToolError, ToolResult, _clip, object_summary
 
@@ -194,6 +194,7 @@ def fetch_polypizza(model_id: str, target_size: float = 0.0) -> dict:
 
 def load_polypizza(fetched: dict, target_size: float = 0.0) -> ToolResult:
     """import_polypizza's scene half (a worker's child runs it): the downloaded GLB, no network."""
+    tools.undo_before("import asset")
     model_id, model, path = fetched["id"], fetched["model"], Path(fetched["path"])
     before = {obj.name for obj in bpy.data.objects}
     try:

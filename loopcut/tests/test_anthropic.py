@@ -375,6 +375,12 @@ class StreamTest(Base):
         self.assertTrue(self.body()["stream"])
         self.assertEqual(self.body()["model"], "claude-opus-5-5")
 
+    def test_every_event_but_a_ping_is_progress_for_the_stall_clock(self):
+        payload = reply(text("Hel", "lo."))
+        Fake.script, progress = [(200, payload)], []
+        self.stream(on_progress=lambda: progress.append(1))
+        self.assertEqual(len(progress), payload.count(b"event: ") - payload.count(b"event: ping\n"))
+
     def test_one_tool_call_from_partial_json(self):
         Fake.script = [(200, reply(text("Adding a cube."), tool("toolu_1", "run_python", '{"co', 'de": "bpy.ops', '.mesh"}'),
                                    stop="tool_use"))]
@@ -633,6 +639,20 @@ class StopTest(Base):
             am.stream(base_url=BASE, api_key=KEY, model="claude-opus-5-5", messages=conversation(), tools=TOOLS,
                       reasoning_effort="low", on_text=lambda _: cancelled.set(), is_cancelled=cancelled.is_set)
         self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_stop_while_the_status_line_is_withheld_returns_at_once(self):
+        """The stall tester (2026-10-25): a stand-in that accepted and sent nothing kept a Stop waiting for the 300 s
+        read timeout. llm.opened leaves the open at once."""
+        from test_llm import Silent
+        silent = Silent()
+        self.addCleanup(silent.close)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"LOOPCUT_ANTHROPIC_API_URL": silent.url}), self.assertRaises(llm.Cancelled):
+            am.stream(base_url=BASE, api_key=KEY, model="claude-opus-5-5", messages=conversation(), tools=TOOLS,
+                      reasoning_effort="low", on_text=lambda _: None,
+                      is_cancelled=lambda: time.monotonic() - started > 0.3)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(len(silent.held), 1)
 
     def test_the_wall_clock_limit_ends_the_reply_like_the_output_cap(self):
         Fake.script = [(200, reply(text("Working"), tool("toolu_1", "run_python", '{"code": "x"}'), end=False), {}, 5.0)]

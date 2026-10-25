@@ -92,16 +92,19 @@ def per_step(account: dict) -> float | None:
     return float(value) if _amount(value) and value > 0 else None
 
 
-def step_credits(account: dict) -> int:
-    """per_step rounded to the nearest whole credit, never under 1 (the contract's display rule)."""
+def step_credits(account: dict) -> float:
+    """per_step as shown: under 1 credit to one decimal, never under 0.1 (a Fast step costs about 0.2, and "≈1"
+    overstated it about 5×, owner 2026-10-25); from 1 up, the nearest whole credit. 1 when the account says nothing."""
     value = per_step(account)
-    return max(1, round(value)) if value is not None else 1
+    if value is None:
+        return 1
+    return max(0.1, round(value, 1)) if value < 1 else round(value)
 
 
 def step_label(account: dict, short: bool = False) -> str:
-    """"≈1 credit / step", or "≈1 / step" on a tile's price."""
+    """"≈0.2 credits / step", or "≈0.2 / step" on a tile's price."""
     n = step_credits(account)
-    return f"≈{n} / step" if short else f"≈{n} credit{'' if n == 1 else 's'} / step"
+    return f"≈{n:g} / step" if short else f"≈{n:g} credit{'' if n == 1 else 's'} / step"
 
 
 def typical_build(account: dict) -> int:

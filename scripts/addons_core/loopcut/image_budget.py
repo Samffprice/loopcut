@@ -17,8 +17,9 @@ day before. Compact storage alone cannot bound a request, so there are three lay
    rest are sent smaller step by step (SHRINK_STEPS) and then left out, the newest image never. Which
    images are thumbnails or left out follows from their age alone, so the next request, one look longer,
    starts the same and the provider's cache still holds. The stored images stay as they are.
-3. Sized.tighten(), when the connection dropped while a request went up: the retry gets half the
-   budget, down to MIN_BYTES, rather than the same bytes again.
+3. Sized.tighten(), when the connection dropped while a request went up: each retry gets the next of
+   DROPPED_BUDGETS below what the last try sent, the last none at all (the newest image too, with its note),
+   rather than the same bytes again.
 
 Encoding is Blender's imbuf, in memory and temporary files: any thread, never bpy.data. Without imbuf
 (the Blender-free tests) every image passes unchanged. loopcut/harness/image_budget_check.py runs the
@@ -45,7 +46,11 @@ PNG_COMPRESS = 15      # Blender's default for PNG output: fast, and a flat imag
 # (2026-10-17); 2 MB of images leaves a long request's text room under the lower figure. Stored compact,
 # a request's images are usually well under it: a clip's six sheets (110-180 KB each) are about 1.2 MB.
 REQUEST_BYTES = 2_000_000
-MIN_BYTES = 500_000    # The least a retry after dropped uploads gets.
+# The image base64 of each retry after a dropped upload (or a 413). Halving was enough for api.openai.com's cut
+# uploads; on 2026-10-25 hosted requests of tens to hundreds of KB died on the way for 5 of 15 users while their
+# small ones arrived, and base64 hardly compresses with the body's gzip, so the first retry is already small and
+# the last carries no image at all: the turn goes on without its pictures rather than not at all.
+DROPPED_BUDGETS = (400_000, 100_000, 0)
 KEEP_SHARP = 3         # Tool images sent as stored, the newest: a step's looks (as context.KEEP_IMAGES).
 # Older tool images: enough to recall what a look showed. A 512 px JPEG at 60 is ~20-40 KB of base64, so
 # the 2 MB holds dozens beside the sharp ones (three renders ~0.4 MB each, six clip sheets ~1.2 MB).
@@ -209,12 +214,14 @@ def _shrunk(url: str, side: int, quality: int) -> str:
 
 def fit(messages: list, budget: int = REQUEST_BYTES) -> list:
     """messages with their inline images' base64 at most budget, as far as thumbnails and then leaving out
-    images gets (the newest is never left out; see the module's notes). The same list when it fits already;
-    never changed in place."""
+    images gets (the newest is never left out, but at budget 0, the last try after dropped uploads; see the
+    module's notes). The same list when it fits already; never changed in place."""
     sent = _inline_urls(messages)
     before = total = sum(map(len, sent.values()))
     if total <= budget:
         return messages
+    if budget <= 0:
+        return _sent(messages, dict.fromkeys(sent), {key: _left_out(messages[key[0]]) for key in sent}, before, 0)
     notes = {}
 
     def change(key, url, note):
@@ -250,11 +257,16 @@ def fit(messages: list, budget: int = REQUEST_BYTES) -> list:
         if total <= budget:
             break
         change(key, None, _left_out(messages[key[0]]))
+    return _sent(messages, sent, notes, before, budget)
+
+
+def _sent(messages: list, sent: dict, notes: dict, before: int, budget: int) -> list:
+    """messages with fit's changes: each image in notes sent as sent says (None: left out), with its note."""
     if not notes:
         return messages
     print(f"Loopcut: the request's images were {before // 1000} KB, over its {budget // 1000} KB; "
           f"{sum(v is not None for k, v in sent.items() if k in notes)} sent smaller, "
-          f"{sum(v is None for v in sent.values())} left out: {total // 1000} KB")
+          f"{sum(v is None for v in sent.values())} left out: {sum(len(v or '') for v in sent.values()) // 1000} KB")
     out = list(messages)
     for i in sorted({i for i, _ in notes}):
         parts = []
@@ -271,8 +283,9 @@ def fit(messages: list, budget: int = REQUEST_BYTES) -> list:
 
 
 class Sized:
-    """One request's messages fitted to its budget: REQUEST_BYTES, halved by each tighten() down to MIN_BYTES,
-    so a retry after a dropped upload sends less than the try that was cut off."""
+    """One request's messages fitted to its budget: REQUEST_BYTES, then by each tighten() the next of
+    DROPPED_BUDGETS below what was sent, so a retry after a dropped upload sends less than the try that was cut
+    off, and the last none."""
 
     def __init__(self, messages: list):
         self.source, self.budget, self._fitted = messages, REQUEST_BYTES, None
@@ -284,9 +297,10 @@ class Sized:
 
     def tighten(self) -> bool:
         """After the connection dropped as the request went up, or a 413. False when the next try would send
-        the same: the budget is the least already, or the images are under the smaller one."""
-        smaller = max(MIN_BYTES, self.budget // 2)
-        if self.budget <= MIN_BYTES or sum(map(len, _inline_urls(self.messages()).values())) <= smaller:
+        the same: it sends no image already."""
+        sent = sum(map(len, _inline_urls(self.messages()).values()))
+        smaller = next((budget for budget in DROPPED_BUDGETS if budget < sent), None)
+        if smaller is None:
             return False
         self.budget, self._fitted = smaller, None
         return True

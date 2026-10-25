@@ -53,8 +53,10 @@ ask even then; "Always allow renders" on a render's card stops that for the conv
 code that bakes still needs the plain "Always allow" too. A final render in the code
 (`render.render`) is not asked about as a render: the step asks as code, and the cost guard refuses
 the call when the code reaches it (below). A step that runs longer
-than `LOOPCUT_RUN_TIMEOUT` (60 s) is stopped at the next Python trace event. This cannot interrupt
-a native render or bake. [Durable render jobs](RENDER_JOBS.md) run outside the editing process,
+than `LOOPCUT_RUN_TIMEOUT` (30 s; at least 60 s in a worker's child, which freezes no one's interface)
+is stopped at the next Python trace event, or during a `time.sleep` on the main thread. This cannot
+interrupt a native render or bake. An object the stopped code left in Edit Mode goes back to Object
+Mode, and the card says the step kept Blender frozen and that Undo removes its changes. [Durable render jobs](RENDER_JOBS.md) run outside the editing process,
 with a separate supervisor enforcing cancellation and time limits.
 
 ## The Loopcut build
@@ -412,6 +414,7 @@ earlier, UI buttons, timers); geometry built directly with bmesh or `from_pydata
 | `loopcut/scripts/onboarding_check.sh` | ~40s | First run of the build in a throwaway home folder: clicks through a fresh start, imports stock settings and checks they took effect and stock Blender's folder is byte-identical, screenshots every step to `../out/onboarding/`. |
 | `Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/contact_check.py` | ~3s | `check_contact` on fixtures built on the spot (a floating table top, a lamp with a short foot, a chair through a rug, roots, a collection instance, penetrating cubes, a mirrored slab, a one-sided wall, a bowl): every status, depth and fix asserted, each fix applied and checked again; then watched pairs that `run_python` breaks and mends; then the shared_support eval's reading corner (`corner.py`: a side table wound inward, a lamp base's rim level with the chair's feet), whose gaps once read as metres of overlap; an open strap loop (a torus with a gap cut, wound either way) 39 mm clear of a lens barrel, a band round a lens mount, and the strap dipped 10 mm in, which once read as 375 mm. |
 | `Blender -b --factory-startup --python loopcut/harness/camera_check.py` | ~1s | `frame_camera` on scenes made on the spot (a row with an Array, a tall box at 9:16 and with VERTICAL sensor fit, nested children, a collection instance, orthographic, a QUATERNION camera, lens, shift, clip, a region with a shift kept, report_only at several frames of a Track To shot): every evaluated vertex projected with `world_to_camera_view` is inside, the tight margin is the one asked, the subject centred, the report's numbers match; `report_only` changes nothing; one undo step. |
+| `Blender --factory-startup --python loopcut/harness/undo_push_check.py` | ~30s | Undo right after a step, with the window drawing. Each step pushes "Before Loopcut: …" and "Loopcut: …" after it (`tools.UNDO_AFTER`): with the Before push alone, a step that changed nothing, then one that added an object, then Undo crashed Blender 5.2.2 on the next redraw. Through `tools.execute`: pass, an error and a stop each followed by an add, a single add, two adds, frame_camera creating a camera, import_asset from a library made on the spot, a cloud output (the motion Try it sample through `cloud._apply_to_scene`), merge's rollback; each survives six redraws and Undo takes out only its last step; then the undo history. `UNDO_CHECK_UNFIXED=1` turns the push after off and crashes. Sandbox `BLENDER_USER_RESOURCES` and `TMPDIR`. |
 | `Blender -b --factory-startup --python loopcut/harness/snapshot_check.py` | ~2s | The build's in-place restore (skipped in stock Blender). |
 | `python3 loopcut/harness/guard_check.py [--heavy]` | ~2s | The cost guard in headless Blender under a watchdog that kills it past a time or memory limit: heavy subdivision caught at an operator and at the snapshot, a 1,000-count array, renders refused, a final render in code refused however light. Light by default (tiny meshes, lowered limits); `--heavy` uses real sizes and limits, so run it with nothing else heavy open. |
 | `Blender -b --factory-startup --python loopcut/harness/evals/selfcheck.py` | ~5s | Every eval check fails on the untouched scene and passes on its reference solution. No model. |
@@ -559,8 +562,13 @@ fresh one without losing the old.
   tool images as 512 px thumbnails, the oldest left out eight at a time with a note of what each
   showed; half the budget on a retry after the connection dropped as the request went up.
 - A turn cut short (Stop, or Blender closing) gets its unanswered tool calls answered, so the
-  history stays valid for the API. Files on disk are validated on load; a damaged one is skipped
-  and left in place.
+  history stays valid for the API. A chat Blender closed mid-turn opens with "Blender was closed
+  before this turn finished." and Try again, and its conversation log goes up then, once, as cancelled
+  (load saves the closed chat at once, so reopening it before its next save closes nothing again).
+  That holds for a crash or a kill too: a chat saved while its turn runs (from send or resume, before
+  the turn starts) carries that Blender's mark until the turn's last save, and another Blender's mark
+  on load means the turn never ended.
+  Files on disk are validated on load; a damaged one is skipped and left in place.
 - Checkpoints keep working across restarts. A snapshot store untouched for 30 days is dropped
   to reclaim space; its conversation stays and shows those checkpoints as expired.
 
@@ -634,8 +642,23 @@ cancels a turn; hosted usage remains subject to credits and gateway limits. An o
 `LOOPCUT_MAX_STEPS` (1–10000) bounds requests for evals and power users. Preferences no longer export
 this variable. The Codex app runs its own loop and does not read this override.
 
+A turn with nothing new for 15 minutes stops (`agent.check_stall`, from the main-thread pump) with "Loopcut stopped
+waiting: nothing came back for 15 minutes." (the limit's own length when `LOOPCUT_STALL_SECONDS` sets another) and
+Try again, outcome error/`stalled`, and a console line naming what it waited for. Progress (`Turn.touch`) is a streamed delta on any provider (never a keepalive), the summary, router and
+reference-card requests' too, a tool starting or finishing, a worker's reply, any answer of the server to the turn's
+cloud call (an event or keepalive, a poll, a downloaded chunk; a job detached from its turn touches nothing), or
+anything the Codex app sends. The clock is wall time, so a laptop's sleep counts, though after a gap in the pump's
+looks over a minute what was in flight gets a minute to land; it waits while a card waits for the user, while a
+command with its own time limit runs (a workspace process, Codex's shell), while the turn's workers are within their
+own time and the job's scheduler runs, and while a main-thread task waits for Blender and runs. After 2 minutes
+waiting on the model the panel says "No reply for 2 minutes. You can Stop and try again." `LOOPCUT_STALL_SECONDS`
+sets the limit (0 is off, as the evals set it); the 127.0.0.1 bridge has none. Stop shuts a silent stream's socket at
+once on every provider, and a cloud job whose cancel the server never confirms gives up 60 s after Stop, asking
+again every 2 s.
+
 Workers have no step limits (`max_steps=0`): `job_max_usd=0.40` is shared across the turn's workers
 and `worker_max_seconds=1800` bounds each run. Old brief `steps` values are silently dropped.
+A signed-in account's agent terms can add step limits on the gateway (Workers, settings below).
 A `repeats.Ledger` per turn
 remembers what was tried, and its notices go into the tool results so the history stays append-only:
 
@@ -783,10 +806,15 @@ longer offers sending a fix back to a worker. `job_max_usd` (0-100) replaces 0.4
 and with terms a response's `usage.cost` (USD) is charged before either; a server that sends no terms keeps
 0.2.15's token pricing even if its usage carries a cost. `typical_build` (1-1000) is the showcase's "A typical
 first build uses about N" (`chat_credits.TYPICAL_BUILD`, 12, otherwise). `worker_max_steps` and
-`orchestrator_max_steps` are read and checked, not enforced. Every field is optional; an older server,
-signing out, BYOK and the ChatGPT plan keep the defaults, and an explicit `LOOPCUT_MAX_WORKERS` (at once
-only, as before) or `LOOPCUT_JOB_MAX_USD` still wins. Read as a turn starts (`agent._configure`), so a
-manifest refreshed mid-turn applies from the next turn.
+`orchestrator_max_steps` (5-200 each) sit above the gateway's soft budgets, whose wrap-up notes come first.
+`worker_max_steps` caps one worker run's requests: the steps-left note three before, then the budget's
+wrap-up ("its N steps are used"), a synthesised report and a partial merge; a retry after a crash builds
+again from the brief, so it gets what was left or half the cap, whichever is more, and its own note. `orchestrator_max_steps` is the
+orchestrated loop's step limit per turn (not the single loop's, and a router divert to the workspace takes the
+main config's), counted on the turn's message (`agent.STEPS_TAKEN`) so a resume goes on from it. Every field
+is optional; an older server, signing out, BYOK and the ChatGPT plan keep the defaults, and an explicit
+`LOOPCUT_MAX_WORKERS` (at once only, as before), `LOOPCUT_JOB_MAX_USD` or `LOOPCUT_MAX_STEPS` still wins.
+Read as a turn starts (`agent._configure`), so a manifest refreshed mid-turn applies from the next turn.
 
 In the panel a wave shows as a card with a row per worker (deliverable, status, steps taken,
 checks, and Cancel while it runs, which stops that worker only), and its merge as a card listing

@@ -4,6 +4,7 @@ fixes and result lines. The geometry itself is loopcut/harness/contact_check.py.
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace as NS
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
@@ -233,6 +234,69 @@ class ReportTest(unittest.TestCase):
     def test_the_schema_stays_small(self):
         import json
         self.assertLess(len(json.dumps(llm.wire_tools(C.SCHEMAS))) / 4, 320)
+
+
+def ob(name, kind="MESH", parent=None, ad=None, rig=None, targets=(), children=()):
+    """What animated() and named() read of a Blender object; ad: "action", "nla" or "drivers"."""
+    data = NS(action="Walk" if ad == "action" else None, nla_tracks=["Walk"] * (ad == "nla"),
+              drivers=["d"] * (ad == "drivers")) if ad else None
+    return NS(name=name, type=kind, parent=parent, animation_data=data, children_recursive=list(children),
+              modifiers=[NS(type="ARMATURE", object=rig)] if rig else [NS(type="BEVEL")],
+              constraints=[NS(target=t) for t in targets])
+
+
+class AnimatedTest(unittest.TestCase):
+    def test_what_moves_is_read_from_its_links(self):
+        static, rig = ob("Room", "EMPTY"), ob("Character Rig", "ARMATURE", ad="action")
+        for why, obj in [("its own action", ob("Box", ad="action")),
+                         ("NLA tracks", ob("Box", ad="nla")),
+                         ("drivers", ob("Box", ad="drivers")),
+                         ("a parent's", ob("Box", parent=ob("Cart", "EMPTY", parent=ob("Train", ad="action")))),
+                         ("a constraint target's", ob("Box", targets=[ob("Hand", ad="action")])),
+                         ("the deforming armature's pose action", ob("Cube.001", rig=rig)),
+                         ("an empty's child", ob("Dog", "EMPTY", children=[ob("Body", rig=rig)]))]:
+            with self.subTest(why):
+                self.assertTrue(C.animated(obj))
+        fan = ob("Fan", ad="action")
+        for why, obj in [("nothing animated", ob("Box", parent=static, targets=[ob("Shelf")], rig=ob("Rig", "ARMATURE"))),
+                         ("a sibling, not a link", ob("Box", parent=ob("Room", "EMPTY", children=[fan]))),
+                         ("a mesh's children are not its geometry", ob("Box", children=[fan])),
+                         ("no object", None)]:
+            with self.subTest(why):
+                self.assertFalse(C.animated(obj))
+        looped = ob("Box")
+        looped.constraints = [NS(target=ob("Peg", targets=[looped]))]
+        self.assertFalse(C.animated(looped), "a constraint loop ends")
+
+    def test_a_default_name_is_named_by_its_rig_or_parent(self):
+        dog, armature = ob("Dog", "EMPTY"), ob("Armature", "ARMATURE")
+        for obj, label in [(ob("Cube.001", rig=ob("Character Rig", "ARMATURE")), "the character rig's mesh"),
+                           (ob("Cube", parent=ob("Dog", "ARMATURE")), "the dog rig's mesh"),
+                           (ob("Cube.001", parent=dog), "the mesh under dog"),
+                           (ob("UV Sphere.002", parent=ob("Armature", "ARMATURE", parent=dog), rig=armature),
+                            "the mesh under dog"),
+                           (ob("Icosphere", "EMPTY", parent=ob("LampShade")), "the object under lamp shade"),
+                           (ob("Cube.001"), ""),  # Nothing named: its own name, as before.
+                           (ob("Leg", parent=dog, rig=ob("Rig", "ARMATURE")), ""),
+                           (ob("Cube_Body", parent=dog), "")]:
+            with self.subTest(obj.name):
+                self.assertEqual(C.named(obj), label)
+
+    def test_the_reply_uses_those_names_and_says_what_moves(self):
+        names = {"Cube.001": "the character rig's mesh", "Ground": "", "Cube.002": "the character rig's mesh"}
+        failed = {**pair("Cube.001", b="Ground"), "status": "fail", "line": "", "names": names}
+        self.assertEqual(C._plain_check(failed),
+                         "Failed: the character rig's mesh does not have the required support from ground.")
+        self.assertEqual(C._plain_check({**failed, "names": {}}),
+                         "Failed: cube 001 does not have the required support from ground.", "a normal name, as before")
+        self.assertEqual(C._plain_check({**failed, "b": "Cube.002", "relation": "touches"}),
+                         "Failed: cube 001 does not meet the required contact with cube 002.", "two meshes of one rig")
+        self.assertEqual(C._plain_check({**C.skipped(pair("Cube.001", b="Ground"), "Cube.001"), "names": names}),
+                         "Not checked: the character rig's mesh moves in its animation, so whether it rests on ground "
+                         "isn't judged on one frame.")
+        self.assertEqual(C._plain_check(C.skipped(pair("Crate", "touches", "Lift"), "Lift")),
+                         "Not checked: lift moves in its animation, so whether crate touches it isn't judged on one "
+                         "frame.")
 
 
 class WatchTest(unittest.TestCase):

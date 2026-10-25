@@ -1109,42 +1109,48 @@ def _merge(session: dict, ws: Path, prepared: dict, number: int, result_name: st
                         dict((snapshot or {}).get("tokens") or {}), dict(pointers), live_tokens=live_tokens)
     brief = {"id": "build", "role": "", "prefix": "", "aspects": ["camera", "lighting"], "keep_collections": True}
     before = scene_diff.snapshot()
-    report = merge.merge_wave(spawn, [{"brief": brief, "manifest": manifest}], checkpoint=lambda: "", keep_spawn=True)
-    scene = bpy.context.scene
-    source_settings = (snapshot or {}).get("settings") or {}
-    live_now = scene_settings(scene)
-    wanted, kept = settings_changes(prepared.get("settings") or {}, source_settings, live_now,
-                                    live_settings or source_settings)
-    failed = set_settings(scene, wanted)
+    # merge_wave pushes the undo step before the merge; the one after it waits for the settings and scenes
+    # below, so one Undo takes out the whole build, as with a step's own pushes (tools.UNDO_AFTER).
+    report = merge.merge_wave(spawn, [{"brief": brief, "manifest": manifest}], checkpoint=lambda: "", keep_spawn=True,
+                              push_after=False)
+    try:
+        scene = bpy.context.scene
+        source_settings = (snapshot or {}).get("settings") or {}
+        live_now = scene_settings(scene)
+        wanted, kept = settings_changes(prepared.get("settings") or {}, source_settings, live_now,
+                                        live_settings or source_settings)
+        failed = set_settings(scene, wanted)
 
-    # What is live now, for the next apply: every key this one created or replaced, measured as the
-    # next apply will measure it (the same key -> uid map), with the snapshot count at this time.
-    renamed = _build_key_names(report)
-    for entry in manifest.get("created") or ():
-        kind, _, name = entry.partition(":")
-        live = ownership.find(f"{kind}:{renamed.get((kind, name), name)}")
-        if live is not None:
-            ids[entry] = live.session_uid
-            names[entry] = live.name
-    for key, uid in spawn.moved.items():
-        ids[key] = uid
-    by_uid = {idb.session_uid: idb for idb in ownership.all_ids()}
-    uid2spawn = {uid: key.split(":", 1)[1] for key, uid in ids.items() if uid in by_uid}
-    touched = set(manifest.get("created") or ()) | set(spawn.moved) | {r["key"] for r in report.replaced if not r.get("pointer")}
-    count = len(data["snapshots"])
-    for key in touched:
-        idb = by_uid.get(ids.get(key))
-        if idb is None:
-            data["live"]["tokens"].pop(key, None)
-            continue
-        data["live"]["tokens"][key] = [ownership.token(idb, uid2spawn), count, ownership.TOKEN_VERSION]
-        data["live"]["names"][key] = idb.name
-    uid2key = {uid: key for key, uid in ids.items()}
-    data["live"]["pointers"] = {"snapshots": count, "value": {
-        attr: (uid2key.get(getattr(scene, attr).session_uid, ownership.key_of(getattr(scene, attr)))
-               if getattr(scene, attr) is not None else None) for attr in ("camera", "world")}}
-    data["live"]["settings"] = {"snapshots": count, "value": scene_settings(scene)}
-    scene_lines = _mirror_scenes(prepared.get("scenes") or [], ids, by_uid, data, scene)
+        # What is live now, for the next apply: every key this one created or replaced, measured as the
+        # next apply will measure it (the same key -> uid map), with the snapshot count at this time.
+        renamed = _build_key_names(report)
+        for entry in manifest.get("created") or ():
+            kind, _, name = entry.partition(":")
+            live = ownership.find(f"{kind}:{renamed.get((kind, name), name)}")
+            if live is not None:
+                ids[entry] = live.session_uid
+                names[entry] = live.name
+        for key, uid in spawn.moved.items():
+            ids[key] = uid
+        by_uid = {idb.session_uid: idb for idb in ownership.all_ids()}
+        uid2spawn = {uid: key.split(":", 1)[1] for key, uid in ids.items() if uid in by_uid}
+        touched = set(manifest.get("created") or ()) | set(spawn.moved) | {r["key"] for r in report.replaced if not r.get("pointer")}
+        count = len(data["snapshots"])
+        for key in touched:
+            idb = by_uid.get(ids.get(key))
+            if idb is None:
+                data["live"]["tokens"].pop(key, None)
+                continue
+            data["live"]["tokens"][key] = [ownership.token(idb, uid2spawn), count, ownership.TOKEN_VERSION]
+            data["live"]["names"][key] = idb.name
+        uid2key = {uid: key for key, uid in ids.items()}
+        data["live"]["pointers"] = {"snapshots": count, "value": {
+            attr: (uid2key.get(getattr(scene, attr).session_uid, ownership.key_of(getattr(scene, attr)))
+                   if getattr(scene, attr) is not None else None) for attr in ("camera", "world")}}
+        data["live"]["settings"] = {"snapshots": count, "value": scene_settings(scene)}
+        scene_lines = _mirror_scenes(prepared.get("scenes") or [], ids, by_uid, data, scene)
+    finally:
+        merge._undo("push", f"Loopcut: merge wave {number}")
     after = scene_diff.snapshot()
     summary = {"number": number, "result": result_name, "snapshot": (snapshot or {}).get("number"),
                "time": round(time.time(), 3), "log": report.log(), "settings": wanted, "settings_kept": kept}

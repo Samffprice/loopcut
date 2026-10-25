@@ -528,6 +528,48 @@ class GatingTest(Base):
         image = next(e for e in upload["transcript"] if e.get("text") == "image omitted")
         self.assertEqual(image["data"]["width"], 3, "the conversation's own images folder")
 
+    def test_a_chat_blender_closed_mid_turn_goes_up_as_cancelled_when_it_is_loaded(self):
+        from loopcut import conversations, state
+        session = state.new_session()
+        session["id"] = PARENT
+        card = state.item_tool("run_python", "Add a cube", "x")
+        card["status"] = "running"
+        session["items"] += [state.item_user("Add a cube"), card]
+        session["messages"] += [{"role": "user", "content": "Add a cube"},
+                                {"role": "assistant", "content": None, "tool_calls": [call("c1", "run_python", "{}")]}]
+        conversations.save(session)
+        hops, built = [], []
+        real_snapshot = session_logs.snapshot
+
+        def snapshot(*args):
+            built.append(threading.current_thread())
+            return real_snapshot(*args)
+        with patch.object(credentials, "interest_install_id", return_value=INSTALL_ID), \
+                patch("loopcut.cloud.model_source", return_value="loopcut"), \
+                patch.object(session_logs, "snapshot", side_effect=snapshot), \
+                patch("loopcut.mainthread.run_on_main", side_effect=hops.append):
+            conversations.load(PARENT)
+            deadline = time.monotonic() + 5
+            while not hops and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(hops), 1, "queued on the main thread, once")
+            self.assertEqual(len(built), 1)
+            self.assertIsNot(built[0], threading.current_thread(), "the transcript is built off the main thread")
+            self.assertEqual(session_logs._pending, {})
+            hops[0]()
+        [upload] = session_logs._pending.values()
+        self.assertEqual((upload["session_id"], upload["meta"]["outcome"]), (session_logs.session_uuid(PARENT), "cancelled"))
+        self.assertIn({"role": "event", "error": "Blender was closed before this turn finished.",
+                       "data": {"kind": "error", "retry": True}}, upload["transcript"])
+        schema, folder = _schema("conversation-log.schema.json")
+        if schema is not None:  # The contract's outcomes include "cancelled" (usage-event.schema.json).
+            validate(session_logs.log_body(upload), schema, schema, folder)
+        with patch.object(session_logs, "_privacy_seen", return_value=False):
+            session_logs._pending.clear()
+            conversations.save(session)
+            conversations.load(PARENT)
+            self.assertEqual(session_logs._pending, {}, "not when the user has not seen what is shared")
+
     def test_nothing_without_a_start_with_the_switch_off_or_without_an_install_id(self):
         session = {"id": PARENT, "messages": [], "items": [{"kind": "user", "text": "x"}], "created": 0, "jobs": []}
         hops = []

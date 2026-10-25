@@ -22,9 +22,10 @@ before each of those, and before every render:
 A check estimates the final face count of each object whose modifiers changed since the last
 check, from modifier settings alone: nothing is evaluated. Above MAX_OBJECT_FACES, or when the
 scene passes MAX_SCENE_FACES, it switches off the viewport display of the most expensive modifiers
-until the estimate fits. The modifiers and their render settings stay as they are, and each switch
-is named in the tool result and in the panel. Remesh, geometry nodes and whatever else cannot be
-estimated are reported and never switched off.
+until the estimate fits, or until the next would save less than MIN_SAVING faces. The modifiers and
+their render settings stay as they are; each switch is named in the tool result, and the panel shows
+one notice per step with a Show anyway for all of them. Remesh, geometry nodes and whatever else
+cannot be estimated are reported and never switched off.
 
 Known and accepted as uncatchable:
 - code that evaluates by itself: evaluated_depsgraph_get(), evaluated_get(), to_mesh(),
@@ -43,6 +44,10 @@ import traceback
 
 MAX_OBJECT_FACES = 2_000_000    # One object in the viewport; still drawable on an 8 GB laptop.
 MAX_SCENE_FACES = 6_000_000     # All objects with modifiers together.
+# What a switch-off must save. Less hides detail and lightens nothing: a large build at est. 8.9M faces, over the
+# limit by what the guard cannot switch, had 371 small bevels (34 faces each) switched off one by one (0.2.8 logs).
+MIN_SAVING = 10_000
+MAX_LISTED = 20  # Switches the tool result names one by one; the rest are counted by modifier name.
 # Renders use render levels, usually a level above the viewport's: four times the faces.
 MAX_RENDER_OBJECT_FACES = 4_000_000
 MAX_RENDER_SCENE_FACES = 12_000_000
@@ -205,9 +210,9 @@ def plan(views: dict, changed, render: bool = False) -> tuple[list[dict], list[s
         if name not in counted:
             continue
         unknown += [f"{m['name']} on {name}" for m in estimate(counted[name], render)[1]]
-        while estimate(counted[name], render)[0] > max_object:
-            mod, _ = _cheapest_without(counted[name], render)
-            if mod is None:
+        while (faces := estimate(counted[name], render)[0]) > max_object:
+            mod, without = _cheapest_without(counted[name], render)
+            if mod is None or faces - without < MIN_SAVING:
                 break
             switch(name, mod, None)
     total = sum(estimate(view, render)[0] for view in counted.values())
@@ -220,7 +225,9 @@ def plan(views: dict, changed, render: bool = False) -> tuple[list[dict], list[s
                     options.append((estimate(counted[name], render)[0] - faces, name, mod))
         if not options:
             break
-        _, name, mod = max(options, key=lambda option: option[0])
+        saving, name, mod = max(options, key=lambda option: option[0])
+        if saving < MIN_SAVING:  # What is left weighs in the meshes, or in modifiers it cannot estimate.
+            break
         switch(name, mod, total)
         total = sum(estimate(view, render)[0] for view in counted.values())
     return switches, unknown
@@ -427,21 +434,46 @@ def watching_ops():
         _watching = False
 
 
+def _listed(switched: list[dict]) -> list[str]:
+    """The tool result's lines: each switch up to MAX_LISTED, then the rest counted by modifier name."""
+    lines = [f"- {n['text']}" for n in switched[:MAX_LISTED]]
+    rest: dict[str, int] = {}
+    for note in switched[MAX_LISTED:]:
+        rest[note["modifiers"][0][1]] = rest.get(note["modifiers"][0][1], 0) + 1
+    if rest:
+        counts = ", ".join(f"{name} on {n} object{'s' if n > 1 else ''}" for name, n in rest.items())
+        lines.append(f"- and {len(switched) - MAX_LISTED} more: {counts}")
+    return lines
+
+
+def _panel_note(switched: list[dict]) -> dict:
+    """One notice for every modifier a check switched off: a long build can switch hundreds."""
+    if len(switched) == 1:
+        return switched[0]
+    modifiers = [m for note in switched for m in note["modifiers"]]
+    named = ", ".join(f"{modifier} on {name}" for name, modifier in modifiers[:3])
+    more = f" and {len(modifiers) - 3} more" if len(modifiers) > 3 else ""
+    return {"text": f"Viewport display off for {len(modifiers)} modifiers to keep Blender responsive: {named}{more}.",
+            "modifiers": modifiers}
+
+
 def take() -> tuple[str, list[dict]]:
     """What the guard did since begin(): text for the tool result ("" when nothing) and the notes
-    the panel shows, one per switched modifier or refused render."""
+    the panel shows: one for all switched modifiers, one per refused render."""
     notes, unknown = list(_notes), list(_unknown)
     _notes.clear()
     _unknown.clear()
     parts = []
-    switched = [n["text"] for n in notes if n["modifiers"]]
+    switched = [n for n in notes if n["modifiers"]]
+    refused = [n for n in notes if not n["modifiers"]]
     if switched:
         parts.append("Cost guard: switched off show_viewport before Blender evaluated these (render settings "
-                     "unchanged; turn it back on once lighter):\n" + "\n".join(f"- {t}" for t in switched))
-    parts += [n["text"] for n in notes if not n["modifiers"]]  # Refused renders.
+                     "unchanged; turn it back on once lighter):\n" + "\n".join(_listed(switched)))
+    parts += [n["text"] for n in refused]
     if unknown:
         parts.append(f"Cost guard could not estimate, left on: {', '.join(unknown)}.")
-    return ("\n".join(parts) + "\n\n") if parts else "", notes
+    panel = ([_panel_note(switched)] if switched else []) + refused
+    return ("\n".join(parts) + "\n\n") if parts else "", panel
 
 
 def show_again(modifiers: list) -> int:

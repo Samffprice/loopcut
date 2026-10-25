@@ -180,6 +180,9 @@ class RequestTest(unittest.TestCase):
                          ("glm-5.3-flash", "low", [], router.TIMEOUT))
         self.assertEqual(request["headers"], {"x-loopcut-conversation": session["id"], "x-loopcut-role": "router"},
                          "the gateway correlates this stream's usage row (llm.correlation_headers)")
+        # 2026-10-25: a stalled router read went four times, 2.5 minutes and four charges before the turn began.
+        self.assertEqual((request["retry_delays"], request.get("on_retry")), ((1.0,), None),
+                         "one more try a second later, and none after part of a reply")
         user, = request["messages"]
         self.assertEqual(request["prompt_id"], "router")
         text = user["content"]
@@ -198,6 +201,62 @@ class RequestTest(unittest.TestCase):
         text = model.requests[0]["messages"][0]["content"]
         self.assertIn("Previous turn: none", text)
         self.assertLess(len(text), router.MAX_SCENE + len(CORNER) + 200)
+
+
+class StoppedBuildTest(unittest.TestCase):
+    """2026-10-25 (Luna): a tower routed for workers was stopped before they ran; the next message, "make the
+    roof walkable", was routed level 1 on an empty scene and the whole tower built in one step. A routed
+    build stopped before any worker started stays in the router's previous-turn line until a turn acts."""
+    TOWER = "Build a five-storey brick tower with a flat roof and a stair core."
+    TWEAK = "make the roof walkable"
+
+    def note(self, *turns, levels) -> str:
+        session = session_with(*turns)
+        session["turn_levels"] = levels
+        return router.previous_note(session)
+
+    def test_the_stopped_previous_turn_is_said_last(self):
+        stopped = {"turn": 1, "first": 0, "final": 0, "routed": 3, "stopped": True}
+        session = session_with(self.TOWER, self.TWEAK)
+        session["turn_levels"] = [stopped]
+        model = FakeModel('{"level": 3, "deliverables": ["Tower"]}')
+        router.route(session, session["messages"][-1], CFG, lambda: False, model)
+        self.assertIn(f'Previous turn: the user asked "{self.TOWER}"; Loopcut worked at level 0; its reply ended '
+                      '"Done."; that build was stopped before it ran\n', model.requests[0]["messages"][0]["content"])
+        for routed in (2, 3):  # Shared setup or a first step done before the Stop, but no worker started.
+            self.assertTrue(self.note(self.TOWER, self.TWEAK, levels=[{**stopped, "final": 1, "routed": routed}])
+                            .endswith("; that build was stopped before it ran"))
+
+    def test_an_earlier_one_is_quoted_while_no_turn_since_has_acted(self):
+        stopped = {"turn": 1, "first": 0, "final": 0, "routed": 3, "stopped": True}
+        question = {"turn": 2, "first": 0, "final": 0, "routed": 0}
+        note = self.note(self.TOWER, "What is a stair core?", self.TWEAK, levels=[stopped, question])
+        self.assertTrue(note.startswith('the user asked "What is a stair core?"; Loopcut worked at level 0'), note)
+        self.assertTrue(note.endswith(f'; an earlier build was stopped before it ran: "{self.TOWER}"'), note)
+        acted = {**question, "first": 1, "final": 1}
+        self.assertNotIn("stopped", self.note(self.TOWER, "Add a door.", self.TWEAK, levels=[stopped, acted]))
+
+    def test_a_completed_build_or_one_whose_workers_started_changes_nothing(self):
+        before = 'the user asked "{}"; Loopcut worked at level {}; its reply ended "Done."'
+        for entry in ({"turn": 1, "first": 3, "final": 3, "routed": 3},  # Completed.
+                      {"turn": 1, "first": 1, "final": 1, "routed": 2},  # Built without workers, completed.
+                      {"turn": 1, "first": 3, "final": 3, "routed": 3, "stopped": True},  # Workers had started.
+                      {"turn": 1, "first": 0, "final": 0, "routed": 1, "stopped": True},  # Not a build for workers.
+                      {"turn": 1, "first": 0, "final": 0, "routed": None, "stopped": True}):  # No routing.
+            self.assertEqual(self.note(self.TOWER, self.TWEAK, levels=[entry]),
+                             before.format(self.TOWER, entry["final"]), entry)
+
+    def test_the_stopped_build_survives_the_cap_and_a_restore_drops_it(self):
+        stopped = {"turn": 1, "first": 0, "final": 0, "routed": 3, "stopped": True}
+        session = session_with(self.TOWER, "x" * 300, self.TWEAK)
+        session["messages"][-2]["content"] = "y" * 300
+        session["turn_levels"] = [stopped, {"turn": 2, "first": 0, "final": 0}]
+        note = router.previous_note(session)
+        self.assertLessEqual(len(note), router.MAX_PREVIOUS)
+        self.assertTrue(note.endswith(f'an earlier build was stopped before it ran: "{self.TOWER}"'), note)
+        session = session_with(self.TOWER, self.TWEAK)
+        session["turn_levels"], session["turn_number"] = [stopped], 3  # Turn 2 was restored away.
+        self.assertNotIn("stopped", router.previous_note(session))
 
 
 class RulesTest(unittest.TestCase):
@@ -353,6 +412,17 @@ class RecordTest(unittest.TestCase):
         session["turn_number"] = 3
         agent._record_level(session, a_turn())
         self.assertEqual(session["turn_levels"][-1], {"turn": 3, "first": 0, "final": 0}, "router off: no key")
+
+    def test_a_stop_is_recorded_and_a_resume_that_ends_otherwise_clears_it(self):
+        session = session_with(CORNER)
+        stopped = a_turn()
+        stopped.route_tried, stopped.routed, stopped.outcome = True, router.Decision(3), "cancelled"
+        agent._record_level(session, stopped)
+        self.assertEqual(session["turn_levels"], [{"turn": 1, "first": 0, "final": 0, "routed": 3, "stopped": True}])
+        resumed = a_turn()
+        resumed.outcome, resumed.level_first, resumed.level_max = "completed", 3, 3
+        agent._record_level(session, resumed)
+        self.assertEqual(session["turn_levels"], [{"turn": 1, "first": 3, "final": 3, "routed": 3}])
 
 
 class ConfigTest(unittest.TestCase):

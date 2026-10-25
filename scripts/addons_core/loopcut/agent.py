@@ -107,6 +107,9 @@ CAPTURE_TOOLS = {"capture_viewport", "compare_with_reference", "inspect_scene"}
 # An explicit step limit (cfg.max_steps > 0) is announced this many steps before it; at it, the model is asked
 # once more, for text only, to say where the work stands (_wrap_up).
 STEPS_LEFT_NOTICE = 3
+# On the turn's message, with the account's orchestrator_max_steps (Turn.carry_steps): the steps it has made, so a
+# resumed turn (resume) goes on counting from them rather than starting a fresh limit.
+STEPS_TAKEN = "loopcut_steps_taken"
 STEPS_LEFT_NOTE = ("\n\n({left} steps left in this turn. Finish what matters most, or wrap up: say what is done, "
                    "what is left and what you did not verify.)")
 # A worker's own (LoopSpec.steps_left_note), in its system prompt's words: "Finish what matters most"
@@ -145,6 +148,9 @@ FILTERED_REPLY_MESSAGE = ("The model provider's content filter stopped this repl
 UPSTREAM_CODES = frozenset({"upstream_error", "upstream_rejected", "upstream_unavailable", "rate_limited"})
 UPSTREAM_MESSAGE = "Loopcut's AI is having a problem right now; it's not your plan or your request."
 BUSY_MESSAGE = "Loopcut's AI is busy right now; try again in a minute."
+# The stall clock stopped the turn (check_stall): nothing came back for its limit (stall_message). Try again.
+STALL_MESSAGE = "Loopcut stopped waiting: nothing came back for {limit}."
+WAKE_SECONDS = 60  # A gap this long between the pump's looks (a sleep) leaves the turn this long before it stalls.
 # A reply that wrote its calls out as text and called nothing (_unmade): what goes back as the turn's record
 # correction, what the panel says when it cannot go back, and what the stored reply says instead, for this and
 # for a reply the record correction (completion_guard.CORRECTION) sends back.
@@ -154,6 +160,10 @@ UNMADE_PROMPT = ("[Loopcut] Your last reply wrote {calls} out as text instead of
 UNMADE_FINAL = ("Stopped: the assistant again wrote out its steps instead of running them, so none of the work "
                 "it described was done or checked.")
 UNMADE_STORED = context.UNMADE_STORED
+# A <scene_context> line on the first message after the user's Stop. Without it the model cannot tell what a press
+# refers to: "pressed by mistake, continue" was read as a mistaken press of continue, and it stopped (0.2.14 logs).
+STOPPED_LINE = ("last turn: the user pressed Stop before you finished. If this message says that was a mistake or "
+                "asks you to go on, carry on with the stopped work; otherwise do what it asks.")
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -211,6 +221,7 @@ class Turn:
         # agent's workspace loop (_configure), and whether it did (router.start_turn's divert).
         self.may_divert = False
         self.diverted = False
+        self.carry_steps = False  # The account's orchestrator_max_steps: steps counted on the turn's message too.
         self.codex = None  # config.CodexApp when Codex's own loop runs the turn (CODEX_SPEC, codex_app.py).
         self.try_it = ""  # The setup card that sent this turn's request unedited: its cloud call is on the house.
         # Credits (spending.py, C47): paid calls this turn, workers' included, and the burst guard's limit;
@@ -230,6 +241,7 @@ class Turn:
         self.executed_tools = 0
         self.unrun_claim = False  # One record correction per user turn, including resume.
         self.unmade_final = ""  # Loopcut's last line after a reply that only wrote its calls out (_unmade).
+        self.motion_notice = ""  # Loopcut's line after a last reply that says objects move that do not (_motion_claim).
         self.contact_checks: list = []  # Measurements and evaluated geometry fingerprints, only this turn.
         self.contact_bounced = False   # At most one correction for a pass invalidated by later edits.
         # The turn's usage event (telemetry.py): when it started, what ran it, the first chat item it added,
@@ -245,6 +257,17 @@ class Turn:
         self.returned_submission = False
         # Its conversation log (session_logs.py): what ran it, or {} when the conversation is not uploaded.
         self.conversation_log: dict = {}
+        # The stall clock (check_stall): when the turn last made progress, in wall time so that a laptop's sleep
+        # counts, what it has waited for since, and its limit in seconds (0: off; set as it launches).
+        self.progress_at = time.time()
+        self.progress = state.MODEL_REPLY
+        self.stall_seconds = 0
+        self.checked_at: float | None = None  # The pump's last look (time.time()); a long gap is a sleep.
+
+    def touch(self, label: str) -> None:
+        """Real progress (a streamed delta, a tool starting or finishing, a worker's reply, a cloud job moving on):
+        the stall clock starts again, now waiting for `label`. Any thread."""
+        self.progress_at, self.progress = time.time(), label
 
 
 def _redraw() -> None:
@@ -516,6 +539,7 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
     from . import cloud
     cloud.sync_settings()
     turn.spending = config.spending()
+    turn.stall_seconds = config.stall_seconds()
     codex = config.codex_app()
     if codex is not None:
         session["mode"] = "workspace"
@@ -534,6 +558,9 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
         turn.roles = dataclasses.replace(roles, orchestrator=_keep_mode(roles.orchestrator),
                                          worker=_keep_mode(roles.worker))
         turn.config, turn.spec = turn.roles.orchestrator, ORCH_SPEC
+        if roles.orchestrator_max_steps:  # The account's steps per turn, for this loop only (_route's divert).
+            turn.config = dataclasses.replace(turn.config, max_steps=roles.orchestrator_max_steps)
+            turn.carry_steps = True
         turn.may_divert = roles.workspace and _never_delegated(session)
     else:
         turn.config = _keep_mode(roles.orchestrator) if roles.orchestrate else _turn_config()
@@ -696,8 +723,9 @@ def _warn_low_allowance(session: dict, items: list, info: dict, *, turn: Turn | 
 
 
 def _warn_low_credits(items: list, info: dict, owner: Turn | None) -> None:
-    """Main thread, credits arm (0.2.15): one quiet heads-up per refill period once a reply's balance is down to
-    about 20 credits, with the offer, before the out-of-credits stop. Never raises."""
+    """Main thread, credits arm on Pro and Max (0.2.15): one quiet heads-up per refill period once a reply's balance
+    is down to about 20 credits, with Add credits, before the out-of-credits stop. Never on the free plan: there the
+    out-of-credits stop is the offer, and a heads-up let users stop short of it (owner, 2026-10-25). Never raises."""
     from . import chat_credits, nudges
     balance = info.get("credits_balance")
     if (info.get("billing") != chat_credits.CREDITS or type(balance) is not int
@@ -705,13 +733,13 @@ def _warn_low_credits(items: list, info: dict, owner: Turn | None) -> None:
         return
     try:
         account, _ = chat_credits._account()
+        if chat_credits.plan_of(account) not in ("pro", "max"):
+            return
         if not nudges.first_time("low_chat_credits", chat_credits.low_key(account)):
             return
         item = state.item_notice(chat_credits.low_text(balance, account))
-        if config.billing_open():  # Paid plans top up; the free plan's way to more is Pro.
-            paid = chat_credits.plan_of(account) in ("pro", "max")
-            item.update(action_label="Add credits" if paid else chat_credits.upgrade_button({"plan": "pro"}, True),
-                        url=config.credits_url("low_credits") if paid else config.pricing_url("low_credits", "pro"))
+        if config.billing_open():  # Paid plans top up.
+            item.update(action_label="Add credits", url=config.credits_url("low_credits"))
         items.append(item)
         if owner is not None:
             owner.allowance_notices.append((items, item))
@@ -1204,6 +1232,16 @@ def _capture_refusal(turn: Turn, call_name: str, arguments: str) -> str:
     return ""
 
 
+def _after_framing(turn: Turn, call_name: str, arguments: str, result) -> None:
+    """Once frame_camera has framed the scene camera, the automatic looks go through it until the model
+    asks for another angle: at its last look's angle, a model fell back to its own camera math (about 15
+    tries, 2026-10-25). A camera other than the scene camera is not what angle camera shows."""
+    if (call_name == "frame_camera" and getattr(result, "ok", False) and not _only_reads(call_name, _arguments(arguments))
+            and "Not the scene camera" not in (getattr(result, "text", "") or "")):
+        turn.angle = "camera"
+        turn.shot.pop("camera", None)
+
+
 def _look_note(turn: Turn) -> str:
     """Appended to a look the model asked for once it has asked for many: a nudge, not a wall."""
     if turn.captures <= SOFT_LOOKS:
@@ -1233,16 +1271,35 @@ def _correlation_headers(session: dict, role: str, turn=None) -> dict:
     return llm.correlation_headers(session["id"], role, try_it_card(turn))
 
 
-def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single",
-                    turn: Turn | None = None) -> list[str]:
-    """Describe the images the user just attached, so the description outlives the turn and any
-    summary, and the model works from a checklist rather than a glance. Returns their names. A clip's
-    contact sheets are left out: they are frames to time an action by, not an image to reproduce, and the
-    message describes them already (videoref.user_content)."""
+# In place of the card when describing failed or came back empty: the model still gets the images' names, which tools
+# take (photo→3D, compare_with_reference). Without them, a model passed "character reference" to photo→3D
+# (2026-10-25). Not marked REFERENCE_CARD, so a resumed turn asks again; a card that then comes back replaces it.
+UNDESCRIBED = '\n\n<reference_card images="{names}">(not described: the description request failed)</reference_card>'
+
+
+def _stills(session: dict, message: dict) -> tuple[list[str], list[str]]:
+    """The references and names of the stills attached to the message. A clip's contact sheets are left
+    out: they are frames to time an action by, not an image to reproduce, and the message describes them
+    already (videoref.user_content)."""
     sheets = {r["ref"] for r in session["references"] if r.get("video")}
     refs = [p["image_url"]["url"] for p in message["content"]
             if p.get("type") == "image_url" and p["image_url"]["url"] not in sheets]
-    names = [r["name"] for r in session["references"] if r["ref"] in refs]
+    return refs, [r["name"] for r in session["references"] if r["ref"] in refs]
+
+
+def _undescribed(session: dict, message: dict) -> None:
+    """UNDESCRIBED on the message, once."""
+    names = _stills(session, message)[1] if isinstance(message.get("content"), list) else []
+    note = UNDESCRIBED.format(names=", ".join(names))
+    if names and note not in message["content"][0]["text"]:
+        message["content"][0]["text"] += note
+
+
+def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancelled, role: str = "single",
+                    turn: Turn | None = None) -> list[str]:
+    """Describe the images the user just attached (_stills), so the description outlives the turn and any
+    summary, and the model works from a checklist rather than a glance. Returns their names."""
+    refs, names = _stills(session, message)
     if not refs:
         message[context.REFERENCE_CARD] = True
         return []
@@ -1255,12 +1312,16 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
         messages=[{"role": "system", "content": REFERENCE_PROMPT}, {"role": "user", "content": parts}],
         tools=[], reasoning_effort="low", on_text=lambda _: None, is_cancelled=is_cancelled,
         max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-        headers=_correlation_headers(session, "reference", turn), on_retry=lambda: None)  # Nothing shown mid-stream to undo.
+        headers=_correlation_headers(session, "reference", turn), on_retry=lambda: None,  # Nothing shown to undo.
+        on_progress=(lambda: turn.touch(state.MODEL_REPLY)) if turn is not None else None)
     if turn is not None:
         _hosted_reply(turn, cfg, completion.account, success=True, session=session)
     card = completion.text.strip()
-    if card:
-        message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
+    message["content"][0]["text"] = message["content"][0]["text"].replace(UNDESCRIBED.format(names=", ".join(names)), "")
+    if not card:
+        _undescribed(session, message)
+        return []
+    message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
     message[context.REFERENCE_CARD] = True
     return names
 
@@ -1387,7 +1448,7 @@ def _route(session: dict, turn: Turn) -> None:
         card = try_it_card(turn)
         if card:  # The router's request is one of the card's turn too (router.ask sends the correlation headers).
             kwargs["headers"] = {**(kwargs.get("headers") or {}), llm.TRY_IT_HEADER: card}
-        completion = llm.stream_chat(**kwargs)
+        completion = llm.stream_chat(**kwargs, on_progress=lambda: turn.touch(state.MODEL_REPLY))
         _hosted_reply(turn, roles.router, completion.account, success=True, session=session)
         return completion
     router.start_turn(session, turn, roles.router if roles else None, turn.cancel.is_set, stream=stream, divert=divert)
@@ -1397,7 +1458,7 @@ def _route(session: dict, turn: Turn) -> None:
         # The orchestrator's own limits stay behind: the workspace loop has the main config's step limit.
         base = getattr(roles, "orchestrator", None)
         cfg = dataclasses.replace(turn.config, max_steps=base.max_steps) if base is not None else turn.config
-        turn.config = _workspace_config(cfg)
+        turn.config, turn.carry_steps = _workspace_config(cfg), False
         turn.roots = _on_main(_project_roots, turn.cancel.is_set)  # Relative paths now mean the workspace.
         _workspace_turn(session, turn)
 
@@ -1535,7 +1596,9 @@ def _note_level(turn: Turn, name: str, arguments: str, delegations_before: int) 
 
 def _record_level(session: dict, turn: Turn) -> None:
     """session["turn_levels"]: {turn, first, final}, plus routed (the router's level, None when it
-    gave none) once the router ran and nudged once it nudged; a resumed turn updates its own entry."""
+    gave none) once the router ran, nudged once it nudged and stopped while its last run ended on Stop
+    (router.previous_note: a routed build stopped before it ran is still to do); a resumed turn updates
+    its own entry."""
     levels = session.setdefault("turn_levels", [])
     number = session.get("turn_number") or 1
     entry = {"turn": number, "first": turn.level_first or 0, "final": turn.level_max}
@@ -1543,10 +1606,14 @@ def _record_level(session: dict, turn: Turn) -> None:
         entry["routed"] = turn.routed.level if turn.routed else None
     if getattr(turn, "nudged", False):
         entry["nudged"] = True
+    if turn.outcome == "cancelled":
+        entry["stopped"] = True
     if levels and levels[-1]["turn"] == number:
         previous = levels[-1]
         entry = {**previous, **entry, "first": previous["first"] or entry["first"],
                  "final": max(previous["final"], entry["final"])}
+        if turn.outcome != "cancelled":
+            entry.pop("stopped", None)
         levels[-1] = entry
     else:
         levels.append(entry)
@@ -1633,9 +1700,13 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
     schemas = _session_schemas(session, spec)
     fixed = context.fixed_tokens(system, schemas, prompt_id=hosted, index=index)
     card = try_it_card(turn)  # A summary made in a Try it card's turn is one of its requests too.
-    summarize = {"summarize": functools.partial(context.summarize, try_it=card)} if card else {}
+
+    def on_progress() -> None:
+        turn.touch(state.MODEL_REPLY)
+
+    summarize = functools.partial(context.summarize, try_it=card, on_progress=on_progress)
     prepared, compacted = context.prepare(session, cfg, turn.cancel.is_set, fixed=fixed, skill_index=index,
-                                          **summarize)
+                                          summarize=summarize)
     if compacted:
         items.append(state.item_notice(
             f"Summarized {compacted} earlier messages so requests stay small."))
@@ -1668,12 +1739,13 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
                 max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
                 headers=_correlation_headers(session, spec.role, turn), on_retry=on_retry,
-                prompt_id=hosted,
+                prompt_id=hosted, on_progress=on_progress,
             )
         except llm.LLMError as ex:
             if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
                 _drop_empty(items, reply)
-            elif ex.code == llm.CONNECTION_LOST or (ex.code in UPSTREAM_CODES and config.on_service(cfg.base_url)):
+            elif ex.code in (llm.CONNECTION_LOST, llm.STREAM_FAILED) or (
+                    ex.code in UPSTREAM_CODES and config.on_service(cfg.base_url)):
                 reply["text"] = ""  # Its card's Try again asks for this reply afresh: no fragment of it above the card.
                 _drop_empty(items, reply)
             raise
@@ -1839,13 +1911,18 @@ def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec,
 
 
 def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
-    """After the existing finish gate (including late merges), validate this turn's contact evidence."""
+    """After the existing finish gate (including late merges), Loopcut's own check of a rig this turn animated or
+    reweighted (rig_gate), then this turn's contact evidence."""
     if turn.cancel.is_set():
         return None
     bounce = spec.on_final(session, turn, completion) if spec.on_final else None
     if bounce and turn.outcome == "running":
         return bounce
-    from . import contact
+    from . import contact, rig_gate
+    bounce = rig_gate.finish_gate(session, turn, completion, spec.role,
+                                  lambda fn: _on_main(fn, turn.cancel.is_set, "rig check"))
+    if bounce:
+        return bounce
     return contact.finish_gate(session, turn, completion,
                                lambda: _on_main(lambda: contact.refresh(turn), turn.cancel.is_set))
 
@@ -1891,6 +1968,51 @@ def _continue_announced(session: dict, turn: Turn, spec: LoopSpec, request: dict
     return True
 
 
+def _motion_on_main(text: str, is_cancelled):
+    """motion_claims.check on the main thread: it reads and steps the live scene's frames."""
+    from . import motion_claims
+    return _on_main(lambda: motion_claims.check(text), is_cancelled, "the motion check")
+
+
+def _motion_claim(session: dict, turn: Turn, spec: LoopSpec, request: dict, completion, cfg: config.Config,
+                  step: int) -> str | None:
+    """A reply that would end the turn saying scene objects move when they do not (motion_claims; rel017-app
+    recapped moons it never animated as "orbiting") goes back once a user turn with motion_claims.nudge, from the
+    nudges it shares with announced steps (completion_guard.MOTION_CHECKED). A later reply that still says so, or
+    one that cannot go back (no nudge left, the step limit), ends the turn on motion_claims.notice. Never for a
+    worker (nor a helper's report_back), after a Stop, with a note the user sent during the reply (it goes to the
+    model next), or while workers have yet to report (the finish gate merges them and continues the turn)."""
+    from . import motion_claims
+    turn.motion_notice = ""
+    if (spec.role == "worker" or turn.cancel.is_set() or turn.notes
+            or not motion_claims.may_claim(completion.text)):
+        return None
+    job = getattr(turn, "job", None)
+    if job is not None:
+        from . import waves
+        try:
+            if waves.pending(job):
+                return None
+        except Exception:  # Unknown: leave the turn to the finish gate.
+            return None
+    try:
+        found = _motion_on_main(completion.text, turn.cancel.is_set)
+    except llm.Cancelled:
+        raise
+    except Exception as ex:  # Never in the way of the reply.
+        print(f"Loopcut: motion check not run: {type(ex).__name__}: {ex}")
+        return None
+    if not found:
+        return None
+    if (not request.get(completion_guard.MOTION_CHECKED) and turn.outcome == "running"
+            and not (cfg.max_steps and step >= cfg.max_steps) and completion_guard.nudges_left(request) > 0):
+        request[completion_guard.MOTION_CHECKED] = True
+        print(f"Loopcut: the reply says {len(found['names'])} objects move that do not; sent back once.")
+        return motion_claims.nudge(found)
+    turn.motion_notice = motion_claims.notice(found)
+    return None
+
+
 def _turn_items(session: dict, request: dict) -> list:
     """The chat items of the user's turn, across resumes: from its own message's item on. Notes sent during
     the turn are user items too: those folded into the history (STEER) and those still queued are passed over."""
@@ -1926,6 +2048,16 @@ def _run(session: dict, turn: Turn, run_tool=_run_tool_on_main,
             print(f"Loopcut: conversation log not sent: {type(ex).__name__}")
         from . import chat_credits
         chat_credits.turn_end(session, turn)  # The credits arm's "Done · N credits"; never raises.
+
+
+def _tool_dropped(name: str, ex: BaseException):
+    """A network connection a tool used broke and the tool let it through (2026-10-25: a library thumbnail's read
+    timing out): that step failed, and the turn goes on. Before, it ended the turn on "The connection to the model
+    dropped", which it had not."""
+    from . import tools
+    print(f"Loopcut: the {name} tool's connection dropped: {ex!r}")
+    return tools.ToolResult(f"{name} failed: its network connection dropped ({llm.short_cause(ex)}). "
+                            "Try it again, or go on without it.", ok=False)
 
 
 def _error_code(ex) -> str:
@@ -1970,7 +2102,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         no_progress = repeats.NoProgress()
         plan_turn = turn.plan_turn = uuid.uuid4().hex
         session["active_turn_id"] = plan_turn
-        step = 0
+        carry = getattr(turn, "carry_steps", False)
+        step = int(request.get(STEPS_TAKEN) or 0) if carry else 0  # A resume goes on counting.
         while not cfg.max_steps or step < cfg.max_steps:
             if turn.cancel.is_set():
                 raise llm.Cancelled()
@@ -1985,6 +2118,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                         if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
                             raise
                         print(f"Loopcut: could not describe the attached images: {ex}")
+                        _undescribed(session, user_message)
                 if spec.on_turn_start:
                     spec.on_turn_start(session, turn)
                     if getattr(turn, "spec", None) not in (None, spec):  # The router sent the turn to another loop.
@@ -2008,6 +2142,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
             messages.append(completion.as_message())
+            if carry and getattr(turn, "carry_steps", False):  # A failed request is made again by a resume:
+                request[STEPS_TAKEN] = step  # only a reply counts.
             if not completion.tool_calls:
                 bounce = None
                 # The turn's one record correction, from the nudges it shares with announced steps: for calls the
@@ -2033,6 +2169,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if not bounce and not written_out and not honest and _continue_announced(
                         session, turn, spec, request, completion, cfg, step, scene_action):
                     bounce = completion_guard.CONTINUE
+                # Before the finish gates too, and on a question as well: rel017-app's false recap answered one.
+                if not bounce and not written_out and not honest:
+                    bounce = _motion_claim(session, turn, spec, request, completion, cfg, step)
                 if not bounce:
                     bounce = _final_reply(session, turn, completion, spec)
                 if bounce:  # Sent back, marked so it continues the turn, and the loop goes on.
@@ -2142,12 +2281,19 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     turn.executed_tools += 1
                     request[completion_guard.EXECUTED] = turn.executed_tools
                     turn.capped_call = call.id if capped else None
+                    turn.touch(f"the {call.name} tool")
                     try:
                         result = run_tool(call.name, arguments)
+                    except Exception as ex:
+                        if not llm.dropped_connection(ex):
+                            raise
+                        result = _tool_dropped(call.name, ex)
                     finally:
                         turn.capped_call = None
+                turn.touch(state.MODEL_REPLY)
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
+                _after_framing(turn, call.name, call.arguments, result)
                 changed = spec.scene_changed(result)
                 may_change = _changes_scene(call.name, call.arguments)
                 if may_change or changed:
@@ -2165,8 +2311,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 ledger_note = turn.ledger.record(step, key, result.text, result.ok, read, step_message)
                 if consent.rig:  # The rig card shows its result text; the ledger's note is for the model.
                     result.model_note = (getattr(result, 'model_note', '') or '') + ledger_note
-                else:
-                    result.text += ledger_note
+                    ledger_note = ""
+                # Nor on any other card: "Same error as before. Already tried: step 14 {...}" on a failed step read
+                # as something broken (a free-plan persona, 2026-10-24). The model's copy keeps it where it was.
+                own = len(result.text)
+                result.text += ledger_note
                 if note:
                     result.text += note
                 if spec.after_tool:
@@ -2182,11 +2331,17 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     turn.changed, turn.touched = False, []
                 # A paid call the user skipped did not fail: it is shown as skipped (spending.declined).
                 card["status"] = "done" if result.ok else "rejected" if card.get("declined") else "failed"
-                card["output"] = result.text
+                # An asset search's card keeps its report's JSON (card_output); the model's copy is a table.
+                card_text = getattr(result, "card_output", "") or result.text[:own]
+                card["output"] = card_text + result.text[own + len(ledger_note):]
+                if getattr(result, "outcome", ""):  # A report's line; its JSON stays behind the card's toggle.
+                    card["outcome"] = result.outcome
                 if card.get("plan_turn") and getattr(result, "plan_refused", False):
                     card["plan_repair"] = "needed"
                 elif card.get("plan_turn") and getattr(result, "plan_capped", False):
                     card["plan_repair"] = "capped"  # The turn's worker limit: a neutral card (ui.layout).
+                if getattr(result, "timed_out", 0):
+                    card["timed_out"] = result.timed_out  # Its card says Blender was frozen, not a mistake (ui.layout).
                 consent.finish(result)
                 if getattr(result, "receipt", "") and not consent.rig:
                     card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
@@ -2247,8 +2402,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         items.append(state.item_error(f"Stopped by the budget: {ex}"))
         _end_at_limit(session, turn, cfg, spec, BUDGET_PROMPT.format(reason=ex))
     except llm.Cancelled:
-        turn.outcome = "cancelled"
-        items.append(state.item_error("Stopped."))
+        if turn.stop_reason == "stalled":  # The stall clock, not the user: an error another try may get past.
+            turn.outcome, turn.error_code = "error", "stalled"
+            items.append(state.item_error(stall_message(turn.stall_seconds), retry=True))
+        else:
+            turn.outcome = "cancelled"
+            items.append(state.item_error("Stopped."))
     except (config.ConfigError, llm.LLMError) as ex:
         turn.outcome = "error"
         turn.error_code = _error_code(ex)
@@ -2270,17 +2429,22 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         elif getattr(ex, "code", "") in UPSTREAM_CODES and config.on_service(cfg.base_url):
             items.append(state.item_error(_upstream_text(ex), retry=True))
         else:
-            items.append(state.item_error(str(ex), retry=getattr(ex, "code", "") in (llm.CONNECTION_LOST,
-                                                                                     llm.EMPTY_REPLY)))
+            retry = getattr(ex, "code", "") in (llm.CONNECTION_LOST, llm.EMPTY_REPLY, llm.STREAM_FAILED)
+            items.append(state.item_error(str(ex), retry=retry))
         if getattr(ex, "account", None) and not handled_refusal:
             _hosted_reply(turn, cfg, ex.account, session=session)
     except Exception as ex:  # Last line of defence for the worker thread: show it, never swallow it.
+        from . import version_guard
         turn.outcome = "error"
         turn.error_code = "connection_lost" if llm.dropped_connection(ex) else "internal"
         import traceback
         traceback.print_exc()
-        if llm.dropped_connection(ex):  # A provider's client let a broken connection through: plain words.
+        # A provider's client let a broken connection through: plain words. Never a tool's (_tool_dropped).
+        if llm.dropped_connection(ex):
             items.append(state.item_error(str(llm.connection_lost("the model", ex)), retry=True))
+        elif isinstance(ex, version_guard.RestartNeeded):  # Updated under this Blender: only a restart helps.
+            turn.error_code = "restart_needed"
+            items.append(state.item_error(str(ex)))
         else:
             items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
@@ -2342,6 +2506,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         elif (spec.role != "worker" and not spec.drive and not turn.executed_tools
                 and turn.unrun_claim):
             items.append(state.item_notice(completion_guard.NOTICE))
+        if turn.motion_notice:
+            items.append(state.item_notice(turn.motion_notice))
         try:
             spec.save(session)
         except OSError as ex:
@@ -2405,9 +2571,12 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         session["items"].append(state.item_error(str(ex)))
         telemetry.first_use("result_error")
         return False
+    stopped = note_items is None and session.get("turn_outcome") == "cancelled"  # Not "send now", which stops too.
     messages = session["messages"]
     last = str(messages[-1].get("content")) if messages and messages[-1].get(context.STEP_LIMIT) else ""
-    if last in (completion_guard.CONTINUE, completion_guard.CORRECTION) or last.startswith(UNMADE_PROMPT[:30]):
+    from . import motion_claims
+    if (last in (completion_guard.CONTINUE, completion_guard.CORRECTION) or last.startswith(UNMADE_PROMPT[:30])
+            or last.startswith(motion_claims.NUDGE_HEAD)):
         # A nudge or record correction left last by a Stop or an error; resume() goes on from it, a new message
         # replaces it (it would ask the model to run what the user stopped).
         messages.pop()
@@ -2434,7 +2603,10 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
             session["items"].append(item)
     # The model also gets what the user is looking at, and what changed since it last acted; the
     # chat shows only what they typed. The snapshot taken here is what changed_only measures from.
-    content = f"{_scene_context(text, session.get('scene_seen'))}\n\n{text or 'See the attached images.'}"
+    scene = _scene_context(text, session.get("scene_seen"))
+    if stopped:
+        scene = scene.replace("\n</scene_context>", f"\n{STOPPED_LINE}\n</scene_context>", 1)
+    content = f"{scene}\n\n{text or 'See the attached images.'}"
     session["scene_seen"] = session["scene_turn_start"] = _scene_snapshot()
     # The prompt's last lines, read here on the main thread: the model and cloud tools, then the add-ons.
     session["addons_line"] = "\n".join(line for line in (_setup_line(turn.config), _addons_line()) if line)
@@ -2450,12 +2622,14 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         session["attachments"] = []
     else:
         session["messages"].append({"role": "user", "content": content})
-    conversations.save(session)
     _launch(session, turn)
     return True
 
 
 def _launch(session: dict, turn: Turn) -> None:
+    # Saved as running first (send's message, resume's retry): if Blender dies before the turn's last save (a crash,
+    # a kill, a power cut), the next load still ends it with the closing card and Try again (conversations.load).
+    conversations.save(session, running=True)
     from . import session_logs, telemetry
     turn.started, turn.first_item = time.monotonic(), len(session["items"])
     turn.telemetry = telemetry.turn_start(turn.config)  # Main thread: which kind of model runs this turn.
@@ -2463,6 +2637,8 @@ def _launch(session: dict, turn: Turn) -> None:
     from . import chat_credits
     chat_credits.turn_start(session, turn)  # The balance it starts from, in the credits arm; never raises.
     session["scroll"], session["confirm_restore"] = 0.0, None
+    if llm._is_loopback(getattr(turn.config, "base_url", "")):
+        turn.stall_seconds = 0  # The Claude Code bridge may take minutes, as call_max_seconds allows it (llm.py).
     session["busy"], session["turn"] = True, turn
     session["turn_outcome"] = "running"
     turn.thread = threading.Thread(target=_run, args=(session, turn), name="loopcut-turn", daemon=True)
@@ -2536,3 +2712,55 @@ def stop() -> None:
         with turn.notes_lock:
             turn.send_notes_on_stop = False
             turn.cancel.set()
+
+
+def check_stall(held: float = 0.0, now: float | None = None) -> None:
+    """Main thread, from mainthread's pump while a turn runs: its stall clock. held: the seconds the pump spent in
+    main-thread tasks, or ran late because Blender held its thread, since its last call; they never count. The clock
+    waits while the turn could not move on by itself (_stall_paused). Past turn.stall_seconds with nothing new, the
+    turn is stopped, and run_loop's Cancelled branch says so with Try again."""
+    session = state.session()
+    turn = session.get("turn")
+    if turn is None or not getattr(turn, "stall_seconds", 0) or turn.cancel.is_set():
+        return
+    now = time.time() if now is None else now
+    checked, turn.checked_at = getattr(turn, "checked_at", None) or now, now
+    if _stall_paused(session, turn):
+        turn.progress_at = now
+        return
+    if held:
+        turn.progress_at = min(now, turn.progress_at + held)
+    if now - checked > WAKE_SECONDS:  # The pump did not run (the Mac slept): what was in flight gets time to land.
+        turn.progress_at = max(turn.progress_at, now - max(0.0, turn.stall_seconds - WAKE_SECONDS))
+    silent = now - turn.progress_at
+    if silent >= turn.stall_seconds:
+        print(f"Loopcut: turn stalled: nothing new for {silent:.0f} s, waiting for {turn.progress}", flush=True)
+        turn.stop_reason = "stalled"
+        turn.cancel.set()
+
+
+def stall_message(seconds: int) -> str:
+    """STALL_MESSAGE for the turn's limit: "15 minutes" at config.DEFAULT_STALL_SECONDS, else what
+    LOOPCUT_STALL_SECONDS set, in the largest unit it is a whole number of."""
+    seconds = max(1, int(seconds))
+    count, unit = next((seconds // size, unit) for size, unit in ((3600, "hour"), (60, "minute"), (1, "second"))
+                       if seconds % size == 0)
+    return STALL_MESSAGE.format(limit=f"{count} {unit}{'s' if count != 1 else ''}")
+
+
+def _stall_paused(session: dict, turn: Turn) -> bool:
+    """A card waits for the user (the turn's own or a worker's ask); a command runs that has a time limit of its own
+    and that Stop kills (a workspace process: run_blender, shell; Codex's shell, its card running); or the turn's
+    workers are within their own time (worker_max_seconds and waves.HARD_GRACE) while the job's scheduler runs them."""
+    if any(item.get("status") == "awaiting" or (item.get("name") == "shell" and item.get("status") == "running")
+           for item in session["items"]):
+        return True
+    from . import waves, workspace
+    if workspace.live_rows():
+        return True
+    job = getattr(turn, "job", None)
+    scheduler = getattr(job, "scheduler", None)
+    if scheduler is None or not scheduler.is_alive():
+        return False
+    limit, clock = job.budget.seconds + waves.HARD_GRACE, job.budget.clock()
+    return any(w.finished is None and (w.thread is None or clock - w.started <= limit) for w in list(job.crew))

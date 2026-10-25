@@ -8,9 +8,17 @@ import math
 MAX_TRIANGLES = 100_000
 MAX_VERTICES = 300_000
 # R5-D1: ar-dog-3's model promised a ready-made run before the rig, which then refused it after the purchase.
-SHAPE_WARNING = ("This unusual shape may get an experimental rig: no ready-made motions, so Loopcut animates it "
-                 "with bone keyframes, and the bend check works on it.")
+# R6-D4/B4: Fast repeats these word for word, so they are the user's words ("experimental rig" and "the bend check"
+# reached the user unexplained), and the long coat's hidden leg gap alone does not warn: clothed people got person rigs.
+SHAPE_WARNING = ("This shape may not get a person rig. Then there are no ready-made walks, and Loopcut animates it "
+                 "with keyframes instead, for free.")
 CLOTHING_WARNING = 'Long coats may stretch between the legs.'
+# Measured on the 22 M2 eval meshes and the persona dog (out/autorig/m2/client-ui/r13/hints.json): a long coat or a
+# clothed multi-mesh character (B7, R12, R13: standard rigs) sets only leg_gap; every shape that now gets an
+# experimental rig but B5 (arm_separation) and B8 (none) sets upright_body or head_and_body; R16 (arms down, standard)
+# sets arm_separation.
+PERSON_HINTS = frozenset(('leg_gap',))                         # No warning on these alone.
+EXPERIMENTAL_HINTS = frozenset(('upright_body', 'head_and_body'))  # The price note's "animated for free" path.
 # ar-dog-1: a 3.9 m upload height and a 100x scale read as "resize first", and the model shrank the
 # dog out of sight before rigging; the upload includes size and rotation (autorig.geometry).
 HANDLED = 'Size and rotation are handled, so nothing needs resizing or rotating first.'
@@ -93,7 +101,8 @@ def geometry(points, triangles):
     ankles = [p[1] for p in points if lo[2] + height * .10 <= p[2] <= lo[2] + height * .2]
     shift = ((max(toes) + min(toes)) / 2 - (max(ankles) + min(ankles)) / 2) if toes and ankles else 0
     facing = ('+Y' if shift > 0 else '-Y') if abs(shift) > height * .005 else 'ambiguous'
-    warnings = ([SHAPE_WARNING] if uncertain else []) + ([CLOTHING_WARNING] if 'leg_gap' in uncertain else [])
+    warnings = ([SHAPE_WARNING] if set(uncertain) - PERSON_HINTS else []) + ([CLOTHING_WARNING] if 'leg_gap' in uncertain
+                                                                              else [])
     return {"eligible": True, "pose": pose, "pose_handling": POSE_HANDLING, "up": "Z", "height_metres": height,
             "triangles": len(triangles), "vertices": len(points),
             "facing": facing, "facing_basis": "foot surface extent; confirmed against returned foot joints",

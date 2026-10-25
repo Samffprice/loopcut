@@ -2,6 +2,7 @@
 
 import json
 import sys
+import threading
 import types
 import unittest
 from copy import deepcopy
@@ -591,6 +592,44 @@ class StarterWaitingTest(unittest.TestCase):
         self.assertNotIn("chat.starter_waiting.l0", ids(build(session), "prims"))
 
 
+class StallNoticeTest(unittest.TestCase):
+    """Two minutes with nothing new from the running turn (its stall clock, agent.check_stall): a muted line under
+    Thinking, never while a card waits for the user."""
+
+    def session(self, quiet: float, stall_seconds: int = 900, progress: str = state.MODEL_REPLY):
+        session = state.new_session()
+        session["busy"] = True
+        session["items"] = [state.item_user("Model a chest"), state.item_assistant()]
+        session["turn"] = types.SimpleNamespace(progress_at=1000.0 - quiet, stall_seconds=stall_seconds, plan_turn="",
+                                                progress=progress, cancel=threading.Event())
+        return session
+
+    def line(self, session):
+        display = build(session, now=1000.0)
+        return " ".join(p["text"] for p in display["prims"] if p["id"].startswith("chat.stall."))
+
+    def test_the_line_shows_after_two_minutes_with_nothing_new(self):
+        self.assertEqual(self.line(self.session(121)), "No reply for 2 minutes. You can Stop and try again.")
+        self.assertEqual(self.line(self.session(60)), "")
+
+    def test_never_while_a_card_waits_for_the_user_or_with_the_clock_off(self):
+        session = self.session(600)
+        card = state.item_tool("run_python", "Build", "pass")
+        card["status"] = "awaiting"
+        session["items"].append(card)
+        self.assertEqual(self.line(session), "")
+        card["status"] = "running"
+        self.assertEqual(self.line(session), layout.STALL_NOTICE)
+        self.assertEqual(self.line(self.session(600, stall_seconds=0)), "", "LOOPCUT_STALL_SECONDS=0, the bridge")
+
+    def test_only_while_the_turn_waits_for_the_model(self):
+        for progress in ("the run_blender tool", "the loopcut_cloud__image_generate cloud job", "its workers"):
+            self.assertEqual(self.line(self.session(600, progress=progress)), "", progress)
+        session = self.session(600)
+        session["turn"].cancel.set()  # Stop, or the stall clock itself: the turn is ending.
+        self.assertEqual(self.line(session), "")
+
+
 class ApprovalScopeTest(unittest.TestCase):
     def display(self, index=0, **flags):
         session = state.new_session()
@@ -692,6 +731,26 @@ class ToolFailureCardTest(unittest.TestCase):
                 self.assertNotIn("\n", reason["text"])
                 self.assertLessEqual(right(reason), card["x"] + card["w"] - T.CARD_PAD)
 
+    def test_a_failed_internal_check_reads_plainly_with_its_output_behind_the_toggle(self):
+        # A free-plan persona, 2026-10-24, read a refused checks add as "i think something broke?".
+        output = 'checks refused; nothing changed:\n- add[0].names: a list of object names'
+        display = self.display(output, name="checks", summary="Checks: add 1", code='{"add": [{}]}')
+        reason = [p for p in display["prims"] if p["id"].startswith("item0.tool.reason")]
+        self.assertEqual(" ".join(p["text"] for p in reason),
+                         "Loopcut's internal check didn't take; the agent adjusted and went on.")
+        self.assertTrue(all(p["color"] == T.TEXT_MUTED for p in reason))
+        self.assertEqual((prim(display, "item0.tool.glyph")["text"], prim(display, "item0.tool.glyph")["color"]),
+                         ("–", T.TEXT_MUTED))
+        self.assertFalse(any(p["id"].startswith("item0.tool.output") for p in display["prims"]))
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
+        display = self.display(output, name="checks", summary="Checks: add 1", code='{"add": [{}]}', expanded=True)
+        self.assertFalse(any(p["id"].startswith("item0.tool.reason") for p in display["prims"]))
+        lines = [p for p in display["prims"] if p["id"].startswith("item0.tool.output")]
+        self.assertEqual([p["text"] for p in lines], output.splitlines(), "the full output, as it was")
+        self.assertTrue(all(p["color"] == T.TEXT_MUTED for p in lines))
+        display = self.display(output, name="checks", summary="Checks: add 1", status="done")
+        self.assertFalse(any(p["id"].startswith("item0.tool.reason") for p in display["prims"]))
+
     def test_collapsed_success_and_running_cards_keep_only_the_title(self):
         for status in ("done", "running"):
             with self.subTest(status=status):
@@ -700,6 +759,27 @@ class ToolFailureCardTest(unittest.TestCase):
                 self.assertEqual(tool_ids, ["item0.tool.card", "item0.tool.glyph", "item0.tool.summary"])
                 self.assertEqual(prim(display, "item0.tool.card")["h"],
                                  prim(display, "item0.tool.summary")["h"] + 14)
+
+    def test_a_cloud_report_s_collapsed_card_is_its_line_and_the_json_waits_behind_the_toggle(self):
+        # The owner, 0.2.17 walkthrough: an asset search's report JSON as a "massive wall of text".
+        report = json.dumps({"schema": "loopcut.asset_search/1", "results": [{"title": "Treasure Chest"}] * 10})
+        output = f"Attached reports: report. Job job_1; provenance recorded.\nreport:\n{report}"
+        line = "Searched libraries: 10 matches; best: Treasure Chest (Poly Haven, CC0)"
+        card = dict(name="loopcut_cloud__asset_search", summary="Search assets", status="done", outcome=line)
+        display = self.display(output, **card)
+        ids = [p["id"] for p in display["prims"] if p["id"].startswith("item0.tool.")]
+        self.assertEqual(ids[:3], ["item0.tool.card", "item0.tool.glyph", "item0.tool.summary"])
+        self.assertTrue(ids[3:] and all(i.startswith("item0.tool.outcome") for i in ids[3:]), ids)
+        outcome = lambda display: " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item0.tool.outcome"))
+        self.assertEqual(outcome(display), line)
+        self.assertFalse(any("{" in p.get("text", "") or "schema" in p.get("text", "") for p in display["prims"]),
+                         "no JSON on the collapsed card")
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
+        display = self.display(output, expanded=True, **card)
+        lines = [p for p in display["prims"] if p["id"].startswith("item0.tool.output")]
+        self.assertEqual("".join(p["text"] for p in lines).replace(" ", ""),
+                         output.replace("\n", "").replace(" ", ""), "expanded: the full output, wrapped")
+        self.assertEqual(outcome(display), line)
 
     def test_expanded_failure_keeps_full_output_without_reason_line(self):
         output = "Warning: unavailable device\nError: invalid input\nCleanup complete"
@@ -752,6 +832,27 @@ class CodeCorrectionTest(unittest.TestCase):
                 self.assertIn("SyntaxError: invalid syntax", output)
                 self.assertIn("item0.tool.code.l0", ids(expanded, "prims"))
                 self.assertEqual(card["output"], self.OUTPUT)
+
+    def test_a_timed_out_step_says_it_froze_blender_and_never_had_a_mistake(self):
+        output = ("Stopped: the code ran for more than 30 s, which usually means a loop that never ends. Whatever "
+                  "it changed before that is listed below. Split the work into smaller run_python calls.\n\n"
+                  "Scene changes (+ added, - removed):\n+ Cube")
+        frozen = ("Stopped after 30 s because this step kept Blender frozen. Its changes so far stay; "
+                  "Undo removes them.")
+        for busy, later, ending in ((True, [], []), (False, [self.card("done", turn_id="one")], []),
+                                    (False, [], [state.item_error("Connection dropped")])):
+            with self.subTest(busy=busy, later=later, ending=ending):
+                items = [self.card(turn_id="one", output=output, timed_out=30.0), *later, *ending]
+                display = self.display(items, busy=busy, active_turn_id="one" if busy else None)
+                self.assertEqual(self.note(display), frozen)
+                self.assertFalse(any("mistake" in p.get("text", "") for p in display["prims"]))
+                self.assertEqual(prim(display, "item0.tool.details.label")["text"], "Details")
+                self.assertEqual(self.note(self.display(json.loads(json.dumps(items)), busy=busy,
+                                                        active_turn_id="one" if busy else None)), frozen)
+        self.assertTrue(self.note(self.display([self.card(output=output, timed_out=1.0)], busy=True))
+                        .startswith("Stopped after 1 s because"))
+        # Any other failure keeps its own line.
+        self.assertIn("had a mistake", self.note(self.display([self.card(output=output)], busy=True)))
 
     def test_partial_or_unmeasured_failure_never_claims_no_scene_changes(self):
         for output in ("RuntimeError: stopped", "RuntimeError: stopped\nScene changes (+ added, - removed):\n+ Cube",
@@ -895,6 +996,7 @@ class CodeCorrectionTest(unittest.TestCase):
 class ErrorCardTest(unittest.TestCase):
     def test_a_dropped_connection_offers_try_again_while_it_is_the_newest_item(self):
         session = state.new_session()
+        session["messages"].append({"role": "user", "content": "go"})
         session["items"].append(state.item_error("The connection to ChatGPT dropped before it could answer.", retry=True))
         hits = {h["id"]: h for h in build(session)["hits"]}
         self.assertEqual(hits["item0.error.retry"]["action"], ("resume", 0))
@@ -907,6 +1009,7 @@ class ErrorCardTest(unittest.TestCase):
     def test_try_again_stays_under_the_turn_s_end_cards_and_only_on_the_newest_error(self):
         """A failed turn that changed the scene ends with its changes card (and maybe a notice) after the error."""
         session = state.new_session()
+        session["messages"].append({"role": "user", "content": "go"})
         session["items"] += [state.item_error("The connection dropped.", retry=True),
                              state.item_changes("1 added", ["+ Sphere"], "cp1"), state.item_notice("Saved a copy.")]
         hits = {h["id"]: h for h in build(session)["hits"]}
@@ -916,6 +1019,14 @@ class ErrorCardTest(unittest.TestCase):
             with self.subTest(later=later["kind"]):
                 display = build({**session, "items": session["items"] + [later]})
                 self.assertNotIn("item0.error.retry", ids(display, "hits"))
+
+    def test_no_try_again_where_resume_would_refuse(self):
+        """agent.resume needs a history that does not end on a reply: a Codex turn stopped after its last message."""
+        session = state.new_session()
+        session["messages"] += [{"role": "user", "content": "go"}, {"role": "assistant", "content": "Done."}]
+        session["items"].append(state.item_error("Loopcut stopped waiting: nothing came back for 15 minutes.",
+                                                 retry=True))
+        self.assertNotIn("item0.error.retry", ids(build(session), "hits"))
 
     def test_other_errors_have_no_button(self):
         session = state.new_session()

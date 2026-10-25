@@ -1,6 +1,7 @@
 """006 request bytes, index lifecycle and mixed local/served selection, without Blender."""
 
 import dataclasses
+import gzip
 import io
 import json
 import os
@@ -27,6 +28,12 @@ def response(version=None):
     return result
 
 
+def body(request) -> dict:
+    """A chat request's JSON; Loopcut's gateway gets it gzipped (llm.GZIP_REFUSED)."""
+    data = request.data
+    return json.loads(gzip.decompress(data) if request.get_header('Content-encoding') == 'gzip' else data)
+
+
 def cfg(url=config.SERVICE_BASE_URL):
     return config.Config('test', url, 'fast', 'low', True, False, 25, 40_000)
 
@@ -48,7 +55,7 @@ class RequestTest(unittest.TestCase):
         with mock.patch.object(agent, '_redraw'), mock.patch.object(llm.urllib.request, 'urlopen', return_value=response()) as opened:
             agent._request(session, agent.Turn(), cfg(url), spec)
         request = opened.call_args.args[0]
-        return json.loads(request.data), {k.lower(): v for k, v in request.header_items()}
+        return body(request), {k.lower(): v for k, v in request.header_items()}
 
     def test_single_and_orchestrator_tail_and_no_tail(self):
         for spec in (agent.SINGLE_SPEC, agent.ORCH_SPEC):
@@ -93,7 +100,7 @@ class RequestTest(unittest.TestCase):
             router.ask(cfg(), {'role': 'user', 'content': 'hello'}, {'id': 'test', 'messages': []}, lambda: False)
         request = opened.call_args.args[0]
         self.assertEqual(request.get_header('X-loopcut-prompt'), 'router')
-        self.assertEqual([m['role'] for m in json.loads(request.data)['messages']], ['user'])
+        self.assertEqual([m['role'] for m in body(request)['messages']], ['user'])
 
     def test_reference_header_and_open_prompt(self):
         message = {'role': 'user', 'content': [{'type': 'text', 'text': 'ref'},
@@ -105,7 +112,7 @@ class RequestTest(unittest.TestCase):
         request = opened.call_args.args[0]
         self.assertEqual(request.get_header('X-loopcut-role'), 'reference')
         self.assertIsNone(request.get_header('X-loopcut-prompt'))
-        self.assertEqual(json.loads(request.data)['messages'][0]['content'], agent.REFERENCE_PROMPT)
+        self.assertEqual(body(request)['messages'][0]['content'], agent.REFERENCE_PROMPT)
 
     def test_workspace_specs_remain_open(self):
         self.assertIsNone(agent.WORKSPACE_SPEC.prompt_id)
@@ -232,10 +239,10 @@ class IndexTest(unittest.TestCase):
             self.assertIsNone(turn.roles)
             agent._request(session, turn, turn.config, turn.spec)
         request = opened.call_args.args[0]
-        body = json.loads(request.data)
+        sent = body(request)
         self.assertIsNone(request.get_header('X-loopcut-prompt'))
-        self.assertEqual(body['messages'][0]['content'], agent.SYSTEM_PROMPT)
-        self.assertNotIn('delegate', {row['function']['name'] for row in body['tools']})
+        self.assertEqual(sent['messages'][0]['content'], agent.SYSTEM_PROMPT)
+        self.assertNotIn('delegate', {row['function']['name'] for row in sent['tools']})
 
     def test_chatgpt_plan_completes_with_or_without_loopcut_account_or_index(self):
         from loopcut import chatgpt_responses

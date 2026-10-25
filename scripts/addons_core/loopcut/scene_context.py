@@ -260,11 +260,13 @@ def interface_language(view, locale: str) -> tuple[str, str] | None:
 
 def language_line(name: str, starter: bool) -> str:
     """Which language to answer in, for a user whose Blender is in `name`. A starter card's words are ours,
-    in English, so they say nothing about the user's language."""
+    in English, so they say nothing about the user's language. Otherwise the interface is only a fallback,
+    and the user's own language is said last: Luna followed a closing "reply in Russian" for English writers
+    with a Russian interface, helpers too (waves._scene_context; 2026-10-25)."""
     if starter:
         return f"interface language: {name}. This request is a starter Loopcut wrote for the user: reply in {name}."
-    return (f"interface language: {name}. Reply in the language the user writes in; when their words don't "
-            f"settle it (romaji, a word or two), reply in {name}.")
+    return (f"interface language: {name}, a fallback only for a message of a word or two or in romaji. "
+            "Otherwise reply in the language the user writes in, English included.")
 
 
 def for_message(text: str, since: dict | None = None) -> str:
