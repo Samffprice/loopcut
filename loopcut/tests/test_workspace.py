@@ -3,6 +3,8 @@ on a temp folder, and how the agent, the router and the config choose the worksp
 harness/workspace_check.py runs the whole loop headless with real background Blenders and a real apply."""
 
 import base64
+import contextlib
+import io
 import json
 import os
 import struct
@@ -267,6 +269,35 @@ class ShellTest(Folder):
                 self.assertTrue(result.text.startswith(f"exit {code} in "), result.text)
                 self.assertEqual(result.ok, code == 0, result.text)
 
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_a_process_left_running_in_the_background_is_said_to_the_model_and_the_user(self):
+        """A user's log (0.2.8): nohup blender -b ... & returned at once, and a 4K render ran on for 14 h out of
+        Loopcut's sight and Stop while the user asked how far it was."""
+        import re
+        import signal
+        result = self.then(workspace.shell("nohup sleep 5 > /dev/null 2>&1 & echo started", summary="Render it"))
+        self.assertTrue(result.ok, result.text)
+        group = int(re.search(r"process group (\d+)", result.model_note).group(1))
+
+        def stop():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(stop)
+        self.addCleanup(workspace._LEFT.clear)
+        self.assertNotIn("process group", result.text, "the card shows the command's own output")
+        self.assertEqual(result.notice, "Still running in the background: Render it. It's in Background jobs, where "
+                                        "you can stop it. Quitting Blender stops it.")
+        self.assertIn("Background jobs", result.model_note)
+        workspace._LEFT.clear()
+        plain = self.then(workspace.shell("sleep 0.1; echo done"))
+        self.assertEqual((plain.notice, plain.model_note), ("", ""), "a command that finished leaves nothing")
+        # A helper that exits a moment after the shell did is not left running (workspace.LEFT_GRACE).
+        brief = self.then(workspace.shell("(sleep 0.1; true) & echo done"))
+        self.assertEqual((brief.notice, brief.model_note), ("", ""), "gone a moment later")
+        self.assertEqual(workspace.left_rows(), [], "no row for either")
+
     @unittest.skipIf(os.name == "nt", "POSIX shell glob expansion")
     def test_unmatched_glob_does_not_hide_matching_files(self):
         (self.ws / "matched.txt").write_text("match")
@@ -318,6 +349,236 @@ class ShellTest(Folder):
                               ({"command": "ls", "timeout": "soon"}, "number")):
             with self.assertRaisesRegex(tools.ToolError, words):
                 workspace.shell(**kwargs)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX process groups; Windows would need job objects")
+class LeftRunningTest(Folder):
+    """Owner, 2026-10-26: a ChatGPT-plan user's agent left a 15-hour render running from a shell command, with no
+    view and no Stop. Such a group is tracked: a row in Background jobs with Stop, stopped when Blender quits, named
+    in the conversation's next requests. Only processes these tests started are signalled, by their own group."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(workspace._LEFT.clear)
+
+    def own_group(self, pid: int) -> None:
+        """Kill a group this test made, by its number, when the test ends."""
+        import signal
+
+        def kill():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        self.addCleanup(kill)
+
+    def unrelated(self) -> subprocess.Popen:
+        other = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(other.wait)  # After the kill below: cleanups run last first.
+        self.own_group(other.pid)
+        return other
+
+    def leave(self, summary="Render it") -> tuple[dict, int]:
+        import re
+        result = self.then(workspace.shell("nohup sleep 60 > /dev/null 2>&1 & echo started", summary=summary))
+        group = int(re.search(r"process group (\d+)", result.model_note).group(1))
+        self.own_group(group)
+        return result, group
+
+    @staticmethod
+    def gone(group: int) -> bool:
+        """No member left (macOS can say EPERM for a moment while the last one exits)."""
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        return False
+
+    def until(self, check, seconds=6.0) -> bool:
+        import time
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if check():
+                return True
+            time.sleep(0.05)
+        return check()
+
+    def test_a_group_left_running_is_a_row_with_its_time_and_its_stop_ends_exactly_that_group(self):
+        other = self.unrelated()
+        result, group = self.leave()
+        self.assertEqual(result.notice, "Still running in the background: Render it. It's in Background jobs, where "
+                                        "you can stop it. Quitting Blender stops it.")
+        [row] = workspace.left_rows()
+        self.assertEqual({k: row[k] for k in ("label", "group", "state")},
+                         {"label": "Render it", "group": group, "state": "running"})
+        self.assertGreaterEqual(row["elapsed"], workspace.LEFT_GRACE, "counted from the command's start")
+        json.dumps(row)  # UI snapshots contain only plain data.
+        self.assertFalse(workspace.poll_left(), "still running: nothing changed")
+        self.assertTrue(workspace.stop_left(row["id"]))
+        self.assertTrue(self.until(lambda: workspace.poll_left() or workspace.left_rows()[0]["state"] == "stopped"))
+        self.assertEqual(workspace.left_rows()[0]["state"], "stopped")
+        self.assertTrue(self.until(lambda: self.gone(group)))
+        self.assertIsNone(other.poll(), "a process in another group runs on")
+        self.assertFalse(workspace.stop_left(row["id"]), "stopped already")
+
+    def test_a_stop_that_sigterm_does_not_end_gets_sigkill_after_the_grace(self):
+        import re
+        result = self.then(workspace.shell("nohup sh -c 'trap \"\" TERM; while :; do sleep 1; done' > /dev/null 2>&1 &"
+                                           " echo started", summary="Stubborn"))
+        group = int(re.search(r"process group (\d+)", result.model_note).group(1))
+        self.own_group(group)
+        [row] = workspace.left_rows()
+        with mock.patch.object(workspace, "KILL_GRACE", 0.3):
+            self.assertTrue(workspace.stop_left(row["id"]))
+            self.assertTrue(self.until(lambda: (workspace.poll_left(), workspace.left_rows()[0]["state"])[1]
+                                       == "stopped"))
+        self.assertTrue(self.until(lambda: self.gone(group)))
+
+    def test_a_recorded_group_whose_member_changed_is_never_signalled(self):
+        """A group's number is used again once it ended: Stop, the poll and quit check it is still the one seen."""
+        import time
+        other = self.unrelated()
+        entry = workspace.track_left(other.pid, "Render it", self.session["id"], time.time())
+        self.assertIsNotNone(entry)
+        # As if the recorded group ended and its number now leads another one: same pid, another start time.
+        entry["members"] = {other.pid: 0}
+        self.assertFalse(workspace.stop_left(entry["id"]))
+        self.assertEqual(entry["state"], "finished", "not ours any more: ended, its row with it")
+        entry.update(state="running", ended=None, checked=0.0)
+        workspace.poll_left()
+        self.assertEqual(entry["state"], "finished")
+        entry.update(state="running", ended=None)
+        workspace.stop_all_left(grace=0.2)
+        time.sleep(0.2)
+        self.assertIsNone(other.poll(), "never signalled")
+
+    def test_a_ps_that_could_not_run_decides_nothing(self):
+        """Review, 2026-10-26: one failed ps (a fork failure, a timeout under memory pressure) read as "the group was
+        reused" ended a running row: Stop gone, the quit no longer stopping it, the model told it ended."""
+        import time
+        _, group = self.leave()
+        [row] = workspace.left_rows()
+        entry = workspace._LEFT[row["id"]]
+        real, sent = os.killpg, []
+
+        def killpg(number, sig):  # Signal 0 is the liveness check; anything else is recorded, never delivered.
+            if sig:
+                sent.append((number, sig))
+            else:
+                real(number, sig)
+
+        def cannot_fork(*args, **kwargs):
+            raise OSError(35, "Resource temporarily unavailable")
+
+        def failed(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="ps: failed")
+        with mock.patch.object(workspace.os, "killpg", killpg):
+            for ps in (cannot_fork, failed):
+                with self.subTest(ps=ps.__name__), mock.patch.object(workspace.subprocess, "run", ps):
+                    entry["checked"] = 0.0
+                    workspace.poll_left()
+                    self.assertEqual(entry["state"], "running", "the check is asked again, not decided")
+                    self.assertIsNone(workspace.stop_left(row["id"]), "the row's Stop says it couldn't check")
+                    self.assertEqual(entry["state"], "running")
+                    entry.update(state="stopping", term=time.monotonic() - workspace.KILL_GRACE)
+                    workspace.poll_left()
+                    self.assertEqual(entry["state"], "stopping", "its SIGKILL is tried again after the grace")
+                    entry.update(state="running", term=None)
+            self.assertEqual(sent, [], "nothing signalled")
+            self.assertEqual(workspace.ended_notes(self.session["id"]), [], "the model is not told it ended")
+        self.assertTrue(workspace.stop_left(row["id"]), "ps working again, its Stop works")
+        self.assertTrue(self.until(lambda: self.gone(group)))
+
+    def test_start_times_are_read_in_utc_so_a_time_zone_change_does_not_move_them(self):
+        """Review, 2026-10-26: ps prints start times in local time; after a time zone change the same process read
+        as another, and its row ended."""
+        with mock.patch.dict(os.environ, {"TZ": "Asia/Tokyo"}):
+            _, group = self.leave()
+        [row] = workspace.left_rows()
+        with mock.patch.dict(os.environ, {"TZ": "America/Chicago"}):
+            self.assertTrue(workspace._ours(workspace._LEFT[row["id"]]))
+
+    def test_linux_start_times_may_read_a_second_apart(self):
+        recorded = {4242: 1_000}
+        for slack, seen, same in ((1, 1_001, True), (1, 999, True), (1, 1_002, False), (0, 1_001, False)):
+            with self.subTest(slack=slack, seen=seen), mock.patch.object(workspace, "START_SLACK", slack):
+                self.assertEqual(workspace._same({4242: seen}, recorded), same)
+        self.assertFalse(workspace._same({4343: 1_000}, recorded), "another pid")
+
+    @staticmethod
+    @contextlib.contextmanager
+    def lifecycle():
+        """A fresh lifecycle on stand-in handlers: one another test imported is bound to its own stand-in bpy."""
+        import importlib
+        import loopcut
+        handlers = types.SimpleNamespace(load_post=[], save_pre=[], save_post=[], render_complete=[], undo_post=[],
+                                         redo_post=[], exit_pre=[], persistent=lambda fn: fn)
+        bpy = types.ModuleType("bpy")
+        bpy.app = types.SimpleNamespace(handlers=handlers, driver_namespace={})
+        with mock.patch.dict(sys.modules, {"bpy": bpy, "bpy.app": bpy.app, "bpy.app.handlers": handlers}), \
+                mock.patch.object(loopcut, "lifecycle", None, create=True):
+            sys.modules.pop("loopcut.lifecycle", None)
+            yield importlib.import_module("loopcut.lifecycle"), handlers
+
+    def test_the_jobs_timer_goes_on_when_a_step_raises(self):
+        """Review, 2026-10-26: an OSError listing jobs ended the one-second timer for good, and with it the rows'
+        polling and a Stop's SIGKILL."""
+        import loopcut
+        import loopcut.ui
+        calls = []
+
+        def step(name, error=None):
+            def run():
+                calls.append(name)
+                if error:
+                    raise error
+            return run
+        for failing in ("refresh_ui", "poll_left", "tag_redraw_all"):
+            with self.subTest(failing=failing):
+                calls.clear()
+                jobs = types.SimpleNamespace(refresh_ui=step("refresh_ui", OSError(5, "I/O error")
+                                                             if failing == "refresh_ui" else None))
+                host = types.SimpleNamespace(tag_redraw_all=step("tag_redraw_all", RuntimeError("redraw")
+                                                                 if failing == "tag_redraw_all" else None))
+                with self.lifecycle() as (lifecycle, _), \
+                        mock.patch.dict(sys.modules, {"loopcut.job_tools": jobs, "loopcut.ui.host": host}), \
+                        mock.patch.object(loopcut, "job_tools", jobs, create=True), \
+                        mock.patch.object(loopcut.ui, "host", host, create=True), \
+                        mock.patch.object(workspace, "poll_left", step("poll_left", OSError(35, "no fork")
+                                                                       if failing == "poll_left" else None)), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(lifecycle._poll_jobs(), 1.0, "still registered")
+                self.assertEqual(calls, ["refresh_ui", "poll_left", "tag_redraw_all"], "the others still ran")
+
+    def test_quitting_blender_stops_every_tracked_group(self):
+        _, first = self.leave("Render it")
+        _, second = self.leave("Bake it")
+        self.assertEqual(len(workspace.left_rows()), 2)
+        with self.lifecycle() as (lifecycle, handlers):
+            [on_exit] = [fn for registry, fn in lifecycle._handlers() if registry is handlers.exit_pre]
+        on_exit(True)
+        for group in (first, second):
+            self.assertTrue(self.until(lambda: self.gone(group)))
+        self.assertEqual({row["state"] for row in workspace.left_rows()}, {"stopped"})
+
+    def test_the_next_requests_name_a_group_running_then_ended_once(self):
+        import signal
+        _, group = self.leave()
+        [running] = workspace.running_notes(self.session["id"])
+        self.assertRegex(running, rf"^running now in the background: Render it \(process group {group}\), for \d+s; "
+                                  r"it is in the user's Background jobs, where they can stop it\.$")
+        self.assertEqual(workspace.running_notes("another chat"), [])
+        self.assertEqual(workspace.ended_notes(self.session["id"]), [], "nothing ended yet")
+        os.killpg(group, signal.SIGKILL)  # It ends on its own, as far as Loopcut knows.
+        self.assertTrue(self.until(lambda: workspace.poll_left()))
+        self.assertEqual(workspace.running_notes(self.session["id"]), [])
+        [ended] = workspace.ended_notes(self.session["id"])
+        self.assertRegex(ended, rf"^since your last turn: the background process Render it \(process group {group}\) "
+                                r"ended after \d+s; it ended on its own \(exit code unknown")
+        self.assertEqual(workspace.ended_notes(self.session["id"]), [], "said once")
+        self.assertEqual(workspace.left_rows(), [], "its row goes with it")
 
 
 class WindowsShellTest(unittest.TestCase):
@@ -521,7 +782,7 @@ class RunBlenderTest(Folder):
         self.assertIn("-b --factory-startup --python-exit-code 1 --python", result.text)
         self.assertIn(f'--python-exit-code 1 --python {workspace.SHAPE_KEY_GUARD} '
                       f'--python {workspace.OP_NOTES} --python {workspace.RENDER_PATH_GUARD} '
-                      f'--python {self.ws / "build.py"} -- --final', result.text)
+                      f'--python {workspace.RENDER_TIMING} --python {self.ws / "build.py"} -- --final', result.text)
         self.assertIn("-- --final", result.text)
         self.assertNotIn("Wrote:", result.text, "nothing was written")
         self.assertEqual(len(list((self.ws / "logs").glob("*-build.log"))), 1)
@@ -542,6 +803,7 @@ class RunBlenderTest(Folder):
                                                "--python", str(workspace.SHAPE_KEY_GUARD),
                                                "--python", str(workspace.OP_NOTES),
                                                "--python", str(workspace.RENDER_PATH_GUARD),
+                                               "--python", str(workspace.RENDER_TIMING),
                                                "--python", str(self.ws / "build.py"), "--"])
                     log.write_text(output)
                     return 0, 0.1, False

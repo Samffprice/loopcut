@@ -37,3 +37,12 @@ def require(*parts):
             raise FileNotFoundError(REASON + (f" ({'/'.join(parts)})" if parts else ""))
         raise unittest.SkipTest(REASON + (f" ({'/'.join(parts)})" if parts else ""))
     return path
+
+
+def live_tool(name, **changes):
+    """A tool's descriptor as the contract records it (fixtures/tool-descriptor), live and available as the mock
+    serves a --live-tools tool to a funded account: its cost is the recorded catalog's."""
+    import json
+    descriptor = json.loads(require("fixtures", "tool-descriptor", f"{name}.json").read_text())
+    descriptor.update(status="live", available=True, unavailable_reason=None, **changes)
+    return descriptor

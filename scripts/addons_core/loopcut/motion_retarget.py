@@ -212,6 +212,10 @@ SOMA_EXTRA = ("Jaw", "LeftEye", "RightEye")  # Animated on SOMA's own skeleton o
 
 RIG_LABELS = {"soma": "SOMA skeleton", "mixamo": "Mixamo", "rigify": "Rigify", "rigify_metarig": "Rigify metarig",
               "auto_rig_pro": "Auto-Rig Pro", "unreal": "Unreal mannequin", "generic": "humanoid matched by bone names"}
+# The user's own rig in the applied motion's first sentence (R14).
+RIG_SAID = {"soma": "a SOMA skeleton", "mixamo": "a Mixamo rig", "rigify": "a Rigify rig",
+            "rigify_metarig": "a Rigify metarig", "auto_rig_pro": "an Auto-Rig Pro rig",
+            "unreal": "an Unreal mannequin", "generic": "matched by its bone names"}
 
 
 class Rig:
@@ -915,8 +919,12 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     if in_place:  # Keep the sway, drop the travel: subtract a one-second moving average of the path.
         trend = smooth(src_pelvis, round(fps_scene))
         travel = [(p[0] - t[0], p[1] - t[1], p[2]) for p, t in zip(src_pelvis, trend)]
-    # How far the hips get from where they start, in scene units (ar-beginner-2's walk left the view at 5.5 m).
+    # How far the hips get from where they start, in scene units (ar-beginner-2's walk left the view at 5.5 m), and
+    # where they end up against the way the character faces (R7-B2: "walks 6.4 m forward").
     reach = max((((p[0] - travel[0][0]) ** 2 + (p[1] - travel[0][1]) ** 2) ** .5 for p in travel), default=0.) * k
+    moved = psi @ Vector((travel[-1][0] - travel[0][0], travel[-1][1] - travel[0][1], 0.)) * k
+    facing = body_frame(current[tb["hips"]], current[tb["head"]], current[tb["upperarm_l"]],
+                        current[tb["upperarm_r"]]).col[2]
 
     # Bones whose pose the chain math assumes: the mapped ones, the travel bone and their ancestors.
     needed = set(pairs) | {root}
@@ -972,7 +980,8 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
         # hinges sent Snow's hips 2 km): an axis it does not carry is never pushed, and each frame's location
         # stays within two leg lengths of the chain math's.
         gain = travel_gain(_travel_response(ob, root, pelvis_bones)) if evaluate else (1.0, 1.0, 1.0)
-        reach = 2 * _leg_length({b.name: b.head_local for b in bones}, legs_t)
+        # R7-B2: this limit once had the travel's name, so results gave 2 leg lengths as the travel (1.6 m of 6.4).
+        limit = 2 * _leg_length({b.name: b.head_local for b in bones}, legs_t)
         for f, pose in enumerate(poses):
             arm, desired = {}, {}
             for n in order:
@@ -1000,12 +1009,14 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
                 solved, loc = _solve(ob, mapped_order, desired, start, start_loc, root, pelvis_bones, want, gain)
                 for n in targets:
                     rotations[n][-1] = solved[n]
-                if (loc - guess).length > reach:
+                if (loc - guess).length > limit:
                     loc, clamped = guess.copy(), clamped + 1
                 locations[-1] = loc
     finally:
         for modifier in muted:
             modifier.show_viewport = True
+    if not any(gain) or bones[root].use_connect:
+        reach, moved = 0., Vector()  # Its travel is lost (warned).
     if not any(gain):
         warnings.append(f"moving {root} does not move the hips, so the character stays where it stands")
     elif not all(gain):
@@ -1040,7 +1051,8 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
                         "the deforming bones (a limb left in IK mode?)")
     return {"action": action, "frames": (frames[0], frames[-1]), "count": len(frames), "fps": fps_scene,
             "mapped": len(pairs), "stashed": stashed, "warnings": warnings, "scale": k, "evaluated": evaluate,
-            "relaxed": len(relaxed), "kept": len(kept), "travel": reach}
+            "relaxed": len(relaxed), "kept": len(kept), "travel": reach, "moved": (moved.x, moved.y),
+            "facing": (facing.x, facing.y)}
 
 
 def _rotation_values(mats, mode):
@@ -1472,14 +1484,74 @@ def read_meta(text):
     return out
 
 
-def travel_note(metres):
-    """How far the root goes and how to keep it in view, past TRAVEL_NOTE metres: ar-beginner-2's character walked
-    5.5 m out of view, and from the front he "just gets bigger"."""
-    if metres < TRAVEL_NOTE:
-        return ""
-    # R6-D3/B2: told to "follow it", the model made a camera and told the user to press Numpad 0.
-    return (f"it travels {metres:.1f} m from where it starts; character_rig show (free) sets up the user's view to "
-            "follow it")
+def way(moved, facing):
+    """'forward', 'backward', 'to its left' or 'to its right': where the root ends up, against the way the character
+    faced at the start (both (x, y) in the world); '' when either is too short to tell."""
+    if math.hypot(*moved) < 1e-6 or math.hypot(*facing) < 1e-6:
+        return ''
+    angle = math.degrees(math.atan2(facing[0] * moved[1] - facing[1] * moved[0], facing[0] * moved[0]
+                                    + facing[1] * moved[1]))
+    return 'forward' if abs(angle) <= 45 else 'backward' if abs(angle) >= 135 else \
+        'to its left' if angle > 0 else 'to its right'
+
+
+def travel_note(metres, direction='', reach=None):
+    """How far the root goes and which way, past TRAVEL_NOTE metres: ar-beginner-2's character walked 5.5 m out of
+    view, and from the front he "just gets bigger". metres: where it ends up; reach: the farthest it gets."""
+    if metres >= TRAVEL_NOTE:
+        return f"it moves {metres:.1f} m{' ' + direction if direction else ''} from where it starts"
+    if reach is not None and reach >= TRAVEL_NOTE:
+        return f"it moves up to {reach:.1f} m from where it starts and ends near it"
+    return ""
+
+
+# R7-B2: Fast repeats this result to the user word for word ("root motion in world", "resampled from 30", "Mixamo,
+# 22 bones mapped"); every sentence is one a user can read, and none is only for the model. The service's motion.json
+# warning codes (workers/motion/README.md) in words; '' drops one another sentence already says.
+WARNINGS = {
+    "fingers_static": "",
+    "resampled_from_": "",
+    "downscaled_to_": "",
+    "prompt_split_into_": "the prompt was made as {n} parts, one after another",
+    "person_not_visible_in_all_frames": "the person is not in every frame of the video, so those frames are guessed",
+    "multiple_people_tracked_largest": "the video shows more than one person; it follows the largest",
+    "body_partly_visible": "part of the body is outside the video, so that part is guessed",
+}
+FREE_EXTRAS = ("Free on this rig: a wave, point or raised arm over this motion (character_rig gesture), and a side "
+               "camera that follows it (character_rig show)")
+
+
+def plain_warning(text):
+    """A motion.json warning in words: its code's sentence, else the text as it came."""
+    for code, words in WARNINGS.items():
+        if text == code or code.endswith("_") and text.startswith(code):
+            n = re.search(r"\d+", text)
+            return words.format(n=n.group() if n else "several")
+    return text
+
+
+def result_text(action, where, first, last, seconds, fps, *, travel="", in_place=False, stashed=None, scene_set=False,
+                outside=None, fingers="", warnings=(), extras=False):
+    """The applied motion in sentences (R7-B2), without a final full stop (cloud_jobs.result_summary adds one).
+    where: "on 'Character Rig'"; outside: the scene's (start, end) when part of the motion plays outside it."""
+    sentences = [f"Motion '{action}' now plays {where} over frames {first}–{last} ({seconds:.1f} s at {fps:g} fps)"]
+    sentences.append(travel[:1].upper() + travel[1:] if travel else
+                     "It stays on the spot" if in_place else "It stays within 1 m of where it starts")
+    if stashed:
+        sentences.append(f"It replaces the earlier motion '{stashed}', which is kept, switched off, in the "
+                         "Nonlinear Animation editor")
+    if scene_set:
+        sentences.append(f"The scene now plays frames {first}–{last}")
+    elif outside:
+        sentences.append(f"The scene plays frames {outside[0]}–{outside[1]}, so part of this motion is outside it")
+    if fingers:
+        sentences.append(fingers)
+    for w in warnings:
+        if w:  # A warning may start with a bone's name ("mixamorig:Hips is connected…"), which keeps its case.
+            sentences.append(w[:1].upper() + w[1:] if w.split(" ", 1)[0].isalpha() else w)
+    if extras:
+        sentences.append(FREE_EXTRAS)
+    return ". ".join(s.rstrip(". ") for s in sentences)
 
 
 def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_start=None, scene=None):
@@ -1513,30 +1585,27 @@ def apply(bvh_text, meta, *, target=None, title="motion", in_place=False, frame_
         scene.frame_start, scene.frame_end = first, last
     scene.frame_set(scene.frame_current)
     seconds = (report["count"] - 1) / report["fps"] if report["count"] > 1 else 0.0
-    rate = f"{report['fps']:g} fps"
-    if abs(report["fps"] - bvh.fps) > 1e-3:
-        rate += f", resampled from {bvh.fps:g}"
-    where = (f"on a new skeleton '{target.name}' with a simple body '{created.name}' (no armature was targeted)"
-             if created else f"on '{target.name}' ({rig.label}, {report['mapped']} bones mapped)")
-    notes = []
-    if report["stashed"]:
-        notes.append(f"its previous action '{report['stashed']}' is kept in a muted NLA track")
-    if empty:
-        notes.append(f"scene frame range set to {first}–{last}")
+    from . import autorig, rig_experimental
+    ours = created is None and autorig._KEY in target
+    # The user's own rig is named by its kind ("a Mixamo rig"); a Loopcut rig's Mixamo bone names are not news.
+    where = (f"on a new skeleton '{target.name}' with a simple body '{created.name}', because no rig was chosen"
+             if created else f"on '{target.name}'" if ours else
+             f"on '{target.name}' ({RIG_SAID.get(rig.kind, rig.label)})")
     n = report["kept"]
     kept = f"keys already on {n} finger bone{'s' if n != 1 else ''} were left as they are" if n else ""
+    hands = ""
     if report["relaxed"]:
-        notes.append("fingers set to a relaxed pose; the model doesn't animate fingers"
-                     + (f" ({kept})" if kept else ""))
+        hands = "Its fingers hold a relaxed pose; this motion does not move them" + (f" ({kept})" if kept else "")
     elif fingers is False:
-        notes.append("fingers not animated by this model" + (f"; {kept}" if kept else ""))
-    notes += meta.get("warnings", [])[:5]
-    notes += report["warnings"][:5]
-    line = (f"Motion '{report['action'].name}' {where}: frames {first}–{last} at {rate} ({seconds:.1f} s), "
-            f"root motion {'in place' if in_place else 'in world'}")
-    travel = "" if in_place else travel_note(report.get("travel", 0.) * (scene.unit_settings.scale_length or 1.))
-    if travel:
-        notes.insert(0, travel)
-    if notes:
-        notes[0] = notes[0][:1].upper() + notes[0][1:]
-    return line + (". " + "; ".join(notes) if notes else "")
+        hands = "This motion does not move the fingers" + (f"; {kept}" if kept else "")
+    unit = scene.unit_settings.scale_length or 1.
+    moved = math.hypot(*report.get("moved", (0., 0.))) * unit
+    travel = "" if in_place else travel_note(moved, way(report.get("moved", (0., 0.)), report.get("facing", (0., 0.))),
+                                             report.get("travel", 0.) * unit)
+    outside = (scene.frame_start, scene.frame_end) if not empty and (first < scene.frame_start
+                                                                      or last > scene.frame_end) else None
+    extras = ours and not rig_experimental.marked(target)
+    return result_text(report["action"].name, where, first, last, seconds, report["fps"], travel=travel,
+                       in_place=in_place, stashed=report["stashed"], scene_set=empty, outside=outside, fingers=hands,
+                       warnings=[plain_warning(w) for w in meta.get("warnings", [])[:5]] + report["warnings"][:5],
+                       extras=extras)

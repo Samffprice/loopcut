@@ -1085,7 +1085,8 @@ def _items_outcome(items: list) -> str:
     users = [index for index, item in enumerate(items) if isinstance(item, dict) and item.get("kind") == "user"]
     last_user = users[-1] if users else -1
     tail = [item for item in items[last_user + 1:] if isinstance(item, dict)]
-    errors = [item for item in tail if item.get("kind") in ("error", "limit")]
+    from .chat_credits import is_tool  # A paid tool's refusal (0.2.19) is no end of the turn.
+    errors = [item for item in tail if item.get("kind") in ("error", "limit") and not is_tool(item)]
     if errors:
         from .conversations import CLOSED_MESSAGE
         return "cancelled" if errors[-1].get("text") in ("Stopped.", CLOSED_MESSAGE) else "error"

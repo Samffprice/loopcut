@@ -3,6 +3,7 @@
     python3 -m unittest discover -s tests -v
 """
 
+import ast
 import dataclasses
 import io
 import json
@@ -134,6 +135,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def panel_input(frame: dict, key: str = "ESC"):
+    """ui/host.py's handling of `key` (Esc, or RET for Enter) and of a click, over `frame`, the panel's last drawn
+    display. host.py imports Blender's gpu and draw modules, so only these functions run here, on the real agent and
+    state."""
+    source = Path(__file__).resolve().parents[2] / "scripts" / "addons_core" / "loopcut" / "ui" / "host.py"
+    tree = ast.parse(source.read_text())
+    nodes = [n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef)
+             and n.name in {"_key", "_drawn_cards", "_shown_card", "_scroll_to_waiting", "_do_action"}]
+    namespace = {"agent": agent, "state": state, "layout": layout, "sys": sys, "_displays": {1: frame},
+                 "_update_mentions": lambda session: None}  # The @-mention list: Blender's names.
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    panel = types.SimpleNamespace(area_pointer=1)
+    press = types.SimpleNamespace(type=key, shift=False, oskey=False, ctrl=False, alt=False, unicode="")
+    return (lambda session: namespace["_key"](panel, None, session, press),
+            lambda session, x, y: namespace["_do_action"](session, layout.hit_at(frame, x, y)["action"],
+                                                          layout.hit_at(frame, x, y).get("card")))
 
 
 class AgentLoopTest(unittest.TestCase):
@@ -274,6 +294,206 @@ class AgentLoopTest(unittest.TestCase):
                 self.session["turn"].thread.join(5)
         self.assertEqual([r["_headers"].get("x-loopcut-try-it") for r in SCRIPT.requests], ["motion", None])
         self.assertEqual({r["_headers"].get("x-loopcut-conversation") for r in SCRIPT.requests}, {self.session["id"]})
+
+    def test_a_picture_chips_request_waits_for_a_picture(self):
+        """A user's log (0.2.12): the trial card's Picture to 3D chip was sent with nothing attached, and the model
+        passed one of Loopcut's chat previews to image_to_3d. The request waits in the input until a picture is."""
+        from loopcut import nudges
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        request = nudges.TRIAL_CHIPS["image_to_3d"][1]
+        self.assertFalse(agent.send(request))
+        self.assertEqual(self.session["items"][-1]["kind"], "notice")
+        self.assertIn("Attach a picture first", self.session["items"][-1]["text"])
+        self.assertFalse(self.session["busy"])
+        self.assertEqual(self.session["messages"], [])
+        # A picture from an earlier turn, here a Try it card's sample photo, is not the one the chip means: the model
+        # took the sample for the user's own picture (2026-10-25).
+        self.session["references"] = [{"ref": "r1", "name": "dwarf-warrior.jpg", "pinned": True}]
+        self.assertFalse(agent.send(request))
+        self.assertIn("Attach a picture first", self.session["items"][-1]["text"])
+        from loopcut import conversations
+        picture = Path(self.data_dir.name) / "cat.png"
+        picture.write_bytes(b"\x89PNG cat")
+        stored = conversations.store_image(self.session, picture)
+        self.session["attachments"] = [{"ref": stored, "full": stored, "name": "cat.png"}]
+        SCRIPT.replies += [text_reply("A grey cat sitting."), text_reply("Which part should I model?")]
+        self.assertTrue(agent.send(request))
+        self.session["turn"].thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 2, "the picture's card, then the request")
+
+    def catalog_runtime(self):
+        """A signed-in catalog from the contract mock, image_generate and image_to_3d live: its recorded
+        descriptors price them at 6 and 80 credits."""
+        from loopcut import cloud, cloud_http
+        from mock_service import MockService
+        service = MockService("--live-tools", "image_generate,image_to_3d")
+        client = cloud_http.Client(base_url=service.url, api_key=service.key, transport=service.transport,
+                                   client_headers=cloud_http.contract_headers())
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        runtime = cloud.Runtime(client, cache.name, signed_in=True)
+        self.assertTrue(runtime.refresh())
+        return runtime
+
+    def test_a_picture_chips_ask_offers_to_make_one_at_the_catalogs_prices(self):
+        """Owner, 2026-10-25: with no picture, the Picture to 3D chip's ask also says Loopcut can make one first, with
+        both steps' prices from the catalog (the contract mock serves its recorded descriptors: 6 and 80 credits)."""
+        from loopcut import cloud, nudges
+        runtime = self.catalog_runtime()
+        with mock.patch.object(cloud, "_runtime", runtime):
+            self.assertFalse(agent.send(nudges.TRIAL_CHIPS["image_to_3d"][1]))
+            self.assertEqual(self.session["items"][-1]["text"], (
+                "Attach a picture first: drop it on the panel or pick it from +. No picture? Describe it and Loopcut "
+                "makes one first: about 6 credits ($0.06) for the picture, then about 80 credits ($0.80) for the 3D "
+                "model."))
+            self.assertFalse(agent.send(nudges.TRIAL_CHIPS["motion_from_video"][1]))
+            self.assertEqual(self.session["items"][-1]["text"],
+                             "Attach a video clip first: drop it on the panel or pick it from +.", "a clip is not made")
+            runtime.policy = {"no_generation": True}
+            self.assertFalse(agent.send(nudges.TRIAL_CHIPS["image_to_3d"][1]))
+            self.assertEqual(self.session["items"][-1]["text"],
+                             "Attach a picture first: drop it on the panel or pick it from +.", "none can be made")
+        self.assertEqual(self.session["messages"], [])
+        self.assertFalse(self.session["busy"])
+
+    def test_a_made_pictures_card_gets_its_turn_it_into_3d_button_and_the_model_the_plain_line(self):
+        """Owner, 2026-10-26: image_generate's picture card has "Turn it into 3D", priced from the catalog (80), and the
+        model's result says so in plain words; the card's output does not. The model's own image_to_3d on that
+        picture marks the button done."""
+        from loopcut import cloud
+        name = "Loopcut job_1 image"
+        text = f"Added image references: {name}. Job job_1; provenance recorded."
+        row = {"image": name, "job": "job_1", "path": ""}
+        results = iter([tools.ToolResult(text, made_pictures=[row]),
+                        tools.ToolResult("Imported and selected models: Loopcut job_2 model. Job job_2.",
+                                         converted="job_1")])
+        self.session["auto_run"] = True
+        self.run_tool = lambda tool, arguments: next(results)
+        SCRIPT.replies += [tool_reply("loopcut_cloud__image_generate", {"prompt": "a brass lantern"}),
+                           text_reply("Does the picture look right?")]
+        with mock.patch.object(cloud, "_runtime", self.catalog_runtime()):
+            self.start("make a picture of a brass lantern").thread.join(5)
+            card = next(i for i in self.session["items"] if i["kind"] == "tool")
+            self.assertEqual(card["to_3d"], {"pictures": [{**row, "state": "ready"}], "credits": 80})
+            self.assertEqual(SCRIPT.requests[1]["messages"][-1]["content"], text + "\n\n" + cloud.TO_3D_LINE)
+            self.assertNotIn(cloud.TO_3D_LINE, card["output"])
+            SCRIPT.replies += [tool_reply("loopcut_cloud__image_to_3d", {"image": name}), text_reply("Done.")]
+            self.start("yes, turn it into 3D").thread.join(5)
+        self.assertEqual(card["to_3d"]["pictures"], [{**row, "state": "done"}])
+
+    def test_what_the_user_started_from_a_card_reaches_the_model_with_the_next_message(self):
+        """A Turn it into 3D click runs no model call; the model reads what it did with the next message."""
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        line = "since your last turn: the user pressed Turn it into 3D on the picture P; it ran: Imported."
+        self.session["between_turns"] = [line]
+        SCRIPT.replies.append(text_reply("Which part should I change?"))
+        self.assertTrue(agent.send("Make the lantern taller."))
+        self.session["turn"].thread.join(5)
+        self.assertIn(f"\n{line}\n</scene_context>", SCRIPT.requests[0]["messages"][-1]["content"])
+        self.assertEqual(self.session["between_turns"], [], "said once")
+        self.assertEqual(self.session["items"][-2]["text"], "Make the lantern taller.", "the chat shows what was typed")
+
+    def test_a_turns_end_leaves_a_running_click_alone_and_ends_a_clicks_ask(self):
+        """Re-review F1a, 2026-10-26: the end of a turn marked every waiting or running card rejected, a Turn it into
+        3D click's too, whose ask then waited where nobody could answer it. Its running card is left as it is; its
+        ask is answered No, so it ends rejected with the picture ready and nothing submitted."""
+        running_key, asking_key = (self.session["id"], "job_1"), (self.session["id"], "job_2")
+        running = {**state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""), "click": list(running_key)}
+        asking = state.awaiting({**state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""),
+                                 "click": list(asking_key)})
+        self.session["items"] += [running, asking]
+        wait = agent._card_waits[asking_key] = agent._CardWait()
+        self.addCleanup(agent._card_waits.pop, asking_key, None)
+        clicks = mock.patch.dict(state.running_clicks, {running_key: "P1", asking_key: "P2"})
+        clicks.start()
+        self.addCleanup(clicks.stop)
+        SCRIPT.replies.append(text_reply("Which part should I change?"))
+        self.start("hello").thread.join(5)
+        self.assertEqual(running["status"], "running")
+        self.assertTrue(wait.event.is_set())
+        self.assertFalse(wait.approved)
+
+    def test_a_click_still_running_is_said_with_the_next_message(self):
+        """Review, 2026-10-26: a turn started while a Turn it into 3D click runs had the model unaware of it."""
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        running = mock.patch.dict(state.running_clicks, {(self.session["id"], "job_1"): "Loopcut job_1 image",
+                                                         ("another chat", "job_2"): "Loopcut job_2 image"})
+        running.start()
+        self.addCleanup(running.stop)
+        SCRIPT.replies.append(text_reply("Which part should I change?"))
+        self.assertTrue(agent.send("Make the lantern taller."))
+        self.session["turn"].thread.join(5)
+        content = SCRIPT.requests[0]["messages"][-1]["content"]
+        self.assertIn("\nrunning now: the user's Turn it into 3D on the picture Loopcut job_1 image; its model is not "
+                      "in the scene yet.\n</scene_context>", content)
+        self.assertNotIn("job_2", content, "another chat's click")
+
+    def test_what_a_shell_command_left_running_is_named_with_each_request_and_its_end_once(self):
+        """Owner, 2026-10-26: a 15-hour render a shell command left running was out of the model's sight."""
+        from loopcut import workspace
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        entry = {"id": "left1", "group": 4242, "label": "Render it", "conversation": self.session["id"],
+                 "started": time.time() - 125, "state": "running", "ended": None, "members": set(), "checked": 0.0,
+                 "term": None}
+        other = {**entry, "id": "left2", "group": 4343, "label": "Bake it", "conversation": "another chat"}
+        tracked = mock.patch.dict(workspace._LEFT, {"left1": entry, "left2": other}, clear=True)
+        tracked.start()
+        self.addCleanup(tracked.stop)
+        SCRIPT.replies += [text_reply("It is still rendering."), text_reply("It finished."), text_reply("Hi.")]
+        self.assertTrue(agent.send("How far is the render?"))
+        self.session["turn"].thread.join(5)
+        content = SCRIPT.requests[0]["messages"][-1]["content"]
+        self.assertRegex(content, r"\nrunning now in the background: Render it \(process group 4242\), for 2m 0\ds; it is "
+                                  r"in the user's Background jobs, where they can stop it\.\n</scene_context>")
+        self.assertNotIn("Bake it", content, "another chat's")
+        entry.update(state="finished", ended=entry["started"] + 54_125)
+        self.assertTrue(agent.send("And now?"))
+        self.session["turn"].thread.join(5)
+        content = SCRIPT.requests[1]["messages"][-1]["content"]
+        self.assertIn("\nsince your last turn: the background process Render it (process group 4242) ended after 15h 02m; "
+                      "it ended on its own (exit code unknown: it was not Loopcut's child).\n", content)
+        self.assertNotIn("running now in the background", content)
+        self.assertEqual(list(workspace._LEFT), ["left2"], "said once: its row goes")
+        self.assertTrue(agent.send("Thanks."))
+        self.session["turn"].thread.join(5)
+        self.assertNotIn("Render it", SCRIPT.requests[2]["messages"][-1]["content"])
+
+    def test_the_no_picture_chips_request_goes_without_a_picture_as_if_typed(self):
+        """The trial card's No picture? chip (owner, 2026-10-25) asks for no file of the user's: its request, with the
+        thing named, is sent at once and as the typed words would be, with nothing of a Try it card's."""
+        from loopcut import nudges
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        request = nudges.MAKE_ONE_CHIP[1].replace(nudges.BLANK, "a brass lantern")
+        self.assertEqual(request, "Make a picture of a brass lantern and turn it into a 3D model.")
+        SCRIPT.replies.append(text_reply("Which style should the lantern have?"))
+        self.assertTrue(agent.send(request))
+        self.session["turn"].thread.join(5)
+        self.assertEqual(len(SCRIPT.requests), 1)
+        self.assertIn(request, json.dumps(SCRIPT.requests[0]["messages"][-1]))
+        self.assertIsNone(SCRIPT.requests[0]["_headers"].get("x-loopcut-try-it"))
+        self.assertFalse([i for i in self.session["items"] if i["kind"] == "notice"], "nothing asked for first")
+
+    def test_a_clip_chips_request_sent_while_its_clip_prepares_waits_for_it_not_for_another(self):
+        """A Motion from video chip sent while the user's clip was still preparing said "Attach a video clip first",
+        and the user might attach it again. It says the clip is still preparing."""
+        from loopcut import nudges, video_attach
+        request = nudges.TRIAL_CHIPS["motion_from_video"][1]
+        with mock.patch.object(video_attach, "preparing", return_value=["take.mp4"]):
+            self.assertFalse(agent.send(request))
+        self.assertEqual(self.session["items"][-1]["text"], "Still preparing take.mp4; send once it is ready.")
+        self.assertEqual(self.session["messages"], [])
+        self.assertEqual(nudges.chip_needs(request, [], [], ["take.mp4"]), "", "the chip opens no file browser either")
+        self.assertEqual(nudges.chip_needs(nudges.TRIAL_CHIPS["image_to_3d"][1], [], [], ["take.mp4"]), "a picture")
 
     def test_the_router_request_of_a_try_it_cards_turn_names_the_card(self):
         from loopcut import router
@@ -524,6 +744,198 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn('Loopcut did not run your Python "x": Cancelled before this ran.',
                       SCRIPT.requests[-1]["messages"][2]["content"])
 
+    def frame(self, items=None, scroll=0.0):
+        """The panel's last frame, drawn from `items` (default: the session's now)."""
+        shown = {**self.session, "items": self.session["items"] if items is None else items, "scroll": scroll}
+        return layout.build(shown, 400, 600, 1.0, LayoutTest.measure, "m")
+
+    def test_esc_stops_the_turn_while_its_waiting_card_is_not_on_screen(self):
+        """rel018-app: Esc while an import card waited that the panel had not drawn yet declined the card, and the
+        turn went on without the user. The card on screen is the one Esc declines; with none, Esc stops the turn."""
+        for case in ("undrawn", "scrolled away"):
+            with self.subTest(case=case):
+                SCRIPT.requests.clear()
+                SCRIPT.replies.append(tool_reply("run_python", {"code": "x", "summary": "Add the armchair"}))
+                turn = self.start("go")
+                self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]),
+                              "approval card")
+                card = next(i for i in self.session["items"] if i.get("status") == "awaiting")
+                if case == "undrawn":  # The pump's redraw had not come yet: the frame before the card.
+                    frame = self.frame([i for i in self.session["items"] if i is not card])
+                else:  # The user scrolled up the history; the card waits below the view.
+                    long = [state.item_assistant() | {"text": "earlier " * 400, "streaming": False}]
+                    frame = self.frame(long + self.session["items"], scroll=10_000.0)
+                self.assertNotIn(("reject", self.session["items"].index(card)),
+                                 [h["action"] for h in frame["hits"]])
+                esc, _ = panel_input(frame)
+                self.assertTrue(esc(self.session))
+                turn.thread.join(5)
+                self.assertFalse(turn.thread.is_alive())
+                self.assertEqual(self.session["items"][-1], state.item_error("Stopped."))
+                self.assertEqual(card["status"], "rejected", "the stopped turn's card does not stay waiting")
+                self.assertFalse(self.session["busy"])
+                self.assertEqual(self.ran, [])
+                self.assertEqual(len(SCRIPT.requests), 1, "the turn did not go on to ask the model again")
+                self.assertEqual(self.session["messages"][-1]["content"], "Cancelled before this ran.")
+
+    def test_esc_declines_the_waiting_card_on_screen_and_the_turn_goes_on(self):
+        SCRIPT.replies += [tool_reply("run_python", {"code": "rm()", "summary": "Delete all"}),
+                           text_reply("OK, what instead?")]
+        turn = self.start("clean up")
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "approval card")
+        card = next(i for i in self.session["items"] if i.get("status") == "awaiting")
+        esc, _ = panel_input(self.frame())
+        self.assertTrue(esc(self.session))
+        turn.thread.join(5)
+        self.assertEqual(card["status"], "rejected")
+        self.assertEqual(self.ran, [])
+        self.assertIn("rejected", SCRIPT.requests[1]["messages"][-1]["content"])
+        self.assertEqual(self.session["items"][-1]["text"], "OK, what instead?")
+
+    def test_a_click_on_the_esc_stop_hint_stops_a_busy_turn(self):
+        """rel018-app, rel018-ja2: people click "esc  stop"; it was only text, so nothing happened."""
+        SCRIPT.replies.append(Trickle(["Still ", "working "] * 40, 0.05))
+        turn = self.start("go")
+        self.wait_for(lambda: self.session["items"][-1].get("text"), "the reply streaming")
+        frame = self.frame()
+        stop = next(h for h in frame["hits"] if h["id"] == "input.stop")
+        _, click = panel_input(frame)
+        click(self.session, stop["x"] + stop["w"] / 2, stop["y"] + stop["h"] / 2)
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(self.session["items"][-1], state.item_error("Stopped."))
+        self.assertFalse(self.session["busy"])
+
+    def test_enter_runs_only_a_waiting_paid_card_the_panel_drew(self):
+        """Esc's rule for Enter too: on an empty input, Enter approved the first waiting card whether or not the panel
+        had drawn it, so a paid step could run on a card the user never saw."""
+        turn = agent.Turn()
+        card = {**state.item_tool("loopcut_cloud__image_generate", "Generate image", ""), "status": "awaiting",
+                "ask": "cost", "ask_lines": ["About 80 credits ($0.80)", "Balance 100 → 20 credits"],
+                "ask_label": "Approve", "paid_approval": True, "cost": "About 80 credits ($0.80)"}
+        self.session["items"] += [state.item_user("make a poster"), card]
+        self.session["busy"], self.session["turn"] = True, turn
+        undrawn = self.frame(self.session["items"][:1])
+        enter, _ = panel_input(undrawn, "RET")
+        self.assertTrue(enter(self.session))
+        self.assertFalse(turn.decided.is_set(), "a paid card the user has not seen is not approved")
+        self.assertEqual(card["status"], "awaiting")
+        self.assertEqual([i["kind"] for i in self.session["items"]], ["user", "tool"], "and nothing was sent")
+        drawn = self.frame()
+        self.assertIn(("approve", 1), [h["action"] for h in drawn["hits"]])
+        enter, _ = panel_input(drawn, "RET")
+        self.assertTrue(enter(self.session))
+        self.assertTrue(turn.decided.is_set() and turn.approved, "the card on screen runs, as before")
+
+    def test_a_frame_drawn_before_the_items_moved_answers_no_card(self):
+        """Review of gate018-ui: a worker's paid ask drawn at k+1; the orchestrator's tool-call-only reply at k is
+        removed (_drop_empty), the worker card moves to k and the turn's own card waits at k+1. Enter, Esc or a
+        click before the next redraw matched the undrawn card by its index."""
+        turn = agent.Turn()
+        reply = state.item_assistant()
+        worker_card = state.awaiting(state.item_tool("loopcut_cloud__image_generate", "chair: Generate image", ""),
+                                     ask="cost", ask_lines=["About 5 credits ($0.05)"], ask_label="Approve",
+                                     paid_approval=True, worker="chair")
+        self.session["items"] += [state.item_user("make a room"), reply, worker_card]
+        self.session["busy"], self.session["turn"] = True, turn
+        stale = self.frame()
+        self.session["items"].remove(reply)
+        own = state.awaiting(state.item_tool("run_python", "Delete everything", "rm()"))
+        self.session["items"].append(own)
+        enter, click = panel_input(stale, "RET")
+        enter(self.session)
+        self.assertFalse(turn.decided.is_set(), "the turn's own card was never drawn")
+        approve = next(h for h in stale["hits"] if h["action"] == ("approve", 2))
+        click(self.session, approve["x"] + 2, approve["y"] + 2)
+        self.assertFalse(turn.decided.is_set(), "a click on the stale frame's Approve neither")
+        self.assertEqual((own["status"], worker_card["status"]), ("awaiting", "awaiting"))
+        esc, _ = panel_input(stale)
+        self.assertFalse(agent.decide(True, index=2, drawn=approve["card"]))
+        self.assertTrue(esc(self.session))
+        self.assertTrue(turn.cancel.is_set(), "with no card on screen, Esc stops the turn")
+
+    def test_a_frame_drawn_during_a_cards_earlier_ask_does_not_answer_its_next_one(self):
+        """A card that asks twice in a row (a limit or burst ask, then the price): the frame of the first ask must
+        not approve the second."""
+        turn = agent.Turn()
+        card = state.awaiting(state.item_tool("loopcut_cloud__image_generate", "Generate image", ""), ask="burst",
+                              ask_lines=["The 6th paid call this turn"], ask_label="Allow", paid_approval=True)
+        self.session["items"] += [state.item_user("make posters"), card]
+        self.session["busy"], self.session["turn"] = True, turn
+        first = self.frame()
+        state.awaiting(card, ask="cost", ask_lines=["About 80 credits ($0.80)"], ask_label="Approve")
+        enter, _ = panel_input(first, "RET")
+        enter(self.session)
+        self.assertFalse(turn.decided.is_set(), "the price was not on screen yet")
+        enter, _ = panel_input(self.frame(), "RET")
+        enter(self.session)
+        self.assertTrue(turn.decided.is_set() and turn.approved)
+
+    def test_enter_runs_the_whole_card_nearest_the_input_not_a_sliver_above_it(self):
+        """Review of gate018-ui: a worker's paid ask with only a sliver of its buttons under the header, its price
+        scrolled away, was approved by Enter instead of the turn's own card, whole, below it."""
+        from loopcut.ui import theme
+        turn = agent.Turn()
+        worker_card = state.awaiting(state.item_tool("loopcut_cloud__image_generate", "chair: Generate image", ""),
+                                     ask="cost", ask_lines=["About 40 credits ($0.40)"], ask_label="Approve",
+                                     paid_approval=True, worker="chair")
+        worker_answer = agent._card_waits[id(worker_card)] = agent._CardWait()
+        self.addCleanup(agent._card_waits.pop, id(worker_card), None)
+        own = state.awaiting(state.item_tool("run_python", "Add a reading lamp", "lamp()"))
+        self.session["items"] += [state.item_user("make a room"), worker_card,
+                                  state.item_assistant() | {"text": "The chair comes next. " * 20, "streaming": False},
+                                  own]
+        self.session["busy"], self.session["turn"] = True, turn
+        top = theme.HEADER_HEIGHT
+        for height in range(200, 1600):
+            sliver = layout.build(self.session, 400, height, 1.0, LayoutTest.measure, "m")
+            row = next((h for h in sliver["hits"] if h["action"] == ("approve", 1)), None)
+            if row and row["y"] < top < row["y"] + row["h"]:
+                break
+        else:
+            self.fail("no panel height shows a sliver of the worker's buttons")
+        enter, _ = panel_input(sliver, "RET")
+        enter(self.session)
+        self.assertFalse(worker_answer.event.is_set(), "a sliver of a card is not a card on screen")
+        self.assertTrue(turn.decided.is_set() and turn.approved, "the card on screen, whole, runs")
+        turn.decided.clear()
+        both = layout.build(self.session, 400, 3000, 1.0, LayoutTest.measure, "m")
+        self.assertEqual([c["index"] for c in both["cards"] if c["shown"]], [3, 1])
+        enter, _ = panel_input(both, "RET")
+        enter(self.session)
+        self.assertFalse(worker_answer.event.is_set())
+        self.assertTrue(turn.decided.is_set(), "with both whole, the one nearest the input")
+
+    def test_enter_scrolls_to_a_waiting_card_out_of_view_and_the_next_enter_runs_it(self):
+        """Review of gate018-ui: Enter with the waiting card out of view did nothing, and the panel looks idle then
+        ("Working" is not drawn while a card waits). Enter brings the card into view without running it."""
+        long = state.item_assistant() | {"text": "Earlier notes. " * 300, "streaming": False}
+        for case in ("below", "above", "undrawn"):
+            with self.subTest(case=case):
+                self.session = state.reset()
+                turn = agent.Turn()
+                own = state.awaiting(state.item_tool("run_python", "Add a reading lamp", "lamp()"))
+                items = [state.item_user("make a room"), long, own] if case != "above" else \
+                    [state.item_user("make a room"), own, long]
+                self.session["items"] += items
+                self.session["busy"], self.session["turn"] = True, turn
+                self.session["scroll"] = 10_000.0 if case != "above" else 0.0  # The user reads up the history.
+                frame = self.frame(self.session["items"][:-1] if case == "undrawn" else None, self.session["scroll"])
+                self.assertFalse(any(c["shown"] for c in frame["cards"]))
+                enter, _ = panel_input(frame, "RET")
+                self.assertTrue(enter(self.session))
+                self.assertFalse(turn.decided.is_set(), "a card the user has not seen is not run")
+                self.assertEqual(own["status"], "awaiting")
+                if case == "undrawn":
+                    self.assertEqual(self.session["scroll"], 0.0, "to the chat's end, where it comes")
+                    continue
+                self.assertNotEqual(self.session["scroll"], 10_000.0 if case == "below" else 0.0)
+                frame = self.frame(scroll=self.session["scroll"])
+                self.assertEqual([c["shown"] for c in frame["cards"]], [True], "the card is in view")
+                enter, _ = panel_input(frame, "RET")
+                enter(self.session)
+                self.assertTrue(turn.decided.is_set() and turn.approved)
+
     def test_stop_during_a_batch_does_not_execute_remaining_calls(self):
         def run_tool(name, arguments):
             self.ran.append((name, arguments))
@@ -652,6 +1064,56 @@ class AgentLoopTest(unittest.TestCase):
                 self.assertEqual(turn.outcome, "completed")
                 self.assertEqual(len(self.ran), 16)
                 self.assertFalse(any(i.get("text") == agent.NO_PROGRESS_NOTICE for i in self.session["items"]))
+
+    def test_four_failed_steps_in_a_row_are_said_and_the_turn_goes_on(self):
+        """A user's log (0.2.14): seven run_python tries in a row failed, each catching its own exception and printing
+        the traceback, and the model never wrote a word; the user saw only finished steps. From the fourth failed step
+        in a row the chat says so, once a streak; a step that works starts the count again."""
+        self.failing_tools(ok=True)
+        run = self.run_tool
+
+        def printed(name, arguments):
+            result = run(name, arguments)
+            if len(self.ran) != 6:  # The sixth try works.
+                result.text = ("{'err': 'Traceback (most recent call last):\\n  File \"<loopcut>\", line 2\\n"
+                               "ModuleNotFoundError: No module named \\'probe\\''}\n\nScene changes: none.")
+            return result
+        self.run_tool = printed
+        SCRIPT.replies[:] = ([tool_reply("run_python", {"code": f"try_{n}()", "summary": "Try"}) for n in range(10)]
+                             + [text_reply("Blocked.")])
+        turn = self.start("build")
+        turn.thread.join(10)
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual(len(self.ran), 10)
+        kinds = [i["kind"] if i.get("text") != agent.STUCK_NOTICE else "stuck" for i in self.session["items"]]
+        self.assertEqual(kinds, ["user"] + ["tool"] * 4 + ["stuck"] + ["tool"] * 6 + ["stuck", "assistant"])
+        self.assertEqual({i["status"] for i in self.session["items"] if i["kind"] == "tool"}, {"done"},
+                         "the cards still say each step ran")
+        self.assertIn("This error has now come up 4 times", self.results()[3], "the model's copy counts them too")
+
+    def test_a_running_steps_card_keeps_when_it_started(self):
+        """The card shows a long step's time (ui.layout._running_time), counted from when it started running."""
+        SCRIPT.replies[:] = [tool_reply("get_scene_info", {}), text_reply("Done.")]
+        seen = []
+
+        def run(name, arguments):
+            card = next(i for i in self.session["items"] if i["kind"] == "tool")
+            seen.append((card["status"], card.get("started_at")))
+            return types.SimpleNamespace(text="ok", ok=True, image_path=None)
+        self.run_tool = run
+        before = time.time()
+        self.start("what is here?").thread.join(5)
+        self.assertEqual(seen[0][0], "running")
+        self.assertGreaterEqual(seen[0][1], before)
+
+    def test_a_tools_notice_for_the_user_follows_its_card(self):
+        """workspace.shell's process left running in the background: the user is told under the step."""
+        SCRIPT.replies[:] = [tool_reply("get_scene_info", {}), text_reply("Rendering.")]
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(
+            text="exit 0 in 0.1 s", ok=True, image_path=None, notice="Still running in the background: Render.")
+        self.start("render it").thread.join(5)
+        kinds = [(i["kind"], i.get("text", "")) for i in self.session["items"]]
+        self.assertEqual(kinds[1:3], [("tool", ""), ("notice", "Still running in the background: Render.")])
 
     def test_no_progress_closes_pending_calls_and_ignores_tools_in_wrap_up(self):
         self.failing_tools()
@@ -2446,6 +2908,40 @@ class AgentLoopTest(unittest.TestCase):
         self.assertNotIn("not described", message["content"][0]["text"], "the card replaces the note")
         self.assertIn('<reference_card images="hero.png">\nA hero in a red cape.', message["content"][0]["text"])
 
+    def test_a_refused_reference_study_is_no_card_and_the_user_is_told(self):
+        """A user's log (0.2.14): the provider answered the picture with "The request was rejected because it was
+        considered high risk" as an ordinary reply; it went to the model as the picture's card, under "Studied the
+        reference". A refusal is no card: the user is told, and the picture still goes to the model, named as a failed
+        card's is."""
+        from loopcut import conversations, context
+        picture = Path(self.data_dir.name) / "hero.png"
+        picture.write_bytes(b"\x89PNG hero concept")
+        session = self.session
+        stored = conversations.store_image(session, picture)
+        session["attachments"] = [{"ref": stored, "full": stored, "name": "hero.png"}]
+        SCRIPT.replies += [text_reply("The request was rejected because it was considered high risk"),
+                           text_reply("A knight in silver armour.")]
+        agent._scene_context = lambda text, since=None: "<scene_context>\nfile: unsaved\n</scene_context>"
+        self.assertTrue(agent.send("what is this?"))
+        session["turn"].thread.join(5)
+        message = session["messages"][0]
+        self.assertFalse(message.get(context.REFERENCE_CARD), "a turn resumed after picking another model asks again")
+        self.assertNotIn("high risk", message["content"][0]["text"])
+        self.assertTrue(message["content"][0]["text"].endswith(agent.UNDESCRIBED.format(names="hero.png")))
+        self.assertEqual([i["kind"] for i in session["items"]], ["user", "notice", "assistant"])
+        self.assertEqual(session["items"][1]["text"], agent.REFERENCE_REFUSED)
+        self.assertEqual(SCRIPT.requests[1]["messages"][1]["content"][1]["type"], "image_url", "the picture is sent")
+        for card in ("I'm sorry, but I can't help with that.", "I cannot describe this image.",
+                     "Claude declined to continue this request.", "Claude declined to continue this request (cyber).",
+                     "I must decline to describe this picture.", "I'll decline this one."):
+            self.assertTrue(agent._refused_card(card), card)
+        for card in ("A wooden chair: seat 0.45 m high, four round legs, #8B5A2B, matte.", "a red mug",
+                     "Rejected prototypes lean on the wall: " + "plank, " * 60,
+                     "1. A line chart, the red line declining to the right; bars declined 40%. Matte white background.",
+                     "A hillside that declines toward a lake at dusk; a road sign reads DECLINE.",
+                     "Declining sun, orange sky."):
+            self.assertFalse(agent._refused_card(card), card[:40])
+
     def test_the_workspace_agent_gets_attached_images_without_a_reference_card(self):
         from loopcut import conversations, context
         picture = Path(self.data_dir.name) / "chest.png"
@@ -3932,6 +4428,31 @@ class LimitStateTest(unittest.TestCase):
                     self.assertEqual(state.ui["allowance_notice"]["item"]["reason"], reason)
                 self.assertEqual(state.ui["account"]["session"]["used"], 0.82)
 
+    def test_a_refused_first_request_keeps_the_notes_of_what_the_user_started_from_a_card(self):
+        """Review, 2026-10-26: a Turn it into 3D click's note left the chat with the message it went in, so a first
+        request the service refused lost it."""
+        self.session = state.reset()
+        state.clear_allowance_notice()
+        note = "since your last turn: the user pressed Turn it into 3D on the picture P; it ran: Imported."
+        self.session["between_turns"] = [note]
+        turn = self.send("make it taller")
+        self.assertEqual(self.session["between_turns"], [], "sent with this message")
+        self.refuse(turn)
+        self.assertEqual(self.session["input"], "make it taller")
+        self.assertEqual(self.session["between_turns"], [note], "the request returned, and its note with it")
+
+    def test_a_clicks_note_added_while_the_first_request_is_refused_stays(self):
+        """Re-review F3, 2026-10-26: the refused request's restore replaced the notes with the ones it took, so a
+        click ending meanwhile lost its note."""
+        self.session = state.reset()
+        state.clear_allowance_notice()
+        taken, meanwhile = "since your last turn: one.", "since your last turn: two."
+        self.session["between_turns"] = [taken]
+        turn = self.send("make it taller")
+        self.session["between_turns"].append(meanwhile)
+        self.refuse(turn)
+        self.assertEqual(self.session["between_turns"], [taken, meanwhile])
+
     def test_out_of_credits_keeps_the_servers_reset_and_upgrade_and_warns_about_no_window(self):
         """The credits arm's 402 (the live server's body, 2026-10-23): the send returns to the draft, the notice
         carries the reset and upgrade for the pop-up, the turn event's code is insufficient_credits, and the
@@ -5195,6 +5716,28 @@ class AnnouncedStepTest(unittest.TestCase):
         bounces = [m["content"] for m in session["messages"] if m.get(context.STEP_LIMIT)]
         self.assertEqual(bounces, [router.NUDGE.format(what="room"), self.guard.CONTINUE])
         self.assertEqual((requests, turn.outcome), (5, "completed"))
+
+    def test_no_delegate_nudge_after_the_user_declined_a_call_or_when_the_reply_asks_them(self):
+        """rel018-app items 9-11: after a declined import_asset the model asked "build from scratch, or use the
+        numbered assets?"; the routing nudge then had it build without the user. The user answers first."""
+        from loopcut import router
+        routed = types.SimpleNamespace(level=3, deliverables=[("Armchair", ""), ("FloorLamp", "")])
+        question = llm.Completion(text="The armchair import was declined, so I haven't changed the scene. Would you "
+                                       "like me to build it from scratch, or use the numbered assets?")
+        for reject, replies in ((True, [self.call(), question]),
+                                (True, [self.call(), llm.Completion(text="Nothing was added; the import was declined.")]),
+                                (False, [question])):
+            with self.subTest(reject=reject, last=replies[-1].text[:30]):
+                session, turn, requests, _ = self.run_replies(replies, "Make a cozy reading corner", reject=reject,
+                                                              role="orchestrator", routed=routed,
+                                                              on_final=agent._orchestrator_final)
+                self.assertEqual([m["content"] for m in session["messages"] if m.get(context.STEP_LIMIT)], [])
+                self.assertEqual((requests, turn.outcome, turn.declined), (len(replies), "completed", reject))
+        session, turn, requests, _ = self.run_replies(
+            [llm.Completion(text="Nothing was added yet."), llm.Completion(text="Done.")], "Make a cozy reading corner",
+            role="orchestrator", routed=routed, on_final=agent._orchestrator_final)
+        self.assertEqual([m["content"] for m in session["messages"] if m.get(context.STEP_LIMIT)],
+                         [router.NUDGE.format(what="Armchair, FloorLamp")], "a plain final reply is still nudged")
 
     def test_a_note_typed_during_the_reply_goes_to_the_model_without_a_nudge_before_it(self):
         session = state.new_session()

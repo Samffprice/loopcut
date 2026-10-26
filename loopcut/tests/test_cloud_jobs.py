@@ -108,6 +108,25 @@ class Transport:
                                  client_headers={"x-loopcut-contract": "0.1", "x-loopcut-client": "test"})
 
 
+class Busy(Transport):
+    """The first fails[(method, url suffix)] requests get a 5xx (0.2.19's gate: a 500 after the job was charged)."""
+
+    def __init__(self, fails, streams=(), final=None, status=500, code="server_error"):
+        super().__init__(streams, final)
+        self.fails, self.status, self.code = dict(fails), status, code
+
+    def __call__(self, request, *, timeout):
+        for (method, suffix), left in self.fails.items():
+            if request.method == method and request.full_url.endswith(suffix) and left:
+                self.fails[(method, suffix)] = left - 1
+                self.calls.append((request.method, request.full_url, {}))
+                if suffix == "/jobs":
+                    self.posts.append(json.loads(request.data))
+                return Reply({"error": {"message": "The job service is temporarily unavailable. Try again shortly.",
+                                        "code": self.code, "type": "server_error"}}, status=self.status)
+        return super().__call__(request, timeout=timeout)
+
+
 class JobsTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -181,6 +200,108 @@ class JobsTest(unittest.TestCase):
         self.assertEqual(len(transport.posts), 2)
         self.assertEqual(transport.posts[0], transport.posts[1])
         self.assertTrue(transport.posts[0]["idempotency_key"])
+
+    def run_busy(self, transport, **options):
+        slept = []
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=slept.append)):
+            return self.run_job(transport, **options), round(sum(slept))
+
+    def test_a_500_creating_a_job_asks_again_with_the_same_key_and_gets_the_one_job(self):
+        transport = Busy({("POST", "/jobs"): 1})
+        result, slept = self.run_busy(transport)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertEqual(len(transport.posts), 2)
+        self.assertEqual(transport.posts[0], transport.posts[1], "the identical body, so the server replays its job")
+        self.assertEqual(len({post["idempotency_key"] for post in transport.posts}), 1)
+        self.assertEqual(slept, cloud_jobs.SERVER_RETRY_SECONDS[0])
+
+    def test_500s_creating_a_job_throughout_say_it_may_exist_never_a_plain_failure(self):
+        transport = Busy({("POST", "/jobs"): 99})
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            self.run_busy(transport)
+        error = caught.exception
+        self.assertEqual(error.code, cloud_jobs.UNCONFIRMED)
+        self.assertEqual(len(transport.posts), 1 + len(cloud_jobs.SERVER_RETRY_SECONDS))
+        keys = {post["idempotency_key"] for post in transport.posts}
+        self.assertEqual(len(keys), 1, "every retry reuses the one key")
+        self.assertEqual(error.extra["idempotency_key"], keys.pop())
+        text = cloud.error_text(error)
+        for said in ("may have been created", "do not start another", error.extra["idempotency_key"],
+                     "never charges twice"):
+            self.assertIn(said, text)
+        self.assertNotIn("Try again shortly", text)
+        self.assertFalse(text.startswith("server_error"))
+
+    def test_backoff_on_5xx_is_bounded_to_about_a_minute(self):
+        slept = []
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=slept.append)), \
+                self.assertRaises(cloud_http.CloudError):
+            self.run_job(Busy({("POST", "/jobs"): 99}, status=503, code="http_error"))
+        self.assertTrue(55 <= sum(slept) <= 65, sum(slept))
+        self.assertEqual(sum(cloud_jobs.SERVER_RETRY_SECONDS), 60)
+
+    def test_a_4xx_or_a_refunded_502_creating_a_job_is_definite_and_not_asked_again(self):
+        for status, code in ((402, "insufficient_credits"), (409, "quote_changed"), (422, "invalid_input"),
+                             (502, "vendor_failed")):
+            with self.subTest(code=code):
+                transport = Busy({("POST", "/jobs"): 99}, status=status, code=code)
+                with self.assertRaises(cloud_http.CloudError) as caught:
+                    _, slept = self.run_busy(transport)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(len(transport.posts), 1)
+
+    def test_a_503_on_the_event_stream_polls_and_succeeds(self):
+        transport = Busy({("GET", "/events"): 1}, streams=[b"unused"], status=503, code="http_error")
+        result, slept = self.run_busy(transport)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertTrue(any(method == "GET" and url.endswith("/job_test") for method, url, _ in transport.calls))
+        self.assertEqual(len(transport.posts), 1)
+        self.assertEqual(slept, 0, "polled at once")
+
+    def test_503s_on_the_polling_get_are_asked_again_then_succeed(self):
+        transport = Busy({("GET", "/events"): 1, ("GET", "/job_test"): 2}, streams=[b"unused"], status=503,
+                         code="server_error")
+        result, slept = self.run_busy(transport)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertEqual(sum(url.endswith("/job_test") and m == "GET" for m, url, _ in transport.calls), 3)
+        self.assertEqual(slept, sum(cloud_jobs.SERVER_RETRY_SECONDS[:2]))
+        self.assertEqual(len(transport.posts), 1)
+
+    def test_5xx_polling_throughout_names_the_job_that_may_still_run(self):
+        transport = Busy({("GET", "/events"): 1, ("GET", "/job_test"): 99}, streams=[b"unused"], status=500)
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            self.run_busy(transport)
+        error = caught.exception
+        self.assertEqual(error.code, cloud_jobs.UNCONFIRMED)
+        self.assertEqual(error.extra["job"]["id"], "job_test")
+        self.assertEqual(error.extra["job"]["status"], "queued")
+        text = cloud.error_text(error)
+        for said in ("job job_test", "may still be running", "do not start another", error.extra["idempotency_key"]):
+            self.assertIn(said, text)
+        # The same key again picks the job up anew, rather than repeating the stored answer.
+        transport.fails.clear()
+        transport.streams = [urllib.error.HTTPError("events", 405, "unsupported", {}, io.BytesIO())]
+        result, _ = self.run_busy(transport, arguments={"prompt": "prop",
+                                                        "idempotency_key": error.extra["idempotency_key"]})
+        self.assertEqual(result["status"], "succeeded")
+
+    def test_a_long_jobs_5xx_polls_throughout_leave_job_status_naming_its_key(self):
+        transport = Busy({("GET", "/events"): 1, ("GET", "/job_test"): 99}, streams=[b"unused"], status=503)
+        slept = []
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=slept.append)):
+            started = self.run_job(transport, descriptor={**DESCRIPTOR, "latency": "long"})
+            for thread in [t for t in threading.enumerate() if t.name == "Loopcut cloud job"]:
+                thread.join(timeout=5)
+        self.assertEqual(started["status"], "queued")
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            cloud_jobs.job_status("job_test")
+        error = caught.exception
+        self.assertEqual(error.code, cloud_jobs.UNCONFIRMED)
+        self.assertEqual(error.extra["idempotency_key"], transport.posts[0]["idempotency_key"])
+        self.assertIn(f'idempotency_key "{transport.posts[0]["idempotency_key"]}"', cloud.error_text(error))
 
     def test_cancel_during_progress_posts_cancel_and_exposes_refund(self):
         cancel = threading.Event()
@@ -638,11 +759,12 @@ class ApplyTest(unittest.TestCase):
     def test_resolve_paths_export_image_copy_and_object_tree_without_mutating_source(self):
         copied = []
         def copy_image():
-            image = types.SimpleNamespace()
+            image = types.SimpleNamespace(size=(4, 4))
             image.save = lambda: Path(image.filepath_raw).write_bytes(b"png")
             copied.append(image)
             return image
-        image = types.SimpleNamespace(copy=copy_image, filepath_raw="original", file_format="JPEG")
+        image = types.SimpleNamespace(copy=copy_image, filepath_raw="original", file_format="JPEG",
+                                      get=lambda key: None)
         ob = types.SimpleNamespace(children_recursive=["child"])
         class Images(dict):
             def remove(self, image):
@@ -679,6 +801,46 @@ class ApplyTest(unittest.TestCase):
             with self.assertRaises(cloud_http.CloudError) as raised:
                 cloud_jobs.resolve_files(descriptor, {"image": "character reference"}, Path(self.temp.name))
             self.assertEqual(str(raised.exception), "Scene reference or file was not found")
+
+    def test_resolve_refuses_loopcut_previews_and_images_without_pixels(self):
+        """A user's log (0.2.12): image_to_3d got a chat preview whose copy had no pixels yet; saving it raised a
+        RuntimeError that ended the turn. A preview is refused and an unsavable image is an input error."""
+        def copy(size, save=None):
+            def make():
+                image = types.SimpleNamespace(size=size, save=save or (lambda: None))
+                copied.append(image)
+                return image
+            return make
+        copied = []
+        class Images(dict):
+            def remove(self, image):
+                copied.remove(image)
+
+        def broken():
+            raise RuntimeError("Error: Image 'x' does not have any image data")
+        images = Images(preview=types.SimpleNamespace(copy=copy((4, 4)), get={"lc_temp": True}.get),
+                        empty=types.SimpleNamespace(copy=copy((0, 0)), get=lambda key: None),
+                        unsaved=types.SimpleNamespace(copy=copy((4, 4), broken), get=lambda key: None))
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(images=images, objects={}))
+        descriptor = {"file_inputs": [{"field": "image"}]}
+        for name, words in (("preview", "Loopcut's own preview"), ("empty", "no pixels"),
+                            ("unsaved", "could not be saved")):
+            with self.subTest(name), patch.dict(sys.modules, {"bpy": fake}), \
+                    self.assertRaises(cloud_http.CloudError) as raised:
+                cloud_jobs.resolve_files(descriptor, {"image": name}, Path(self.temp.name))
+            self.assertEqual(raised.exception.code, "invalid_input")
+            self.assertIn(words, str(raised.exception))
+        self.assertEqual(copied, [], "every copy was removed")
+        # Refused, the model gets the names it can pass, as for a name that is not found.
+        from loopcut import conversations
+        session = {"id": "c1", "references": [{"ref": "cat", "name": "cat.png", "pinned": True}],
+                   "messages": [{"role": "user", conversations.ATTACHED: True, "content": [
+                       {"type": "text", "text": "go"}, {"type": "image_url", "image_url": {"url": "cat"}}]}]}
+        with patch.object(state, "_session", session), patch.dict(sys.modules, {"bpy": fake}), \
+                self.assertRaises(cloud_http.CloudError) as raised:
+            cloud_jobs.resolve_files(descriptor, {"image": "preview"}, Path(self.temp.name))
+        self.assertEqual(str(raised.exception), "That image is Loopcut's own preview, not the user's; images the user "
+                                                "attached last, newest first: cat.png")
 
 
 def remove_identical(items, block):

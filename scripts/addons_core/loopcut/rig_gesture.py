@@ -9,8 +9,13 @@ hands them here as rig_pose bones; pose() aims the arm in the body's frame at th
 poses in armature space: the chest's turn since rest carries the body's up, left and front, so a wave stays beside
 the head while the walk turns and sways the chest. blend() eases the gesture in and out over the walk's own
 rotations, so the walk is unchanged at both ends of the range and everywhere outside it.
+
+R7-B1 (ar-beginner-4): "can he wave too? like stop and wave at the end" bought a 6-credit motion_from_text ("A man
+stands still and waves with his right hand."), which replaced the walk. asked() reads such a prompt as one of these
+gestures, so autorig.free_gesture can offer the free one over the walk instead; a whole-body action stays a motion.
 """
 import math
+import re
 
 from . import rig_pose
 from .rig_pose import add, apply3, mul, rotation, unit
@@ -118,3 +123,36 @@ def frames(first, last, playback, fps, has_action):
         raise rig_pose.PoseError(f'A gesture needs at least {SHORTEST} frames.')
     return int(first), int(last)
 
+
+
+_WORDS = re.compile(r"[a-z]+")
+_WAVE = frozenset(('wave', 'waves', 'waved', 'waving'))
+_POINT = frozenset(('point', 'points', 'pointed', 'pointing'))
+_RAISE = frozenset(('raise', 'raises', 'raised', 'raising', 'lift', 'lifts', 'lifted', 'lifting'))
+_LIMB = frozenset(('arm', 'arms', 'hand', 'hands'))
+# The body moves, not only an arm: a motion, even with a wave in it ("jumps and waves", "walks over and points").
+_BODY = frozenset([w + end for w in (
+    'walk', 'run', 'jog', 'sprint', 'jump', 'hop', 'leap', 'danc', 'kick', 'punch', 'squat', 'crouch', 'kneel', 'sit',
+    'fall', 'spin', 'turn', 'roll', 'flip', 'crawl', 'climb', 'swim', 'bow', 'stretch', 'throw', 'clap', 'push', 'pull',
+    'lung', 'skip', 'stomp', 'march', 'step', 'sneak', 'limp', 'fight', 'box', 'pick', 'lie', 'lay', 'shrug', 'nod',
+    'shak', 'salut', 'cartwheel', 'backflip', 'somersault')
+    for end in ('', 's', 'es', 'e', 'ed', 'ing', 'ning', 'ping', 'ting', 'ped', 'ding')]
+    + ['ran', 'fell', 'sat', 'threw', 'leapt', 'swam', 'lying'])
+
+
+def asked(prompt):
+    """(gesture, side or None) when a motion prompt asks only for a wave, a point or a raised arm or hand; None when
+    it names anything else the body does, or no gesture."""
+    words = set(_WORDS.findall(prompt.lower())) if isinstance(prompt, str) else set()
+    if words & _BODY:
+        return None
+    if words & _WAVE:
+        kind = 'wave'
+    elif words & _POINT:
+        kind = 'point'
+    elif words & _LIMB and (words & _RAISE or 'up' in words):
+        kind = 'raise_arm'
+    else:
+        return None
+    sides = [s for s in SIDES if s in words]
+    return kind, sides[0] if len(sides) == 1 else None

@@ -531,8 +531,7 @@ class CodexTurn:
         if (self.cfg.auto_run or self.session["auto_run"]) and not install:
             return True
         self.turn.decided.clear()
-        card["status"] = "awaiting"
-        card["install"] = install
+        state.awaiting(card, install=install)
         agent._redraw()
         if agent._wait_for_approval(self.turn):
             card["status"] = "running"
@@ -569,7 +568,7 @@ class CodexTurn:
         approval = agent._approval(name, arguments, self.turn.roots)
         if agent._asks(approval, name, self.session, self.cfg):
             self.turn.decided.clear()
-            card["status"] = "awaiting"
+            state.awaiting(card)
             card["heavy"] = approval == "heavy" and not self.session["auto_heavy"]
             card["install"] = approval == "install"
             agent._redraw()

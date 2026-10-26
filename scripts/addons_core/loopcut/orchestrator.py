@@ -1657,7 +1657,9 @@ def accept_quarantine(wave: str, names: list | None = None):
     return tools.ToolResult(str(text))
 
 
-_QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”')
+# The user's words in a retire reason: straight or curly double quotes, or the quote marks a model writing in the user's
+# language uses (Japanese and Chinese 「」『』, guillemets, full-width double quotes).
+_QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”|「([^」]+)」|『([^』]+)』|«([^»]+)»|＂([^＂]+)＂')
 
 
 def _reason_error(reason, words: str) -> str:
@@ -1665,7 +1667,7 @@ def _reason_error(reason, words: str) -> str:
     their messages), or numbers measured on the scene."""
     if not isinstance(reason, str) or len(reason.strip()) < 8:
         return "say why: the user's words in double quotes, or what you measured"
-    quotes = [a or b for a, b in _QUOTED.findall(reason)]
+    quotes = ["".join(groups) for groups in _QUOTED.findall(reason)]
     for quote in quotes:
         if not quote_found(quote, words):
             return f"{quote[:60]!r} is not in the user's messages; quote them word for word"

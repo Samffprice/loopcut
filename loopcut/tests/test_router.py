@@ -392,6 +392,22 @@ class NudgeTest(unittest.TestCase):
         self.assertIsNone(router.nudge(a_turn(), llm.Completion(text="Done.")), "no routing, no nudge")
 
 
+    def test_not_when_the_user_is_to_answer_a_question_or_declined_a_call(self):
+        """rel018-app: import_asset was declined, the reply asked the user which way to go, and the nudge sent the
+        model on to build everything without them ("I'll use the requested worker workflow")."""
+        question = ("The armchair import was declined, so I haven't changed the scene. Would you like me to build the "
+                    "reading corner from scratch, or continue using specific numbered assets from the thumbnails?")
+        for declined, text in ((False, question), (True, question), (True, "I'll build the reading corner myself.")):
+            with self.subTest(declined=declined, text=text[:30]):
+                turn = a_turn()
+                turn.routed, turn.declined = router.parse(LEVEL_3), declined
+                self.assertIsNone(router.nudge(turn, llm.Completion(text=text)))
+                self.assertFalse(turn.nudged)
+        turn = a_turn()
+        turn.routed = router.parse(LEVEL_3)
+        self.assertIsNotNone(router.nudge(turn, llm.Completion(text="I'll build the reading corner myself.")),
+                             "a plain level-3 final reply is still nudged")
+
 class RecordTest(unittest.TestCase):
     def test_routed_and_nudged_join_the_turns_levels_and_a_resume_keeps_them(self):
         session = session_with(CORNER)

@@ -67,11 +67,15 @@ CHILD_SCRIPT = Path(__file__).with_name("workspace_child.py")
 SHAPE_KEY_GUARD = Path(shape_key_guard.__file__).resolve()
 OP_NOTES = Path(op_notes.__file__).resolve()
 RENDER_PATH_GUARD = Path(__file__).with_name("render_path_guard.py").resolve()
+RENDER_TIMING = Path(__file__).with_name("render_timing.py").resolve()  # run_blender's frames, for render_offer.
 SNAPSHOT_PROP = "lc_snapshot"   # On every scene of a snapshot: its number, so a build says what it came from.
 SHELL_TIMEOUT, BLENDER_TIMEOUT, MAX_TIMEOUT = 600, 900, 3600
 CHILD_TIMEOUT = 600             # Stamping a snapshot, preparing a result.
 KILL_GRACE = 2.0
 POLL = 0.1
+LEFT_CHECK = 5.0                # Seconds between a tracked group's member checks (_left_check) while it runs.
+LEFT_GRACE = 0.4                # Seconds a finished command's helpers get to exit before what remains
+                                # counts as left running (_left_running).
 LOG_TAIL = 40                   # Lines of a run_blender log shown.
 WRITTEN_LIMIT = 12              # Files a run lists as written; the rest counted.
 LISTED = 30                     # Entries the turn's note names.
@@ -214,6 +218,7 @@ _ROOTS: set = set()     # Every workspace this Blender has used: files.check let
 _BLENDER: list = []     # This Blender's binary, read on the main thread (ensure) for the agent thread.
 _UIDS: dict = {}        # Conversation id -> {key: live session_uid}: identity across renames this session.
 _LIVE_PROCESSES: dict = {}
+_LEFT: dict = {}        # id -> a process group a shell command left running (track_left), until noted after it ended.
 _PROCESS_LOCK = threading.Lock()
 
 
@@ -516,9 +521,10 @@ def _kill(process: subprocess.Popen) -> None:
 
 
 def run_process(command: list | str, cwd: Path, env: dict, timeout: float, log: Path, is_cancelled,
-                label: str = "") -> tuple:
+                label: str = "", left_running=None) -> tuple:
     """Run to the end, the time limit or a Stop; stdout and stderr into log. Returns (exit code or None,
-    seconds, "timeout" | ""). A Stop kills it and raises llm.Cancelled."""
+    seconds, "timeout" | ""). A Stop kills it and raises llm.Cancelled. left_running(process group) is called
+    when it ended but what it started in the background goes on (_left_running)."""
     from . import llm
     log.parent.mkdir(parents=True, exist_ok=True)
     id = uuid.uuid4().hex
@@ -548,7 +554,222 @@ def run_process(command: list | str, cwd: Path, env: dict, timeout: float, log: 
             finally:
                 with _PROCESS_LOCK:
                     _LIVE_PROCESSES.pop(id, None)
+    if left_running is not None and not stopped and _left_running(process.pid):
+        left_running(process.pid)
     return None if stopped else process.returncode, time.monotonic() - started, stopped
+
+
+def _left_running(group: int) -> bool:
+    """Whether a finished command's process group still has members LEFT_GRACE seconds on: something it started in
+    the background (nohup blender -b ... &) runs on, where Loopcut no longer sees it and Stop does not reach it. A
+    helper that exits a moment after the shell is not that. POSIX only: each command is its own session
+    (start_new_session), so the group is the shell's pid."""
+    if os.name == "nt":
+        return False
+    deadline = time.monotonic() + LEFT_GRACE
+    while True:
+        try:
+            os.killpg(group, 0)
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.05)
+
+
+# ------------------------------------------------------------------ what a shell command left running
+# A detached render ran 15 h with no view and no Stop (owner, 2026-10-26), so such a group is tracked: a row in the
+# panel's Background jobs with Stop (left_rows, stop_left), stopped when Blender quits (stop_all_left, lifecycle's
+# exit_pre; a crash leaves it), named in its conversation's next requests (ended_notes, running_notes). POSIX only;
+# Windows would need job objects. A group's number can be used again once it ended, so it is signalled only while a
+# member Loopcut saw in it is still there with the same start time (_ours).
+
+def _members(group: int) -> dict | None:
+    """{pid: start time in seconds} of each process in the group, from ps; None when ps could not say (it failed to
+    start, timed out or failed), which is not the group having ended. Start times in UTC, so a time zone change
+    can't move them."""
+    import calendar
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        done = subprocess.run([ps, "-A", "-o", "pid=,pgid=,lstart="], capture_output=True, text=True, timeout=5,
+                              env={**os.environ, "LC_ALL": "C", "TZ": "UTC0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    members = {}
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[1] == str(group) and parts[0].isdigit():
+            try:
+                members[int(parts[0])] = calendar.timegm(time.strptime(" ".join(parts[2:]), "%a %b %d %H:%M:%S %Y"))
+            except ValueError:
+                continue
+    return members
+
+
+START_SLACK = 1 if sys.platform.startswith("linux") else 0  # Seconds: Linux's ps derives start times from the boot
+                                                            # time, which can read a second apart.
+
+
+def _same(members: dict, recorded: dict) -> bool:
+    return any(pid in recorded and abs(start - recorded[pid]) <= START_SLACK for pid, start in members.items())
+
+
+def _alive(group: int) -> bool:
+    try:
+        os.killpg(group, 0)
+    except OSError:  # Gone, or (EPERM) a group of that number that is another user's.
+        return False
+    return True
+
+
+def _ours(entry: dict) -> bool | None:
+    """Whether the group is still the one recorded: one of the members last seen in it runs with the same start
+    time. That member was there throughout, so the group never ended, and the others now in it are trusted too.
+    None when ps could not say: nothing is decided on that, it is asked again."""
+    members = _members(entry["group"])
+    if members is None:
+        return None
+    if not _same(members, entry["members"]):
+        return False
+    entry["members"] = members
+    return True
+
+
+def _signal(entry: dict, sig) -> bool | None:
+    """Sent; False when the group is not the one recorded (or gone); None when that could not be checked."""
+    ours = _ours(entry)
+    if not ours:
+        return ours
+    try:
+        os.killpg(entry["group"], sig)
+    except OSError:
+        return False
+    return True
+
+
+def _end(entry: dict, how: str) -> None:
+    entry["state"], entry["ended"] = how, time.time()
+
+
+def track_left(group: int, label: str, conversation: str, started: float) -> dict | None:
+    """Track the group a finished command left running (_left_running), counted from the command's start (wall
+    clock: the elapsed time the user reads). None when ps finds no member to know it by."""
+    members = _members(group)
+    if not members:
+        return None
+    entry = {"id": uuid.uuid4().hex, "group": group, "label": label, "conversation": conversation,
+             "started": started, "state": "running", "ended": None, "members": members,
+             "checked": time.monotonic(), "term": None}
+    with _PROCESS_LOCK:
+        _LEFT[entry["id"]] = entry
+    return entry
+
+
+def _tracked(*states) -> list:
+    with _PROCESS_LOCK:
+        return [entry for entry in _LEFT.values() if entry["state"] in states]
+
+
+def left_rows() -> list[dict]:
+    """The panel's rows, plain data: running, stopping, or ended and not yet told to the model (ended_notes)."""
+    now = time.time()
+    with _PROCESS_LOCK:
+        return [{"id": e["id"], "label": e["label"], "group": e["group"], "state": e["state"],
+                 "elapsed": max(0.0, (e["ended"] or now) - e["started"])} for e in _LEFT.values()]
+
+
+def stop_left(id: str) -> bool | None:
+    """A row's Stop: SIGTERM to exactly that group; poll_left sends SIGKILL after KILL_GRACE if anything is left.
+    None when ps could not check the group: the row stays as it is, to be tried again."""
+    with _PROCESS_LOCK:
+        entry = _LEFT.get(id)
+    if entry is None or entry["state"] != "running":
+        return False
+    sent = _signal(entry, signal.SIGTERM)
+    if sent is None:
+        return None
+    if not sent:
+        _end(entry, "finished")  # Ended on its own meanwhile, or the number is another group's now.
+        return False
+    entry["state"], entry["term"] = "stopping", time.monotonic()
+    return True
+
+
+def poll_left() -> bool:
+    """From the UI's one-second timer: a group that is gone has ended (stopped, after its Stop), a Stop's SIGKILL
+    once KILL_GRACE passed. A signal 0 per group; ps only every LEFT_CHECK seconds. Whether a row changed."""
+    now, changed = time.monotonic(), False
+    for entry in _tracked("running", "stopping"):
+        how = "stopped" if entry["term"] is not None else "finished"
+        if not _alive(entry["group"]):
+            _end(entry, how)
+        elif entry["term"] is not None and now - entry["term"] >= KILL_GRACE:
+            entry["term"] = now  # Sent, or ps could not check (None): stopping still, tried again after the grace.
+            if _signal(entry, signal.SIGKILL) is not False:
+                continue
+            _end(entry, how)
+        elif now - entry["checked"] >= LEFT_CHECK:
+            entry["checked"] = now
+            if _ours(entry) is not False:  # Ours, or ps could not say: asked again next check.
+                continue
+            _end(entry, how)
+        else:
+            continue
+        changed = True
+    return changed
+
+
+def stop_all_left(grace: float = KILL_GRACE) -> None:
+    """Blender quits (lifecycle's exit_pre): every tracked group still running gets SIGTERM, then SIGKILL for what
+    is left after grace."""
+    entries, sent = _tracked("running", "stopping"), []
+    for entry in entries:
+        result = _signal(entry, signal.SIGTERM)
+        if result is None:  # ps could not check: once more, else it is left running, as a crash leaves it.
+            result = _signal(entry, signal.SIGTERM)
+        if result:
+            sent.append(entry)
+    deadline = time.monotonic() + grace
+    while sent:
+        sent = [entry for entry in sent if _alive(entry["group"])]
+        if not sent or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    for entry in sent:
+        _signal(entry, signal.SIGKILL)
+    for entry in entries:
+        _end(entry, "stopped")
+
+
+def duration(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+
+def ended_notes(conversation: str) -> list[str]:
+    """Since-your-last-turn lines for the conversation's groups that ended, said once: their rows go with them."""
+    lines = []
+    with _PROCESS_LOCK:
+        for id, entry in list(_LEFT.items()):
+            if entry["conversation"] != conversation or entry["state"] not in ("finished", "stopped"):
+                continue
+            how = ("the user stopped it in Background jobs" if entry["state"] == "stopped"
+                   else "it ended on its own (exit code unknown: it was not Loopcut's child)")
+            lines.append(f"since your last turn: the background process {entry['label']} (process group "
+                         f"{entry['group']}) ended after {duration(entry['ended'] - entry['started'])}; {how}.")
+            del _LEFT[id]
+    return lines
+
+
+def running_notes(conversation: str) -> list[str]:
+    """A line per group of the conversation's still running, for each request until it ends."""
+    now = time.time()
+    return [f"running now in the background: {entry['label']} (process group {entry['group']}), for "
+            f"{duration(now - entry['started'])}; it is in the user's Background jobs, where they can stop it."
+            for entry in _tracked("running", "stopping") if entry["conversation"] == conversation]
 
 
 def _shell_command(command: str) -> list | str:
@@ -601,6 +822,18 @@ def _inline_python(command: str, depth: int = 0) -> bool:
                 return True
     return False
 
+
+# A shell command that left something running in the background (_left_running): tracked (track_left), the model and
+# the user are told where it is; where it can't be (Windows, or ps can't list it), that it runs on outside Stop.
+LEFT_TRACKED = ("What this command started in the background is still running (process group {group}). It is in "
+                "the user's Background jobs, where they can stop it; it is stopped when Blender quits, and your "
+                "next requests say whether it still runs. Tell the user.")
+LEFT_TRACKED_NOTICE = ("Still running in the background: {what}. It's in Background jobs, where you can stop it. "
+                       "Quitting Blender stops it.")
+LEFT_RUNNING = ("What this command started in the background is still running (process group {group}). "
+                "Loopcut's Stop does not end it, and it can run on after this turn: tell the user, and kill it "
+                "when it is no longer wanted.")
+LEFT_RUNNING_NOTICE = "Still running in the background: {what}. Stop won't end it; ask Loopcut to stop it."
 
 INLINE_PYTHON_HELP = ("Write the code to a .py file with write_file, then run python3 file.py here; for bpy use "
                       'run_blender(script="script.py", blend="") or run_python for the live scene.')
@@ -876,14 +1109,15 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
     if os.name == "nt" and _inline_python(command):
         return ToolResult("Not run: inline Python in Windows shell commands can change the code. "
                           + INLINE_PYTHON_HELP, ok=False)
-    _, ws = _workspace()
+    session, ws = _workspace()
     env = shell_env(ws)
 
     def then(is_cancelled, on_main):
         number = _next_run(ws)
         log = _own(ws) / "tmp" / f"shell-{number:04d}.txt"
+        label, left = command.strip().splitlines()[0][:80], []
         code, took, stopped = run_process(_shell_command(command), ws, env, seconds, log, is_cancelled,
-                                         label=command.strip().splitlines()[0][:80])
+                                         label=label, left_running=left.append)
         output = _read(log)
         head = _exit_text(code, took, stopped, seconds)
         if len(output) > MAX_OUTPUT_CHARS:
@@ -892,7 +1126,13 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
             head += f"; the whole output ({_human(len(output.encode('utf-8')))}) is in {LOGS}/{kept.name}"
         else:
             log.unlink(missing_ok=True)
-        return ToolResult(f"{head}\n{_clip(output.rstrip()) or '(no output)'}", ok=code == 0 and not stopped)
+        result = ToolResult(f"{head}\n{_clip(output.rstrip()) or '(no output)'}", ok=code == 0 and not stopped)
+        if left:  # Said to both: a 4K render left this way ran for 14 h while the user asked how far it was.
+            what = summary.strip() or label
+            tracked = track_left(left[0], what, session["id"], time.time() - took)
+            result.model_note = (LEFT_TRACKED if tracked else LEFT_RUNNING).format(group=left[0])
+            result.notice = (LEFT_TRACKED_NOTICE if tracked else LEFT_RUNNING_NOTICE).format(what=what)
+        return result
     return ToolResult("", then=then)
 
 
@@ -909,17 +1149,23 @@ def run_blender(script: str, blend: str = SOURCE, args: list | None = None, time
         raise ToolError("args must be a list of strings")
     extra = [str(a) for a in args or ()]
     env = shell_env(ws)
+    from . import render_offer
+    # source.blend is the live scene: a render of it times this scene's frames, keyed as the open .blend's.
+    live = render_offer.live_path() if blend_path == (ws / SOURCE).resolve() else None
 
     def then(is_cancelled, on_main):
         number = _next_run(ws)
         log = ws / LOGS / f"{number:04d}-{script_path.stem}.log"
         command = [env["BLENDER"], "-b", "--factory-startup", *([str(blend_path)] if blend_path else []),
                    "--python-exit-code", "1", "--python", str(SHAPE_KEY_GUARD),
-                   "--python", str(OP_NOTES), "--python", str(RENDER_PATH_GUARD),
+                   "--python", str(OP_NOTES), "--python", str(RENDER_PATH_GUARD), "--python", str(RENDER_TIMING),
                    "--python", str(script_path), "--", *extra]
         before = files_state(ws)
         code, took, stopped = run_process(command, ws, env, seconds, log, is_cancelled, label=script_path.name)
-        text = _read(log)
+        frames, text = render_offer.log_frames(_read(log))  # Its frame lines are for Loopcut, not the model.
+        timings = render_offer.run_seconds(frames)
+        for scene, rendered, per_frame in timings if live is not None else ():
+            render_offer.record((live, scene), rendered, per_frame)
         tail, noise = log_tail(text)
         on = blend_path.name if blend_path else "an empty scene"
         lines = [f"{script_path.name} on {on}: {_exit_text(code, took, stopped, seconds)}. "
@@ -934,7 +1180,9 @@ def run_blender(script: str, blend: str = SOURCE, args: list | None = None, time
                      if line.startswith((shape_key_guard.NOTICE_PREFIX, op_notes.NOTICE_PREFIX))
                      and line not in shown_lines)
         lines.append(f"--- log tail ---\n{shown or '(empty)'}")
-        return ToolResult("\n".join(lines), ok=code == 0 and not stopped)
+        # A test render's card says what a frame took, as see_render's does.
+        return ToolResult("\n".join(lines), ok=code == 0 and not stopped,
+                          outcome=render_offer.frame_line(timings[-1][2]) if timings else "")
     return ToolResult("", then=then)
 
 

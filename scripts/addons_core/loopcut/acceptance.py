@@ -111,6 +111,13 @@ _QUOTES = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "′": 
 _WORD = re.compile(r"[^\W_]+(?:['.][^\W_]+)*")
 _GAP = re.compile(r"\.\.\.+|…|\[\.\.\.\]")
 _DECIMAL_COMMA = re.compile(r"(?<=\d),(?=\d)")
+# Letters of scripts written without spaces between words: Han, Hiragana, Katakana, Thai, Lao, Khmer,
+# Myanmar, and Hangul, which has spaces but joins its particles to the word before.
+_UNSPACED = ("\u1000-\u109f\u0e00-\u0eff\u1100-\u11ff\u1780-\u17ff\u3005-\u3007\u3040-\u30ff"
+             "\u3130-\u318f\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+             "\U00020000-\U0003134f")
+_UNSPACED_LETTER = re.compile(f"[{_UNSPACED}]")
+_SPACE_BY_UNSPACED = re.compile(f"(?<=[{_UNSPACED}]) | (?=[{_UNSPACED}])")
 
 
 # ------------------------------------------------------------------ quotes (pure)
@@ -123,20 +130,38 @@ def normalise(text: str) -> str:
     return " ".join(_WORD.findall(_DECIMAL_COMMA.sub(".", text)))
 
 
+def _edge(text: str, at: int, letter: str) -> bool:
+    """Whether a match whose end letter is `letter` may stop next to text[at]: a word's end in spaced
+    scripts, anywhere in unspaced ones."""
+    return (at < 0 or at >= len(text) or text[at] == " "
+            or bool(_UNSPACED_LETTER.match(letter)) or bool(_UNSPACED_LETTER.match(text[at])))
+
+
+def _find(piece: str, text: str, start: int) -> int:
+    """Where piece is in text from start, or -1: whole words where it begins or ends in a spaced script
+    ("red" is not in "bored"), anywhere where it begins or ends in an unspaced one."""
+    at = text.find(piece, start)
+    while at >= 0 and not (_edge(text, at - 1, piece[0]) and _edge(text, at + len(piece), piece[-1])):
+        at = text.find(piece, at + 1)
+    return at
+
+
 def quote_found(quote: str, user_texts) -> bool:
     """Whether the quote is in one of the user's messages, word for word after normalise(); an
-    ellipsis in the quote skips words, the pieces in order."""
-    pieces = [normalise(piece) for piece in _GAP.split(str(quote or ""))]
+    ellipsis in the quote skips words, the pieces in order. In scripts written without spaces (Japanese,
+    Chinese, Thai...) the spaces normalise() leaves for punctuation don't count, and a quote matches
+    without word boundaries: "天井ファンも、回るやつで" is in "あと天井ファンも、回るやつで" (rel018-ja2)."""
+    pieces = [_SPACE_BY_UNSPACED.sub("", normalise(piece)) for piece in _GAP.split(str(quote or ""))]
     pieces = [piece for piece in pieces if piece]
     if not pieces:
         return False
     for text in [user_texts] if isinstance(user_texts, str) else user_texts or ():
-        haystack, start = f" {normalise(text)} ", 0
+        haystack, start = _SPACE_BY_UNSPACED.sub("", normalise(text)), 0
         for piece in pieces:
-            at = haystack.find(f" {piece} ", start)
+            at = _find(piece, haystack, start)
             if at < 0:
                 break
-            start = at + len(piece) + 1
+            start = at + len(piece)
         else:
             return True
     return False

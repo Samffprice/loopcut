@@ -17,6 +17,7 @@ their file server rejects Python's default User-Agent; asset_common sends Loopcu
 
 import json
 import os
+import re
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -40,6 +41,16 @@ DEFAULT_RESOLUTION = "1k"
 DEFAULT_LIMIT = 8
 MAX_LIMIT = 12
 LICENSES = {"royalty_free": "Royalty Free (commercial use, no credit needed)", "cc_zero": "CC0"}
+# Words left out of a search (live API, 2026-10-25). The free text is matched against names, descriptions,
+# tags and the style parameter, and "realistic" is most models' style and in thousands of names:
+# 'realistic floor lamp reading lamp' counted 10000 with grass, hair and kitchens first, the same words
+# without it 368 floor lamps. Photorealistic, photoreal and realism pull in photo scans the same way, and a
+# texture resolution such as '4k' matches nothing at all. A row gives its asset's style, and import's
+# resolution sets the texture size. The real style filter, modelStyle:realistic, adds nothing (most models
+# have it) and with modelStyle:lowpoly 'floor lamp' found a factory and a mask, so words are only dropped.
+REALISM_WORDS = {"realistic", "photorealistic", "photoreal", "realism", "hyperrealistic"}
+RESOLUTION_WORD = re.compile(r"\d+k")
+COUNT_CAP = 10000   # The most matches the search API counts.
 
 # ------------------------------------------------------------------ pure helpers (unit tested)
 
@@ -65,6 +76,38 @@ def search_url(query: str, kind: str, limit: int, free_only: bool) -> str:
         terms.append("is_free:true")
     limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
     return f"{API}/search/?{urllib.parse.urlencode({'query': ' '.join(terms), 'page_size': limit})}"
+
+
+def search_words(query: str) -> tuple[str, list[str]]:
+    """(the words BlenderKit is searched for, the ones left out: REALISM_WORDS and resolutions)."""
+    kept, dropped = [], []
+    for word in str(query).split():
+        bare = word.strip(".,;!?\"'()").lower().replace("-", "")
+        (dropped if bare in REALISM_WORDS or RESOLUTION_WORD.fullmatch(bare) else kept).append(word)
+    return " ".join(kept), dropped
+
+
+def unrelated(query: str, count, results: list) -> bool:
+    """BlenderKit's generic list rather than matches: a count at the API's cap and no result named for
+    any query word. A word that matches most of the library outranks the rest (realistic did, above)."""
+    if not isinstance(count, int) or count < COUNT_CAP:
+        return False
+    words = re.findall(r"\w+", " ".join(t for t in query.lower().split() if ":" not in t))
+    words = [w for w in words if len(w) > 2]
+    names = [str(asset.get("name") or "").lower() for asset in results]
+    return bool(words) and not any(form in name for word in words for form in _singulars(word) for name in names)
+
+
+def _singulars(word: str) -> set:
+    """A word and its simple singular forms, for names that have it once: benches, bench; berries, berry."""
+    forms = {word}
+    if len(word) > 3 and word.endswith("s"):
+        forms.add(word[:-1])
+        if word.endswith("es"):
+            forms.add(word[:-2])
+        if word.endswith("ies"):
+            forms.add(word[:-3] + "y")
+    return forms
 
 
 def parameter(asset: dict, key: str):
@@ -207,17 +250,26 @@ def search_blenderkit(query: str, type: str, limit: int = DEFAULT_LIMIT) -> Tool
         raise ToolError(f"type must be one of {', '.join(TYPES)}")
     if not str(query).strip():
         raise ToolError("Give a few words to search for.")
+    words, dropped = search_words(query)
+    if not words:
+        raise ToolError(f"Give words for what the asset is: BlenderKit's search mishandles {' '.join(dropped)!r} "
+                        "(each result gives its style; import sets the resolution).")
     headers = _headers()
-    data = get_json(search_url(query, type, limit, free_only=not headers), headers)
+    data = get_json(search_url(words, type, limit, free_only=not headers), headers)
     results = [a for a in (data.get("results") or []) if isinstance(a, dict) and a.get("id")]
     if not results:
         raise ToolError(f"No BlenderKit {type}s match {query!r}. Try fewer or more general words.")
+    if unrelated(words, data.get("count"), results):
+        raise ToolError(f"BlenderKit returned its generic list for {words!r}, not matches. Search with the "
+                        "object's own name, such as 'floor lamp'.")
     numbers = [asset_picks.number("blenderkit", str(asset["id"]), asset.get("name")) for asset in results]
     lines = [describe_asset(n, asset) for n, asset in zip(numbers, results)]
     image = sheet([_thumbnail(asset) for asset in results], "blenderkit_sheet.png", fit=True, labels=numbers)
     scope = "free assets" if not headers else "free and plan assets"
-    text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {query!r} ({scope}):\n"
-            + "\n".join(lines) + "\n\n" + asset_picks.footer(image))
+    left_out = (f"Searched without {' '.join(dropped)!r}, which BlenderKit's search mishandles: each row gives "
+                "its style, and import sets the resolution.\n" if dropped else "")
+    text = (f"{len(results)} of {data.get('count', len(results))} BlenderKit {type}s for {words!r} ({scope}):\n"
+            + left_out + "\n".join(lines) + "\n\n" + asset_picks.footer(image))
     if any(not a.get("canDownload", True) for a in results):
         text += f"\nFull-plan assets need the user's BlenderKit key ({PLANS})."
     return ToolResult(_clip(text), image_path=image)

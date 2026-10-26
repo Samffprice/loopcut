@@ -52,6 +52,13 @@ class ToolResult:
     outcome: str = ""  # An attached report's line for its card, in place of its JSON (cloud_jobs.report_line).
     card_output: str = ""  # The card's output in place of text: a report the model gets as a table (cloud_jobs).
     timed_out: float = 0.0  # run_python stopped at its deadline: those seconds, for its card (ui.layout).
+    notice: str = ""  # A line for the user under the step's card (agent.run_loop): a shell's process left running.
+    # delegate's workers merged, and only parts kept aside for the user's accept are missing (waves.held_back_only):
+    # not ok for the model, which deals with them, but done on the card (agent).
+    held_back: bool = False
+    made_pictures: list | None = None  # image_generate's pictures (datablock names): its card's Turn it into 3D button.
+    converted: str = ""  # image_to_3d done on a picture Loopcut made: the job that made it (agent._turned_into_3d).
+    unapplied: str = ""  # A finished job whose outputs did not land (another file open): its id (cloud.apply_finished).
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -1179,7 +1186,9 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: b
              "rendered": "Rendered (EEVEE)"}[style] if angle != "user" else "as the user has it"
     what += (f". Drawn: the viewport, {drawn}, {scene.view_settings.view_transform} view, "
              f"{pixels.shape[1]}x{pixels.shape[0]} px")
-    return ToolResult(f"Image attached: {what}.{order}", image_path=path)
+    from . import autorig  # R7-D1: the user's view draws a Loopcut rig's bones; this look (overlays off) does not.
+    return ToolResult(f"Image attached: {what}.{order}", image_path=path,
+                      model_note=autorig.unseen_bones() if angle != "user" else "")
 
 
 # ------------------------------------------------------------------ reference images

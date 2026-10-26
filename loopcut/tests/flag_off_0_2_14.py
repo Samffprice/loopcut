@@ -47,12 +47,15 @@ def extra(folder: Path = base.PACKAGE, name: str = "_flag_off_0214") -> dict:
                 display = layout.build(session, width, 800, 1.0, base.measure, "fast", None, ui)
                 shots[f"reply_{provider.lower()}_{width}"] = {"prims": display["prims"], "hits": display["hits"]}
     cards = {}
-    for label, credits in (("trial_and_low", {"balance": 15, "monthly": 100, "resets_at": reset,
+    granted = 1792144800.0  # 2026-10-16T10:00:00Z. An hour later and still whole, the trial card shows in 0.2.14 and
+    # since 0.2.19 alike; 0.2.19 drops it for an older or spent grant (test_nudges).
+    for label, credits in (("trial_and_low", {"balance": 100, "monthly": 1000, "resets_at": reset,
                                               "trial": {"amount": 100, "granted_at": "2026-10-16T10:00:00Z"}}),
                            ("trial_pack", {"balance": 24}), ("plenty", {"balance": 90, "monthly": 100})):
         with nudges._lock:
             nudges._pending.clear()
-        with patch.object(nudges.config, "billing_open", return_value=True):
+        with patch.object(nudges.config, "billing_open", return_value=True), \
+                patch.object(nudges.time, "time", return_value=granted + 3600):
             nudges.observe({"account": {"plan": "free", "credits": credits}}, True, ["sfx", "image_to_3d"])
         with nudges._lock:
             cards[label] = [[kind, key, card] for card, kind, key in nudges._pending]

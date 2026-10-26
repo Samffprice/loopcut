@@ -691,6 +691,38 @@ class WorkerSteerTest(unittest.TestCase):
             "created": [{"worker": "b", "name": "B_Part", "id_type": "OBJECT"}]})
         self.assert_delivery_receipt(result, "held back (quarantined, waiting for the user's accept): A_Light")
         self.assertEqual(state.worker_outcome(self.crew[1].row), "completed and merged")
+        self.assertFalse(result.held_back or orchestrator.delegate(wait=True).held_back,
+                         "a's every new part is held back: b's merge does not make a's delivery done on the card")
+
+    def test_a_worker_that_merged_only_reused_materials_with_its_new_parts_held_back_is_not_held_back_only(self):
+        """Review of gate018-ui: a row counts as merged through a reused live material alone; with every new object
+        of its own held back, its delegate card is failed, not done."""
+        result = self.collect_merge_receipt({
+            "created": [{"worker": "a", "name": "A_Light", "id_type": "OBJECT"},
+                        {"worker": "a", "name": "A_LightData", "id_type": "LIGHT"},
+                        {"worker": "b", "name": "B_Part", "id_type": "OBJECT"}],
+            "quarantined": [{"worker": "a", "name": "A_Light", "id_type": "OBJECT"}],
+            "reused": [{"worker": "a", "name": "Oak", "made": "Oak.001", "id_type": "MATERIAL"}]})
+        self.assertTrue(self.crew[0].row["merged"], "merged, through the reused material")
+        self.assertFalse(result.ok)
+        self.assertFalse(result.held_back)
+        self.assertFalse(self.crew[0].row.get("merged_new"))
+
+    def test_wait_bases_held_back_on_the_rows_holding_parts_back(self):
+        """Review of gate018-ui: wait_result reads every wave of the job, so a later wave whose worker merged nothing
+        of its own, only held-back parts, showed done because an earlier wave merged."""
+        clean = {**state.wave_row("chair", "Chair", "modeling"), "status": "done", "merged": True, "merged_new": True,
+                 "merged_changes": ["+ Chair"], "quarantined": [], "conflicts": []}
+        held = {**state.wave_row("lamp", "Lamp", "modeling"), "status": "done", "merged": False, "merged_new": False,
+                "merged_changes": [], "quarantined": ["Lamp_Bulb"], "conflicts": [], "merge_unchanged": True}
+        session = state.new_session()
+        session["items"] = [{"kind": "wave", "job": "1-1", "wave": "1-1-w1", "number": 1, "rows": [clean]},
+                            {"kind": "wave", "job": "1-1", "wave": "1-1-w2", "number": 2, "rows": [held]}]
+        result = waves.wait_result(session)
+        self.assertFalse(result.ok)
+        self.assertFalse(result.held_back, "wave 2 merged nothing of its own; wave 1's merge does not stand in")
+        held.update(merged=True, merged_new=True, merged_changes=["+ Lamp"], merge_unchanged=False)
+        self.assertTrue(waves.wait_result(session).held_back, "with its own work in, only the bulb waits for accept")
 
     def held_results(self, *names):
         entries = [{"worker": "a", "name": name, "id_type": "OBJECT"} for name in names]
@@ -844,6 +876,7 @@ class WorkerSteerTest(unittest.TestCase):
             "created": [{"worker": "b", "name": "B_Part", "id_type": "OBJECT"}]})
         self.assert_delivery_receipt(result, "conflicted (nothing merged): scene.camera")
         self.assertEqual(state.worker_outcome(self.crew[1].row), "completed and merged")
+        self.assertFalse(result.held_back or orchestrator.delegate(wait=True).held_back, "failed on the delegate card")
 
     def test_partial_delivery_keeps_errors_alongside_what_merged(self):
         error = "a: scene.camera target A_Camera did not arrive"
@@ -2814,6 +2847,58 @@ class WaveTest(unittest.TestCase):
                 "bounds": [[x0, -0.5, 0.015], [x0 + 0.9, 0.5, 0.9]], "rests_on": "Rug",
                 "checks": [{"kind": "contact", "a": name, "relation": "rests_on", "b": "Rug",
                             "quote": f"an {name.lower()} on the rug"}]}
+
+    def test_a_delegate_whose_wave_merged_with_parts_kept_aside_is_done_on_its_card_not_for_the_model(self):
+        """rel018-ja2 item 40: the wave started (FloorLamp, CeilingFan) and merged, the fan's parts outside its role
+        were kept aside for the user's accept, and the delegate card ended failed (a red ✕). The card is done, the
+        merge card's Accept is the held-back parts' own line, and the model's result still fails so it deals with
+        them (dbcd031b3e2). A conflict stays failed on the card too; a delegate that started nothing (items 35 and
+        37, refused) stays failed."""
+        def brief(name, quote, x0):
+            planned = self.brief_on_rug(name, x0)
+            planned["requirements"] = [{"quote": quote, "do": name}]
+            planned["checks"][0]["quote"] = quote
+            return planned
+        shared = {"supports": [{"name": "Rug", "top_z": 0.015}]}
+        crew = [brief("FloorLamp", "a floor lamp", -1.0), brief("CeilingFan", "a ceiling fan", 0.2)]
+        unquoted = {"shared": shared, "workers": [{**w, "requirements": []} for w in crew]}
+        held = [{"worker": "ceilingfan", "name": name, "id_type": "OBJECT"} for name in ("Fan Blades", "Fan Hub")]
+        clash = [{"worker": "ceilingfan", "keys": ["OBJECT:Rug"], "reason": "live value changed"}]
+        report = waves.report
+        for conflicts, card_status in (([], "done"), (clash, "failed")):
+            with self.subTest(conflicts=bool(conflicts)):
+                def merge(spawn, results, checkpoint, keep_spawn=False):  # The fan's blades and hub: outside its role.
+                    merged = WaveTest.merge(self, spawn, results, checkpoint, keep_spawn)
+                    ids = {r["brief"]["id"] for r in results}
+                    merged.quarantined = [e for e in held if e["worker"] in ids]
+                    merged.conflicts = [e for e in conflicts if e["worker"] in ids]
+                    return merged
+                self.merge, results = merge, []
+                with mock.patch.object(waves, "report", lambda *a, **k: results.append(report(*a, **k)) or results[-1]):
+                    session, turn = self.orchestrated_turn(
+                        "Add a floor lamp and a ceiling fan on the rug.",
+                        [calls(("delegate", {"wave": unquoted})),
+                         calls(("delegate", {"wave": {"shared": shared, "workers": crew}})),
+                         text("The lamp and the fan are in; the fan's blades and hub wait for your accept.")],
+                        floorlamp=[build(), finish("Lamp built.")], ceilingfan=[build(), finish("Fan built.")])
+                self.assertEqual(turn.outcome, "completed")
+                refused, started = [i for i in session["items"] if i.get("name") == "delegate"]
+                self.assertEqual(refused["status"], "failed", refused["output"])
+                self.assertTrue(started["output"].startswith("Wave 1 started: FloorLamp, CeilingFan."), started["output"])
+                self.assertIn("held back (quarantined, waiting for the user's accept): Fan Blades; Fan Hub",
+                              started["output"])
+                self.assertEqual([r.ok for r in results], [False], "the model's result: the held-back parts are its to do")
+                self.assertEqual(started["status"], card_status)
+                [kept] = [i for i in session["items"] if i["kind"] == "merge" and i["quarantined"]]
+                self.assertEqual(kept["quarantined"], ["Fan Blades", "Fan Hub"])
+                session["busy"] = False
+                from loopcut.ui import layout
+                display = layout.build(session, 420, 4000, 1.0, lambda font, size, text: len(text) * size * 0.6,
+                                       "fast", None, {})
+                drawn = {p["id"]: p.get("text") for p in display["prims"]}
+                self.assertEqual(drawn[f"item{session['items'].index(started)}.tool.glyph"],
+                                 "✓" if card_status == "done" else "✕")
+                self.assertIn(f"item{session['items'].index(kept)}.merge.accept", {h["id"] for h in display["hits"]})
 
     def test_a_reply_while_a_worker_runs_waits_for_it_and_bounces_once_with_its_result(self):
         """No work is merged unseen: the orchestrator's final reply came while the ottoman still built;

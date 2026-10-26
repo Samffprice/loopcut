@@ -58,8 +58,14 @@ Current boundaries:
 - The requested camera is fixed, including across camera markers. File Output compositor nodes are
   disabled in the copy so they cannot write outside the job's directory. Other compositor processing
   remains enabled. This is a main-image export, not an export of compositor side outputs.
-- External assets must exist as concrete files. Hashes are checked before and after rendering;
-  changed assets invalidate verification/resume. Pack sequence/tiled textures first. Simulation
+- External assets are concrete files, hashed. A missing file a datablock reads on its own (a single
+  image, an IES or script node's file, a sound, a movie clip, a font, a cache file or volume that is
+  not a sequence, a library) is rendered without, a texture showing magenta and a library's objects
+  absent, and the start, status and inspection results name it. Hashes, and that each missing file is
+  still missing, are checked before and after rendering; a changed asset, or a missing one that
+  appears, invalidates verification/resume. Pack sequence/tiled textures first: those, folders, and a
+  missing path an object or modifier owns (a fluid, ocean or point cache folder the job's simulation
+  would write into the project, a mesh cache) are refused. Simulation
   caches must be baked and portable in the copied scene. Jobs do not bake simulations for you.
 - Changing the Blender build or worker implementation requires a new job, avoiding mixed render
   versions in one sequence. Disk cleanup is manual; jobs and outputs are intentionally retained.
@@ -71,6 +77,7 @@ Checks (from the repository root):
 ```sh
 python3 -m unittest discover -s loopcut/tests
 Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/jobs_check.py
+Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/missing_assets_check.py
 ```
 
 The Blender check interrupts a 120-frame job, corrupts and removes frames, resumes and verifies all
@@ -78,3 +85,7 @@ The Blender check interrupts a 120-frame job, corrupts and removes frames, resum
 one-second timeout, and verifies a job completes after the Blender process that launched it exits.
 No live model calls. `test_jobs.StatusWaitTests` covers the wait without Blender: it returns on
 the job's end, at the end of the wait, and at once on a stop, and it polls off the main thread.
+missing_assets_check.py renders a scene whose texture file and IES profile are missing, with a packed
+image whose file is gone: the packed one is not missing, the frame comes out with the texture magenta and
+the start, status and inspection results name both files, a resume after the texture appears is refused,
+and a Quick Smoke domain's Replay cache folder, not made yet, is refused up front.

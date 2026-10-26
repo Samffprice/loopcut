@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from . import bl_info, config, credentials
 
-CONTRACT = "0.9"
+CONTRACT = "0.10"  # 0.10: expired outputs, job timestamps (cloud jobs picked up after a restart).
 MAX_RESPONSE = 4 * 1024 * 1024
 
 

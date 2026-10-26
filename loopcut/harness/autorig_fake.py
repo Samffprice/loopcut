@@ -218,7 +218,7 @@ class Server:
                     if getattr(owner, 'age_required', False):
                         return self.send({'error': {'code': 'age_confirmation_required', 'type': 'invalid_input',
                             'message': 'Age confirmation required', 'confirm_url': 'https://loopcut.org/account'}}, 403)
-                    assert data.get('tool_version') == 3 and self.headers.get('x-loopcut-contract') == '0.9'
+                    assert data.get('tool_version') == 3 and self.headers.get('x-loopcut-contract') == '0.10'
                     task = json.loads(owner.blobs[data['files']['rig_task']])
                     assert data['input'].get('accept_experimental', False) == task.get('accept_experimental', False)
                     if owner.contract:
@@ -234,7 +234,7 @@ class Server:
                     return self.send(quote)
                 if self.path == '/v1/jobs':
                     assert 'targets' not in data['input'] and data['quote_id'] == 'qt_offline'
-                    assert self.headers.get('x-loopcut-contract') == '0.9'
+                    assert self.headers.get('x-loopcut-contract') == '0.10'
                     if owner.contract:
                         owner.contract.request(data, 'job-create-request', owner.blobs)
                     task = json.loads(owner.blobs[data['files']['rig_task']])
@@ -252,7 +252,7 @@ class Server:
                         return self.send({}, 422)
                     assert set(data) == {'reason'} and data['reason'] in {
                         'correspondence_ambiguous', 'canonicalize_refused', 'validation_failed', 'other'}
-                    assert self.headers.get('x-loopcut-contract') == '0.9'
+                    assert self.headers.get('x-loopcut-contract') == '0.10'
                     with owner.refund_lock:
                         if key not in owner.reports:
                             refunded = 0 if owner.refund_review else 20

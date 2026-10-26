@@ -36,7 +36,7 @@
 ],
 [
 "low_credits",
-"2099-10-21:100",
+"2099-10-21:1000",
 {
 "actions": [
 {
@@ -62,7 +62,7 @@
 "nudge": "low_credits",
 "resolved": "",
 "text": "Your monthly credits renew 2099-10-21.",
-"title": "15 credits left ($0.15)"
+"title": "100 credits left ($1.00)"
 }
 ]
 ],

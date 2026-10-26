@@ -54,6 +54,13 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def assets_changed(spec: dict) -> bool:
+    """Whether a file outside the job's scene copy is not as the job recorded it: another hash, or a
+    file that was missing is there now (frames rendered without it and with it must not mix)."""
+    return (any(digest(Path(asset["path"])) != asset["sha256"] for asset in spec.get("assets", []))
+            or any(os.path.exists(asset["path"]) for asset in spec.get("missing_assets", [])))
+
+
 def verify_png(path: Path, width: int, height: int) -> None:
     """Validate our 8-bit RGBA PNG stream, including CRCs and complete compressed scanlines.
 

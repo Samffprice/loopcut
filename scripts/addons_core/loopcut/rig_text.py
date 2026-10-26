@@ -4,6 +4,9 @@
 # only when found: 19- and 22-bone standard rigs have none. The platform's quote still carries its own line.
 QUOTE = 'Body bones with automatic weights, and finger bones when it can find them; best on humanoids, others may bend oddly.'
 TIME_HINT = 'usually under a minute'
+# The credits arm's refusal (0.2.19, cloud.error_text): the panel's out-of-credits pop-up has the way on, so no
+# "Add credits, then retry" (the free plan cannot buy credits) and no retry.
+CREDITS_OFFERED = 'Not enough credits for this rig; the panel shows how to get more.'
 STAGES = {
     'checking': 'Checking character',
     'uploading': 'Preparing character',
@@ -84,6 +87,7 @@ def error(error):
         'approval_required': 'Approve this rig to continue.',
         'canceled': 'Rigging canceled; retry when ready.',
         'connection_failed': 'Connection lost; retry to check this rig.',
+        'job_unconfirmed': 'Unconfirmed; this rig may still run, so check it before starting another.',
         'quote_changed': 'The price changed; approve a new quote to continue.',
         'insufficient_credits': 'Add credits, then retry.',
         'daily_limit_reached': approval('daily_limit_reached', ''),

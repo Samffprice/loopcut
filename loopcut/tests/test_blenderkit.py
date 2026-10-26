@@ -8,7 +8,9 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "addons_core"))
 
@@ -19,7 +21,11 @@ sys.modules.setdefault("bpy", fake_bpy)
 if not hasattr(sys.modules["bpy"], "context"):
     sys.modules["bpy"].context = types.SimpleNamespace(preferences=types.SimpleNamespace(addons={}))
 
-from loopcut import assets, blenderkit, credentials, tools  # noqa: E402
+from loopcut import assets, blenderkit, credentials, state, tools  # noqa: E402
+
+# Search API bodies keyed by the query sent, recorded 2026-10-25 (trimmed to the fields read).
+RECORDED = json.loads((Path(__file__).parent / "fixtures" / "blenderkit-search-2026-10-25.json")
+                      .read_text(encoding="utf-8"))["bodies"]
 
 FILES = [{"fileType": "blend", "downloadUrl": "https://www.blenderkit.com/api/v1/downloads/a/"},
          {"fileType": "resolution_0_5K", "downloadUrl": "https://www.blenderkit.com/api/v1/downloads/b/"},
@@ -83,6 +89,65 @@ class BlenderKitTest(unittest.TestCase):
         self.assertIsNone(blenderkit.dimensions({}))
         tags_only = blenderkit.describe_asset(1, {**live, "description": "", "dictParameters": {}})
         self.assertIn("; chair, wooden; free", tags_only)
+
+    def search(self, query, type="model", served=None):
+        """search_blenderkit against recorded API bodies (no network): the body recorded for the query it
+        sends, or `served` for any query. Returns (its result or the ToolError, the queries sent)."""
+        sent = []
+        def get_json(url, headers=None):
+            sent.append(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["query"][0])
+            return served if served is not None else RECORDED.get(sent[-1], {"count": 0, "results": []})
+        with mock.patch.object(blenderkit, "get_json", get_json), \
+                mock.patch.object(blenderkit, "_thumbnail", return_value=None), \
+                mock.patch.object(blenderkit, "sheet", return_value=None):
+            try:
+                return blenderkit.search_blenderkit(query, type), sent
+            except tools.ToolError as ex:
+                return ex, sent
+
+    def test_style_and_resolution_words_are_left_out_of_the_search(self):
+        # rel018-ja2: the user asked for 本物っぽい (real-looking), every query had "realistic", and every search
+        # came back 8 of 10000 led by "Uncut summer grass for scettering", for a lamp, a rug or a cat alike.
+        state.reset()
+        self.addCleanup(state.reset)
+        result, sent = self.search("realistic floor lamp reading lamp")
+        self.assertEqual(sent, ["floor lamp reading lamp asset_type:model is_free:true"])
+        rows = [line for line in result.text.splitlines() if line.startswith("#")]
+        self.assertEqual(rows[0].split(" (")[0], "#1 Arc Floor Lamp")
+        self.assertNotIn("grass", result.text)
+        self.assertTrue(result.text.startswith("8 of 368 BlenderKit models for 'floor lamp reading lamp' (free assets):\n"
+                                               "Searched without 'realistic'"), result.text[:200])
+        self.assertEqual(blenderkit.search_words("Photorealistic, hyper-realistic 4K oak table (realism)"),
+                         ("oak table", ["Photorealistic,", "hyper-realistic", "4K", "(realism)"]))
+        for kept in ("low poly tree", "stylized lamp", "high quality sofa", "real wood chair", "k2 mountain"):
+            self.assertEqual(blenderkit.search_words(kept), (kept, []))
+        self.assertEqual(self.search("wood floor realistic", "material")[1], ["wood floor asset_type:material is_free:true"])
+        error, sent = self.search("photorealistic 4k")
+        self.assertIsInstance(error, tools.ToolError)
+        self.assertIn("Give words for what the asset is", str(error))
+        self.assertEqual(sent, [], "nothing to search for")
+
+    def test_the_generic_list_at_the_count_cap_reads_as_no_match(self):
+        # The recorded 10000 body served for other words, as for any word BlenderKit matches on most models.
+        state.reset()
+        self.addCleanup(state.reset)
+        generic = RECORDED["realistic floor lamp reading lamp asset_type:model is_free:true"]
+        error, _ = self.search("cozy reading nook armchair", served=generic)
+        self.assertIsInstance(error, tools.ToolError)
+        self.assertEqual(str(error), "BlenderKit returned its generic list for 'cozy reading nook armchair', not "
+                                     "matches. Search with the object's own name, such as 'floor lamp'.")
+        self.assertNotIn("fewer or more general", str(error), "that sends the model back toward the problem")
+        mixed = RECORDED["realistic floor lamp asset_type:model is_free:true"]
+        result, _ = self.search("floor lamps", served=mixed)
+        self.assertIn("#1 Moon Floor Lamp", result.text, "at the cap, but some names match: the rows as they are")
+        self.assertIn("Uncut summer grass", result.text)
+        result, _ = self.search("cozy reading nook armchair", served={**generic, "count": 9999})
+        self.assertIn("Uncut summer grass", result.text, "under the cap the rows are the library's answer")
+        self.assertFalse(blenderkit.unrelated("椅子", 10000, generic["results"]), "no words to compare: not judged")
+        for plural, name in (("benches", "Park Bench"), ("lamps", "Arc Floor Lamp"), ("berries", "Berry Bowl"),
+                             ("glasses", "Wine Glass"), ("bench", "Garden Benches")):
+            self.assertFalse(blenderkit.unrelated(plural, 10000, [{"name": name}]), (plural, name))
+        self.assertTrue(blenderkit.unrelated("benches", 10000, [{"name": "Realistic Hair"}]))
 
     def test_key_from_env_then_credentials_then_the_blenderkit_addon(self):
         self.assertEqual(blenderkit.api_key(), "")

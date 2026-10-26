@@ -172,7 +172,7 @@ class RuntimeTest(RuntimeFixture):
         restarted = cloud.Runtime(runtime.client, self.directory.name, signed_in=True)
         self.assertEqual(restarted.etag, '"v1"')
         self.assertEqual(restarted.descriptors(), runtime.descriptors())
-        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.9')
+        self.assertEqual(self.transport.calls[0]['headers']['x-loopcut-contract'], '0.10')
 
     def test_multipart_capability_comes_from_the_latest_manifest(self):
         offered = {'blob_multipart': {'min_size': 16 * 1024 * 1024}}
@@ -989,7 +989,7 @@ class DispatchTest(RuntimeFixture):
             if on_progress:
                 on_progress({'pct': 40, 'message': 'Working'})
             return {'id': 'job_1', 'status': 'succeeded', 'outputs': [], 'error': None}
-        def apply(descriptor, job):
+        def apply(descriptor, job, **_):  # cloud_jobs.apply_result's details: an image result's pictures.
             self.calls.append(('apply', threading.get_ident(), job))
             return 'Imported result.'
         self.module.resolve_files, self.module.run, self.module.apply_result = resolve, run, apply
@@ -1226,7 +1226,8 @@ class DispatchTest(RuntimeFixture):
         for code, status, extra, expected in [('insufficient_credits', 402, {'balance': 1, 'needed': 2}, 'balance 1, needed 2'),
                 ('generation_disabled', 403, {}, 'disabled'), ('vendor_failed', 502, {'refunded': True}, 'refunded'),
                 ('rate_limited', 429, {'retry_after': 7}, '7 seconds'), ('tool_disabled', 403, {}, 'refreshing'),
-                ('contract_unsupported', 426, {}, cloud.UPDATE_MESSAGE)]:
+                ('contract_unsupported', 426, {}, cloud.UPDATE_MESSAGE),
+                ('job_unconfirmed', 500, {'idempotency_key': 'k1'}, 'may have been created')]:
             with self.subTest(code=code), patch.object(runtime, 'refresh_async') as refresh:
                 runtime.supported = True
                 self.module.run = lambda *a, **k: (_ for _ in ()).throw(cloud_http.CloudError('Refused', code, status, extra))
@@ -1522,7 +1523,7 @@ class LifecycleTest(RuntimeFixture):
                 patch.object(config, 'service_policy', return_value={'no_generation': True, 'private_mode': True}), \
                 patch.object(config, 'service_backends', return_value={}):
             signed_in = cloud._snapshot()
-            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.9')
+            self.assertEqual(signed_in.client.client_headers['x-loopcut-contract'], '0.10')
             signed_in.manifest = manifest(tool())
             signed_in._save()
             key.return_value = ''

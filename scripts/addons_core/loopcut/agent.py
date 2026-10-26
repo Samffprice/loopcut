@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 import json
+import re
 import threading
 import time
 import uuid
@@ -122,6 +123,10 @@ STEP_LIMIT_PROMPT = ("[Loopcut] This turn has used all {steps} of its steps, so 
 BUDGET_PROMPT = ("[Loopcut] The job's budget is spent ({reason}), so tools are off now: any tool call is ignored. "
                  "Reply in plain text only, in three short parts: what is done, what is left, and what you did "
                  "not verify.")
+# repeats.STUCK_STEPS steps in a row failed: said to the user, who saw only finished steps from code that caught
+# its own errors and a model that never wrote a word (a user's log, 0.2.14). The turn goes on.
+STUCK_NOTICE = (f"The last {repeats.STUCK_STEPS} steps failed and nothing in the scene changed. Stop to tell Loopcut "
+                "what to try, or let it keep going.")
 # Either repeats.NoProgress limit: one call's failures and refusals, or refused repeats of any calls.
 NO_PROGRESS_NOTICE = "Stopped because the same steps kept repeating without changing the scene."
 NO_PROGRESS_PROMPT = ("[Loopcut] The same tool calls keep failing or being refused as repeats without changing the "
@@ -174,6 +179,20 @@ Blender as closely as possible. Be terse and concrete, numbers and names over pr
 If several images are attached, describe each under its name."""
 
 
+# A study the model refused (_refused_card, or a content filter's finish): the user is told, and the picture still
+# goes to the model as it is, named as a failed card is (UNDESCRIBED). Unmarked too: a turn resumed after picking
+# another model asks that model.
+REFERENCE_REFUSED = ("The model declined to study the attached picture. If it can't work from it either, pick "
+                     "another model in the model menu below.")
+REFUSED_CARD_CHARS = 300
+# "Declined" only as speech about the request (anthropic_messages: "Claude declined to continue this request."), never
+# bare: a picture's card may say a slope or a chart declines.
+_REFUSAL = re.compile(r"\b(?:rejected|refused|high risk|inappropriate|violat\w*|sorry|apologi[sz]e|(?:can ?not|can't|"
+                      r"won't|unable to|not able to) (?:help|assist|describe|process|comply|analy[sz]e)|"
+                      r"declin(?:e|ed|es|ing) to (?:continue|help|assist|describe|process|comply|analy[sz]e|answer)|"
+                      r"(?:must|have to|'ll) decline)\b", re.I)
+
+
 class Turn:
     def __init__(self):
         self.cancel = threading.Event()
@@ -217,6 +236,9 @@ class Turn:
         self.route_tried = False
         self.routed = None
         self.nudged = False
+        # The user turned down one of this turn's calls on its card (Reject, or Skip on a paid call): the next
+        # move is theirs, so the router's nudge stays out of it (rel018-app).
+        self.declined = False
         # The workspace (workspace.py): whether the router may send this orchestrated turn to the single
         # agent's workspace loop (_configure), and whether it did (router.start_turn's divert).
         self.may_divert = False
@@ -253,6 +275,8 @@ class Turn:
         self.allowance_generation = state.ui.get("allowance_generation", 0)
         self.hosted_requests = 0
         self.allowance_notices: list = []  # (items, notice) retained if a refused send restores its draft.
+        self.tool_paywall = False  # A paid tool's refusal opened the out-of-credits pop-up (_Consent._paywall): once.
+        self.credit_offers: set = set()  # The tools that pop-up or a locked card (nudges.offer_locked) offered.
         self.submission = None  # A new send can be returned to the input if its first request is refused.
         self.returned_submission = False
         # Its conversation log (session_logs.py): what ran it, or {} when the conversation is not uploaded.
@@ -323,6 +347,19 @@ def _run_tool_on_main(name: str, arguments: str, is_cancelled=lambda: False):
 def _inspection_current(token: dict) -> bool:
     from . import inspection, mainthread
     return mainthread.run_on_main(lambda: token == inspection.live_token()).result()
+
+
+def _resume_playback(spec) -> None:
+    """Playback an inspection paused for its look (inspection.pause_playback) plays again, once the
+    batch's looks were checked against the scene (_fresh_images) or the turn ends. Not from a worker's
+    loop: workers run beside the lead in this Blender, and their looks are in their own windowless
+    Blenders, so a pause is always the lead's (the one loop of a turn that isn't a worker)."""
+    from . import inspection, mainthread
+    if spec.role != "worker" and inspection.paused():
+        try:
+            mainthread.run_on_main(inspection.resume_paused).result(timeout=10)
+        except Exception as ex:  # Never keeps a step or the turn from going on; the user can press play.
+            print(f"Loopcut: could not resume playback: {ex!r}")
 
 
 def _fresh_images(images: list) -> list:
@@ -585,8 +622,9 @@ def _hosted_reply(turn: Turn, cfg: config.Config, info: dict | None = None, *, s
             return  # A signed-out account or a provider we left cannot repopulate the display/meter.
         if info:
             _update_account(info)
-        if success:
-            state.clear_allowance_notice()
+        from . import chat_credits
+        if success and not chat_credits.is_tool((state.ui.get("allowance_notice") or {}).get("item")):
+            state.clear_allowance_notice()  # A paid tool's refusal still stands while chat goes on (_Consent._paywall).
         if info and session is not None:
             _warn_low_allowance(session, session["items"], info, turn=turn)
     mainthread.run_on_main(apply)
@@ -616,6 +654,8 @@ def _hosted_refusal(session: dict, turn: Turn, item: dict, info: dict | None = N
             session["messages"][:] = snapshot["messages"]
             for key in ("references", "scene_seen", "scene_turn_start", "pending_checkpoint", "turn_number"):
                 session[key] = snapshot[key]
+            # Its notes go with the request again, and a click's note added meanwhile stays after them.
+            session["between_turns"] = [*snapshot.get("between_turns", []), *(session.get("between_turns") or [])]
             from .ui import textedit
             draft = "\n".join(t for t in (snapshot["text"], *extra, session["input"]) if t)
             textedit.set_text(session, draft)
@@ -623,8 +663,10 @@ def _hosted_refusal(session: dict, turn: Turn, item: dict, info: dict | None = N
             session["attachments"] = snapshot["attachments"] + [a for a in session["attachments"] if a["ref"] not in refs]
             turn.notes.clear()
             turn.returned_submission = True
+        from . import chat_credits
         latest = state.latest_limit(session["items"])
-        if not turn.hosted_requests and latest is not None:
+        # A paid tool's refusal (_Consent._paywall) is history in the chat, never this send's card to reuse.
+        if not turn.hosted_requests and latest is not None and not chat_credits.is_tool(session["items"][latest]):
             existing = session["items"][latest]
             existing.clear()
             existing.update(item)
@@ -949,9 +991,27 @@ class _CardWait:
         self.event.set()
 
 
+def _wait_key(card: dict):
+    """What a card's own wait is found by: a Turn it into 3D click's key (turn_into_3d), which a reopened chat's copy
+    of the card has too, else the card itself."""
+    click = card.get("click")
+    return tuple(click) if isinstance(click, list) else id(card)
+
+
+def end_click_asks(conversation: str) -> None:
+    """A chat leaves the screen (lifecycle.switch_to), or a turn's end meets a click's ask (run_loop): each Turn it
+    into 3D click of that chat still asking is answered No, so it ends rejected with its picture ready and nothing
+    submitted, instead of waiting where nobody can answer it."""
+    for key, wait in list(_card_waits.items()):
+        if isinstance(key, tuple) and key[:1] == (conversation,):
+            wait.answer(False)
+
+
 def _wait_for_card(card: dict, turns) -> bool:
-    """A worker's ask: wait for its own card's answer, so a main-turn card waiting at the same time keeps its own."""
-    wait = _card_waits[id(card)] = _CardWait()
+    """A worker's ask: wait for its own card's answer, so a main-turn card waiting at the same time keeps its own.
+    A wait registered before the card showed (_Consent._pause) is the one waited on."""
+    key = _wait_key(card)
+    wait = _card_waits.setdefault(key, _CardWait())
     try:
         while not wait.event.wait(_POLL_SECONDS):
             if any(t.cancel.is_set() for t in turns):
@@ -960,14 +1020,52 @@ def _wait_for_card(card: dict, turns) -> bool:
             raise llm.Cancelled()
         return wait.approved
     finally:
-        _card_waits.pop(id(card), None)
+        _card_waits.pop(key, None)
 
 
 def _save_spend(session: dict) -> None:
     """A charge known after the turn ended (a detached job) is saved with its conversation now; a running turn
-    saves it with its next step."""
-    if not session.get("busy"):
+    saves it with its next step. A copy no longer on screen writes only its spend into its file: History reopens a
+    chat as a new copy, and an older copy must never be written over newer turns."""
+    if session is not state.session():
+        with spending.lock:
+            spend = dict(spending.ledger(session))
+        _patch_spend(session, lambda body: body.update(spend=spend))
+    elif not session.get("busy"):
         conversations.save(session)
+
+
+def _patch_spend(session: dict, change) -> None:
+    """change(body) on the file of a chat no longer on screen. One nobody has written in has no file (as
+    conversations.save leaves it), and a failed write never fails the call whose charge it settles."""
+    if not session["items"]:
+        return
+    try:
+        conversations.patch(session["id"], change)
+    except Exception as ex:
+        print(f"Loopcut: could not save a closed chat's spend: {ex!r}")
+
+
+def _settle_spend(chat_session: dict, held, charged, auto: bool) -> None:
+    """A call's hold becomes its charge in its chat as it is now: the copy on screen (History may have reopened it
+    as a new copy), or else its file, never by saving an older copy over it."""
+    live = state.session()
+    if live is not chat_session and live.get("id") == chat_session.get("id"):
+        chat_session = live
+    if chat_session is live:
+        with spending.lock:
+            spending.settle(spending.ledger(live), held, charged, auto)
+        _save_spend(live)
+        return
+
+    def change(body):
+        if not spending.valid_ledger(body.get("spend")):
+            body["spend"] = spending.new_ledger()
+        with spending.lock:
+            spending.settle(body["spend"], held, charged, auto)
+    with spending.lock:
+        spending.settle(spending.ledger(chat_session), held, charged, auto)  # This copy's card, if it shows again.
+    _patch_spend(chat_session, change)
 
 
 class _Consent:
@@ -979,9 +1077,13 @@ class _Consent:
 
     settles = True  # cloud_account.charge_reporter sends it what each call was charged.
 
-    def __init__(self, session, turn, card, asks=True, files_allowed=False):
+    def __init__(self, session, turn, card, asks=True, files_allowed=False, clicked=False, shown=None):
         self.session, self.turn, self.card = session, turn, card
         self.asks, self.files_allowed = asks, files_allowed
+        # A Turn it into 3D click made this call (turn_into_3d): no turn of the panel's, so its asks are answered on
+        # their own card; shown is the price its button showed, which the click approved, and charged what the call
+        # was charged, which goes to its chat when it ends.
+        self.clicked, self.shown_credits, self.charged = clicked, shown, None
         self.hold = None       # (credits held, ran without asking) once the call may run.
         self.settled = None    # A rig's last net charge and original auto flag; its refund can reduce it later.
         self.limit_approved = False  # The user approved past a server limit, seeing this call's cost: no second ask.
@@ -991,7 +1093,31 @@ class _Consent:
     def chat(self):
         if getattr(self.turn, "chat", None):
             return self.turn.chat
-        return (self.session if self.session is not None else state.session()), self.turn
+        session = self.session if self.session is not None else state.session()
+        live = state.session() if self.clicked else session
+        if live is not session and live.get("id") == session.get("id"):
+            session = live  # A click's chat reopened since: a new dict, the one on screen.
+        return session, self.turn
+
+    def _pause(self, card: dict, **fields) -> bool:
+        """card asks (state.awaiting) and the user's answer. A click's call (turn_into_3d) waits on its own card, its
+        wait registered before the card shows: no turn of the panel's would hear Approve, Skip, Enter or Esc, and
+        a later turn's would take the answer as its own (agent.decide)."""
+        if self.clicked:
+            _card_waits[_wait_key(card)] = _CardWait()
+            state.awaiting(card, **fields)
+            _redraw()
+            return _wait_for_card(card, (self.turn,))
+        self.turn.decided.clear()
+        state.awaiting(card, **fields)
+        _redraw()
+        return _wait_for_approval(self.turn)
+
+    def _click_covers(self, details: dict) -> bool:
+        """The click approved this call: a quoted price no higher than its button showed."""
+        credits = details.get("credits")
+        return (self.clicked and type(self.shown_credits) in (int, float) and type(credits) in (int, float)
+                and credits <= self.shown_credits and not details.get("vendor"))
 
     def __call__(self, details):
         if 'progress' in details:  # Only a rig reports here (cloud_account.progress_reporter).
@@ -1009,9 +1135,13 @@ class _Consent:
                     cloud._card_progress(card, details['progress'])
             return True
         if "error" in details:
+            paywall = details["error"].get("paywall")
+            error = {k: v for k, v in details["error"].items() if k != "paywall"}
             for card in self.shown:
-                card["cloud_error"] = details["error"]
-                card["expanded"] = True
+                card["cloud_error"] = error
+                card["expanded"] = not paywall  # The pop-up has the offer: the call's card keeps its one line.
+            if paywall:
+                self._paywall(paywall)
             _redraw()
             return True
         if "charged" in details:
@@ -1032,11 +1162,12 @@ class _Consent:
                 return True
             if not self.asks:
                 return False
-            self.turn.decided.clear()
-            self.card.update(status="awaiting", paid_approval=False, heavy=False)
-            _redraw()
-            approved = _wait_for_approval(self.turn)
+            approved = self._pause(self.card, paid_approval=False, heavy=False)
             self.card["status"] = "running" if approved else "rejected"
+            if approved:
+                self.card["started_at"] = time.time()  # Its time shown counts from the answer, not the ask.
+            else:
+                self.turn.declined = True
             _redraw()
             return approved
         if details.get("limit"):  # A server limit refused it (cloud_account._confirmed): ask, then it goes again.
@@ -1046,7 +1177,10 @@ class _Consent:
             return approved
         chat_session, chat_turn = self.chat()
         settings = getattr(chat_turn, "spending", None) or spending.Settings()
-        explicit, allowed = self.limit_approved, set()  # A limit card that showed the price was its approval.
+        # A limit card that showed the price was its approval, unless the call is a made picture's 3D, which asks on
+        # its own card; a click approved what its button showed (_click_covers).
+        explicit = (self.limit_approved and not details.get("made_picture")) or self._click_covers(details)
+        allowed = set()
         while not explicit:
             with spending.lock:
                 kind = spending.decide(details, spending.ledger(chat_session), settings, calls=chat_turn.paid_calls,
@@ -1060,9 +1194,12 @@ class _Consent:
             with spending.lock:
                 spending.allow(kind, details, spending.ledger(chat_session), settings, chat_turn,
                                chat_session["spend_vendors"])
-            if kind in (spending.COST, spending.VENDOR):  # The user approved this very call.
+            if kind in (spending.COST, spending.VENDOR, spending.MADE):  # The user approved this very call.
                 explicit = True
                 break
+        if self.clicked:  # Nothing held: its charge goes to its chat when it ends (turn_into_3d), wherever that is.
+            _redraw()
+            return True
         with spending.lock:
             chat_turn.paid_calls += 1
             held = spending.start(spending.ledger(chat_session), details, not explicit)
@@ -1089,16 +1226,22 @@ class _Consent:
             from . import rig_text
             lines = [rig_text.approval(kind, self.card.get('rig_notice'))]
         fields = {"ask": kind, "ask_lines": lines, "ask_label": spending.approve_label(kind, settings),
+                  "ask_skip": spending.skip_label(kind), "ask_title": spending.ask_title(kind, details),
                   "paid_approval": True, "heavy": False, "install": False}
         if details.get("url"):
             fields["ask_link"] = details["url"]
+        if kind == spending.COST and not self.rig:
+            from . import render_offer  # A long render's ask is the choice: the cloud or this computer.
+            fields.update(render_offer.card_fields(details))
+        picture = (details.get("made_picture") or {}).get("path") if kind == spending.MADE else ""
+        if picture:  # The picture it would turn into 3D, on the card that asks.
+            fields["image_path"] = picture
         if self.rig:
             fields['rig_stage'] = 'Waiting for approval.'
         if worker:
             card = (self.shown[-1] if self.rig and len(self.shown) > 1 else  # Its mirrored progress card.
                     state.item_tool(self.card.get("name", ""), f"{worker}: {self.card.get('summary') or ''}".rstrip(": "), ""))
-            card.update(cost=self.card["cost"], worker=worker, **fields)
-            card["status"] = "awaiting"
+            state.awaiting(card, cost=self.card["cost"], worker=worker, **fields)
             if card not in self.shown:
                 self.shown.append(card)
             if card not in chat_session["items"]:
@@ -1111,23 +1254,60 @@ class _Consent:
                 raise
         else:
             card = self.card
-            self.turn.decided.clear()
-            card.update(status="awaiting", **fields)
-            _redraw()
-            approved = _wait_for_approval(self.turn)
-        for key in ("ask", "ask_lines", "ask_label", "ask_link"):
+            approved = self._pause(card, **fields)
+        choice, picked = card.get("render_choice"), card.pop("picked", None)
+        for key in ("ask", "ask_lines", "ask_label", "ask_link", "render_choice", "price", "ask_skip", "ask_title"):
             card.pop(key, None)
+        if picture:
+            card.pop("image_path", None)
+        if choice and not approved and picked == "here":
+            # "Render on my laptop": this paid call is declined, and the same frames render here instead.
+            from . import render_offer
+            card.update(status="done" if worker else "running", summary=render_offer.here_summary(choice))
+            _redraw()
+            raise render_offer.here(choice, card)
         # A rig's worker card keeps running until finish(); other workers' asks are done once answered.
         card["status"] = ("running" if self.rig or not worker else "done") if approved else "rejected"
+        if card["status"] == "running":
+            card["started_at"] = time.time()  # Its time shown counts from the answer, not the ask (ui.layout).
         _redraw()
         if not approved:
-            self.card["declined"] = True
+            self.card["declined"] = self.turn.declined = True
             if self.rig:
                 for shown in self.shown:
                     shown['cost'] = rig_text.price(0, self.card.get('rig_balance'))
+            if choice:  # Esc on the choice card: neither render, and the model asks which.
+                from . import render_offer
+                raise cloud_http.CloudError(render_offer.SKIPPED, "declined")
             raise cloud_http.CloudError(spending.declined(kind, details, settings, calls=chat_turn.paid_calls),
                                         "declined")
         return True
+
+    def _paywall(self, refusal: dict) -> None:
+        """The credits arm (0.2.19): the server refused this paid call for credits (cloud_account.error_details), so
+        the user's chat gets the chat's out-of-credits pop-up for it, at once, in the turn that runs: the same limit
+        item, headed by the tool (chat_credits.tool_item). Once a turn: a retry, or another paid tool refused in the
+        same turn, keeps the one shown; a worker's call shows in the user's chat, on the user's turn. Never raises."""
+        from . import chat_credits, cloud
+        chat_session, chat_turn = self.chat()
+        live = state.session()
+        if chat_session is not live and (not chat_session.get("id") or chat_session.get("id") != live.get("id")):
+            return  # The conversation is closed.
+        # The turn running now: a detached job's refusal (job_status, a later turn) counts in that turn, once.
+        owner = live.get("turn") or chat_turn
+        name = self.card.get("name", "")
+        tool = cloud.tool_name(name) or name
+        if getattr(owner, "tool_paywall", False) or tool in (getattr(owner, "credit_offers", None) or ()):
+            return
+        try:
+            account, _ = chat_credits._account()
+            item = chat_credits.tool_item(cloud.plain_title(name), refusal.get("needed"), refusal.get("balance"),
+                                          account)
+        except Exception as ex:  # The offer is a courtesy; the call's own result still reaches the model.
+            print(f"Loopcut: could not show the out-of-credits offer for a tool: {ex!r}")
+            return
+        if item is not None:
+            chat_credits.show_tool_item(chat_session, owner, item, tool)
 
     def finish(self, result):
         """A rig's mirrored worker card ends with the call's result."""
@@ -1141,6 +1321,8 @@ class _Consent:
         if self.rig:
             self._settle_rig(charged, text)
             return
+        if self.clicked and charged is not None:
+            self.charged = charged
         if self.hold is None and not charged:
             return  # Nothing held and nothing charged: a free call keeps "Free", a skipped one its price.
         if text:
@@ -1150,9 +1332,7 @@ class _Consent:
             held, auto = self.hold
             self.hold = None  # Once: a job's watcher and its job_status may both report.
             chat_session, _ = self.chat()
-            with spending.lock:
-                spending.settle(spending.ledger(chat_session), held, charged, auto)
-            _save_spend(chat_session)
+            _settle_spend(chat_session, held, charged, auto)
         _redraw()
 
     def _settle_rig(self, charged, text: str) -> None:
@@ -1181,6 +1361,142 @@ class _Consent:
         if charged is not None:
             _save_spend(chat_session)
         _redraw()
+
+
+def _made_pictures(session: dict, card: dict, call, result) -> None:
+    """After a tool call in the user's turn: image_generate's pictures get their card's Turn it into 3D button and
+    the model the line saying so (cloud.TO_3D_LINE); image_to_3d done on one marks its button."""
+    from . import cloud
+    offer = cloud.to_3d_offer(getattr(result, "made_pictures", None))
+    if offer:
+        card["to_3d"] = offer
+        result.model_note = "\n\n".join(filter(None, [getattr(result, "model_note", ""), cloud.TO_3D_LINE]))
+    if result.ok and getattr(result, "converted", ""):
+        _turned_into_3d(session, result.converted)
+
+
+def _turned_into_3d(session: dict, job: str) -> None:
+    """The picture that job made turned into 3D (by the job, so a renamed picture too): each button for it reads
+    Turned into 3D ✓ and runs nothing again."""
+    for item in session["items"]:
+        for picture in (item.get("to_3d") or {}).get("pictures") or ():
+            if job and picture.get("job") == job:
+                picture["state"] = "done"
+
+
+def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
+    """Main thread: the Turn it into 3D button on a made picture's card (owner, 2026-10-26). The click approves the
+    price it showed (shown): image_to_3d runs on that picture as a paid call, quoted, with no model call; a higher
+    quote, or a server limit, asks on its own card. Its tool card shows it, a refusal for credits goes the usual way
+    (the paywall pop-up), and the model reads what happened with the next message. Once per picture and chat: a
+    second click, a click while it runs (the chat saved so, state.running_clicks) or while a turn runs does nothing.
+    drawn: the card the clicked frame drew (gate018-ui); a frame drawn before the chat changed answers nothing.
+    A conversion whose model was made but could not land (another file was open, cloud._apply_to_scene) loads that
+    model on the next click, from the job this Blender kept: no new job and no new charge (cloud.apply_finished)."""
+    session = state.session()
+    items = session["items"]
+    if session.get("busy") or not 0 <= index < len(items) or (drawn is not None and drawn[0] != id(items[index])):
+        return False
+    pictures = (items[index].get("to_3d") or {}).get("pictures") or []
+    if not 0 <= which < len(pictures) or pictures[which].get("state") != "ready":
+        return False
+    picture = pictures[which]
+    key = (session["id"], picture.get("job") or picture["image"])
+    if key in state.running_clicks:
+        return False
+    from . import cloud, cloud_account, cloud_jobs, mainthread, tools
+    name = cloud.PREFIX + "image_to_3d"
+    runtime = cloud._runtime
+    descriptor = next((d for d in (runtime.descriptors() if runtime else []) if d["name"] == "image_to_3d"), {})
+    image = cloud_jobs.made_name(picture)  # Found by the job that made it: a renamed picture still converts.
+    arguments = {cloud_jobs.picture_field(descriptor): image}  # Own-key image_to_3d takes reference.
+    summary = (cloud.describe(name, arguments) or (name, ""))[0]
+    made = picture.get("unapplied")
+    card = state.item_tool(name, f"{summary.split(' · ')[0]} · made already" if made else summary, "")
+    card.update(started_at=time.time(), click=list(key))
+    items.append(card)
+    picture["state"] = "running"
+    state.running_clicks[key] = image
+    conversations.save(session)  # Reopened meanwhile, the chat shows it running.
+    turn = Turn()
+    # files_allowed: the picture is Loopcut's own (the chat's copy, when Undo took its datablock away).
+    consent = _Consent(session, turn, card, files_allowed=True, clicked=True, shown=shown)
+
+    def done(result):
+        try:
+            _click_ended(key, card, result, consent.charged)
+        finally:
+            state.running_clicks.pop(key, None)
+            _redraw()
+
+    try:
+        with cloud_account.approval_context(consent):
+            prepared = cloud.apply_finished(made) if made else tools.execute(name, json.dumps(arguments))
+    except Exception as ex:  # As below: the card says so, and the button can be pressed again.
+        prepared = tools.ToolResult(f"Could not turn it into 3D: {ex}", ok=False)
+    if prepared.then is None:
+        done(prepared)
+        return True
+
+    def work():
+        result = None
+        try:
+            with cloud_account.approval_context(consent):
+                result = prepared.then(turn.cancel.is_set, lambda fn: _on_main(fn, turn.cancel.is_set))
+        except BaseException as ex:  # Its card says so: a thread nobody waits on never fails silently.
+            result = tools.ToolResult(f"Could not turn it into 3D: {ex}", ok=False)
+        finally:
+            ended = result or tools.ToolResult("Could not turn it into 3D.", ok=False)
+            mainthread.run_on_main(lambda: done(ended))
+    threading.Thread(target=work, name="loopcut-to-3d", daemon=True).start()
+    _redraw()
+    return True
+
+
+def _click_ended(key: tuple, card: dict, result, charged) -> None:
+    """Main thread: a Turn it into 3D click's call ended. Its chat gets the card's result, the charge and the model's
+    note: the chat on screen when it is that one, reopened since or not, else that chat's file. Never the dict the
+    click began in once it is no longer the chat: saving it would drop what came after."""
+    from . import spending
+    conversation, made = key
+    chat = state.session()
+    if chat.get("id") != conversation:
+        try:
+            chat = conversations.load(conversation)
+        except conversations.ConversationError as ex:
+            print(f"Loopcut: could not keep a Turn it into 3D result: {ex}")
+            return
+    own = card if any(i is card for i in chat["items"]) else next(
+        (i for i in reversed(chat["items"]) if i.get("click") == list(key)), None)
+    if own is None:
+        own = card
+        chat["items"].append(own)
+    if own is not card:  # The chat was reopened: its copy of the card gets what this one heard.
+        own.update({k: card[k] for k in ("cost", "cloud_error", "expanded") if k in card})
+    own.pop("click", None)
+    own["status"] = "done" if result.ok else "rejected" if card.get("declined") else "failed"
+    own["output"] = getattr(result, "card_output", "") or result.text
+    if getattr(result, "outcome", ""):
+        own["outcome"] = result.outcome
+    if getattr(result, "receipt", ""):
+        own["cost"] = result.receipt
+    unapplied = getattr(result, "unapplied", "")  # Made and charged, its model not in this file: the next click loads it.
+    for item in chat["items"]:
+        for picture in (item.get("to_3d") or {}).get("pictures") or ():
+            if (picture.get("job") or picture.get("image")) == made:
+                picture["state"] = "done" if result.ok else "ready"
+                if unapplied:
+                    picture["unapplied"] = unapplied
+                else:
+                    picture.pop("unapplied", None)
+    if type(charged) in (int, float) and charged > 0:
+        with spending.lock:
+            spending.ledger(chat)["credits"] += charged
+    first = next((line for line in result.text.splitlines() if line.strip()), "")[:300]
+    chat.setdefault("between_turns", []).append(
+        f"since your last turn: the user pressed Turn it into 3D on the picture {state.running_clicks.get(key, made)}; "
+        + (f"it ran: {first}" if result.ok else f"it did not run: {first}"))
+    conversations.save(chat)
 
 
 def _cloud_consent(turn, card, asks, details, *, files_allowed=False, session=None):
@@ -1318,12 +1634,21 @@ def _reference_card(session: dict, cfg: config.Config, message: dict, is_cancell
         _hosted_reply(turn, cfg, completion.account, success=True, session=session)
     card = completion.text.strip()
     message["content"][0]["text"] = message["content"][0]["text"].replace(UNDESCRIBED.format(names=", ".join(names)), "")
+    if getattr(completion, "finish_reason", None) in llm.FILTERED_FINISHES or _refused_card(card):
+        raise llm.LLMError(REFERENCE_REFUSED, code=llm.CONTENT_FILTER)  # run_loop: a notice, and UNDESCRIBED.
     if not card:
         _undescribed(session, message)
         return []
     message["content"][0]["text"] += f"\n\n<reference_card images=\"{', '.join(names)}\">\n{card}\n</reference_card>"
     message[context.REFERENCE_CARD] = True
     return names
+
+
+def _refused_card(card: str) -> bool:
+    """A short reply that refuses rather than describes. A provider's filter answered a picture with one ordinary
+    line, "The request was rejected because it was considered high risk", and it went to the model as the study of
+    that picture (a user's log, 0.2.14). A real card is a checklist: only a short one is read this way."""
+    return len(card) < REFUSED_CARD_CHARS and bool(_REFUSAL.search(card))
 
 
 def _auto_look(session: dict, turn: Turn, run_tool, alike) -> tuple[str, "Path | None"]:
@@ -1949,8 +2274,9 @@ def _continue_announced(session: dict, turn: Turn, spec: LoopSpec, request: dict
     if (spec.role == "orchestrator" and not session.get("workers_unavailable") and routed is not None
             and routed.level >= 3 and not turn.delegations and not getattr(turn, "nudged", False)):
         return False  # router.nudge, in the finish gates, asks for the delegation first.
+    from . import chat_credits  # A paid tool's refusal (0.2.19) stops nothing: the turn may still go on.
     if any(item.get("status") == "awaiting" or (item.get("kind") == "offer" and not item.get("resolved"))
-           or (item.get("kind") == "limit" and item.get("status") != "done")
+           or (item.get("kind") == "limit" and item.get("status") != "done" and not chat_credits.is_tool(item))
            for item in _turn_items(session, request)):
         return False
     job = getattr(turn, "job", None)
@@ -2117,6 +2443,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     except llm.LLMError as ex:
                         if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
                             raise
+                        if ex.code == llm.CONTENT_FILTER:
+                            items.append(state.item_notice(str(ex)))
                         print(f"Loopcut: could not describe the attached images: {ex}")
                         _undescribed(session, user_message)
                 if spec.on_turn_start:
@@ -2232,18 +2560,18 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if spec.asks and _asks(approval, call.name, session, cfg):
                     turn.decided.clear()
                     # heavy: asking because it renders, so the card's "always" allows renders.
-                    card["status"] = "awaiting"
+                    state.awaiting(card)
                     card["heavy"] = approval == "heavy" and not session["auto_heavy"]
                     card["install"] = approval == "install"
                     _redraw()
                     if not _wait_for_approval(turn):
                         if no_progress:
                             no_progress.reset()
-                        card["status"] = "rejected"
+                        card["status"], turn.declined = "rejected", True
                         messages.append({"role": "tool", "tool_call_id": call.id,
                                          "content": "The user rejected this action. Ask what they want instead."})
                         continue
-                card["status"] = "running"
+                card["status"], card["started_at"] = "running", time.time()  # The card shows its time (ui.layout).
                 _redraw()
                 arguments, note = call.arguments, ""
                 refusal = _capture_refusal(turn, call.name, arguments)
@@ -2301,14 +2629,16 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     # not see every setting, and a read after such a step may well differ.
                     turn.ledger.scene_changed()
                     seen[key][1] = turn.ledger.revision  # Its own double right after it is still one call.
+                # Code that caught its own exception and printed it failed too, unless it changed the scene.
+                worked = result.ok and (changed or not repeats.printed_traceback(call.name, result.text))
                 if no_progress:
                     # Workers return the child's measured change flag instead of full snapshots.
                     # Without either, a potentially mutating tool is conservatively progress.
                     measured = ((spec.role == "worker" and hasattr(result, "changed"))
                                 or (getattr(result, "scene_before", None) is not None
                                     and getattr(result, "scene_after", None) is not None))
-                    stalled = no_progress.record(key, result.ok, changed or (may_change and not measured))
-                ledger_note = turn.ledger.record(step, key, result.text, result.ok, read, step_message)
+                    stalled = no_progress.record(key, worked, changed or (may_change and not measured))
+                ledger_note = turn.ledger.record(step, key, result.text, worked, read, step_message)
                 if consent.rig:  # The rig card shows its result text; the ledger's note is for the model.
                     result.model_note = (getattr(result, 'model_note', '') or '') + ledger_note
                     ledger_note = ""
@@ -2329,8 +2659,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if asked_look:  # After the change: run_python's own capture is taken after its code ran.
                     result.text += _look_note(turn)
                     turn.changed, turn.touched = False, []
-                # A paid call the user skipped did not fail: it is shown as skipped (spending.declined).
-                card["status"] = "done" if result.ok else "rejected" if card.get("declined") else "failed"
+                # A paid call the user skipped did not fail: it is shown as skipped (spending.declined). A delegate
+                # whose workers merged and only kept parts aside is done; the model's result still says what is held
+                # back (waves.held_back_only).
+                card["status"] = ("done" if result.ok or getattr(result, "held_back", False)
+                                  else "rejected" if card.get("declined") else "failed")
                 # An asset search's card keeps its report's JSON (card_output); the model's copy is a table.
                 card_text = getattr(result, "card_output", "") or result.text[:own]
                 card["output"] = card_text + result.text[own + len(ledger_note):]
@@ -2345,8 +2678,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 consent.finish(result)
                 if getattr(result, "receipt", "") and not consent.rig:
                     card["cost"] = result.receipt  # What the paid call used, in place of its estimate (M4).
+                if spec.role != "worker":
+                    _made_pictures(session, card, call, result)
                 for guard in getattr(result, "guard_notes", None) or ():  # Already in result.text too.
                     items.append(state.item_guard(guard["text"], guard["modifiers"]))
+                if getattr(result, "notice", ""):
+                    items.append(state.item_notice(result.notice))
                 model_note = getattr(result, 'model_note', '')
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": result.text + ('\n\n' + model_note if model_note else '')})
@@ -2382,6 +2719,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             # Tool messages must directly follow the assistant message, so images go after them all.
             messages.extend(_image_message(reference, what, file_preview=file_preview)
                             for reference, what, file_preview in _fresh_images(images))
+            if no_progress and no_progress.end_step() == repeats.STUCK_STEPS and not stalled and spec.role != "worker":
+                items.append(state.item_notice(STUCK_NOTICE))
+            _resume_playback(spec)
             spec.save(session)  # The history is consistent here: every call has its result.
             _redraw()
             if stalled:
@@ -2449,6 +2789,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
+        _resume_playback(spec)
         end_failed = False
         if spec.on_end:
             try:
@@ -2472,6 +2813,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             if item.get("streaming"):
                 item["streaming"] = False
                 finish_reply(item, turn.roots[0] if turn.roots else None)
+            click = tuple(item.get("click") or ())
+            if item.get("status") in ("awaiting", "running") and click in state.running_clicks:
+                if item["status"] == "awaiting" and click in _card_waits:
+                    _card_waits[click].answer(False)  # Its ask ends with the turn, as the turn's own asks do.
+                continue  # A Turn it into 3D click's call is not this turn's: it goes on (turn_into_3d).
             if item.get("status") in ("awaiting", "running"):
                 item["status"] = "rejected"
         # Keep the display outcome on the last tool, including account notices and teardown errors.
@@ -2557,10 +2903,17 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         return True
     if not (text or attachments):
         return False
-    from . import video_attach
+    from . import nudges, video_attach
     waiting = video_attach.preparing(session)
-    if waiting:
+    if waiting:  # First: a chip's clip still preparing is not yet attached, but must not be asked for again.
         session["items"].append(state.item_notice(f"Still preparing {', '.join(waiting)}; send once it is ready."))
+        return False
+    missing = nudges.chip_needs(text, attachments, session.get("references") or [])
+    if missing:  # A trial chip's request about the user's own file, with none attached: it waits in the input.
+        from . import cloud
+        other_way = nudges.make_one_first(cloud.make_one_prices()) if missing == "a picture" else ""
+        session["items"].append(state.item_notice(
+            " ".join(filter(None, [f"Attach {missing} first: drop it on the panel or pick it from +.", other_way]))))
         return False
     from . import telemetry
     telemetry.first_use("prompt_sent")
@@ -2572,6 +2925,10 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         telemetry.first_use("result_error")
         return False
     stopped = note_items is None and session.get("turn_outcome") == "cancelled"  # Not "send now", which stops too.
+    # What a shell command left running and has ended since (workspace.ended_notes) goes in before turn.submission is
+    # taken, so a refused first request keeps it, as a click's note.
+    from . import workspace
+    session.setdefault("between_turns", []).extend(workspace.ended_notes(session["id"]))
     messages = session["messages"]
     last = str(messages[-1].get("content")) if messages and messages[-1].get(context.STEP_LIMIT) else ""
     from . import motion_claims
@@ -2586,6 +2943,7 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     if turn.config is not None and config.on_service(turn.config.base_url):
         turn.submission = {"text": draft, "attachments": attachments, "items": list(session["items"]),
                            "messages": deepcopy(session["messages"]), "references": list(session["references"]),
+                           "between_turns": list(session.get("between_turns") or []),
                            **{k: session.get(k) for k in ("scene_seen", "scene_turn_start", "pending_checkpoint", "turn_number")}}
     turn.roots = _project_roots()
     card, prompt = session.pop("try_it", None) or ("", "")
@@ -2606,6 +2964,15 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     scene = _scene_context(text, session.get("scene_seen"))
     if stopped:
         scene = scene.replace("\n</scene_context>", f"\n{STOPPED_LINE}\n</scene_context>", 1)
+    # What the user started from a card since the last turn (turn_into_3d), and a click still running: the model's
+    # only. Taken after turn.submission keeps them for a first request the service refuses.
+    between = list(session.get("between_turns") or [])
+    session["between_turns"] = []
+    between += [f"running now: the user's Turn it into 3D on the picture {name}; its model is not in the scene yet."
+                for (chat, _), name in list(state.running_clicks.items()) if chat == session["id"]]
+    between += workspace.running_notes(session["id"])  # And what a shell command left running that still runs.
+    if between:
+        scene = scene.replace("\n</scene_context>", "\n" + "\n".join(between) + "\n</scene_context>", 1)
     content = f"{scene}\n\n{text or 'See the attached images.'}"
     session["scene_seen"] = session["scene_turn_start"] = _scene_snapshot()
     # The prompt's last lines, read here on the main thread: the model and cloud tools, then the add-ons.
@@ -2636,6 +3003,8 @@ def _launch(session: dict, turn: Turn) -> None:
     turn.conversation_log = session_logs.turn_start(session, turn.config)  # {} when it is not uploaded.
     from . import chat_credits
     chat_credits.turn_start(session, turn)  # The balance it starts from, in the credits arm; never raises.
+    if chat_credits.is_tool((state.ui.get("allowance_notice") or {}).get("item")):
+        state.ui.pop("allowance_notice")  # A paid tool's refusal was its turn's; its card stays, as history.
     session["scroll"], session["confirm_restore"] = 0.0, None
     if llm._is_loopback(getattr(turn.config, "base_url", "")):
         turn.stall_seconds = 0  # The Claude Code bridge may take minutes, as call_max_seconds allows it (llm.py).
@@ -2663,20 +3032,32 @@ def resume() -> bool:
     return True
 
 
-def decide(approved: bool, always: bool = False, index: int | None = None) -> bool:
-    """Answer a pending approval card: the one at `index` when it is waiting (a click), else the first waiting
-    (Enter, Esc). `always` stops asking in this conversation: for renders when the card is a render's, otherwise
-    for everything else; never for paid or install cards. A worker's ask (a paid call in the background) is
-    answered on its own card, so a card of the user's turn waiting at the same time keeps its own answer."""
+def decide(approved: bool, always: bool = False, index: int | None = None, drawn: tuple | None = None) -> bool:
+    """Answer a pending approval card: the one at `index` when it is waiting (a click), else the first waiting.
+    drawn: (id, ask_serial) of the card a panel frame drew at `index` (ui.host: a click, Enter, Esc); then only that
+    card, in that ask, is answered, and a frame drawn before the items moved or the card asked again answers none.
+    `always` stops asking in this conversation: for renders when the card is a render's, otherwise for everything
+    else; never for paid or install cards. A worker's ask (a paid call in the background) is answered on its own
+    card, so a card of the user's turn waiting at the same time keeps its own answer."""
     session = state.session()
     items = session["items"]
-    card = items[index] if index is not None and 0 <= index < len(items) and items[index].get("status") == "awaiting" \
-        else next((i for i in items if i.get("status") == "awaiting"), None)
+    waiting = index is not None and 0 <= index < len(items) and items[index].get("status") == "awaiting"
+    if drawn is not None and not (waiting and (id(items[index]), items[index].get("ask_serial")) == tuple(drawn)):
+        return False
+    card = items[index] if waiting else next((i for i in items if i.get("status") == "awaiting"), None)
     if card is None:
         return False
-    wait = _card_waits.get(id(card))
+    if approved and card.get("render_choice") and card.get("picked") != "cloud":
+        from . import render_offer  # Enter on the choice card: only a Recommended cloud the balance covers.
+        if not render_offer.enter_ok(card["render_choice"], render_offer.live_balance()):
+            return False
+    wait = _card_waits.get(_wait_key(card))
     if wait is not None:
         wait.answer(approved)
+        if card.get("click"):  # A reopened chat's copy shows the answer as the click's own card does (_Consent._ask).
+            card["status"] = "running" if approved else "rejected"
+            for key in ("ask", "ask_lines", "ask_label", "ask_link", "ask_skip", "ask_title", "image_path"):
+                card.pop(key, None)
         return True
     turn = session["turn"]
     if turn is None:

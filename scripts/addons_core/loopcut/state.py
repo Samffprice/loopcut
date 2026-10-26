@@ -5,6 +5,7 @@ Not bpy.app.driver_namespace: Blender wipes that whenever a .blend is opened, wh
 take the conversation with it.
 """
 
+import itertools
 import time
 import uuid
 from datetime import datetime, timezone
@@ -95,6 +96,11 @@ def new_session() -> dict:
         "spend_vendors": [],
         # Asset search results' pick numbers (asset_picks): {next, rows: [{n, source, id, name}]}; saved.
         "asset_picks": {"next": 1, "rows": []},
+        # What the user started from a card since the model's last turn (agent.turn_into_3d): lines its next
+        # message carries in the scene context, then empty. Saved, so a reopen keeps them.
+        "between_turns": [],
+        # Managed long cloud jobs this chat started (cloud_restore): plain records, picked up when it opens; saved.
+        "cloud_jobs": [],
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},
@@ -150,6 +156,22 @@ def item_tool(name: str, summary: str, code: str) -> dict:
             "status": "running", "output": ""}
 
 
+_asks = itertools.count(1)
+# Turn it into 3D clicks whose call runs (agent.turn_into_3d): (conversation id, job) -> the picture's name. A chat
+# reopened meanwhile keeps the click's card running (conversations.load), and no second click runs it.
+running_clicks: dict = {}
+
+
+def awaiting(card: dict, **fields) -> dict:
+    """card waits for the user's answer from now, as a new ask: a new ask_serial each time, so a panel frame drawn
+    before it (this card's earlier ask, or another card that sat at its place) cannot answer it (agent.decide)."""
+    card.update(fields, status="awaiting", ask_serial=next(_asks))
+    item = (ui.get("allowance_notice") or {}).get("item")
+    if isinstance(item, dict) and item.get("tool"):  # A paid tool's pop-up, open mid-turn (agent._Consent._paywall):
+        item["popup_closed"] = True                  # the question comes first; its slim card stays.
+    return card
+
+
 def item_notice(text: str, action_label: str = "", checkpoint: str = "", url: str = "") -> dict:
     # The button restores `checkpoint`, or opens `url` in the browser.
     return {"kind": "notice", "text": text, "action_label": action_label, "checkpoint": checkpoint, "url": url}
@@ -192,6 +214,15 @@ def item_limit(text: str, reason: str, plan: str, resets_at: str, upgrade: dict 
             "upgrade": dict(upgrade) if upgrade and billing else None, "status": ""}
 
 
+def item_cloud_back(job_id: str, status: str, title: str, detail: str, actions: list[dict], frames=None) -> dict:
+    """A cloud job that finished while its chat was closed (cloud_restore): what it was, its frames' thumbnails once
+    they arrive, and buttons ({label, do}). Never saved: it is built again each time the chat opens until its outputs
+    are applied, and an older add-on would refuse the file. busy/resolved/error: what pressing a button did."""
+    return {"kind": "cloud_back", "job_id": job_id, "status": status, "title": title, "detail": detail,
+            "actions": [dict(a) for a in actions], "frames": frames, "thumbnails": [], "thumbnail_labels": [],
+            "note": "", "busy": "", "resolved": "", "error": ""}
+
+
 def item_offer(nudge: str, title: str, text: str, actions: list[dict]) -> dict:
     """A conversion card (nudges.py): a title, a line or two, and buttons ({label, do, arg, when}). Never
     saved with the conversation: it is about the moment, and an older add-on would refuse the file.
@@ -219,7 +250,8 @@ def wave_row(worker: str, deliverable: str, role: str) -> dict:
     partial | failed | cancelled (its own Cancel) | stopped (Stop, the budget before it started, its
     time, or a reload while it ran) | question. checks: "4/5" once run. merged: its result is in the
     scene (each worker merges as it finishes, not with its whole wave). merged_changes records the
-    merge's live names; quarantined, conflicts and merge_error retain incomplete deliveries.
+    merge's live names; quarantined, conflicts and merge_error retain incomplete deliveries; merged_new: the merge
+    brought new work of its own, beyond what is held back and reused live materials (waves.held_back_only).
     merge_unchanged confirms no changes reached the scene, including a successful rollback."""
     return {"id": worker, "deliverable": deliverable, "role": role, "status": "queued", "steps": 0,
             "checks": "", "note": "", "merged": False}

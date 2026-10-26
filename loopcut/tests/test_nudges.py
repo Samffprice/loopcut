@@ -12,6 +12,7 @@ import tempfile
 import time
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +30,10 @@ def measure(font, size, text):
 
 def display(session, width=420, **ui):
     return layout.build(session, width, 900, 1, measure, "fast", None, ui)
+
+
+GRANTED = "2026-10-16T10:00:00Z"
+SOON = datetime(2026, 10, 16, 11, tzinfo=timezone.utc).timestamp()  # An hour after GRANTED: the trial is still news.
 
 
 class DataDir(unittest.TestCase):
@@ -120,21 +125,55 @@ class CardsTest(DataDir):
         chips = [a for a in card["actions"] if a["do"] == "prompt"]
         self.assertEqual([c["label"] for c in chips], ["Sound effect", "Picture to 3D"])
         self.assertEqual(nudges.trial_card(100, [])["text"], "They pay for Loopcut's cloud tools as they open.")
+        # A chip about the user's own picture or clip lacks it until one is attached (a clip now or earlier, a picture
+        # now); edited, it is the user's own request.
+        picture, clip = nudges.TRIAL_CHIPS["image_to_3d"][1], nudges.TRIAL_CHIPS["motion_from_video"][1]
+        still, video = {"name": "cat.jpg"}, {"name": "take.mp4", "video": {"id": "c1"}}
+        self.assertEqual(nudges.chip_needs(picture, []), "a picture")
+        self.assertEqual(nudges.chip_needs(picture + " ", [video]), "a picture", "a clip is not the picture")
+        self.assertEqual(nudges.chip_needs(picture, [video, still]), "")
+        self.assertEqual(nudges.chip_needs(clip, [still]), "a video clip")
+        self.assertEqual(nudges.chip_needs(clip, [video]), "")
+        # An earlier picture may be a Try it card's sample photo: the model reused it for the user's (2026-10-25).
+        sample = {"name": "dwarf-warrior.jpg", "pinned": True}
+        self.assertEqual(nudges.chip_needs(picture, [], [sample]), "a picture")
+        self.assertEqual(nudges.chip_needs(clip, [], [sample, video]), "", "an earlier clip is the user's own")
+        self.assertEqual(nudges.chip_needs("Turn my cat photo into a 3D model.", []), "")
+        self.assertEqual(nudges.chip_needs(nudges.TRIAL_CHIPS["sfx"][1], []), "")
         monthly = nudges.low_credits_card(440, 2200, "2026-11-01")
         self.assertEqual(monthly["title"], "440 credits left ($4.40)")
         self.assertIn("renew 2026-11-01", monthly["text"])
         self.assertIn("2,200 credits every month", nudges.low_credits_card(20, 0, "")["text"])
 
+    def test_picture_to_3d_has_a_no_picture_way_in_with_the_picture_price_while_images_can_be_made(self):
+        """Owner, 2026-10-25: beside Picture to 3D, "No picture? Describe it and Loopcut makes one", with
+        image_generate's catalog price. Its request is about no file of the user's, so nothing waits for one."""
+        card = nudges.trial_card(100, ["sfx", "image_to_3d", "image_generate"], {"image_generate": 6, "image_to_3d": 80})
+        chips = [a for a in card["actions"] if a["do"] == "prompt"]
+        self.assertEqual([c["label"] for c in chips], ["Sound effect", "Picture to 3D",
+                                                       "No picture? Describe it and Loopcut makes one · 6 credits ($0.06)",
+                                                       "Reference image"])
+        self.assertEqual(chips[2]["arg"], "Make a picture of … and turn it into a 3D model.")
+        self.assertEqual(nudges.chip_needs(chips[2]["arg"], []), "", "no picture is wanted, so none is waited for")
+        self.assertEqual(nudges.chip_needs(chips[1]["arg"], []), "a picture", "the plain chip still asks for one")
+        # Without a catalog price it shows none rather than guess; without image_generate, or Picture to 3D, no chip.
+        self.assertEqual(nudges.trial_card(100, ["image_to_3d", "image_generate"])["actions"][1]["label"],
+                         "No picture? Describe it and Loopcut makes one")
+        for live in (["image_to_3d"], ["image_generate", "sfx"], ["sfx", "voice_line", "render", "image_to_3d",
+                                                                  "image_generate"]):
+            labels = [a["label"] for a in nudges.trial_card(100, live, {"image_generate": 6})["actions"]]
+            self.assertFalse([label for label in labels if label.startswith("No picture?")], live)
+
     def test_observe_queues_only_while_billing_is_open_and_flush_waits_for_a_reply(self):
-        credits = {"balance": 20, "trial": {"amount": 100, "granted_at": "2026-10-16T10:00:00Z"}}
+        credits = {"balance": 100, "monthly": 2200, "trial": {"amount": 100, "granted_at": GRANTED}}
         data = {"account": {"credits": credits}}
-        nudges.observe(data, True, ["sfx"])
+        nudges.observe(data, True, ["sfx"], SOON)
         self.assertEqual(nudges._pending, [], "billing closed: nothing to sell")
         with patch.object(config, "billing_open", lambda: True):
-            nudges.observe(data, False, ["sfx"])
+            nudges.observe(data, False, ["sfx"], SOON)
             self.assertEqual(nudges._pending, [], "signed out")
-            nudges.observe(data, True, ["sfx"])
-            nudges.observe(data, True, ["sfx"])
+            nudges.observe(data, True, ["sfx"], SOON)
+            nudges.observe(data, True, ["sfx"], SOON)
         self.assertEqual([k for _, k, _ in nudges._pending], ["trial", "low_credits"], "deduplicated")
         session = state.new_session()
         session["items"].append(state.item_user("hi"))
@@ -142,26 +181,57 @@ class CardsTest(DataDir):
         self.assertEqual(len(session["items"]), 1, "never before the first reply")
         session["items"].append({**state.item_assistant(), "streaming": False})
         with patch.object(config, "billing_open", lambda: True):
-            nudges.observe(data, True, ["sfx"])
+            nudges.observe(data, True, ["sfx"], SOON)
         nudges.flush(session)
         offers = [i for i in session["items"] if i["kind"] == "offer"]
         self.assertEqual([o["nudge"] for o in offers], ["trial"], "one soft card per turn end")
         with patch.object(config, "billing_open", lambda: True):
-            nudges.observe(data, True, ["sfx"])
+            nudges.observe(data, True, ["sfx"], SOON)
         nudges.flush(session)
         self.assertEqual(len([i for i in session["items"] if i["kind"] == "offer"]), 1, "one a day")
 
     def test_the_credits_arm_never_gets_the_trial_card(self):
         """0.2.15: the arm's setup says the free credits; the card would arrive after a first paid turn."""
-        credits = {"balance": 60, "trial": {"amount": 100, "granted_at": "2026-10-23T10:00:00Z"}}
+        credits = {"balance": 100, "trial": {"amount": 100, "granted_at": GRANTED}}
         with patch.object(config, "billing_open", lambda: True):
-            nudges.observe({"account": {"billing": "credits", "credits": credits}}, True, ["sfx"])
+            nudges.observe({"account": {"billing": "credits", "credits": credits}}, True, ["sfx"], SOON)
             self.assertEqual(nudges._pending, [])
             for billing in ("allowance", None):  # Every other account keeps it.
-                nudges.observe({"account": {"billing": billing, "credits": credits}}, True, ["sfx"])
+                nudges.observe({"account": {"billing": billing, "credits": credits}}, True, ["sfx"], SOON)
                 self.assertEqual([k for _, k, _ in nudges._pending], ["trial"])
                 with nudges._lock:
                     nudges._pending.clear()
+
+    def test_the_trial_card_only_for_a_grant_under_48_hours_old_and_still_whole(self):
+        """0.2.19: any fresh profile (a reinstall, a new machine) showed a long-spent trial as news beside 0 or 10."""
+        def stamp(hours_ago, zone=timezone.utc):
+            return datetime.fromtimestamp(SOON - hours_ago * 3600, zone).isoformat()
+        cases = (
+            ({"balance": 0, "trial": {"amount": 100, "granted_at": stamp(72)}}, False),  # Old and spent.
+            ({"balance": 100, "trial": {"amount": 100, "granted_at": stamp(49)}}, False),  # Old, even when whole.
+            ({"balance": 10, "trial": {"amount": 100, "granted_at": GRANTED}}, False),  # Fresh but spent.
+            ({"balance": 100, "trial": {"amount": 100, "granted_at": GRANTED}}, True),  # Fresh and whole, as before.
+            ({"balance": 140, "trial": {"amount": 100, "granted_at": stamp(30)}}, True),  # Inside the 48 h window.
+            ({"balance": 100, "trial": {"amount": 100, "granted_at": stamp(1, timezone(timedelta(hours=-5)))}}, True),
+            ({"balance": 100, "trial": {"amount": 100}}, False),  # No granted_at.
+            ({"balance": 100, "trial": {"amount": 100, "granted_at": "yesterday"}}, False),
+            ({"balance": 100, "trial": {"amount": 100, "granted_at": "2026-10-16T10:00:00"}}, False),  # No offset.
+            ({"trial": {"amount": 100, "granted_at": GRANTED}}, False),  # No balance.
+            ({"balance": "100", "trial": {"amount": 100, "granted_at": GRANTED}}, False),
+        )
+        with patch.object(config, "billing_open", lambda: True):
+            for credits, shows in cases:
+                with nudges._lock:
+                    nudges._pending.clear()
+                nudges.observe({"account": {"plan": "free", "credits": credits}}, True, ["sfx"], SOON)
+                self.assertEqual("trial" in [k for _, k, _ in nudges._pending], shows, credits)
+            whole = {"account": {"credits": {"balance": 100, "trial": {"amount": 100, "granted_at": GRANTED}}}}
+            for hours, shows in ((47, True), (49, False)):  # No now: observe reads the module's clock.
+                with nudges._lock:
+                    nudges._pending.clear()
+                with patch.object(nudges.time, "time", return_value=SOON + (hours - 1) * 3600):
+                    nudges.observe(whole, True, [])
+                self.assertEqual(bool(nudges._pending), shows, hours)
 
     def test_low_credit_thresholds(self):
         with patch.object(config, "billing_open", lambda: True):
@@ -219,6 +289,18 @@ class OfferCardDrawTest(DataDir):
                 self.assertLessEqual(hit["x"] + hit["w"], width, (width, hit))
             if width == 260:
                 self.assertGreater(len({h["y"] for h in buttons}), 1, "wrapped onto more rows")
+
+    def test_a_too_wide_chip_keeps_its_price_and_shortens_its_words(self):
+        session = state.new_session()
+        session["items"] = [nudges.trial_card(100, ["image_to_3d", "image_generate"], {"image_generate": 6})]
+        for width in (260, 600):
+            drawn = display(session, width=width)
+            labels = [p["text"] for p in drawn["prims"] if p["id"].endswith(".label") and ".offer." in p["id"]]
+            self.assertTrue(labels[1].startswith("No pict"), labels)
+            self.assertTrue(labels[1].endswith(" · 6 credits ($0.06)"), (width, labels[1]))
+            self.assertEqual("…" in labels[1], width == 260, labels[1])
+            for hit in (h for h in drawn["hits"] if h["action"][0] == "offer"):
+                self.assertLessEqual(hit["x"] + hit["w"], width, (width, hit))
 
     def test_purchase_buttons_on_tool_and_limit_cards_follow_billing(self):
         session = state.new_session()
@@ -343,6 +425,56 @@ class CloudOfferTest(RuntimeFixture):
             again.assert_called_once_with()
             self.assertEqual(cloud._apply(module, {"backend": "byok"}, job).receipt, "")
 
+    def catalog(self, balance=500, **changes):
+        import platform_contract
+        return self.locked(platform_contract.live_tool("image_generate"), platform_contract.live_tool("image_to_3d"),
+                           balance=balance, **changes)
+
+    def test_the_offer_names_both_catalog_prices_and_only_where_a_picture_can_be_made(self):
+        """Owner, 2026-10-25: photo→3D with no picture of the user's own offers to make one first (image_generate,
+        then image_to_3d), each step priced from the catalog: here the contract's recorded descriptors, 6 and 80."""
+        self.catalog()
+        prices = cloud.make_one_prices()
+        self.assertEqual(prices, {"image_generate": 6, "image_to_3d": 80})
+        self.assertEqual(nudges.generate_first(prices), (
+            "No picture of theirs? Offer in one line, with both prices, to make one with image_generate (about 6 "
+            "credits ($0.06)) from a short description (a single object on a plain background, three-quarter view); "
+            "the user then turns it into 3D with the picture's Turn it into 3D button (about 80 credits ($0.80))."))
+        self.assertEqual(nudges.make_one_first(prices), (
+            "No picture? Describe it and Loopcut makes one first: about 6 credits ($0.06) for the picture, then about "
+            "80 credits ($0.80) for the 3D model."))
+        # Short of credits it is still offered: each tool's own card is what the user then meets.
+        self.catalog(balance=0)
+        self.assertEqual({r["name"] for r in cloud.locked_tools()}, {"image_generate", "image_to_3d"})
+        self.assertEqual(cloud.make_one_prices(), {"image_generate": 6, "image_to_3d": 80})
+        # No generation: no picture can be made, so nothing offers one.
+        self.catalog().policy = {"no_generation": True}
+        self.assertIsNone(cloud.make_one_prices())
+        self.assertEqual(nudges.generate_first(None), "")
+        self.assertEqual(nudges.make_one_first(None), "")
+        cloud._runtime = None
+        self.assertIsNone(cloud.make_one_prices())
+        # A price the catalog does not give is left out rather than guessed.
+        self.assertEqual(nudges.make_one_first({"image_generate": 6, "image_to_3d": None}),
+                         "No picture? Describe it and Loopcut makes one first: about 6 credits ($0.06) for the picture.")
+        self.assertNotIn("prices", nudges.generate_first({"image_generate": 6, "image_to_3d": None}))
+        self.assertNotIn("credits", nudges.generate_first({"image_generate": None, "image_to_3d": None}))
+
+
+    def test_the_trial_cards_no_picture_chip_is_priced_from_the_catalog(self):
+        """The No picture? chip's price is image_generate's catalog estimate, as the refresh that queues the card
+        reads it (the contract's recorded descriptor: 6 credits)."""
+        import platform_contract
+        from datetime import datetime, timezone
+        data = manifest(platform_contract.live_tool("image_generate"), platform_contract.live_tool("image_to_3d"))
+        data["account"]["credits"] = {"balance": 100, "trial": {
+            "amount": 100, "granted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}}
+        data["flags"]["billing"] = True
+        with patch.object(nudges, "_pending", []):
+            self.runtime(Reply(data), signed_in=True, keys_set={}).refresh()
+            card = next(card for card, kind, _ in nudges._pending if kind == "trial")
+        self.assertIn("No picture? Describe it and Loopcut makes one · 6 credits ($0.06)",
+                      [a["label"] for a in card["actions"]])
 
 
 class UnavailableLineTest(CloudOfferTest):

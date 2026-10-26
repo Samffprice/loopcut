@@ -948,6 +948,46 @@ def show(name=None, side=None):
             f'To pose it by hand later, show {arm.name} again in the Outliner.')
 
 
+def unseen_bones():
+    """R7-D1 (ar-dog-5): the user asked about "spikes", and the model said "no spikes" twice and spent 10 minutes on
+    weights: they were the bones, which apply draws over the body (STICK, in front), and its pictures never show
+    them. The model's fact for capture_viewport's own looks and inspect_scene: '' when no visible Loopcut rig is drawn
+    in front in a 3D view that draws bones. Never raises."""
+    try:
+        import bpy
+        rigs = [o for o in bpy.context.scene.objects
+                if o.type == 'ARMATURE' and _KEY in o and o.show_in_front and o.visible_get()]
+        views = [area.spaces.active.overlay for window in bpy.context.window_manager.windows
+                 for area in window.screen.areas if area.type == 'VIEW_3D']
+        if not rigs or not any(v.show_overlays and getattr(v, 'show_bones', True) for v in views):
+            return ''
+        names = [o.name for o in rigs[:3]]
+        whose = f"{names[0]}'s bones" if len(names) == 1 else 'the bones of ' + ', '.join(names[:-1]) + \
+            ' and ' + names[-1]
+        shape = 'grey sticks' if all(o.data.display_type == 'STICK' for o in rigs) else 'grey bone shapes'
+        return (f"Not in this picture: {whose}, which the user's viewport draws over the body as {shape}; they "
+                "never render.")
+    except Exception as ex:  # A fact for the model, never a reason a look fails.
+        print(f'Loopcut: bones note skipped: {type(ex).__name__}')
+        return ''
+
+
+def _gesture_refusal(arm):
+    """The RigError add_gesture refuses this Loopcut rig with, or None when a built-in gesture can go on it."""
+    if rig_experimental.marked(arm):
+        return RigError('Built-in gestures need a standard (person-shaped) rig; keyframe this rig\'s bones instead.',
+                        'experimental_rig')
+    ad = arm.animation_data
+    if ad and (len(ad.drivers) or any(not t.mute and len(t.strips) for t in ad.nla_tracks)
+               or ad.action_blend_type != 'REPLACE' or ad.action_influence < 1) \
+            or any(b.constraints for b in arm.pose.bones):
+        return RigError('This rig has controls or animation layers, so built-in gestures are off; keyframe its arm '
+                        'instead.', 'already_animated')
+    if arm.get('loopcut_rig_preview'):
+        return RigError('A test pose is on: reset it first, then add the gesture.', 'invalid_input')
+    return None
+
+
 def add_gesture(name=None, kind='wave', side='right', frames=None):
     """R6-B3: a built-in wave, raised arm or point (rig_gesture), keyed over the arm for a frame range and eased in
     and out of the rig's own animation, which stays as it was everywhere else. Free; standard rigs."""
@@ -956,17 +996,10 @@ def add_gesture(name=None, kind='wave', side='right', frames=None):
     from .merge import _undo
     _main()
     arm = _selected_rig(name)
-    if rig_experimental.marked(arm):
-        raise RigError('Built-in gestures need a standard (person-shaped) rig; keyframe this rig\'s bones instead.',
-                       'experimental_rig')
+    refusal = _gesture_refusal(arm)
+    if refusal is not None:
+        raise refusal
     ad = arm.animation_data
-    if ad and (len(ad.drivers) or any(not t.mute and len(t.strips) for t in ad.nla_tracks)
-               or ad.action_blend_type != 'REPLACE' or ad.action_influence < 1) \
-            or any(b.constraints for b in arm.pose.bones):
-        raise RigError('This rig has controls or animation layers, so built-in gestures are off; keyframe its arm '
-                       'instead.', 'already_animated')
-    if arm.get('loopcut_rig_preview'):
-        raise RigError('A test pose is on: reset it first, then add the gesture.', 'invalid_input')
     kind = kind or 'wave'
     side = side if side in rig_gesture.SIDES else 'right'
     if kind not in rig_gesture.GESTURES:
@@ -1032,6 +1065,59 @@ def add_gesture(name=None, kind='wave', side='right', frames=None):
             f'{last} ({(last - first) / fps:.1f} s), easing in and out over {ease} frames; its animation is unchanged '
             'elsewhere.' + (f' The scene now ends at frame {last}.' if extended else '')
             + ' character_rig show sets up the view to watch it.')
+
+
+# R7-B1: on the turn's user message, JSON text of the rigs whose gesture-like motion_from_text was not bought this
+# turn (conversations.load refuses a marker that is not a string, number or bool); the same call again is bought.
+GUARDED = 'loopcut_gesture_offered'
+GESTURE_WORDS = {'wave': ('a wave', 'wave'), 'point': ('pointing', 'point'),
+                 'raise_arm': ('a raised arm', 'raise the arm')}
+
+
+def free_gesture(arm, prompt):
+    """R7-B1 (ar-beginner-4): "can he wave too? like stop and wave at the end" bought a 6-credit motion_from_text
+    wave, which replaced the walk (to a muted NLA track, the scene cut to 1-72) and cost 6 minutes of NLA stitching;
+    the free gesture, which layers over the walk, was in no result the model read. Main thread, before any quote:
+    (the result the model gets, its card's line) instead of buying a gesture-like prompt (rig_gesture.asked) for a
+    standard Loopcut rig that already moves and takes a gesture; ('', '') to buy it as asked. Once per rig and user
+    turn: the same call again is bought, for a user who wants a new full-body motion. Never raises."""
+    try:
+        from . import rig_gate, rig_gesture, state
+        found = rig_gesture.asked(prompt)
+        if found is None or arm is None or arm.type != 'ARMATURE' or _KEY not in arm or _gesture_refusal(arm):
+            return '', ''  # Experimental rigs, own rigs, NLA or controls, a test pose on: bought as asked.
+        action, channels = _channels(arm)
+        span = _span(action, channels) if action is not None else None
+        session = state.session()
+        request = rig_gate._request(session.get('messages')) if session.get('busy') else None
+        if not span or request is None:
+            return '', ''  # A still rig gets the motion it asked for; outside a turn the offer could not be passed by.
+        try:
+            offered = json.loads(request.get(GUARDED) or '[]')
+        except (TypeError, ValueError):
+            offered = []
+        offered = [n for n in offered if isinstance(n, str)] if isinstance(offered, list) else []
+        if arm.name in offered:
+            return '', ''
+        request[GUARDED] = json.dumps(offered + [arm.name])
+        import bpy
+        render = bpy.context.scene.render
+        fps = render.fps / (render.fps_base or 1.)
+        (kind, side), (first, last) = found, span
+        what, verb = GESTURE_WORDS[kind]
+        after = (last + 1, last + max(rig_gesture.SHORTEST, round(fps * rig_gesture.SECONDS)))
+        cyclic = any(m.type == 'CYCLES' for *_, fc in channels for m in fc.modifiers)
+        stop = ('' if cyclic else f'; frames [{after[0]}, {after[1]}], after the motion ends, make it stop and then '
+                f'{verb}')
+        card = f'Not bought, no credits used: {what} on {arm.name} is free.'
+        return (f'Not bought, no credits used: {what} on {arm.name} is free with character_rig gesture (gesture {kind}'
+                + (f', side {side}' if side else '') + f'), which layers it over its current motion (frames {first}–'
+                f'{last}) and keeps that motion{stop}. motion_from_text would replace that motion with a new one. '
+                'Only if the user wants a new full-body motion in place of it, make the same call again; it is '
+                'charged then.'), card
+    except Exception as ex:  # The guard is a saving, never a reason the user's call fails.
+        print(f'Loopcut: gesture check skipped: {type(ex).__name__}: {ex}')
+        return '', ''
 
 
 def _segment_distance(c, a, b):

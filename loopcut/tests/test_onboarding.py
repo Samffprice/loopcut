@@ -1083,6 +1083,51 @@ class OnboardingTest(unittest.TestCase):
         return self.state.item_limit("Used up.", "session_limit", "free", "",
                                      {"label": "Upgrade to Pro", "url": "https://loopcut.org/pricing"})
 
+    def test_a_trial_chip_about_the_users_file_opens_the_file_browser_unless_it_is_attached(self):
+        """The Picture to 3D chip asks for the picture: a Try it card's sample photo from earlier is not it
+        (2026-10-25), and a Motion from video chip waits for a clip still preparing instead of asking for another."""
+        nudges = importlib.import_module(NAME + ".nudges")
+        video_attach = importlib.import_module(NAME + ".video_attach")
+        session = self.state.new_session()
+        session["items"] = [nudges.trial_card(100, ["image_to_3d", "motion_from_video"])]
+        chip = {a["label"]: i for i, a in enumerate(session["items"][0]["actions"]) if a["do"] == "prompt"}
+        session["references"] = [{"ref": "r1", "name": "dwarf-warrior.jpg", "pinned": True}]
+        for label, preparing, browser in (("Picture to 3D", [], True), ("Picture to 3D", ["take.mp4"], True),
+                                          ("Motion from video", ["take.mp4"], False),
+                                          ("Motion from video", [], True)):
+            with self.subTest(label=label, preparing=preparing):
+                self.fake.ops.reset_mock()
+                with patch.object(video_attach, "preparing", return_value=preparing):
+                    self.host._do_action(session, ("offer", (0, chip[label])))
+                self.assertEqual(session["input"], nudges.TRIAL_CHIPS[
+                    "image_to_3d" if label == "Picture to 3D" else "motion_from_video"][1])
+                self.assertEqual(self.fake.ops.loopcut.attach_images.call_count, int(browser))
+
+    def test_the_no_picture_chip_writes_its_request_with_the_thing_to_name_selected_and_opens_no_browser(self):
+        """Owner, 2026-10-25: Picture to 3D's second way in writes "Make a picture of … and turn it into a 3D model."
+        with the blank selected, so what the user types is the thing; there is no picture to pick, and the chip
+        adds nothing else to the turn: sent, it is the typed request."""
+        nudges = importlib.import_module(NAME + ".nudges")
+        textedit = importlib.import_module(NAME + ".ui.textedit")
+        session = self.state.new_session()
+        session["items"] = [nudges.trial_card(100, ["image_to_3d", "image_generate"], {"image_generate": 6})]
+        labels = [a["label"] for a in session["items"][0]["actions"]]
+        chip = next(i for i, label in enumerate(labels) if label.startswith("No picture?"))
+        before = dict(session)
+        self.host._do_action(session, ("offer", (0, chip)))
+        self.assertEqual(session["input"], "Make a picture of … and turn it into a 3D model.")
+        self.assertEqual(textedit.selected_text(session), "…")
+        self.fake.ops.loopcut.attach_images.assert_not_called()
+        self.assertEqual({k for k in session if session[k] != before.get(k) and not k.startswith("input_undo")},
+                         {"input", "cursor", "anchor", "focused"}, "the input and its undo, nothing for the turn")
+        textedit.insert(session, "a brass lantern")
+        self.assertEqual(session["input"], "Make a picture of a brass lantern and turn it into a 3D model.")
+        self.assertEqual(nudges.chip_needs(session["input"], session["attachments"]), "")
+        # The plain chip beside it still asks for the user's picture.
+        self.host._do_action(session, ("offer", (0, labels.index("Picture to 3D"))))
+        self.fake.ops.loopcut.attach_images.assert_called_once()
+        self.assertEqual(textedit.selection(session), None)
+
     def test_limit_card_switches_to_the_chatgpt_plan_and_goes_on(self):
         session = self.state.reset()
         session["items"] = [self.limit_card()]
@@ -1213,6 +1258,47 @@ class OnboardingTest(unittest.TestCase):
                         watch.call_args.args[1]({"plan": "pro"})
                     resume.assert_called_once()
                 self.assertEqual(len(session["items"]), 2)
+
+    def test_a_paid_plans_tool_refusal_adds_credits_without_waiting_for_a_plan(self):
+        """0.2.19 (test_tool_paywall): on Pro or Max a refused paid tool's pop-up says Add credits, a top-up. Its
+        click opens the account page and the card stays as it was: no plan watch, no "Waiting for your upgrade"."""
+        top_up = {"url": "https://loopcut.org/account?from=app&reason=insufficient_credits", "label": "Add credits"}
+        with patch.object(self.host.config, "billing_open", return_value=True):
+            session = self.state.reset()
+            card = self.state.item_limit("Not enough credits: Image to 3D needs 80, you have 15.",
+                                         "insufficient_credits", "pro", "2026-11-01T00:00:00Z", top_up)
+            card.update(tool="Image to 3D", needed=80, balance=15)
+            session["items"] = [self.state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D", ""), card]
+            self.state.ui["allowance_notice"] = {"item": card, "conversation": session["id"]}
+            self.addCleanup(self.state.ui.pop, "allowance_notice", None)
+            with patch.object(self.account, "open_browser") as opened, patch.object(self.account, "watch_plan") as watch, \
+                    patch.object(self.cloud, "watch_balance") as balance:
+                self.host._do_action(session, ("limit_upgrade", 1))
+            opened.assert_called_once_with(top_up["url"])
+            watch.assert_not_called()
+            balance.assert_called_once_with()  # The next paid call sees the credits without waiting 10 minutes.
+            self.assertEqual(card["status"], "")
+            self.assertTrue(card["popup_closed"], "the pop-up steps aside for the browser")
+
+    def test_a_new_plan_from_a_tool_refusals_get_pro_refreshes_the_tools_manifest(self):
+        """0.2.19 review: the plan watch refreshed the account only, so the tools' manifest still said the free plan's
+        0 credits and the next paid call offered Get Pro to a new subscriber."""
+        upgrade = {"url": "https://loopcut.org/pricing?from=app&reason=insufficient_credits&plan=pro", "plan": "pro",
+                   "label": "Get Pro"}
+        with patch.object(self.host.config, "billing_open", return_value=True):
+            session = self.state.reset()
+            card = self.state.item_limit("Not enough credits: Image to 3D needs 80, you have 15.",
+                                         "insufficient_credits", "free", "2026-11-01T00:00:00Z", upgrade)
+            card.update(tool="Image to 3D", needed=80, balance=15)
+            session["items"] = [self.state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D", ""), card]
+            runtime = types.SimpleNamespace(refresh_async=Mock())
+            with patch.object(self.account, "open_browser"), patch.object(self.account, "watch_plan") as watch, \
+                    patch.object(self.cloud, "_runtime", runtime), patch.object(self.host.conversations, "save"):
+                self.host._do_action(session, ("limit_upgrade", 1))
+                self.assertEqual(card["status"], "waiting")
+                watch.call_args.args[1]({"plan": "pro"})
+            runtime.refresh_async.assert_called_once_with()
+            self.assertEqual(card["status"], "done")
 
     def test_locked_model_upgrade_dispatch_starts_the_same_watch_without_resuming_a_turn(self):
         with patch.object(self.host.config, "billing_open", return_value=True), patch.object(self.settings, "_changed"), \

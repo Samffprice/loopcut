@@ -170,7 +170,7 @@ def draw_area() -> None:
     key_needed = _key_needed(needs_setup)
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
-    from .. import cloud_jobs, playback, workspace
+    from .. import cloud_jobs, playback, rig_gate, workspace
     from .. import chatgpt_ui, onboarding
     if any(item["kind"] == "user" for item in session["items"]):
         onboarding.dismiss_hints()
@@ -181,11 +181,12 @@ def draw_area() -> None:
                             "provider": getattr(prefs, "provider", "LOOPCUT"),
                             "allowance_notice": state.ui.get("allowance_notice"),
                             "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
+                            "watch_rigs": rig_gate.watchable(session),
                             "context_budget": budget, "model_options": options, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
                             "hints_dismissed": onboarding.hints_dismissed(),
                             "sign_in": {"loopcut": account.status(), "chatgpt": chatgpt_ui.status()},
                             "update": update.banner(), "cloud_jobs": cloud_jobs.ui_rows(),
-                            "local_processes": workspace.live_rows(),
+                            "local_processes": workspace.live_rows(), "left_running": workspace.left_rows(),
                             "service_policy": {key: getattr(prefs, key, default) for key, default in cloud_account.DEFAULTS.items()},
                             "service_signed_in": bool(cloud._runtime and cloud._runtime.signed_in),
                             "project_override": cloud_account.project_override(context.scene),
@@ -205,6 +206,8 @@ def _image_paths(session):
         paths.update(chat_credits.media_paths())
     paths.update(row["image_path"] for item in session["items"] if item.get("kind") == "wave"
                  for row in item.get("rows", []) if row.get("image_path"))
+    paths.update(path for item in session["items"] if item.get("kind") == "cloud_back"
+                 for path in item.get("thumbnails", []))
     return paths
 
 
@@ -448,7 +451,34 @@ def _open_settings() -> None:
     bpy.ops.preferences.addon_show(module=settings.PACKAGE)
 
 
-def _do_action(session: dict, action) -> None:
+def _drawn_cards(session: dict, area_pointer) -> list[dict]:
+    """The waiting cards this panel's last frame drew (layout._chat), nearest the input first, that still wait in
+    the ask it drew: not a card at an index the frame drew another one at (an item before it removed), nor one
+    that has asked again since."""
+    items = session["items"]
+    return [entry for entry in (_displays.get(area_pointer) or {}).get("cards", ())
+            if entry["index"] < len(items) and items[entry["index"]].get("status") == "awaiting"
+            and (id(items[entry["index"]]), items[entry["index"]].get("ask_serial")) == entry["card"]]
+
+
+def _shown_card(session: dict, area_pointer) -> tuple | None:
+    """(index, (id, ask_serial)) of the drawn waiting card nearest the input whose whole answer row was on screen.
+    Esc declines only that one and Enter runs only that one: a card the pump has not drawn yet, or one scrolled out
+    of view or showing a sliver, is not on screen (rel018-app: Esc declined an import card not drawn yet)."""
+    entry = next((entry for entry in _drawn_cards(session, area_pointer) if entry["shown"]), None)
+    return (entry["index"], entry["card"]) if entry else None
+
+
+def _scroll_to_waiting(session: dict, area_pointer) -> None:
+    """Enter while a card waits off screen: the chat scrolls to it, and the next Enter answers what the user sees.
+    Doing nothing would leave a panel that looks idle ("Working" is not drawn while a card waits). A card the panel
+    has not drawn yet comes at the chat's end."""
+    entry = next(iter(_drawn_cards(session, area_pointer)), None)
+    session["scroll"] = entry["scroll"] if entry else 0.0
+
+
+def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
+    """drawn: the clicked hit's card (layout._chat), for a waiting card's buttons (agent.decide)."""
     kind, index = action
     if kind in ("limit_upgrade", "limit_chatgpt", "own_key") or (kind == "sign_in" and index == "chatgpt"):
         item = (state.ui.get("allowance_notice") or {}).get("item")
@@ -510,9 +540,15 @@ def _do_action(session: dict, action) -> None:
         from .. import playback
         playback.stop()
     elif kind == "approve":
-        agent.decide(True, index=index)  # That card: a worker's paid ask may wait beside the turn's own.
+        agent.decide(True, index=index, drawn=drawn)  # That card: a worker's paid ask may wait beside the turn's own.
+    elif kind == "render_choice":  # A long render's card: the cloud or this computer (render_offer.py).
+        from .. import render_offer
+        render_offer.click(session, *index, drawn=drawn)
+    elif kind == "paid_upgrade" and config.billing_open() and 0 <= index < len(session["items"]):
+        from .. import render_offer  # A paid card short of its price: the plans page, as the credits pop-up's.
+        render_offer.upgrade(session["items"][index], drawn=drawn)
     elif kind == "approve_always":
-        agent.decide(True, always=True, index=index)
+        agent.decide(True, always=True, index=index, drawn=drawn)
     elif kind == "keep_changes":
         session["items"][index]["resolved"] = "kept"
         conversations.save(session)
@@ -562,6 +598,9 @@ def _do_action(session: dict, action) -> None:
         account.open_browser(index)
     elif kind == "offer":
         _offer_action(session, *index)
+    elif kind == "cloud_back":  # A cloud job's "finished while you were away" card: Load, or Make the MP4.
+        from .. import cloud_restore
+        cloud_restore.act(session, *index)
     elif kind == "tips_toggle":
         from .. import nudges
         nudges.set_tips_off(not nudges.tips_off())
@@ -646,6 +685,11 @@ def _do_action(session: dict, action) -> None:
             session["turn"].ledger.scene_changed()
         item["action_label"] = ""
         conversations.save(session)
+    elif kind == "verification_action":  # A reply's footer button (rig_gate.ACTIONS only), checked again there.
+        from .. import rig_gate
+        line = rig_gate.run_footer(session, index)
+        if line:  # UI only: never saved with the conversation or sent to the model.
+            state.ui["action_notice"] = {"text": line, "until": time.time() + 6.0}
     elif kind == "open_account":
         account.open_browser(config.account_url())
     elif kind == "limit_upgrade" and config.billing_open():
@@ -675,7 +719,7 @@ def _do_action(session: dict, action) -> None:
             pinned[index]["pinned"] = False
             conversations.save(session)
     elif kind == "reject":
-        agent.decide(False, index=index)
+        agent.decide(False, index=index, drawn=drawn)
     elif kind == "stop_turn":
         agent.stop()
     elif kind == "send_queued_now":
@@ -709,6 +753,12 @@ def _do_action(session: dict, action) -> None:
     elif kind in {"job_cancel", "job_resume", "job_preview", "job_open"}:
         from .. import job_tools
         job_tools.ui_action(kind, index)
+    elif kind == "left_stop":  # A row for what a shell command left running: SIGTERM to exactly its group.
+        from .. import workspace
+        stopped = workspace.stop_left(index)
+        if not stopped:  # None: ps could not check it is still the same process, so nothing was signalled.
+            state.ui["action_notice"] = {"text": "That process already ended." if stopped is False else
+                                         "Couldn't check that process; try again.", "until": time.time() + 6.0}
     elif kind == "cloud_job_cancel":
         from .. import cloud_jobs
         if not cloud_jobs.cancel_job(index):  # Say so rather than ignore the click (C47).
@@ -717,6 +767,8 @@ def _do_action(session: dict, action) -> None:
     elif kind == "worker_cancel":
         from .. import waves
         waves.cancel_worker(*index)  # (wave, worker): that worker stops and is not merged; the rest go on.
+    elif kind == "to_3d":  # A made picture's button: the click approves the price it showed and runs image_to_3d.
+        agent.turn_into_3d(*index, drawn=drawn)
     elif kind == "accept_quarantine":
         _accept_quarantine(session, session["items"][index])
     elif kind == "open_conversation":
@@ -780,6 +832,13 @@ def _offer_action(session: dict, index: int, choice: int) -> None:
     elif do == "prompt" and not session["busy"]:
         textedit.set_text(session, arg)
         session["focused"] = True
+        blank = arg.find(nudges.BLANK)
+        if blank >= 0:  # What the user names (the No picture? chip's thing to make): selected, so typing replaces it.
+            session["anchor"], session["cursor"] = blank, blank + len(nudges.BLANK)
+        from .. import video_attach
+        if nudges.chip_needs(arg, session["attachments"], session.get("references") or [],
+                             video_attach.preparing(session)):
+            bpy.ops.loopcut.attach_images("INVOKE_DEFAULT")  # The picture or clip the request is about.
     elif do == "continue_loopcut" and not session["busy"]:
         prefs = settings.preferences()
         if prefs is None:
@@ -804,10 +863,16 @@ def _start_upgrade(session: dict | None, item: dict) -> None:
     if not config.billing_open():
         return
     account.open_browser(item["url"] if "plan_upgrade" in item else item["upgrade"]["url"])
+    from .. import chat_credits, cloud
+    if chat_credits.top_up(item):  # Add credits (a paid plan's tool refusal): no plan to wait for; the manifest is
+        cloud.watch_balance()      # watched until the balance rises, so the next paid call sees the credits.
+        return
     item["status"] = "waiting"
     stopped = session["messages"][-1] if session is not None and state.can_resume(session) and item["kind"] == "limit" else None
 
     def upgraded(payload: dict) -> None:
+        if cloud._runtime is not None:  # The new plan's credits and tools, for the next paid call (0.2.19).
+            cloud._runtime.refresh_async()
         if item.get("status") != "waiting":
             return
         item["status"] = "done"
@@ -1054,7 +1119,8 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         display = _displays.get(area.as_pointer())
         x, y, inside = _local(_window_region(area), event)
         if inside and display:
-            action = layout.hit_test(display, x, y)
+            hit = layout.hit_at(display, x, y) or {}
+            action = hit.get("action")
             kind = action[0] if action else None
             if kind not in POPUP_ACTIONS and kind not in ("picker_open", "model_menu"):
                 _close_popups()  # A click anywhere else puts a menu away.
@@ -1084,6 +1150,8 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
                         textedit.place_caret(session, index)
                     self._selecting = event.value == "PRESS" and not double_click
                     _update_mentions(session)
+            elif action and hit.get("card"):  # A waiting card's button: the card, in the ask, this frame drew.
+                _do_action(session, action, drawn=hit["card"])
             elif action:
                 _do_action(session, action)
         return inside
@@ -1119,9 +1187,14 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             _pick_mention(session, session.get("mention", 0))
             return True
         if kind == "ESC":
+            shown = _shown_card(session, self.area_pointer)
+            drawn = _displays.get(self.area_pointer) or {}
+            item = (state.ui.get("allowance_notice") or {}).get("item")
             if mentions:
                 state.ui["mentions"] = []
-            elif not agent.decide(False):
+            elif session["busy"] and item and any(h["id"] == "popup.close" for h in drawn.get("hits", ())):
+                item["popup_closed"] = True  # A paid tool's pop-up, mid-turn (0.2.19): Esc closes it, not the turn.
+            elif shown is None or not agent.decide(False, index=shown[0], drawn=shown[1]):
                 if session["busy"]:
                     agent.stop()
                 else:
@@ -1130,8 +1203,14 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         if kind in {"RET", "NUMPAD_ENTER"}:
             if shift:
                 textedit.insert(session, "\n")
-            elif not (not session["input"].strip() and agent.decide(True)):
+            elif session["input"].strip() or not any(i.get("status") == "awaiting" for i in session["items"]):
                 _submit(session)
+            else:  # Enter runs only a card on screen, as Esc declines one; to one out of view it scrolls first.
+                shown = _shown_card(session, self.area_pointer)
+                if shown is not None:
+                    agent.decide(True, index=shown[0], drawn=shown[1])
+                else:
+                    _scroll_to_waiting(session, self.area_pointer)
         elif kind in {"BACK_SPACE", "DEL"}:
             textedit.delete(session, backwards=kind == "BACK_SPACE", word=by_word)
         elif kind in {"LEFT_ARROW", "RIGHT_ARROW"}:

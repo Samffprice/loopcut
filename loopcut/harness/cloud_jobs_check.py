@@ -133,7 +133,9 @@ def motion(client):
         print(line, flush=True)
         action = hero.animation_data.action if hero.animation_data else None
         check(action is not None and action.name.startswith("Motion: walk forward"), "motion applied to the named armature")
-        check("root motion in place" in line and "fingers not animated" in line, "in_place and the sidecar reach the handler")
+        check("It stays on the spot" in line and ("does not move the fingers" in line
+                                                    or "this motion does not move them" in line),
+              "in_place and the sidecar reach the handler")
         check("loopcut_provenance" in action, "the motion's action carries provenance")
         xs = []
         for frame in range(scene.frame_start, scene.frame_start + 48):
@@ -166,7 +168,7 @@ def motion(client):
         job = cloud_jobs.run(video, {**prepared, "quote_id": quote}, files, project=project)
         line = cloud_jobs.apply_result(video, job)
         print(line, flush=True)
-        check("new skeleton" in line and "Motion: take" in line and "root motion in world" in line,
+        check("new skeleton" in line and "Motion: take" in line and "It stays on the spot" not in line,
               "no target: the motion lands on a new skeleton named from the clip, travelling")
 
 

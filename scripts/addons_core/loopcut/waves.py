@@ -1520,6 +1520,18 @@ def accept_quarantine(session: dict, wave: str, names: list[str] | None = None) 
     return text
 
 
+def held_back_only(rows: list) -> bool:
+    """Workers' rows (those a result reports on) whose only shortfall is parts kept aside for the user's accept: each
+    row holding parts back merged new work of its own (merged_new), and no row has a merge error or a conflict.
+    Another worker's merge, an earlier wave's, or a reused live material does not stand in for it. delegate's result
+    stays not ok, so the model deals with the held-back parts (dbcd031b3e2: they had read as "completed and
+    merged"); its card is done, with the merge card's Accept as their own line (rel018-ja2's item 40, a wave that
+    started and merged, showed a red ✕)."""
+    held = [row for row in rows if row.get("quarantined")]
+    return (bool(held) and all(row.get("merged") and row.get("merged_new") for row in held)
+            and not any(row.get(key) for row in rows for key in ("merge_error", "conflicts")))
+
+
 def wait_result(session: dict, job: Job | None = None, lead: str = ""):
     """Repeat delivery receipts even after the turn's Job is gone. Wave rows survive save/reload.
     Use the latest job's cards, including earlier waves of that job, never a worker's promises."""
@@ -1549,8 +1561,8 @@ def wait_result(session: dict, job: Job | None = None, lead: str = ""):
                                  "no recorded datablock changes" if changes == [] else "details unavailable in this saved result"))
                 elif row.get("note"):
                     lines.append("  " + row["note"])
-    return tools.ToolResult("\n".join(lines), ok=not any(
-        row.get(key) for row in rows for key in ("merge_error", "quarantined", "conflicts")))
+    ok = not any(row.get(key) for row in rows for key in ("merge_error", "quarantined", "conflicts"))
+    return tools.ToolResult("\n".join(lines), ok=ok, held_back=not ok and held_back_only(rows))
 
 
 def _still_running(busy: list, job: Job | None = None) -> str:
@@ -2070,6 +2082,11 @@ def _settle(wave: Wave, crew: list[Worker], on_main) -> tuple[list[str], list, b
                 worker.row["merged_changes"] = card_lines(changes)
                 for key in ("quarantined", "conflicts"):
                     worker.row[key] = [_short(e) for e in _field(merge_report, key) if _belongs(e, worker.id)]
+                # Its own new work in the scene: what it created (less what is held back; an object's data goes with
+                # its object) or replaced. A live material reused in place of its copy is not (held_back_only).
+                worker.row["merged_new"] = any(
+                    _short(e) not in worker.row["quarantined"] for e in changes["created"] + changes["replaced"]
+                    if not (isinstance(e, dict) and e.get("id_type") in _IMPLIED))
                 errors = [str(e) for e in _field(merge_report, "errors") if _belongs(e, worker.id)]
                 if errors:
                     worker.row["merge_error"] = "; ".join(errors)
@@ -2155,8 +2172,10 @@ def report(job: Job, batch: list[Worker], on_main, lead: str = "", scene_before=
     job.sheets += 1
     sheet, sheet_line = contact_sheet(first.folder, batch, on_main,
                                       "sheet.png" if job.sheets == 1 else f"sheet-{job.sheets}.png")
+    ok = merged and not errors
     return tools.ToolResult(render_report(job, sections, live, held, busy_, sheet_line, lead), image_path=sheet,
-                            ok=merged and not errors, scene_before=scene_before, scene_after=scene_after)
+                            ok=ok, held_back=not ok and held_back_only([w.row for w in batch]),
+                            scene_before=scene_before, scene_after=scene_after)
 
 
 def _field_value(report, key: str):

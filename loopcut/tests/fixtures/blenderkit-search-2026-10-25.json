@@ -1,0 +1,690 @@
+{
+ "about": "BlenderKit search API bodies (GET /api/v1/search/?query=<key>&page_size=8, no key), recorded 2026-10-25 and trimmed to the fields blenderkit.py reads.",
+ "bodies": {
+  "realistic floor lamp reading lamp asset_type:model is_free:true": {
+   "count": 10000,
+   "results": [
+    {
+     "id": "f0104702-2242-4b54-a9a5-318aa1d29fa5",
+     "name": "Uncut summer grass for scettering",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Realistic grass asset with SS, transparency, and normal map created with stereo photometry process and some node magic. \r\n\r\nI have included a single clump of grass for scattering and an example plane ",
+     "tags": [
+      "grass",
+      "uncut",
+      "wild",
+      "summer",
+      "fresh",
+      "lawn",
+      "scan",
+      "plant",
+      "realistic",
+      "flower"
+     ],
+     "author": {
+      "fullName": "Paweł Wałasiewicz"
+     },
+     "dictParameters": {
+      "dimensionX": 0.1361,
+      "dimensionY": 0.1342,
+      "dimensionZ": 0.132,
+      "faceCount": 545,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "dc2bed6d-0cd8-43be-b94e-801688a39a18",
+     "name": "Realistic Hair",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "I created realistic hair in Blender using the Hair Particle System, carefully adjusting particle settings such as hair density, length, and randomness to achieve a natural look. I refined the strands ",
+     "tags": [
+      "Hair",
+      "character",
+      "grooming",
+      "hairsystem",
+      "female",
+      "cloths",
+      "realistic"
+     ],
+     "author": {
+      "fullName": "Abhay Pratap"
+     },
+     "dictParameters": {
+      "dimensionX": 0.4306,
+      "dimensionY": 0.2984,
+      "dimensionZ": 0.5136,
+      "faceCount": 4665571,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "f2d4b221-8441-4ff2-9d79-2355ac0e4548",
+     "name": "Modern Realistic Wooden Kitchen",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "A nice, detailed wooden and realistic kitchen without too many polygons.",
+     "tags": [
+      "kitchen",
+      "interior",
+      "archviz",
+      "sink",
+      "hood",
+      "stove",
+      "food",
+      "modern",
+      "realistic",
+      "cook"
+     ],
+     "author": {
+      "fullName": "SaTales "
+     },
+     "dictParameters": {
+      "dimensionX": 2.98,
+      "dimensionY": 0.6315,
+      "dimensionZ": 2.3931,
+      "faceCount": 40474,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "863a24b6-6b4a-4987-aaae-b14607374d5b",
+     "name": "Realistic grass clump",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Realistic 3D grass model designed for natural outdoor environments, landscapes, gardens, parks, fields, and architectural visualization. Suitable for adding detailed vegetation and ground cover to Ble",
+     "tags": [
+      "grass",
+      "grass_blade",
+      "vegetation",
+      "plant",
+      "foliage",
+      "nature",
+      "nature_asset"
+     ],
+     "author": {
+      "fullName": "3dhub "
+     },
+     "dictParameters": {
+      "dimensionX": 0.5263,
+      "dimensionY": 0.5513,
+      "dimensionZ": 0.1961,
+      "faceCount": 6359,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "c15e4247-ee36-4d77-ad14-614e5979e96a",
+     "name": "Realistic Cloud",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "This image showcases a realistic cloud simulation created in Blender, a powerful open-source 3D modeling and animation software. The cloud texture appears highly lifelike, with varying density and sof",
+     "tags": [
+      "cloud",
+      "CloudSimulation",
+      "clouds",
+      "AtmosphericEffects",
+      "fog",
+      "CGI",
+      "Animation",
+      "dust"
+     ],
+     "author": {
+      "fullName": "sivix gamer"
+     },
+     "dictParameters": {
+      "dimensionX": 3.0248,
+      "dimensionY": 8.4511,
+      "dimensionZ": 2.962,
+      "faceCount": 36,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "d898d0e0-800d-4c4e-b7c4-9de0e444a6c6",
+     "name": "SJ-Realistic Pine Forest Set",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "This high-quality 3D Pine Tree Pack is designed for realistic environments, including games, architectural visualizations, and animations. The pack includes multiple variations of pine trees, each car",
+     "tags": [
+      "Pine",
+      "tree",
+      "gameready",
+      "realistic",
+      "nature",
+      "forest",
+      "vegetation",
+      "environment",
+      "foliage",
+      "lowpoly"
+     ],
+     "author": {
+      "fullName": "sahra javid"
+     },
+     "dictParameters": {
+      "dimensionX": 6.9628,
+      "dimensionY": 7.5546,
+      "dimensionZ": 12.7548,
+      "faceCount": 177146,
+      "modelStyle": "lowpoly"
+     }
+    },
+    {
+     "id": "7a9aa47a-0b4f-4490-af44-be01e633bc47",
+     "name": "Modern Realistic Beige Kitchen",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "A nice, detailed and realistic kitchen without too many polygons.",
+     "tags": [
+      "kitchen",
+      "interior",
+      "archviz",
+      "sink",
+      "hood",
+      "stove",
+      "food",
+      "modern",
+      "realistic",
+      "cook"
+     ],
+     "author": {
+      "fullName": "SaTales "
+     },
+     "dictParameters": {
+      "dimensionX": 3.08,
+      "dimensionY": 2.62,
+      "dimensionZ": 2.43,
+      "faceCount": 23771,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "ef691b98-349a-4c1d-a52e-22941fc350e1",
+     "name": "Schefflera Umbrella Plant",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Realistic Schefflera (Umbrella Plant) with dense layered foliage, natural branching, and a decorative square wooden planter with soil. Ideal for interior visualization, architectural scenes, offices, ",
+     "tags": [
+      "schefflera",
+      "umbrella_plant",
+      "houseplant",
+      "indoor_plant",
+      "tropical_plant",
+      "foliage",
+      "office_plant",
+      "potted_plant",
+      "planter",
+      "realistic"
+     ],
+     "author": {
+      "fullName": "Rick Van Dyk"
+     },
+     "dictParameters": {
+      "dimensionX": 0.7774,
+      "dimensionY": 0.8,
+      "dimensionZ": 1.4912,
+      "faceCount": 123088,
+      "modelStyle": "realistic"
+     }
+    }
+   ]
+  },
+  "floor lamp reading lamp asset_type:model is_free:true": {
+   "count": 368,
+   "results": [
+    {
+     "id": "7ca51c17-dd9f-4044-85c1-0ece5d624803",
+     "name": "Arc Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "This arched floor lamp showcases a minimal design and a mix of materials, making it a versatile addition to your modern décor. Crafted from iron, the round base and arm provide a solid foundation. The",
+     "tags": [
+      "Arc",
+      "Floor",
+      "Lamp",
+      "decor",
+      "light",
+      "led"
+     ],
+     "author": {
+      "fullName": "Yuriy Madar"
+     },
+     "dictParameters": {
+      "dimensionX": 0.3117,
+      "dimensionY": 0.585,
+      "dimensionZ": 1.6136,
+      "faceCount": 3332,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "1e7b1b87-28ce-4a6d-ac16-e2d14c869741",
+     "name": "IKEA Aläng Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "The IKEA Aläng Floor Lamp is a slim-lined lamp with a simple and elegant look perfect for reading and a post height you can change to suit your needs.",
+     "tags": [
+      "Ikea",
+      "Floor",
+      "Lamp",
+      "Interior",
+      "Alang",
+      "Light"
+     ],
+     "author": {
+      "fullName": "Ahmad Go"
+     },
+     "dictParameters": {
+      "dimensionX": 0.2929,
+      "dimensionY": 0.2929,
+      "dimensionZ": 1.6051,
+      "faceCount": 125326,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "2dced5b6-7ea6-425b-bc2a-263ae0892930",
+     "name": "Minimalist LED Tube Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Vagner LED floor lamp by Dyberg Larsen, designed by Vagner Jørgensen. A slim black metal floor light with two integrated LED light fields, touch dimming, and a compact circular base. Accurately scaled",
+     "tags": [
+      "floor_lamp",
+      "led_floor_lamp",
+      "tube_floor_lamp",
+      "vertical_light",
+      "minimalist_lamp",
+      "black_floor_lamp",
+      "dyberg_larsen",
+      "vagner",
+      "vagner_jorgensen",
+      "modern_lighting"
+     ],
+     "author": {
+      "fullName": "Johnny d'Avila"
+     },
+     "dictParameters": {
+      "dimensionX": 0.26,
+      "dimensionY": 0.26,
+      "dimensionZ": 1.5,
+      "faceCount": 888,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "b9c6f86c-4d3c-4338-8922-f878fc668f6b",
+     "name": "Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Floor lamp, lamp",
+     "tags": [
+      "lamp",
+      "floor",
+      "floor_lamp",
+      "Lamp",
+      "Floor_lamp",
+      "light"
+     ],
+     "author": {
+      "fullName": "yossif kh"
+     },
+     "dictParameters": {
+      "dimensionX": null,
+      "dimensionY": null,
+      "dimensionZ": null,
+      "faceCount": null,
+      "modelStyle": null
+     }
+    },
+    {
+     "id": "7e6ab247-aef7-4abd-b0b7-90e23681d169",
+     "name": "Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "wood Floor lamp with high quality material and details, lamp, floor lamp, floor",
+     "tags": [
+      "lamp",
+      "floor_lamp",
+      "Lamp",
+      "wood_lamp",
+      "Floor_Lamp",
+      "floor"
+     ],
+     "author": {
+      "fullName": "yossif kh"
+     },
+     "dictParameters": {
+      "dimensionX": null,
+      "dimensionY": null,
+      "dimensionZ": null,
+      "faceCount": null,
+      "modelStyle": null
+     }
+    },
+    {
+     "id": "c992ddb9-452d-4abb-8cd4-b27d53a24b9f",
+     "name": "Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "If you want to turn the lamp off, just change the material of the filament inside the light bulb to the \"light bulb metal\" material.",
+     "tags": [
+      "lamp",
+      "floor lamp",
+      "interior",
+      "light",
+      "lightbulb",
+      "modern"
+     ],
+     "author": {
+      "fullName": "Cosmo "
+     },
+     "dictParameters": {
+      "dimensionX": 1.7079,
+      "dimensionY": 0.3723,
+      "dimensionZ": 2.022,
+      "faceCount": 52581,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "ee579138-2d66-4343-883b-94a6eb840a03",
+     "name": "Floor lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "a lamp used to illuminate dark areas on the floor, such as under chairs or under the stairs of a house",
+     "tags": [
+      "lamp",
+      "floor",
+      "light",
+      "parthouse"
+     ],
+     "author": {
+      "fullName": "Jon 13"
+     },
+     "dictParameters": {
+      "dimensionX": 0.2717,
+      "dimensionY": 0.118,
+      "dimensionZ": 0.1387,
+      "faceCount": 1546,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "d407e6eb-cde8-44c6-984d-abca45983d50",
+     "name": "Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "A modern floor lamp.",
+     "tags": [
+      "light",
+      "lamp",
+      "floor",
+      "interior",
+      "ambient"
+     ],
+     "author": {
+      "fullName": "Arfat Ikhte Rohman"
+     },
+     "dictParameters": {
+      "dimensionX": 0.4446,
+      "dimensionY": 0.4158,
+      "dimensionZ": 1.4094,
+      "faceCount": 4096,
+      "modelStyle": "realistic"
+     }
+    }
+   ]
+  },
+  "realistic floor lamp asset_type:model is_free:true": {
+   "count": 10000,
+   "results": [
+    {
+     "id": "1a9ee705-4ccc-4846-ae49-bd2429bc25a8",
+     "name": "Moon Floor Lamp",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "A realistic 3D model of a moon-inspired floor lamp featuring a spherical illuminated shade and a clean modern stand. Ideal for interior visualization, architectural rendering, product visualization, a",
+     "tags": [
+      "moon_lamp",
+      "floor_lamp",
+      "lighting",
+      "decorative_lamp",
+      "interior_lighting",
+      "modern_lamp",
+      "home_decor",
+      "furniture",
+      "archviz",
+      "lamp_model"
+     ],
+     "author": {
+      "fullName": "Mohammed Hossain"
+     },
+     "dictParameters": {
+      "dimensionX": 0.2317,
+      "dimensionY": 0.2317,
+      "dimensionZ": 1.5601,
+      "faceCount": 3776,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "262cd52e-6a23-4fd5-9b58-5eb2a8ee2ffb",
+     "name": "Standing Lamp Metallic",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Standing Lamp Metallic is a minimalist modern floor lamp featuring a sleek metallic frame and clean geometric design. Perfect for contemporary interiors, studio renders, architectural visualization, a",
+     "tags": [
+      "lamp",
+      "decoration",
+      "interior",
+      "standing",
+      "aestetic",
+      "modern",
+      "oldlamp"
+     ],
+     "author": {
+      "fullName": "Elin FL"
+     },
+     "dictParameters": {
+      "dimensionX": 0.8273,
+      "dimensionY": 0.8273,
+      "dimensionZ": 3.5608,
+      "faceCount": 5788,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "f0104702-2242-4b54-a9a5-318aa1d29fa5",
+     "name": "Uncut summer grass for scettering",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Realistic grass asset with SS, transparency, and normal map created with stereo photometry process and some node magic. \r\n\r\nI have included a single clump of grass for scattering and an example plane ",
+     "tags": [
+      "grass",
+      "uncut",
+      "wild",
+      "summer",
+      "fresh",
+      "lawn",
+      "scan",
+      "plant",
+      "realistic",
+      "flower"
+     ],
+     "author": {
+      "fullName": "Paweł Wałasiewicz"
+     },
+     "dictParameters": {
+      "dimensionX": 0.1361,
+      "dimensionY": 0.1342,
+      "dimensionZ": 0.132,
+      "faceCount": 545,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "dc2bed6d-0cd8-43be-b94e-801688a39a18",
+     "name": "Realistic Hair",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "I created realistic hair in Blender using the Hair Particle System, carefully adjusting particle settings such as hair density, length, and randomness to achieve a natural look. I refined the strands ",
+     "tags": [
+      "Hair",
+      "character",
+      "grooming",
+      "hairsystem",
+      "female",
+      "cloths",
+      "realistic"
+     ],
+     "author": {
+      "fullName": "Abhay Pratap"
+     },
+     "dictParameters": {
+      "dimensionX": 0.4306,
+      "dimensionY": 0.2984,
+      "dimensionZ": 0.5136,
+      "faceCount": 4665571,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "f2d4b221-8441-4ff2-9d79-2355ac0e4548",
+     "name": "Modern Realistic Wooden Kitchen",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "A nice, detailed wooden and realistic kitchen without too many polygons.",
+     "tags": [
+      "kitchen",
+      "interior",
+      "archviz",
+      "sink",
+      "hood",
+      "stove",
+      "food",
+      "modern",
+      "realistic",
+      "cook"
+     ],
+     "author": {
+      "fullName": "SaTales "
+     },
+     "dictParameters": {
+      "dimensionX": 2.98,
+      "dimensionY": 0.6315,
+      "dimensionZ": 2.3931,
+      "faceCount": 40474,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "863a24b6-6b4a-4987-aaae-b14607374d5b",
+     "name": "Realistic grass clump",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "Realistic 3D grass model designed for natural outdoor environments, landscapes, gardens, parks, fields, and architectural visualization. Suitable for adding detailed vegetation and ground cover to Ble",
+     "tags": [
+      "grass",
+      "grass_blade",
+      "vegetation",
+      "plant",
+      "foliage",
+      "nature",
+      "nature_asset"
+     ],
+     "author": {
+      "fullName": "3dhub "
+     },
+     "dictParameters": {
+      "dimensionX": 0.5263,
+      "dimensionY": 0.5513,
+      "dimensionZ": 0.1961,
+      "faceCount": 6359,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "c15e4247-ee36-4d77-ad14-614e5979e96a",
+     "name": "Realistic Cloud",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "This image showcases a realistic cloud simulation created in Blender, a powerful open-source 3D modeling and animation software. The cloud texture appears highly lifelike, with varying density and sof",
+     "tags": [
+      "cloud",
+      "CloudSimulation",
+      "clouds",
+      "AtmosphericEffects",
+      "fog",
+      "CGI",
+      "Animation",
+      "dust"
+     ],
+     "author": {
+      "fullName": "sivix gamer"
+     },
+     "dictParameters": {
+      "dimensionX": 3.0248,
+      "dimensionY": 8.4511,
+      "dimensionZ": 2.962,
+      "faceCount": 36,
+      "modelStyle": "realistic"
+     }
+    },
+    {
+     "id": "d898d0e0-800d-4c4e-b7c4-9de0e444a6c6",
+     "name": "SJ-Realistic Pine Forest Set",
+     "isFree": true,
+     "canDownload": true,
+     "license": "royalty_free",
+     "description": "This high-quality 3D Pine Tree Pack is designed for realistic environments, including games, architectural visualizations, and animations. The pack includes multiple variations of pine trees, each car",
+     "tags": [
+      "Pine",
+      "tree",
+      "gameready",
+      "realistic",
+      "nature",
+      "forest",
+      "vegetation",
+      "environment",
+      "foliage",
+      "lowpoly"
+     ],
+     "author": {
+      "fullName": "sahra javid"
+     },
+     "dictParameters": {
+      "dimensionX": 6.9628,
+      "dimensionY": 7.5546,
+      "dimensionZ": 12.7548,
+      "faceCount": 177146,
+      "modelStyle": "lowpoly"
+     }
+    }
+   ]
+  }
+ }
+}

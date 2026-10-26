@@ -14,7 +14,9 @@ sleeps right after a render_job call, get a line pointing to status with wait.
 
 Pure Python and locked: one Ledger per turn now, one shared by a job's workers later.
 NoProgress separately counts failures and refusals per call since the last scene change, and refused
-repeats of any call, in every loop, including workers, whose dollars and time are also budgeted.
+repeats of any call, in every loop, including workers, whose dollars and time are also budgeted. It also
+counts steps in a row where every call failed, so the user is told when a turn is stuck (agent.STUCK_NOTICE):
+a model that never says so in text otherwise works on in silence (a user's log, 0.2.14: seven failures).
 """
 
 import hashlib
@@ -30,6 +32,7 @@ POLLS = 3          # Status calls without wait that find a job running, in a tur
 NO_PROGRESS_FAILURES = 8  # Allow several retries after the repeat notes before stopping an unchanged failure.
 REPEAT_REFUSALS = 20  # Refused repeats of any calls in a loop, never reset: a hosted turn rotating among
                       # repeated inspect_api calls had 237 refused and never reached the limit above.
+STUCK_STEPS = 4    # Steps in a row whose calls all failed, none changing the scene, before the user is told.
 
 _HEX = re.compile(r"0x[0-9a-fA-F]+")
 # Names: anything in double quotes, and single-quoted words. A single-quoted phrase with spaces is
@@ -38,6 +41,7 @@ _QUOTED = re.compile(r"\"[^\"\n]*\"|'[^'\s]*'")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _RUNNING = re.compile(r'"state": "(?:queued|running)"')  # In render_job status's JSON.
 _SLEEP = re.compile(r"\bsleep\s*\(")
+_TRACEBACK = "Traceback (most recent call last):"
 
 
 def call_key(name: str, arguments: str) -> tuple[str, str]:
@@ -65,6 +69,12 @@ def error_line(text: str) -> str:
     if stopped >= 0:
         return output[stopped:].split(",", 1)[0]
     return next((line.strip() for line in output.splitlines() if line.strip()), "")
+
+
+def printed_traceback(name: str, text: str) -> bool:
+    """run_python code that caught its own exception and printed the traceback: it ran, but what it tried
+    failed. A weaker model wraps every try in try/except, so each run "succeeded" while all of them failed."""
+    return name == "run_python" and _TRACEBACK in text.split("\n\nScene changes", 1)[0]
 
 
 def normalised(error: str) -> str:
@@ -116,10 +126,12 @@ class NoProgress:
 
     def __init__(self):
         self._refused = 0
+        self._failed = self._progress = False  # This step's calls so far (end_step).
         self.reset()
 
     def reset(self) -> None:
         self._counts: dict[tuple[str, str], int] = {}
+        self._stuck = 0
 
     def skip(self, key: tuple[str, str]) -> bool:
         """Count an automatic refusal as no progress, just like an executed failure."""
@@ -132,6 +144,8 @@ class NoProgress:
 
     def record(self, key: tuple[str, str], ok: bool, changed: bool) -> bool:
         """Whether this call reaches the limit; a scene change resets even if the call failed."""
+        self._progress |= ok or changed
+        self._failed |= not (ok or changed)
         if changed:
             self.reset()
             return False
@@ -140,6 +154,16 @@ class NoProgress:
             return False
         self._counts[key] = self._counts.get(key, 0) + 1
         return self._counts[key] >= NO_PROGRESS_FAILURES
+
+    def end_step(self) -> int:
+        """After a step's calls: how many steps in a row have now had every call fail (or be refused) without a
+        scene change. A step where any call worked starts the count again, as do reset()'s scene changes and notes."""
+        if self._progress:
+            self._stuck = 0
+        elif self._failed:
+            self._stuck += 1
+        self._failed = self._progress = False
+        return self._stuck
 
 
 class Ledger:

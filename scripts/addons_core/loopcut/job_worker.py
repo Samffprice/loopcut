@@ -127,9 +127,8 @@ def render_job(path: Path) -> None:
         raise jobs.JobError("The saved scene changed; create a new job instead of resuming this one.")
     output = Path(spec["output"])
     jobs.check_output(path, spec)
-    for asset in spec.get("assets", []):
-        if jobs.digest(Path(asset["path"])) != asset["sha256"]:
-            raise jobs.JobError("An external scene asset changed; create a new job for the new revision.")
+    if jobs.assets_changed(spec):
+        raise jobs.JobError("An external scene asset changed; create a new job for the new revision.")
     bpy.ops.wm.open_mainfile(filepath=str(snapshot), load_ui=False, use_scripts=False)
     scene = bpy.data.scenes.get(spec["scene"])
     if scene is None:
@@ -138,9 +137,8 @@ def render_job(path: Path) -> None:
     if spec.get("kind") == "inspection":
         from inspection_worker import render_inspection
         render_inspection(path, spec, scene)
-        for asset in spec.get("assets", []):
-            if jobs.digest(Path(asset["path"])) != asset["sha256"]:
-                raise jobs.JobError("An external asset changed during inspection; request a fresh inspection.")
+        if jobs.assets_changed(spec):
+            raise jobs.JobError("An external asset changed during inspection; request a fresh inspection.")
         return
     scene.camera = bpy.data.objects.get(spec["camera"])
     if scene.camera is None or scene.camera.type != "CAMERA":
@@ -186,9 +184,8 @@ def render_job(path: Path) -> None:
         progress["phase"] = "encoding"
         report()
         progress["movie"] = encode_movie(spec, output, completed, path)
-    for asset in spec.get("assets", []):
-        if jobs.digest(Path(asset["path"])) != asset["sha256"]:
-            raise jobs.JobError("An external asset changed during rendering; the job is not verified.")
+    if jobs.assets_changed(spec):
+        raise jobs.JobError("An external asset changed during rendering; the job is not verified.")
     progress.update(phase="verified", verified_complete=True)
     report()
     jobs.atomic_json(path / "manifest.json", {"job": spec, "result": progress})  # Beside spec.json, not the renders.

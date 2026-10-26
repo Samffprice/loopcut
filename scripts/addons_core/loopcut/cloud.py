@@ -344,6 +344,21 @@ def _display(descriptor, key):
     return " ".join(value.split())[:120] if isinstance(value, str) else ""
 
 
+def plain_title(name):
+    """A cloud tool's plain name for people ("Image to 3D", its display title, as the locked cards name it), from
+    the manifest; the bare name when the catalog does not know it."""
+    bare = tool_name(name) or str(name)
+    runtime = _runtime
+    found = None
+    if runtime is not None:
+        with runtime.lock:
+            found = next((d for d in runtime.manifest.get("tools", []) if isinstance(d, dict) and d.get("name") == bare),
+                         None)
+    if found is None:
+        return bare
+    return _display(found, "title") or " ".join(str(found.get("title") or bare).split())[:120]
+
+
 def _category_label(value):
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -492,8 +507,9 @@ class Runtime:
         try:
             with self.lock:
                 manifest, signed_in = deepcopy(self.manifest), self.signed_in
-            live = [d["name"] for d in self.descriptors() if d.get("backend") == "managed"]
-            nudges.observe(manifest, signed_in, live)
+            managed = [d for d in self.descriptors() if d.get("backend") == "managed"]
+            nudges.observe(manifest, signed_in, [d["name"] for d in managed],
+                           prices={d["name"]: (d.get("cost") or {}).get("credits_estimate") for d in managed})
         except Exception as ex:  # Cards are a nicety; the catalog must still load.
             print(f"Loopcut: could not check credits for cards: {ex!r}")
 
@@ -816,6 +832,14 @@ def _timer():
     return 10.0
 
 
+def _on_exit_pre(*_):
+    """bpy.app.handlers.exit_pre: Blender is quitting. It runs before Blender disables add-ons (WM_exit_ex, then
+    bpy.utils._on_exit), so unregister's cancel_all cancels nothing: a detached cloud job goes on in the cloud, and its
+    conversation picks it up when Blender opens again. Disabling the add-on in Preferences still cancels them."""
+    from . import cloud_jobs
+    cloud_jobs.leave_all()
+
+
 def register():
     import bpy
     from . import account
@@ -824,6 +848,9 @@ def register():
     refresh_async()
     if not bpy.app.timers.is_registered(_timer):
         bpy.app.timers.register(_timer, first_interval=10, persistent=True)
+    handlers = getattr(bpy.app, "handlers", None)
+    if handlers is not None and _on_exit_pre not in handlers.exit_pre:
+        handlers.exit_pre.append(handlers.persistent(_on_exit_pre))  # Kept across file loads.
 
 
 def unregister():
@@ -833,7 +860,14 @@ def unregister():
         account.on_signed_in.remove(refresh_async)
     if bpy.app.timers.is_registered(_timer):
         bpy.app.timers.unregister(_timer)
+    handlers = getattr(bpy.app, "handlers", None)
+    if handlers is not None and _on_exit_pre in handlers.exit_pre:
+        handlers.exit_pre.remove(_on_exit_pre)
     from . import cloud_jobs
+    # Once Blender is quitting (_on_exit_pre), only the jobs no chat picks up. Reload Scripts cancels them all, as a
+    # Preferences disable does: both reach here through addon_utils.disable with no exit_pre, and what tells them
+    # apart (default_set, which only Preferences passes) is applied after unregister and seen only in Blender's own
+    # stack frames. A job canceled by a reload refunds its unspent credits, as 0.2.18 did.
     cloud_jobs.cancel_all()
 
 
@@ -867,6 +901,53 @@ def locked_tools(runtime=None):
                      "why": "sign_in" if not signed_in else "plan" if reason == "plan" else "credits",
                      "credits": cost if type(cost) is int else None, "own_key": d["name"] in local})
     return rows
+
+
+MAKE_ONE_TOOLS = ("image_generate", "image_to_3d")  # Photo→3D without a picture: make one, then turn it into 3D.
+
+
+def _offered(runtime, names):
+    """{tool: credits} for those of names that can be called or unlocked here: the catalog's estimate, as the cards
+    price it; None for a tool on the user's own key or without an estimate. A tool blocked here is left out."""
+    if runtime is None or not runtime.supported:
+        return {}
+    live = {d["name"]: d for d in runtime.descriptors()}
+    locked = {row["name"]: row for row in locked_tools(runtime)}
+    prices = {}
+    for name in names:
+        if name in live:
+            cost = (live[name].get("cost") or {}).get("credits_estimate") if live[name].get("backend") == "managed" else None
+        elif name in locked:
+            cost = locked[name].get("credits")
+        else:
+            continue
+        prices[name] = cost if type(cost) is int and cost > 0 else None
+    return prices
+
+
+def make_one_prices(runtime=None):
+    """Photo→3D with no picture of the user's own (owner, 2026-10-25): {tool: credits} for MAKE_ONE_TOOLS (_offered).
+    None when image_generate can be neither called nor unlocked (No generation, Private mode, an off switch): then
+    nothing offers to make a picture. A locked one is offered, and its card (offer_tool) is what the user meets."""
+    prices = _offered(runtime or _runtime, MAKE_ONE_TOOLS)
+    return {name: prices.get(name) for name in MAKE_ONE_TOOLS} if MAKE_ONE_TOOLS[0] in prices else None
+
+
+# What the model is told with image_generate's picture while its card has the button (agent's loop): plain words,
+# which the Fast model passes on as they are.
+TO_3D_LINE = ("The picture's card has a Turn it into 3D button; ask the user to check the picture and press it if "
+              "it's right, or say what to change.")
+
+
+def to_3d_offer(pictures, runtime=None):
+    """The Turn it into 3D button for pictures image_generate made (owner, 2026-10-26), on their card:
+    {"pictures": [{"image", "job", "path", "state": "ready"}] (cloud_jobs._made_rows), "credits": image_to_3d's
+    catalog estimate or None}; None without pictures, or when image_to_3d can be neither called nor unlocked here.
+    The click approves the price it shows (agent.turn_into_3d); a higher quote asks on its card."""
+    prices = _offered(runtime or _runtime, ("image_to_3d",)) if pictures else {}
+    if "image_to_3d" not in prices:
+        return None
+    return {"pictures": [{**row, "state": "ready"} for row in pictures], "credits": prices["image_to_3d"]}
 
 
 UNAVAILABLE_NOTE = "Loopcut cloud tools you can't call now; if asked for one, say why in one line and offer what you can do"
@@ -1119,12 +1200,84 @@ def describe(name, arguments):
     return f"{title} · {route}", ""
 
 
+def _locked_for_credits(runtime, descriptor):
+    """A paid tool the manifest locks for credits (unavailable_reason "credits"), in the credits arm (0.2.19): the
+    refusal its quote would get, insufficient_credits with the balance and the tool's price, so the call gets the
+    out-of-credits pop-up a server refusal opens (agent._Consent._paywall). None elsewhere: the short refusal stands."""
+    from . import chat_credits
+    cost = (descriptor.get("cost") or {}).get("credits_estimate")
+    with runtime.lock:
+        account, signed_in = runtime.manifest.get("account"), runtime.signed_in
+        balance = cloud_account.balance(runtime.manifest)
+    if (descriptor.get("unavailable_reason") != "credits" or type(cost) is not int or cost <= 0 or balance is None
+            or chat_credits.billing({"account": account}, signed_in) != chat_credits.CREDITS):
+        return None
+    return cloud_http.CloudError("Not enough credits for this tool.", "insufficient_credits", 402,
+                                 {"balance": balance, "needed": cost})
+
+
+def _recheck_credits(runtime, name, arguments, locked, rig, fresh, is_cancelled, on_main):
+    """Agent thread: a call the manifest locks for credits. That manifest may be from before a purchase (it refreshes
+    at a turn's end, after a job, or every REFRESH_SECONDS), so it is refreshed first, and the call runs as usual when
+    the fresh one has the tool; only a lock that stands is refused, with the balance the server says now."""
+    from . import tools
+    if not fresh and _refresh_now(runtime):
+        result = on_main(lambda: execute(name, arguments, fresh=True))
+        return result.then(is_cancelled, on_main) if result.then else result
+    return tools.ToolResult(error_text(locked, rig=rig), ok=False)
+
+
+def _refresh_now(runtime, timeout=10.0):
+    """Off the UI thread: the manifest as the server says it now, this refresh's or the one already running (waited
+    for). False when neither happened."""
+    if runtime.refresh():
+        return True
+    if runtime.refresh_lock.acquire(timeout=timeout):
+        runtime.refresh_lock.release()
+        return True
+    return False
+
+
+BALANCE_WATCH = (10.0, 600.0)  # After Add credits: refresh every 10 s, for up to 10 minutes, until the balance rises.
+_balance_watch = 0
+
+
+def watch_balance():
+    """The user went to add credits (a paid plan's tool refusal, ui.host): refresh the manifest every few seconds until
+    its balance rises, so the next paid call and its tools see the credits without waiting for REFRESH_SECONDS. A
+    newer watch replaces an older one; past BALANCE_WATCH it gives up quietly. Any thread."""
+    global _balance_watch
+    runtime = _runtime
+    if runtime is None:
+        return
+    _balance_watch += 1
+    generation = _balance_watch
+    with runtime.lock:
+        before = cloud_account.balance(runtime.manifest)
+
+    def watch():
+        every, longest = BALANCE_WATCH
+        deadline = time.monotonic() + longest
+        while time.monotonic() < deadline and generation == _balance_watch and _runtime is runtime:
+            time.sleep(every)
+            if not runtime.refresh():
+                continue
+            with runtime.lock:
+                now = cloud_account.balance(runtime.manifest)
+            if now is not None and (before is None or now > before):
+                from . import mainthread
+                mainthread.request_redraw()
+                return
+    threading.Thread(target=watch, name="loopcut-balance-watch", daemon=True).start()
+
+
 def error_text(error, *, rig=False):
     if rig or error.extra.get('rig_code') or (isinstance(error.extra.get('job'), dict)
                                             and error.extra['job'].get('tool') == 'auto_rig'):
         from . import rig_text
-        if isinstance(error, cloud_http.CloudError):
-            cloud_account.report_error(error)  # Keep account recovery buttons beside the short copy.
+        if isinstance(error, cloud_http.CloudError):  # Keep account recovery buttons beside the short copy.
+            if cloud_account.report_error(error) == cloud_account.TOOL_REFUSED:
+                return rig_text.CREDITS_OFFERED  # The credits arm's refusal: the panel shows the offer (0.2.19).
         return rig_text.error(error)
     # Preserve contract extras for retries, quotes, refunds and policy explanations.
     # A confirm_token (C47) is a single-use approval capability: never in model text or history.
@@ -1172,6 +1325,15 @@ def _error_message(error):
     if extra.get('rig_code') or (isinstance(extra.get('job'), dict) and extra['job'].get('tool') == 'auto_rig'):
         from . import rig_text
         return rig_text.error(error)
+    if code == "job_unconfirmed":  # cloud_jobs._unsure: 5xx answers outlasted the retries; the job may exist (0.2.19).
+        job = extra["job"] if isinstance(extra.get("job"), dict) and extra["job"].get("id") else None
+        key = extra.get("idempotency_key")
+        return (f"job_unconfirmed: {error}" + (f" while following job {job['id']}, so it may still be running and be "
+                f"charged." if job else " while creating this job, so it may have been created, may still be running "
+                "and be charged.") + " This is not a failed job: do not start another one or reword the request."
+                + (' Wait a minute, then call the same tool again with exactly the same arguments plus '
+                   f'idempotency_key "{key}": that returns ' + (f"job {job['id']}" if job else "this job if it exists")
+                   + " and never charges twice." if key else ""))
     if code == "vendor_failed" and extra.get("field") == "input.bundle":
         return _BUNDLE_REFUSED.format(refunded="credits refunded" if extra.get("refunded") else "no credits charged",
                                       detail=re.sub(r"\s*To try again,.*", "", str(error))[:300])
@@ -1365,8 +1527,9 @@ def _upload_bundle(session, checkpoint, staging, client, cancel, progress):
     return digest
 
 
-def execute(name, arguments):
-    """Main thread: resolve scene references, then hand remote work back to the agent thread."""
+def execute(name, arguments, *, fresh=False):
+    """Main thread: resolve scene references, then hand remote work back to the agent thread. fresh: the manifest
+    was just refreshed for this call (_recheck_credits), so a lock for credits stands."""
     from . import checkpoints, state, tools
     import bpy
     origin_scene = getattr(getattr(bpy, 'context', None), 'scene', None)
@@ -1400,6 +1563,11 @@ def execute(name, arguments):
         if runtime and refused:
             reason = cloud_account.refusal(refused, {"no_generation": runtime.no_generation(),
                                                      "private_mode": runtime.private_mode()})
+            locked = _locked_for_credits(runtime, refused) if reason == cloud_account.NOT_ENOUGH else None
+            if locked is not None:  # The credits arm: as the server's refusal would be, with its pop-up (0.2.19),
+                # told on the agent thread, where the call's card (its approval context) hears it, as a quote's is.
+                return tools.ToolResult("Checking credits…", then=lambda is_cancelled, on_main: _recheck_credits(
+                    runtime, name, arguments, locked, rig, fresh, is_cancelled, on_main))
             if reason:
                 return tools.ToolResult(reason, ok=False)
         if rig:
@@ -1417,8 +1585,12 @@ def execute(name, arguments):
     rig_notice, rig_notice_first = '', False
     if _packs_scene(descriptor):
         arguments = {k: v for k, v in arguments.items() if k != "bundle"}  # Only the scene packed here is sent.
+    offer = None
     try:
         _validate_arguments(descriptor, arguments)
+        if tool_name(name) == "render" and descriptor["backend"] == "managed":
+            from . import render_offer  # These frames' time here, when measured: a long one's card offers both.
+            offer = render_offer.prepare(arguments)
         if descriptor.get('apply') == 'apply_rig':
             if descriptor['version'] != 3:
                 raise cloud_http.CloudError('Refresh the tools to use the current auto-rig service.', 'tool_disabled')
@@ -1429,6 +1601,15 @@ def execute(name, arguments):
             from .autorig import STAGES
             _progress(name, STAGES['checking'])
         files = module.resolve_files(descriptor, arguments, out_dir)
+        made = getattr(module, "made_picture", None)  # A picture Loopcut made: its 3D always asks (spending.MADE).
+        made = made(descriptor, arguments) if callable(made) else None
+        clicked = getattr(getattr(cloud_account._approval, "callback", None), "clicked", False)
+        if made and (state.session().get("id"), made.get("job")) in state.running_clicks and not clicked:
+            # Its card's button is converting it now: the same call again would import it twice (a job replayed
+            # by its retry key is charged once, but applied by each call).
+            raise cloud_http.CloudError("This picture is turning into 3D from its card's Turn it into 3D button now; "
+                                        "its model comes into the scene when that ends. Don't start it again.",
+                                        "invalid_input")
         if descriptor.get('apply') == 'apply_rig':
             from . import autorig
             rig_notice, rig_notice_first = autorig.quote_notice(out_dir)
@@ -1468,10 +1649,16 @@ def execute(name, arguments):
         if isinstance(ex, cloud_http.CloudError) and ex.code == 'experimental_rig':
             from .rig_experimental import MOTION_NOTE, MOTION_REFUSAL  # A condition, not a failure: no red card (R5-D3).
             return tools.ToolResult(MOTION_REFUSAL, model_note=MOTION_NOTE)
+        if isinstance(ex, cloud_http.CloudError) and ex.code == 'free_gesture':  # R7-B1: not bought; a neutral card.
+            return tools.ToolResult(str(ex), outcome=ex.extra.get('outcome', ''))
         if isinstance(ex, cloud_http.CloudError):
             runtime.handle_error(ex)
         return tools.ToolResult(error_text(ex, rig=True) if descriptor.get('apply') == 'apply_rig' else
                                 error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False)
+    where = None
+    if descriptor["latency"] == "long" and descriptor["backend"] == "managed":
+        from . import cloud_restore
+        where = cloud_restore.origin(origin_scene)  # Its outputs' file and scene, by name, for after a restart.
     # Freeze policies and routing before leaving Blender's thread.
     snapshot = SimpleNamespace(policy={"no_generation": runtime.no_generation(), "private_mode": runtime.private_mode()},
                                handle_error=runtime.handle_error, client=client, vendor_key=vendor_key, account=runtime)
@@ -1499,12 +1686,16 @@ def execute(name, arguments):
             approved_arguments = cloud_account.authorize(module, descriptor, call_arguments, files, runtime=runtime,
                 project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
                 cancel=cancel, client=snapshot.client, notice=rig_notice, notice_first=rig_notice_first,
-                on_progress=progress if descriptor.get('apply') == 'apply_rig' else None)  # Quote stages: a rig's only.
+                on_progress=progress if descriptor.get('apply') == 'apply_rig' else None,  # Quote stages: a rig's only.
+                offer=offer, made_picture=made)
             on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
             authorized = True
         except cloud_http.CloudError as ex:
             runtime.handle_error(ex)
             report(0)  # Nothing was submitted: a hold taken at consent is released.
+            from . import render_offer
+            if ex.code == render_offer.LOCAL:  # The user picked this computer: its local render job is the result.
+                return render_offer.result(ex)
             return tools.ToolResult(error_text(ex, rig=descriptor.get('apply') == 'apply_rig'), ok=False)
         finally:
             if bundle_checkpoint:  # Collected or not, its snapshot is no restore point; not waited for.
@@ -1520,6 +1711,12 @@ def execute(name, arguments):
             if descriptor["latency"] == "long" and descriptor["backend"] == "managed":
                 cancel.detach()
                 release = lambda spent=False: cloud_account.complete(runtime, approved_arguments, spent)
+                from . import cloud_restore
+                consent = getattr(cloud_account._approval, "callback", None)
+                chat = consent.chat()[0] if callable(getattr(consent, "chat", None)) else state.session()
+                # Kept with the conversation, so a later Blender picks it up (cloud_restore).
+                saved = cloud_restore.record(chat, job, descriptor, approved_arguments, where,
+                                             getattr(consent, "hold", None))
                 with _jobs_lock:
                     finished = [key for key, row in _jobs.items()
                                 if row["result"] is not None and row["result"].then is None]
@@ -1528,13 +1725,24 @@ def execute(name, arguments):
                     _jobs.setdefault(job["id"], {"descriptor": descriptor, "module": module,
                                                 "handle_error": runtime.handle_error,
                                                 "report_error": cloud_account.error_reporter(), "result": None,
-                                                'scene': origin_scene, 'complete': release, 'charge_reporter': report})
+                                                'scene': origin_scene, 'complete': release, 'charge_reporter': report,
+                                                'saved': saved})
+                if saved is not None and callable(getattr(module, "resumable", None)):
+                    module.resumable(job["id"])  # Its row: safe to close Blender while it runs.
                 watch = getattr(module, "watch", None)
-                if job.get("status") in ("succeeded", "failed", "canceled"):
+                if job.get("status") in ("succeeded", "failed", "canceled") and saved is None:
                     _settle_final(report, job, None)
+                elif job.get("status") in ("succeeded", "failed", "canceled"):
+                    _settle_saved(report, saved, job)
                 elif callable(watch):  # Done, failed or canceled from the panel: the card gets its charge.
                     def settle(final, error):
-                        _settle_final(report, final, error)
+                        if saved is None:
+                            _settle_final(report, final, error)
+                        else:
+                            _settle_saved(report, saved, (error.extra.get("job") if error is not None else final))
+                            # Its card in the chat (Load the frames, the previews), as a picked-up job's: the
+                            # progress row went with no word of the result (rel019-cloud, 2026-10-26).
+                            cloud_restore._over(saved["conversation"], saved, final, error)
                         if final.get("status") in ("failed", "canceled"):
                             release(True)  # A retry before job_status already gets a new key.
                     watch(job["id"], settle)
@@ -1547,6 +1755,8 @@ def execute(name, arguments):
             if job.get("status") != "succeeded":
                 return tools.ToolResult(f"Cloud job {job.get('status', 'incomplete')}; no output applied.", ok=False)
             result = on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene, report=report))
+            if made and result.ok:
+                result.converted = made.get("job", "")
             return result.then(is_cancelled, on_main) if result.then else result
         except cloud_http.CloudError as ex:
             _settle_error(report, ex)
@@ -1604,9 +1814,23 @@ def _settle_final(report, job, error):
         report(0, spending.receipt_text(0, canceled=job.get("status") == "canceled"))
 
 
+def _settle_saved(report, saved, job):
+    """A job kept with its conversation: the chat's hold settles by its record, in that conversation as it is now
+    (cloud_restore.settle; never a copy History has since reopened), and the call's card gets its receipt line."""
+    from . import cloud_restore, spending
+    if not isinstance(job, dict) or job.get("status") not in ("succeeded", "failed", "canceled"):
+        return
+    cloud_restore.settle(saved, job)
+    charged, canceled = _charged(job), job["status"] == "canceled"
+    if charged is not None or job["status"] != "succeeded":
+        report(None, spending.receipt_text(charged or 0, canceled=canceled))  # The card's line; no ledger change.
+
+
 def _settle_error(report, error):
     """A failed call keeps its hold only when the server may have charged it (a lost reply, a 5xx)."""
     job = error.extra.get("job")
+    if error.code == "job_unconfirmed" and isinstance(job, dict) and job.get("status") in ("queued", "running"):
+        return  # 5xx answers while it ran (cloud_jobs._unsure): it may still be charged, so its 0 so far is no outcome.
     if isinstance(job, dict):
         return _settle_final(report, job, None)
     if error.code in NOT_SUBMITTED or (error.status is not None and 400 <= error.status < 500):
@@ -1672,7 +1896,8 @@ def _apply(module, descriptor, job, *, report=None):
         with (contextlib.nullcontext() if descriptor.get("apply", "none") in OWN_UNDO
               else tools.undo_step(str(what))):
             summary = (module.apply_result(descriptor, job, details=details)
-                       if descriptor.get('apply') == 'apply_rig' or reports else module.apply_result(descriptor, job))
+                       if descriptor.get('apply') in ('apply_rig', 'add_image_reference') or reports
+                       else module.apply_result(descriptor, job))
     except cloud_http.CloudError as ex:
         return _rig_failure_result(module, descriptor, ex, report=report, before=before, after=scene_diff.snapshot())
     except (tools.ToolError, OSError, ValueError) as ex:
@@ -1687,14 +1912,33 @@ def _apply(module, descriptor, job, *, report=None):
             'words, without bone names or rig terms.\n' + json.dumps(details['rig'])) if 'rig' in details else ''
     return tools.ToolResult(summary, scene_before=before, scene_after=scene_diff.snapshot(), receipt=receipt,
                             model_note=note, outcome=details.get('outcome', ''),
-                            card_output=details.get('card_output', ''))
+                            card_output=details.get('card_output', ''), made_pictures=details.get('pictures'))
 
 
 def _apply_to_scene(module, descriptor, job, scene, *, report=None):
     from . import tools
     if not _same_scene(scene):
-        return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
+        return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False,
+                                unapplied=str(job.get('id') or ''))
     return _apply(module, descriptor, job, report=report)
+
+
+def apply_finished(job_id):
+    """Main thread: the outputs of a finished job this Blender still holds (cloud_jobs' registry), applied to the
+    scene open now with no new job and no new charge: a Turn it into 3D click whose model could not land where it
+    began (another file was opened meanwhile, agent.turn_into_3d). Refused once they are no longer here."""
+    from . import tools
+    module = importlib.import_module(".cloud_jobs", __package__)
+    try:
+        job = module.job_status(job_id)
+    except cloud_http.CloudError as ex:
+        return tools.ToolResult(error_text(ex), ok=False)
+    descriptor = next((d for d in (_runtime.descriptors() if _runtime else []) if d["name"] == job.get("tool")), None)
+    if descriptor is None:
+        return tools.ToolResult("Cloud tool unavailable; its finished model was not loaded.", ok=False)
+    result = _apply(module, descriptor, job)
+    result.receipt = ""  # Charged when it was made.
+    return result
 
 
 def _same_scene(scene):
@@ -1708,15 +1952,25 @@ def _same_scene(scene):
         return False  # The originating .blend or scene was closed while the job ran.
 
 
-def _job_status(arguments):
-    from . import tools
+def _job_status(arguments, *, here=False):
+    """here: the user pressed Load here anyway on its card, so a file Loopcut can't match to the job is the one."""
+    from . import cloud_restore, tools
     if set(arguments) - {"job_id", "cancel"} or not isinstance(arguments.get("job_id"), str) or type(arguments.get("cancel", False)) is not bool:
         return tools.ToolResult("job_status needs a string job_id and optional boolean cancel.", ok=False)
     with _jobs_lock:
         record = _jobs.get(arguments["job_id"])
         if record is None:
             return tools.ToolResult("Unknown cloud job handle; use the job_id returned by the tool.", ok=False)
-    module = record["module"]
+    module, job_id, saved = record["module"], arguments["job_id"], record.get("saved")
+    in_file = saved is not None and saved["apply"] in cloud_restore.EVIDENCE
+    if record["result"] is not None and in_file and record["result"].ok and record["result"].then is None \
+            and not cloud_restore.applied_before(saved, module):
+        # Applied, then taken out of the file (Undo, a checkpoint restore, quitting unsaved): it applies again,
+        # downloading its files anew if the system cleared them.
+        record["result"] = None
+        record.pop("already", None)
+        if callable(getattr(module, "forget_missing", None)):
+            module.forget_missing(job_id)
     if record["result"] is not None:
         if record['result'].then is not None:
             return record['result']  # Retry only its unconfirmed refund report.
@@ -1724,10 +1978,21 @@ def _job_status(arguments):
                                 model_note=getattr(record['result'], 'model_note', ''),
                                 outcome=getattr(record['result'], 'outcome', ''),
                                 card_output=getattr(record['result'], 'card_output', ''))
+    restored = record.get("restored")
+    if in_file and not arguments.get("cancel") and cloud_restore.applied_before(saved, module):
+        record["already"] = True  # This file has them from an earlier apply: nothing to fetch or apply.
+        record["result"] = tools.ToolResult("This job's outputs are in this file already; nothing was applied again.")
+        return record["result"]
+    if saved is not None and callable(getattr(module, "known", None)) and not module.known(job_id):
+        if restored and not here and not arguments.get("cancel"):
+            state = cloud_restore.where(record)
+            if state != "here":  # Said before anything is downloaded.
+                return tools.ToolResult(cloud_restore.refusal(record, state), ok=False)
+        cloud_restore.follow(record)  # Fetched, followed and downloaded here first (a cancel is queued meanwhile).
     try:
         if arguments.get("cancel"):
-            module.cancel_job(arguments["job_id"])
-        job = module.job_status(arguments["job_id"])
+            module.cancel_job(job_id)
+        job = module.job_status(job_id)
     except cloud_http.CloudError as ex:
         record["handle_error"](ex)
         record["report_error"](ex)
@@ -1738,19 +2003,39 @@ def _job_status(arguments):
         result = (_rig_failure_result(module, record['descriptor'], ex, report=record.get('charge_reporter'))
                   if ex.extra.get('apply_failure') is True else tools.ToolResult(
                       error_text(ex, rig=record.get('descriptor', {}).get('apply') == 'apply_rig'), ok=False))
-        if result.then is not None or ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
+        if result.then is not None or ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch',
+                                                      'job_unconfirmed'}:  # cloud_jobs.UNCONFIRMED
             record["result"] = result
         return result
     if job["status"] in ("queued", "running"):
         return tools.ToolResult(json.dumps(safe_value({"job_id": job["id"], "status": job["status"], "progress": job["progress"]})))
-    if not _same_scene(record.get('scene')):
-        return tools.ToolResult('Cloud output belongs to another scene; switch back before applying.', ok=False)
+    state = "here" if here else cloud_restore.where(record)
+    if state != "here" and not arguments.get("cancel"):
+        return tools.ToolResult(cloud_restore.refusal(record, state), ok=False)
     if record.get('complete'):
         record['complete'](job['status'] != 'succeeded')
+    descriptor, unusable = cloud_restore.descriptor(record)
     if arguments.get("cancel"):
         record["result"] = tools.ToolResult("Cloud job finished before cancellation; no output applied.", ok=False)
     elif _runtime and _runtime.no_generation() and record["descriptor"]["kind"] == "gen":
         return tools.ToolResult("generation_disabled: generation is disabled for this project; output was not applied.", ok=False)
+    elif unusable:  # Fetched and verified, but not applied: say where they are. Asked again, the catalog may fit.
+        paths = [o["path"] for o in job["outputs"] if o.get("path")]
+        return tools.ToolResult(unusable + (" Its verified files: " + ", ".join(paths[:10]) +
+                                            (f" and {len(paths) - 10} more" if len(paths) > 10 else "")
+                                            if paths else ""), ok=False)
+    elif saved is not None and not cloud_restore.claim(saved):  # Not kept: once it is over, apply it here.
+        return tools.ToolResult("Another Blender is applying this job's outputs right now; try again in a moment.",
+                                ok=False)
     else:
-        record["result"] = _apply(module, record["descriptor"], job, report=record.get('charge_reporter'))
+        try:
+            record["result"] = _apply(module, descriptor, job, report=record.get('charge_reporter'))
+        finally:
+            if saved is not None:
+                cloud_restore.unclaim(saved)
+        if saved is not None:
+            done = record["result"].ok and record["result"].then is None
+            cloud_restore.applied(saved, done)
+            if done and here:
+                cloud_restore.retarget(saved)
     return record["result"]

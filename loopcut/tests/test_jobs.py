@@ -198,6 +198,109 @@ class JobTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
 
+class Datablock:
+    """What job_tools reads of a datablock file_path_map names (hashable, as its keys are)."""
+
+    def __init__(self, id_type, name, **fields):
+        self.id_type, self.name, self.library = id_type, name, None
+        self.__dict__.update(fields)
+
+
+def ies_light(name, filepath, mode="EXTERNAL"):
+    node = types.SimpleNamespace(bl_idname="ShaderNodeTexIES", mode=mode, filepath=filepath)
+    return Datablock("LIGHT", name, node_tree=types.SimpleNamespace(nodes=[node]))
+
+
+class ExternalAssetsTests(unittest.TestCase):
+    """The files a job's scene reads, on a stand-in for Blender's file_path_map, which leaves out packed
+    images itself (missing_assets_check.py shows that on a real packed image whose file is gone, and a
+    Quick Smoke domain's cache folder refused). rel018-ru-en: one never-downloaded roughness map and an
+    asset author's C:\\ IES profile refused every local render of the room."""
+
+    IES = "C:/Users/pc/Downloads/aasadsdad.ies"
+
+    def setUp(self):
+        from loopcut import job_tools
+        self.job_tools = job_tools
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.present = self.root / "wood.png"
+        self.present.write_bytes(b"wood")
+        self.gone = str(self.root / "textures" / "SP_2K_Roughness.jpg")
+
+    def scan(self, paths: dict):
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(file_path_map=lambda: paths),
+                                     path=types.SimpleNamespace(abspath=lambda raw, library=None: raw))
+        with patch.dict(sys.modules, {"bpy": fake}):
+            return self.job_tools.external_assets()
+
+    def test_missing_single_files_are_listed_with_what_the_render_does_without_them(self):
+        library = str(self.root / "props.blend")
+        assets, missing = self.scan({Datablock("IMAGE", "wood.png", source="FILE"): [str(self.present)],
+                                     Datablock("IMAGE", "SP_2K_Roughness.jpg", source="FILE"): [self.gone],
+                                     ies_light("Point", self.IES): [self.IES],
+                                     Datablock("LIBRARY", "props.blend"): [library],
+                                     Datablock("CACHEFILE", "rig.abc", is_sequence=False): [str(self.root / "rig.abc")],
+                                     Datablock("FONT", "Inter"): [str(self.root / "Inter.ttf")]})
+        self.assertEqual(assets, [{"path": str(self.present.resolve()), "sha256": jobs.digest(self.present)}])
+        self.assertEqual([(m["path"], m["used_by"], m["without"]) for m in missing], [
+            (str(self.root / "Inter.ttf"), 'font "Inter"', "left out"),
+            (library, 'library "props.blend"', "its objects are absent"),
+            (str(self.root / "rig.abc"), 'cachefile "rig.abc"', "left out"),
+            (self.gone, 'image "SP_2K_Roughness.jpg"', "shows magenta"),
+            (self.IES, 'light "Point"', "no IES profile")])
+        note = self.job_tools.missing_note({"missing_assets": missing[3:]})
+        self.assertEqual(note, f'\nRenders without these missing files: {self.gone} (image "SP_2K_Roughness.jpg": '
+                               f'shows magenta); {self.IES} (light "Point": no IES profile).')
+        self.assertTrue(self.job_tools.missing_note({"missing_assets": missing, "state": "complete"})
+                        .startswith("\nRendered without these missing files: "), "once it has rendered")
+        self.assertIn("(library \"props.blend\": its objects are absent)",
+                      self.job_tools.missing_note({"missing_assets": missing}), "not magenta")
+        self.assertEqual(self.job_tools.missing_note({}), "", "a job from before 0.2.19, or nothing missing")
+
+    def test_status_repeats_what_the_job_renders_without(self):
+        missing = [{"path": self.gone, "used_by": 'image "SP_2K_Roughness.jpg"', "without": "shows magenta"}]
+        row = {"id": "a" * 32, "frames": [1, 2, 3], "state": "running", "missing_assets": missing,
+               "progress": {"completed": 1, "total": 3}, "updated": time.time()}
+        self.assertIn(f"Renders without these missing files: {self.gone}", self.job_tools._status(row, False).text)
+        done = self.job_tools._status({**row, "state": "complete", "progress": {"completed": 3, "total": 3}}, False, 4.0)
+        self.assertIn(f"Rendered without these missing files: {self.gone}", done.text)
+        self.assertIn("the job is now complete", done.text)
+
+    def test_a_missing_folder_or_frame_of_many_is_still_refused(self):
+        # Quick Smoke's domain names a Replay cache folder that playing would make: the job's simulation
+        # would write it into the user's project and then fail the job for an asset that appeared.
+        cache = str(self.root / "cache_fluid_8a3f")
+        for owner, raw in ((Datablock("OBJECT", "Smoke Domain"), cache),
+                           (Datablock("OBJECT", "Ocean"), str(self.root / "cache_ocean")),
+                           (Datablock("IMAGE", "bark", source="TILED"), str(self.root / "bark.<UDIM>.png")),
+                           (Datablock("IMAGE", "flame", source="SEQUENCE"), str(self.root / "flame_0001.png")),
+                           (Datablock("VOLUME", "smoke", is_sequence=True), str(self.root / "smoke_0001.vdb")),
+                           (Datablock("CACHEFILE", "run", is_sequence=True), str(self.root / "run_0001.abc")),
+                           (Datablock("MOVIECLIP", "plate", source="SEQUENCE"), str(self.root / "plate_0001.png")),
+                           (ies_light("Spot", self.IES, mode="INTERNAL"), self.IES),  # Not a path its node reads.
+                           (Datablock("IMAGE", "folder", source="FILE"), str(self.root))):
+            with self.subTest(owner=owner.name), \
+                    self.assertRaisesRegex(jobs.JobError, "missing, a folder or a sequence/tile pattern: " + raw):
+                self.scan({owner: [raw]})
+        with self.assertRaisesRegex(jobs.JobError, 'used by object "Smoke Domain"'):
+            self.scan({Datablock("OBJECT", "Smoke Domain"): [cache],
+                       Datablock("IMAGE", "SP_2K_Roughness.jpg", source="FILE"): [self.gone]})
+
+    def test_an_attempt_after_a_missing_file_appears_is_refused_like_a_changed_one(self):
+        spec = {"assets": [{"path": str(self.present), "sha256": jobs.digest(self.present)}],
+                "missing_assets": [{"path": self.gone, "used_by": 'image "SP_2K_Roughness.jpg"'}]}
+        self.assertFalse(jobs.assets_changed(spec))
+        self.assertFalse(jobs.assets_changed({}), "no external files")
+        Path(self.gone).parent.mkdir()
+        Path(self.gone).write_bytes(b"roughness")
+        self.assertTrue(jobs.assets_changed(spec), "frames without it and with it must not mix")
+        Path(self.gone).unlink()
+        self.present.write_bytes(b"other wood")
+        self.assertTrue(jobs.assets_changed(spec))
+
+
 class StatusWaitTests(unittest.TestCase):
     """render_job status with wait, through the agent's own path: the main-thread call hands back
     the rest, and the agent thread waits between main-thread calls. A single-worker executor

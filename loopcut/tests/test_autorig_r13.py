@@ -516,8 +516,9 @@ class Show(unittest.TestCase):
         self.assertEqual(autorig._show_side(None, {}, 1.), 'left', 'an experimental rig has no named hands')
 
     def test_travel_and_the_rig_results_point_at_show(self):
-        self.assertEqual(motion_retarget.travel_note(5.5), "it travels 5.5 m from where it starts; character_rig show "
-                         "(free) sets up the user's view to follow it")
+        # R14: show is named once, in the motion result's free extras (motion_retarget.FREE_EXTRAS).
+        self.assertEqual(motion_retarget.travel_note(5.5), 'it moves 5.5 m from where it starts')
+        self.assertIn('character_rig show', motion_retarget.FREE_EXTRAS)
         self.assertEqual(motion_retarget.travel_note(.4), '')
         steps = rig_experimental.describe([{'name': 'bone_0', 'parent': None}, {'name': 'bone_1', 'parent': 0}],
                                           'Character Rig')['next_steps']

@@ -193,6 +193,16 @@ class ConsentTest(unittest.TestCase):
         self.assertNotIn("ask", card)
         self.assertEqual(self.session["spend"], {"credits": 80, "auto": 0, "allowed": 0}, "approved, not auto")
 
+    def test_a_card_back_from_its_approval_shows_its_time_from_the_answer(self):
+        """The running card's time (ui.layout._running_time) counted the wait for the user's answer as the step's."""
+        for details in ({**managed(80), "balance": 1840}, {**managed(6), "file_access": True, "required": True}):
+            with self.subTest(file_access="file_access" in details):
+                card, consent = self.consent()
+                card.update(status="running", started_at=1000.0)
+                with self.answer(True), patch.object(agent.time, "time", return_value=1600.0):
+                    self.assertTrue(consent(details))
+                self.assertEqual((card["status"], card["started_at"]), ("running", 1600.0))
+
     def test_skip_declines_only_this_call_with_the_reason(self):
         card, consent = self.consent()
         with self.answer(False), self.assertRaises(cloud_http.CloudError) as caught:
@@ -201,10 +211,18 @@ class ConsentTest(unittest.TestCase):
         self.assertIn("The user declined this paid call", str(caught.exception))
         self.assertEqual((card["status"], card["declined"]), ("rejected", True))
         self.assertFalse(self.turn.cancel.is_set(), "the turn goes on")
+        self.assertTrue(self.turn.declined, "the router's nudge leaves the next move to the user (router.nudge)")
         self.assertEqual(self.session["spend"]["credits"], 0)
         self.assertEqual(self.turn.paid_calls, 0)
         _, consent = self.consent()
         self.assertTrue(consent(managed(6)), "the next small call still runs")
+
+    def test_a_declined_file_upload_marks_the_turn_declined(self):
+        card, consent = self.consent(asks=True)
+        with self.answer(False):
+            self.assertFalse(consent({"required": True, "text": "Upload a.png", "credits": None, "file_access": True}))
+        self.assertEqual(card["status"], "rejected")
+        self.assertTrue(self.turn.declined)
 
     def test_a_declined_call_reaches_the_model_as_its_tool_result(self):
         # The whole turn is in test_agent_loop: Skip, the declined result, and the turn going on.
@@ -289,6 +307,138 @@ class ConsentTest(unittest.TestCase):
         free(managed(0))
         free({"charged": 0, "text": "No charge"})
         self.assertEqual(free_card["cost"], "Free")
+
+
+class MadePictureTest(unittest.TestCase):
+    """Owner, 2026-10-26: image_to_3d on a picture Loopcut made always asks, "Turn it into 3D · N credits" with the
+    picture, whatever the thresholds; "Make it again" declines it and the model asks what to change. The picture's
+    own button is that click already."""
+
+    setUp, consent, answer = ConsentTest.setUp, ConsentTest.consent, ConsentTest.answer
+
+    def made(self, credits=80, server=100, path="/tmp/made.png"):
+        details = managed(credits, server, quote={"quote_id": "qt_1", "credits": credits,
+                                                  "expires_at": "2099-01-01T00:00:00Z"})
+        return {**details, "balance": 100, "made_picture": {"name": "Loopcut job_1 image", "path": path}}
+
+    def test_a_made_pictures_3d_always_asks_and_a_users_own_picture_keeps_its_threshold(self):
+        loose = spending.Settings(ask_above=500)  # A Pro user who lets 80 credits run unasked.
+        for credits, server in ((80, 100), (25, 100), (80, 1000), (0, 100)):
+            with self.subTest(credits=credits, server=server):
+                self.assertEqual(spending.decide(self.made(credits, server), spending.new_ledger(), loose),
+                                 spending.MADE)
+        own = {k: v for k, v in self.made().items() if k != "made_picture"}
+        self.assertEqual(spending.decide(own, spending.new_ledger(), loose), spending.RUN, "today's rules")
+        self.assertEqual(spending.decide(own, spending.new_ledger(), S), spending.COST)
+        self.assertEqual(spending.approve_label(spending.MADE), "Turn it into 3D")
+        self.assertEqual(spending.skip_label(spending.MADE), "Make it again")
+        self.assertEqual(spending.skip_label(spending.COST), "Skip this")
+        self.assertEqual(spending.ask_title(spending.MADE, self.made()), "Turn it into 3D · 80 credits")
+        self.assertEqual(spending.ask_title(spending.COST, self.made()), "")
+        declined = cloud.error_text(cloud_http.CloudError(spending.declined(spending.MADE, self.made(), S), "declined"))
+        self.assertEqual(declined, "declined: The user wants the picture made again before it becomes a 3D model. "
+                                   "Nothing ran and nothing was charged. Ask them what to change (the angle, the "
+                                   "background, one object only), then make it again with image_generate.")
+
+    def test_the_card_asks_with_the_picture_and_turn_it_into_3d_runs_it(self):
+        self.turn.spending = spending.Settings(ask_above=500)
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
+        seen = {}
+        with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: seen.update(card) or True):
+            self.assertTrue(consent(self.made()))
+        self.assertEqual((seen["status"], seen["ask"]), ("awaiting", spending.MADE))
+        self.assertEqual((seen["ask_title"], seen["ask_label"], seen["ask_skip"]),
+                         ("Turn it into 3D · 80 credits", "Turn it into 3D", "Make it again"))
+        self.assertEqual(seen["image_path"], "/tmp/made.png")
+        self.assertIn("Balance 100 → 20 credits", seen["ask_lines"])
+        self.assertEqual(card["status"], "running")
+        self.assertFalse({"ask", "ask_title", "ask_skip", "image_path"} & set(card), card)
+        self.assertEqual(self.session["spend"], {"credits": 80, "auto": 0, "allowed": 0}, "approved, not auto")
+
+    def test_make_it_again_declines_and_the_model_asks_what_to_change(self):
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
+        with self.answer(False), self.assertRaises(cloud_http.CloudError) as caught:
+            consent(self.made(25))
+        self.assertEqual(caught.exception.code, "declined")
+        self.assertIn("Ask them what to change", str(caught.exception))
+        self.assertEqual((card["status"], card["declined"]), ("rejected", True))
+        self.assertEqual(self.session["spend"]["credits"], 0)
+
+    def test_the_pictures_button_approves_the_price_it_showed_and_no_card_asks(self):
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""),
+                                     clicked=True, shown=80)
+        with self.answer(True) as wait, patch.object(agent, "_wait_for_card") as card_wait:
+            self.assertTrue(consent(self.made()))
+            self.assertTrue(consent(self.made(25)), "a lower quote too")
+        wait.assert_not_called()
+        card_wait.assert_not_called()
+        self.assertEqual(card["status"], "running")
+        self.assertEqual(self.session["spend"], {"credits": 0, "auto": 0, "allowed": 0},
+                         "nothing held: the charge goes to its chat when the call ends (agent.turn_into_3d)")
+        consent({"charged": 80, "text": "Used 80 credits ($0.80)"})
+        self.assertEqual((consent.charged, card["cost"]), (80, "Used 80 credits ($0.80)"))
+        self.assertEqual(self.session["spend"]["credits"], 0)
+
+    def asks_on_its_card(self, consent, card, details, answer=True):
+        """A click's ask, answered on its card as the panel does (agent.decide with the drawn card), while a later
+        turn's own card waits too. Returns (what the consent returned or raised, the later turn)."""
+        later = agent.Turn()
+        self.session["turn"] = later
+        waiting = state.awaiting(state.item_tool("run_python", "Something else", ""))
+        self.session["items"][:] = [waiting, card]
+        out = []
+        def run():
+            try:
+                out.append(consent(details))
+            except Exception as ex:
+                out.append(ex)
+        thread = threading.Thread(target=run)
+        with patch.object(agent, "_POLL_SECONDS", .01), patch.object(state, "session", return_value=self.session):
+            thread.start()
+            deadline = time.monotonic() + 5
+            while card.get("status") != "awaiting" and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(card["status"], "awaiting")
+            self.assertTrue(agent.decide(answer, index=1, drawn=(id(card), card["ask_serial"])))
+            thread.join(5)
+        self.assertFalse(thread.is_alive(), "answered")
+        return out[0], later
+
+    def test_a_quote_over_the_price_the_button_showed_asks_on_its_own_card(self):
+        """The button showed 25; the quote says 80: the click did not approve that, so its card asks, and its
+        answer is its own, never the turn running meanwhile's."""
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""),
+                                     clicked=True, shown=25)
+        result, later = self.asks_on_its_card(consent, card, self.made(80))
+        self.assertIs(result, True)
+        self.assertFalse(later.decided.is_set(), "the later turn's card was not answered by it")
+        self.assertEqual(card["status"], "running")
+
+    def test_a_daily_limit_approval_does_not_skip_the_made_pictures_card(self):
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
+        kinds = []
+        with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: kinds.append(card["ask"]) or True):
+            limit = {**self.made(), "limit": spending.DAILY, "required": True, "message": "Today's limit is reached."}
+            self.assertTrue(consent(limit))
+            self.assertTrue(consent(self.made()))
+        self.assertEqual(kinds, [spending.DAILY, spending.MADE])
+
+    def test_the_waiting_card_reads_turn_it_into_3d_with_the_picture(self):
+        session = state.new_session()
+        card = state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model · About 80 credits ($0.80)", "")
+        card["cost"] = "80 credits ($0.80), quoted"
+        state.awaiting(card, ask=spending.MADE, ask_title="Turn it into 3D · 80 credits", ask_label="Turn it into 3D",
+                       ask_skip="Make it again", ask_lines=["Check the picture first."], paid_approval=True,
+                       image_path="/tmp/made.png")
+        session["items"] = [card]
+        drawn = layout.build(session, 420, 900, 1, measure, "fast", None, {})
+        texts = {p["id"]: p["text"] for p in drawn["prims"] if p.get("t") == "text"}
+        self.assertEqual(texts["item0.tool.summary.l0"], "Turn it into 3D · 80 credits")
+        self.assertEqual(texts["item0.tool.run.label"], "Turn it into 3D  ⏎")
+        self.assertEqual(texts["item0.tool.reject.label"], "Make it again  esc")
+        self.assertIn("/tmp/made.png", [p.get("path") for p in drawn["prims"] if p.get("t") == "image"])
+        self.assertEqual([h["action"] for h in drawn["hits"] if h["id"] in ("item0.tool.run", "item0.tool.reject")],
+                         [("approve", 0), ("reject", 0)], "Enter and Esc answer it as any drawn card")
 
 
 class WorkerTest(unittest.TestCase):
@@ -591,7 +741,9 @@ class ChargeTest(unittest.TestCase):
         cloud._settle_error(report, cloud_http.CloudError("Refused", "insufficient_credits", 402))
         cloud._settle_error(report, cloud_http.CloudError("Lost", "connection_failed"))
         cloud._settle_error(report, cloud_http.CloudError("Server", "http_error", 503))
-        self.assertEqual(reports, [0, 0])
+        running = {"status": "running", "credits": {"reserved": 6, "charged": 0, "refunded": 0}}
+        cloud._settle_error(report, cloud_http.CloudError("Unsure", "job_unconfirmed", 503, {"job": running}))
+        self.assertEqual(reports, [0, 0], "a job 5xx answers left unconfirmed may still be charged: its hold stays")
 
 
 class PersistenceTest(unittest.TestCase):

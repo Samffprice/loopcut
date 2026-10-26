@@ -18,6 +18,10 @@ single time, but we also don't want it just going crazy and one agent just doing
   account pays, so they never count against credits.
 - "Ask before every paid call" asks for each one. "Run without asking" changes none of this.
 - Workers spend from the same chat ledger and turn; their asks show in the user's panel (agent._Consent).
+- Owner, 2026-10-26: image_to_3d on a picture Loopcut made (image_generate) always asks, whatever the thresholds
+  and settings: "Turn it into 3D" or "Make it again". A wrong picture (the angle, the background, two objects)
+  must not spend up to 80 credits on a model unseen. The made picture's own button (agent.turn_into_3d) is that
+  click already.
 
 Pure apart from a lock that serializes the agent's and the workers' threads. The ledger is a plain dict saved
 with the conversation (conversations.py); the approved own-key vendors are consent, so they are not saved.
@@ -33,6 +37,7 @@ BURST = 5           # Paid calls one turn may make before the next asks.
 MAX_SETTING = 100_000
 
 RUN, COST, VENDOR, BURST_ASK, BUDGET = "run", "cost", "vendor", "burst", "budget"
+MADE = "made_picture"  # image_to_3d on a picture Loopcut made: details["made_picture"] (cloud_account.authorize).
 DAILY, RATE = "daily_limit_reached", "rate_limited"  # The server's refusals that carry a confirm_token.
 SERVER_LIMITS = (DAILY, RATE)
 
@@ -88,6 +93,8 @@ def decide(details: dict, spend: dict, settings: Settings, *, calls: int = 0, bu
     """RUN, or what the call's card asks: COST (this call), VENDOR (an own-key vendor, once per chat), BURST_ASK
     or BUDGET (Allow more). details is cloud_account.approval_details: required is the server's own threshold
     (credits > confirm_over_credits)."""
+    if details.get("made_picture"):
+        return MADE  # Never runs unasked, under any threshold or setting.
     if not paid(details):
         return RUN  # Free calls never ask and never count.
     vendor, credits = details.get("vendor"), details.get("credits")
@@ -171,6 +178,8 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
     elif kind == DAILY:  # HTTP 402: "Today's cloud spending limit of N credits is reached."
         lines.append(details.get("message") or "Today's credit limit is reached.")
         lines.append("Approve to go over it for this one job.")
+    elif kind == MADE:
+        lines.append("Check the picture first: one object, a plain background, all of it in view.")
     elif kind == RATE:  # HTTP 429: the service's burst guard, more than 30 paid jobs in 10 minutes.
         lines.append("Many paid jobs in a short time.")
         lines.append(details.get("message") or "")
@@ -181,14 +190,28 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
     return [line for line in lines if line]
 
 
-BUTTONS = {COST: "Approve", VENDOR: "Approve", BURST_ASK: f"Allow {BURST} more", DAILY: "Approve", RATE: "Approve"}
+BUTTONS = {COST: "Approve", VENDOR: "Approve", BURST_ASK: f"Allow {BURST} more", DAILY: "Approve", RATE: "Approve",
+           MADE: "Turn it into 3D"}
 SKIP = "Skip this"
+SKIPS = {MADE: "Make it again"}
 
 
 def approve_label(kind: str, settings: Settings | None = None) -> str:
     if kind == BUDGET:
         return f"Allow {_n((settings or Settings()).chat_budget)} more"
     return BUTTONS.get(kind, "Approve")
+
+
+def skip_label(kind: str) -> str:
+    return SKIPS.get(kind, SKIP)
+
+
+def ask_title(kind: str, details: dict) -> str:
+    """The card's title while it asks, in place of the tool's: "Turn it into 3D · 80 credits" from the quote; ""."""
+    if kind != MADE:
+        return ""
+    credits = details.get("credits")
+    return f"Turn it into 3D · {_n(credits)} credits" if _amount(credits) and credits else "Turn it into 3D"
 
 
 def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) -> str:
@@ -205,6 +228,10 @@ def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) ->
               RATE: "the service saw too many paid jobs in a short time"}.get(kind, "they chose not to run it")
     if kind == COST and vendor:
         reason = f"it uses their own {vendor} key"
+    if kind == MADE:
+        return ("The user wants the picture made again before it becomes a 3D model. Nothing ran and nothing was "
+                "charged. Ask them what to change (the angle, the background, one object only), then make it again "
+                "with image_generate.")
     return (f"The user declined this paid call ({reason}). Nothing ran and nothing was charged. Go on without "
             "it: use another way, or finish the turn and say what it would have added.")
 

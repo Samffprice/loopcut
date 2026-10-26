@@ -98,7 +98,7 @@ class PlatformRigFixtures(unittest.TestCase):
         request = self.fixture('quote-request/auto_rig-v3.json')
         task = self.fixture('rig-task/experimental.json')
         quote = self.fixture('quote/auto_rig-v3.json')
-        self.assertEqual((cloud_http.CONTRACT, descriptor['version'], request['tool_version']), ('0.9', 3, 3))
+        self.assertEqual((cloud_http.CONTRACT, descriptor['version'], request['tool_version']), ('0.10', 3, 3))
         self.assertIs(request['input']['accept_experimental'], task['accept_experimental'])
         # The card shows rig_text.QUOTE, never this field; the platform's line may trail the card's (R10).
         self.assertIn(quote['experimental_notice'], (PLATFORM_NOTICE, rig_experimental.QUOTE))

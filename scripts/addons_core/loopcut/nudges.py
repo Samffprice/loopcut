@@ -20,6 +20,7 @@ State lives in <data root>/nudges.json: timestamps and keys only, never content.
 import json
 import threading
 import time
+from datetime import datetime
 
 from . import config, state
 
@@ -29,6 +30,8 @@ LOCKED_PER_WEEK = 3
 SOFT = ("trial", "low_credits")       # Waits for the end of a turn; one a day; the tips switch silences it.
 LOW_FLOOR = 25                        # Trial and pack balances: warn below this many credits.
 LOW_SHARE = 0.2                       # Monthly balances: warn below this share of the monthly grant.
+TRIAL_WINDOW = 2 * DAY                # The trial card only for a grant this recent (onboarding.CLAIM_WINDOW,
+                                      # the server's cutoff for credits.trial).
 DISMISSED = "Not now. This waits a week."  # What a card says once "Not now" was clicked.
 CHATGPT_CODES = ("subscription_sharing_usage_limit_exceeded", "subscription_sharing_user_not_eligible")
 
@@ -166,16 +169,43 @@ def model_note(tool: dict) -> str:
 
 def offer_locked(session: dict, tool: dict, balance=None) -> str:
     """Main thread. Shows the M1 card unless this conversation already had it or the week's cap is used.
-    Returns the tool result for the model."""
+    Returns the tool result for the model. On the free plan of the credits arm (0.2.19) a tool locked for credits
+    gets the out-of-credits pop-up instead (credits_item): its Get credits led to a page that plan cannot buy on.
+    The card or pop-up and a refusal's pop-up (agent._Consent._paywall) never both show for a tool in one turn."""
     offered = session.setdefault("offered_tools", [])
     note = model_note(tool)
-    if tool["name"] in offered or not may_show("locked_tool"):
+    turn = session.get("turn")
+    this_turn = tool["name"] in (getattr(turn, "credit_offers", None) or ())
+    if tool["name"] in offered or this_turn or not may_show("locked_tool"):
         return f"Not shown again. {note} Say so in one sentence and carry on with what you can do."
+    item = credits_item(tool, balance) if tool["why"] == "credits" else None
+    if item is not None:
+        from . import chat_credits
+        if not chat_credits.show_tool_item(session, turn, item, tool["name"]):  # This turn's pop-up is up already.
+            return f"Not shown again. {note} Say so in one sentence and carry on with what you can do."
+    else:
+        session["items"].append(locked_tool_card(tool, balance))
+        if isinstance(getattr(turn, "credit_offers", None), set):
+            turn.credit_offers.add(tool["name"])
     offered.append(tool["name"])
     mark_shown("locked_tool")
-    session["items"].append(locked_tool_card(tool, balance))
     return (f"The user now sees a card with the way to unlock it. {note} Mention it in one short sentence; "
             "do not repeat the card or push it.")
+
+
+def credits_item(tool: dict, balance=None) -> dict | None:
+    """The free credits-arm plan's locked card for credits: the out-of-credits pop-up's item (chat_credits.tool_item)
+    with Get Pro on the plans page and when free credits come back, its links marked locked_tool. None for any other
+    account (Pro and Max keep this card's Get credits; other arms and older servers see 0.2.18's card)."""
+    from . import chat_credits
+    try:
+        account, signed_in = chat_credits._account()
+    except Exception:  # A runtime half way through starting: the card as before.
+        return None
+    if (chat_credits.billing({"account": account}, signed_in) != chat_credits.CREDITS
+            or chat_credits.plan_of(account) in ("pro", "max")):
+        return None
+    return chat_credits.tool_item(tool["title"], tool.get("credits"), balance, account, reason="locked_tool")
 
 
 def chatgpt_card(code: str) -> dict | None:
@@ -209,11 +239,71 @@ TRIAL_CHIPS = {  # Live tool → (chip, the request it writes into the input; no
     "motion_from_text": ("Text to motion", "Animate my character walking forward and waving."),
     "motion_from_video": ("Motion from video", "Capture the movement in my video and put it on my character."),
 }
+# Chips about the user's own picture or clip: the chip opens the file browser for it, and its request is not sent
+# without one. A Picture to 3D chip sent alone had the model pass one of Loopcut's chat previews (0.2.12).
+CHIP_NEEDS = {"image_to_3d": "a picture", "motion_from_video": "a video clip"}
+# Picture to 3D's second way in, beside it while image_generate is live (owner, 2026-10-25): the user describes the
+# thing and Loopcut makes the picture first. Nothing to attach, so no file browser and no CHIP_NEEDS wait; sent, it
+# is an ordinary request, each paid step with its own card. BLANK is selected in the input, so typing replaces it.
+BLANK = "…"
+MAKE_ONE_CHIP = ("No picture? Describe it and Loopcut makes one", f"Make a picture of {BLANK} and turn it into a 3D model.")
 
 
-def trial_card(amount, live: list[str]) -> dict:
-    """M3. live: names of the managed tools the account can run now (already without blocked ones)."""
+def chip_needs(text: str, attachments, references=(), preparing=()) -> str:
+    """What a trial chip's request, sent as the chip wrote it, still lacks ("a picture", "a video clip"), or "".
+    attachments: this message's; references: the conversation's earlier ones. Only this message's picture counts:
+    an earlier one may be a Try it card's sample photo, which the model then took for the user's (2026-10-25), or a
+    cloud job's output. An earlier clip counts: clips are only ever the user's own (video_attach). So does one still
+    preparing (video_attach.preparing): its sheets are attached once it is ready, and it is not asked for again."""
+    for name, need in CHIP_NEEDS.items():
+        if text.strip() == TRIAL_CHIPS[name][1]:
+            if need == "a video clip":
+                found = bool(preparing) or any(a.get("video") for a in [*attachments, *references])
+            else:
+                found = any(not a.get("video") for a in attachments)
+            return "" if found else need
+    return ""
+
+
+# Photo→3D without a picture of the user's own (owner, 2026-10-25): Loopcut offers to make one first. Two paid
+# steps, never one approval for both (it surprised a persona that day): the picture runs as any paid call does, and
+# the 3D waits for the user's own click on the picture's card (agent.turn_into_3d, spending.MADE).
+def _about(prices, name) -> str:
+    cost = (prices or {}).get(name)
+    return f"about {cost:g} credits ({dollars(cost)})" if cost else ""
+
+
+def generate_first(prices) -> str:
+    """The model's line where photo→3D has no picture of the user's: offer to make one first. prices:
+    cloud.make_one_prices(); "" when it is None (no picture can be made here). A missing price is left out. Short:
+    it ends a refusal, which the model gets cut at 400 characters (cloud._error_message)."""
+    if prices is None:
+        return ""
+    picture, model = _about(prices, "image_generate"), _about(prices, "image_to_3d")
+    return ("No picture of theirs? Offer in one line" + (", with both prices," if picture and model else "")
+            + " to make one with image_generate" + (f" ({picture})" if picture else "") + " from a short description "
+            "(a single object on a plain background, three-quarter view); the user then turns it into 3D with the "
+            "picture's Turn it into 3D button" + (f" ({model})" if model else "") + ".")
+
+
+def make_one_first(prices) -> str:
+    """The user's plain equivalent of generate_first, beside "Attach a picture first"; "" when prices is None."""
+    if prices is None:
+        return ""
+    parts = [f"{about} for {what}" for about, what in ((_about(prices, "image_generate"), "the picture"),
+                                                      (_about(prices, "image_to_3d"), "the 3D model")) if about]
+    return "No picture? Describe it and Loopcut makes one first" + (f": {', then '.join(parts)}." if parts else ".")
+
+
+def trial_card(amount, live: list[str], prices: dict | None = None) -> dict:
+    """M3. live: names of the managed tools the account can run now (already without blocked ones); prices: their
+    catalog estimates by name, for the price beside the No picture? chip (a chip's label ends " · <price>")."""
     chips = [_action(TRIAL_CHIPS[name][0], "prompt", TRIAL_CHIPS[name][1]) for name in live if name in TRIAL_CHIPS][:3]
+    picture = next((i for i, c in enumerate(chips) if c["arg"] == TRIAL_CHIPS["image_to_3d"][1]), None)
+    if picture is not None and "image_generate" in live:
+        cost = (prices or {}).get("image_generate")
+        price = f" · {cost:g} credits ({dollars(cost)})" if type(cost) is int and cost > 0 else ""
+        chips.insert(picture + 1, _action(MAKE_ONE_CHIP[0] + price, "prompt", MAKE_ONE_CHIP[1]))
     text = "Try a cloud tool:" if chips else "They pay for Loopcut's cloud tools as they open."
     return state.item_offer("trial", f"{amount:g} trial credits added ({dollars(amount)})", text,
                             chips + [_action("What credits buy ↗", "web", config.pricing_url("trial"))])
@@ -231,8 +321,26 @@ def low_credits_card(balance, monthly, renews: str, top_ups: bool = True) -> dic
                                        _not_now()])
 
 
-def observe(manifest: dict, signed_in: bool, live: list[str]) -> None:
-    """After a manifest refresh (any thread): queue the trial and low-credit cards it calls for."""
+def _trial_is_news(trial: dict, balance, now: float) -> bool:
+    """A recent grant still whole. A fresh profile (a reinstall, a new machine) has no "once" record, so without this
+    a long-spent trial showed as news beside a balance of 0 (0.2.19). Unsure means no card: no granted_at, one
+    without Z or an offset, or no balance."""
+    if type(balance) not in (int, float) or balance < trial["amount"]:
+        return False
+    text = str(trial.get("granted_at") or "").strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        granted = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return granted.tzinfo is not None and now - granted.timestamp() < TRIAL_WINDOW
+
+
+def observe(manifest: dict, signed_in: bool, live: list[str], now: float | None = None,
+            prices: dict | None = None) -> None:
+    """After a manifest refresh (any thread): queue the trial and low-credit cards it calls for. prices: the live
+    tools' catalog estimates by name (trial_card)."""
     if not signed_in or not config.billing_open():
         return
     credits = (manifest.get("account") or {}).get("credits") or {}
@@ -242,9 +350,9 @@ def observe(manifest: dict, signed_in: bool, live: list[str]) -> None:
     # read as news beside a lower balance (0.2.15).
     credits_arm = (manifest.get("account") or {}).get("billing") == "credits"
     if (not credits_arm and isinstance(trial, dict) and type(trial.get("amount")) in (int, float)
-            and trial["amount"] > 0):
+            and trial["amount"] > 0 and _trial_is_news(trial, balance, now or time.time())):
         key = str(trial.get("granted_at") or trial["amount"])
-        _queue(trial_card(trial["amount"], live), "trial", key)
+        _queue(trial_card(trial["amount"], live, prices), "trial", key)
     if type(balance) not in (int, float):
         return
     monthly = monthly if type(monthly) in (int, float) and monthly > 0 else 0

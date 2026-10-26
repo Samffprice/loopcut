@@ -30,6 +30,11 @@ CANCEL_SECONDS = 60  # After a cancel (Stop, the panel), how long the server has
 CANCEL_POLL_SECONDS = 2  # Between asks meanwhile.
 STREAM_TIMEOUT = 2
 STREAM_ATTEMPTS = 2
+# A 5xx creating or following a job (server_trouble): asked again after each of these, 60 s in all, before the call
+# says the job may exist (UNCONFIRMED). 0.2.19's gate: a 500 after the job was charged read as "failed", and the model
+# bought the picture again.
+SERVER_RETRY_SECONDS = (1, 2, 4, 8, 15, 30)
+UNCONFIRMED = "job_unconfirmed"
 MAX_EVENT = 4 * 1024 * 1024
 MAX_REPORT = 64 * 1024
 MAX_OUTPUTS = 4096
@@ -45,8 +50,37 @@ _SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}  # video/mp4, video/quicktime, video/webm (motion_from_video).
 MAX_CAPTURE_SECONDS = 60  # Of video one motion capture takes (contract 0.7, SPEC §3.2 Motion).
 MAX_MOTION_BYTES = 64 * 1024 * 1024
+# Quitting Blender leaves a managed long job running, and its chat picks it up when it opens (cloud_restore). Read by
+# the cloud-or-laptop render choice card, which promises "it keeps rendering" and "the frames wait" only when True.
+SURVIVES_QUIT = True
 _registry = {}
 _lock = threading.Lock()
+# Blender is quitting (cloud.py's exit_pre handler, which runs before Blender disables add-ons): detached jobs that
+# their chats pick up stop being followed here, and none of them is canceled on the server. A managed long job goes
+# on in the cloud, and its conversation picks it up when Blender opens again (cloud_restore). Disabling the add-on
+# still cancels (cancel_all).
+_leaving = threading.Event()
+QUIT_CANCEL_SECONDS = 5  # How long a quit waits for the service to hear each cancel it sends itself (cancel_all).
+
+
+class _Left(Exception):
+    """Blender is quitting: a detached job's thread stops following it, with no cancel, error or watcher."""
+
+
+def _left(job_id, cancel):
+    """Blender is quitting and this job's chat picks it up after a restart (resumable), so its thread stops following
+    it. Any other job is still followed until cancel_all cancels it."""
+    if not _leaving.is_set() or cancel.is_set():
+        return False
+    with _lock:
+        return bool((_registry.get(job_id) or {}).get("resumable"))
+
+
+# Jobs being fetched to be followed again (adopt): id -> watchers waiting for its row. A fetch that failed keeps its
+# error here until job_status reports it once; the next call fetches again.
+_adopting = {}
+_adopt_errors = {}
+_adopt_cancels = set()  # Canceled while being fetched (job_status cancel right after a reopen): canceled once followed.
 
 
 def _invalid(message="Invalid job response from Loopcut"):
@@ -95,6 +129,22 @@ def _job_progress(job):
     return progress
 
 
+SAFE_TITLE = "Safe to close"
+SAFE_RENDER = ("You can quit Blender and turn your computer off: the render keeps going. Open this chat again and the "
+               "frames are here.")
+SAFE_JOB = ("You can quit Blender and turn your computer off: the job keeps going. Open this chat again and the result "
+            "is here.")
+
+
+def resumable(job_id):
+    """The job is kept with its conversation (cloud_restore), so a later Blender picks it up: its row says it is
+    safe to close Blender while it runs."""
+    with _lock:
+        if job_id in _registry:
+            _registry[job_id]["resumable"] = True
+    _redraw()
+
+
 def progress_rows(registry):
     """Pure panel data, with no Events, locks, Blender or mutable registry values exposed. A running job can be
     canceled and the service returns its whole credit hold (C47); once it has finished and only its outputs are
@@ -120,10 +170,12 @@ def progress_rows(registry):
             message = rig_text.progress('Canceling rig' if row.get('canceling') else
                                         'Preparing rig' if downloading else message)
             note = rig_text.price(job['credits']['charged'] if downloading else held, settled=downloading)
+        safe = (SAFE_RENDER if job.get("tool") == "render" else SAFE_JOB) if (
+            row.get("resumable") and not downloading and not row.get("canceling")) else ""
         rows.append({"id": key, "title": "Rig your character" if rig else row["title"], **({"rig": True} if rig else {}), "pct": job["progress"]["pct"],
                      "message": "Canceling…" if row.get("canceling") and not rig else message,
                      "cancelable": not row.get("canceling", False) and not downloading,
-                     "note": "" if row.get("canceling") and not rig else note})
+                     "note": "" if row.get("canceling") and not rig else note, **({"safe": safe} if safe else {})})
     from .cloud import safe_value
     return safe_value(rows)
 
@@ -135,9 +187,13 @@ def ui_rows():
 
 def cancel_job(job_id):
     """False when the job is unknown or already over. A finished job still downloading only stops its download:
-    it was charged, so the panel offers no Cancel then (progress_rows)."""
+    it was charged, so the panel offers no Cancel then (progress_rows). One still being fetched (adopt) is canceled
+    as soon as it is followed."""
     with _lock:
         row = _registry.get(job_id)
+        if row is None and job_id in _adopting:
+            _adopt_cancels.add(job_id)
+            return True
         if row is None or row.get("error") or (row["job"]["status"] in TERMINAL and row.get("ready", True)):
             return False
         row["cancel"].set()
@@ -176,18 +232,44 @@ def _final(job_id, job, error=None):
     _notify(watchers, copy.deepcopy(job), error)
 
 
+def leave_all():
+    """Blender is quitting: stop following the jobs its chats pick up later (resumable), and leave them running in the
+    cloud; cancel_all then cancels only the others, which nothing would ever apply."""
+    _leaving.set()
+
+
 def cancel_all():
-    """Stop both blocking and detached jobs when the add-on is disabled."""
+    """Stop both blocking and detached jobs when the add-on is disabled. Once Blender is quitting (leave_all), only
+    jobs that no chat picks up after a restart: a rig, a minutes-long call, one never kept with its chat. Their threads
+    end with Blender before they would ask the service (0.2.18's quit left such a job running, and charged), so a quit
+    sends those cancels itself, and their unspent credits come back."""
+    leaving = _leaving.is_set()
     with _lock:
-        ids = list(_registry)
-    for job_id in ids:
-        cancel_job(job_id)
+        rows = [(key, row.get("client"), row["job"]["status"] not in TERMINAL) for key, row in _registry.items()
+                if not (leaving and row.get("resumable"))]
+    for job_id, client, running in rows:
+        if cancel_job(job_id) and leaving and running and client is not None:
+            _cancel_now(client, job_id)
+
+
+def _cancel_now(client, job_id):
+    """Main thread, as Blender quits: POST /cancel for a job its own thread no longer has time to cancel."""
+    quick = copy.copy(client)
+    quick.timeout = QUIT_CANCEL_SECONDS
+    try:
+        quick.request("POST", "/v1/jobs/" + urllib.parse.quote(job_id, safe="") + "/cancel")
+    except (cloud_http.CloudError, OSError, ValueError) as ex:
+        print(f"Loopcut: could not cancel cloud job {job_id} as Blender quit: {ex}")
 
 
 def job_status(job_id):
     """Long tools return immediately; their eventual local paths are available here."""
     with _lock:
         row = _registry.get(job_id)
+        if row is None and job_id in _adopting:
+            return {"id": job_id, "status": "running", "progress": {"pct": 0, "message": "Fetching the job from Loopcut"}}
+        if row is None and job_id in _adopt_errors:
+            raise _adopt_errors.pop(job_id)
         if row is None:
             raise cloud_http.CloudError("Cloud job is not available in this session", "not_found", 404)
         if row.get("error"):
@@ -202,6 +284,129 @@ def job_status(job_id):
                                              for output in job['outputs']]})
 
 
+def over(job_id):
+    """The job as it ended here (its outputs downloaded, or its error's job), or None while it runs here or is not
+    followed here."""
+    with _lock:
+        row = _registry.get(job_id)
+        if row is None:
+            return None
+        if row.get("error") is not None:
+            job = row["error"].extra.get("job")
+            return copy.deepcopy(job) if isinstance(job, dict) and job.get("status") in TERMINAL else None
+        return copy.deepcopy(row["job"]) if row["job"]["status"] in TERMINAL and row.get("ready", True) else None
+
+
+def forget_missing(job_id):
+    """A job downloaded here whose files are gone (the system cleared its temp folder): forget it, so following it
+    again downloads them anew. True when it was forgotten."""
+    with _lock:
+        row = _registry.get(job_id)
+        if row is None or row.get("error") or not row.get("ready", True) or row["job"]["status"] not in TERMINAL:
+            return False
+        if all(Path(o["path"]).is_file() for o in row["job"]["outputs"] if o.get("path")):
+            return False
+        del _registry[job_id]
+    return True
+
+
+def applied_here(job_id):
+    """Whether the open file holds this job's outputs: a datablock or strip stamped with its job id
+    (stamp_provenance). Undo, a checkpoint restore, or quitting without saving take them away, and this with them."""
+    import bpy
+    data = getattr(bpy, "data", None)
+
+    def stamped(block):
+        try:
+            value = block.get("loopcut_provenance") if callable(getattr(block, "get", None)) else None
+            return isinstance(value, str) and job_id in value and json.loads(value).get("job_id") == job_id
+        except (ReferenceError, TypeError, ValueError, AttributeError):
+            return False
+    for name in _DATA_COLLECTIONS:
+        if any(stamped(block) for block in getattr(data, name, None) or ()):
+            return True
+    for scene in getattr(data, "scenes", None) or ():
+        editor = getattr(scene, "sequence_editor", None)
+        strips = getattr(editor, "strips_all", None) or getattr(editor, "sequences_all", None) or ()
+        if any(stamped(strip) for strip in strips):
+            return True
+    return False
+
+
+def canceled_here(job_id):
+    """Its cancel was asked from this Blender (its row's Cancel, or job_status), not by the service."""
+    with _lock:
+        return bool((_registry.get(job_id) or {}).get("canceling"))
+
+
+def known(job_id):
+    """This Blender follows the job, or is fetching it to (adopt)."""
+    with _lock:
+        return job_id in _registry or job_id in _adopting
+
+
+def fetch(client, job_id):
+    """A worker: the job as the service has it now, validated (GET /v1/jobs/{id}, fresh 1 h URLs)."""
+    job = _job(client.request("GET", "/v1/jobs/" + urllib.parse.quote(job_id, safe="")))
+    if job["id"] != job_id:
+        raise _invalid("Job identity changed in a response")
+    return job
+
+
+def adopt(job_id, title, inputs=None, apply_args=None, references=None, *, client=None, watcher=None, job=None):
+    """Main thread: follow a job this Blender did not start or no longer follows (Blender restarted; cloud_restore),
+    as run() follows its own: fetch it, then follow it, verify and download its outputs, on a thread. watcher: as
+    watch(), or fn(None, error) when the fetch fails. job: one just fetched (pickup's), which saves the second GET
+    and clears an earlier failed fetch. False when it is followed or being fetched already, or when its last fetch
+    failed and job_status has not reported that yet."""
+    with _lock:
+        followed = job_id in _registry
+        if job is not None:
+            _adopt_errors.pop(job_id, None)
+        if not followed and (job_id in _adopting or job_id in _adopt_errors):
+            if watcher is not None and job_id in _adopting:
+                _adopting[job_id].append(watcher)
+            return False
+        if not followed:
+            _adopting[job_id] = [watcher] if watcher is not None else []
+    if followed:
+        if watcher is not None:
+            watch(job_id, watcher)
+        return False
+    client = client if client is not None else _client()
+
+    fetched = job
+
+    def follow():
+        try:
+            job = fetched if fetched is not None else fetch(client, job_id)
+        except cloud_http.CloudError as ex:
+            with _lock:
+                watchers = _adopting.pop(job_id, [])
+                _adopt_cancels.discard(job_id)
+                _adopt_errors[job_id] = ex
+            _redraw()
+            _notify(watchers, None, ex)
+            return
+        cancel = threading.Event()
+        remembered = _remember(job, title, cancel, inputs, apply_args, references, client=client)
+        with _lock:
+            watchers = _adopting.pop(job_id, [])
+            if remembered:
+                _registry[job_id]["resumable"] = True
+                if job_id in _adopt_cancels and job["status"] not in TERMINAL:
+                    cancel.set()
+                    _registry[job_id]["canceling"] = True
+            _adopt_cancels.discard(job_id)
+        for fn in watchers:
+            watch(job_id, fn)
+        if remembered:
+            _background(client, job, cancel, None)
+    threading.Thread(target=follow, name="Loopcut cloud job", daemon=True).start()
+    _redraw()
+    return True
+
+
 def _remember(job, title, cancel, inputs=None, apply_args=None, references=None, *, client=None):
     """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it.
     apply_args: the call's client-only arguments for the apply handler (contract 0.7), never sent. A replay of a
@@ -213,7 +418,8 @@ def _remember(job, title, cancel, inputs=None, apply_args=None, references=None,
             if row.get('rig_refund') is not None:
                 return False  # Preserve the original account and immutable report on same-job replay.
             error = row.get('error')
-            if error is None or error.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch'}:
+            if error is None or error.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch',
+                                                   UNCONFIRMED}:
                 return False  # Preserve live workers and definitive outcomes on replay.
             del _registry[job['id']]
         # Keep a bounded history for job_status, retaining every running job.
@@ -242,6 +448,31 @@ def _heard(cancel):
 def _unconfirmed(job):
     return cloud_http.CloudError(f"Cloud job cancel not confirmed in {CANCEL_SECONDS} s; it may still finish and be "
                                  "charged", "canceled", extra={"job": job})
+
+
+def server_trouble(error):
+    """A 5xx that says nothing about the job (a database timeout, a proxy's 503): it may exist, run and be charged.
+    502 vendor_failed is a definite, refunded start failure, and 501 a route the server does not have."""
+    return ((error.code == "server_error" or (error.status or 0) >= 500)
+            and error.code != "vendor_failed" and error.status != 501)
+
+
+def _unsure(error, job=None):
+    """The 5xx answers outlasted SERVER_RETRY_SECONDS: never a plain failure the model would buy again (cloud
+    _error_message says so, with the job's id when known and its request key)."""
+    extra = {"job": job} if job is not None else {}
+    # Not the server's own text: "Try again shortly" is what the gate's model did, with a new key.
+    return cloud_http.CloudError(f"Loopcut's server kept failing (HTTP {error.status or '?'} {error.code}) for "
+                                 f"{sum(SERVER_RETRY_SECONDS)} s", UNCONFIRMED, error.status, extra, error.error_type)
+
+
+def _pause(cancel, seconds):
+    """A 5xx backoff step; a Stop meanwhile ends it at once, so its cancel goes next."""
+    stopped = cancel.is_set()
+    for _ in range(round(seconds * 10)):
+        if cancel.is_set() and not stopped:
+            return
+        time.sleep(.1)
 
 
 def _wait_known(job_id, cancel, on_progress):
@@ -288,6 +519,10 @@ def _output(value, *, local=False):
             or not _HASH.fullmatch(value["sha256"]) or type(value.get("size")) is not int
             or value["size"] < 0 or not isinstance(value.get("meta", {}), dict)):
         raise _invalid("Invalid job output from Loopcut")
+    if "expired" in value and not local:  # Contract 0.10: past the 30 days its file is kept, with no URL.
+        if value["expired"] is not True or "url" in value or "expires_at" in value:
+            raise _invalid("Invalid expired job output from Loopcut")
+        return value
     if local:
         if not isinstance(value.get("path"), str) or not Path(value["path"]).is_file():
             raise _invalid("Job output is missing its local file")
@@ -332,7 +567,8 @@ def _job(value, *, expected=None, local=False):
     clean = safe_value(value)
     if not local:
         for original, output in zip(value['outputs'], clean['outputs']):
-            output['url'] = original['url']  # The download capability stays private until verified.
+            if 'url' in original:
+                output['url'] = original['url']  # The download capability stays private until verified.
     return clean
 
 
@@ -395,10 +631,17 @@ def parse_sse(response, cancel=None):
             event_id = value
 
 
-def _follow(client, job, cancel, on_progress):
+def _follow(client, job, cancel, on_progress, *, leave=False):
+    """leave: a detached job's thread, which stops quietly once Blender is quitting (_Left) if its chat picks it up
+    later and it was not canceled."""
     path = "/v1/jobs/" + urllib.parse.quote(job["id"], safe="")
     last_id = None
+
+    def check_left():
+        if leave and _left(job["id"], cancel):
+            raise _Left()
     for _ in range(STREAM_ATTEMPTS):
+        check_left()
         if cancel.is_set():
             job = _job(client.request("POST", path + "/cancel"), expected=job)
             _heard(cancel)
@@ -434,16 +677,30 @@ def _follow(client, job, cancel, on_progress):
                     # Additive contract events are ignored, but can advance the replay cursor.
                     last_id = event_id or last_id
                     _update(job, on_progress)
+                    check_left()
         except cloud_http.CloudError as ex:
-            if ex.code != "connection_failed" and ex.status not in {404, 405, 406, 501}:
+            if ex.code != "connection_failed" and ex.status not in {404, 405, 406, 501} and not server_trouble(ex):
                 raise
             if ex.code != "connection_failed":
-                break
+                break  # Polled instead; a 5xx there is asked again with backoff.
         # EOF without done reconnects with the last fully processed event id.
     canceled_at = None
+    pauses = iter(SERVER_RETRY_SECONDS)
     while True:
+        check_left()
         method, suffix = ("POST", "/cancel") if cancel.is_set() else ("GET", "")
-        job = _job(client.request(method, path + suffix), expected=job)
+        try:
+            job = _job(client.request(method, path + suffix), expected=job)
+        except cloud_http.CloudError as ex:
+            if not server_trouble(ex):
+                raise
+            pause = next(pauses, None)
+            if pause is None:
+                raise _unsure(ex, job) from ex
+            _heard(cancel)  # It answered, if only that it is busy: no stall.
+            _pause(cancel, pause)
+            continue
+        pauses = iter(SERVER_RETRY_SECONDS)
         _heard(cancel)
         _update(job, on_progress, final=job['status'] in TERMINAL)
         if job["status"] in TERMINAL:
@@ -471,8 +728,26 @@ def _raise_failed(job):
                                    extra={"job": job, "refunded": job["credits"]["refunded"]})
 
 
+def preview(output):
+    """A render's small JPEG of one frame for the chat (meta.preview), never one of its frames."""
+    return isinstance(output.get("meta"), dict) and output["meta"].get("preview") is True
+
+
+def expired_message(job):
+    """What a job whose files are past retention says, or "" (contract 0.10; a missing preview is no loss)."""
+    gone = [o for o in job["outputs"] if o.get("expired") is True and not preview(o)]
+    if not gone:
+        return ""
+    return ("These frames were deleted after 30 days." if any(o["type"] == "render_frames" for o in gone)
+            else "These files were deleted after 30 days.")
+
+
 def _download(client, job, cancel):
     _output_limits(job)
+    message = expired_message(job)
+    if message:
+        raise cloud_http.CloudError(message, "outputs_expired", extra={"job": job})
+    job = {**job, "outputs": [o for o in job["outputs"] if o.get("expired") is not True]}
     if not job['outputs']:
         return copy.deepcopy(job)
     directory = Path(tempfile.mkdtemp(prefix=job["id"] + "-"))
@@ -513,12 +788,14 @@ def _download(client, job, cancel):
         raise
 
 
-def _finish(client, job, cancel, on_progress):
+def _finish(client, job, cancel, on_progress, *, leave=False):
     try:
         if job["status"] not in TERMINAL:
-            job = _follow(client, job, cancel, on_progress)
+            job = _follow(client, job, cancel, on_progress, leave=leave)
         _update(job, on_progress, final=True)
         _raise_failed(job)
+        if leave and _left(job["id"], cancel):
+            raise _Left()  # Its outputs stay in the cloud for 30 days; the next Blender downloads them.
         job = _download(client, job, cancel)
         _update(job, None, final=True)
         with _lock:
@@ -528,6 +805,10 @@ def _finish(client, job, cancel, on_progress):
         return job
     except cloud_http.CloudError as ex:
         ex.extra.setdefault('job', job)
+        with _lock:
+            key = (_registry.get(job["id"]) or {}).get("key")
+        if ex.code == UNCONFIRMED and key:  # A long job's thread: job_status names the replay that picks it up.
+            ex.extra.setdefault("idempotency_key", key)
         if job['tool'] == 'auto_rig' and job['status'] == 'succeeded' and ex.code == 'hash_mismatch':
             ex.extra.update(apply_failure=_report_rig_failure(job, 'validation_failed'),
                             apply_message='The returned rig files failed verification. Your character has not been changed.')
@@ -547,9 +828,11 @@ def _finish(client, job, cancel, on_progress):
 
 def _background(client, job, cancel, on_progress):
     try:
-        _finish(client, job, cancel, on_progress)
+        _finish(client, job, cancel, on_progress, leave=True)
     except cloud_http.CloudError:
         return  # Retained in the registry and raised by job_status().
+    except _Left:
+        return  # Blender is quitting; the job goes on in the cloud.
 
 
 def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: dict,
@@ -641,15 +924,25 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
     if arguments.get("quote_id"):
         payload["quote_id"] = arguments["quote_id"]
     try:
-        for attempt in range(2):
+        lost, pauses = False, iter(SERVER_RETRY_SECONDS)
+        while True:
             try:
                 job = _job(client.request("POST", "/v1/jobs", payload, **confirm))
                 if job["tool"] != descriptor["name"]:
                     raise _invalid("Submitted tool changed in job response")
                 break
             except cloud_http.CloudError as ex:
-                if ex.code != "connection_failed" or attempt:
-                    raise
+                # The same body and key: the server returns the job it may have made (SPEC §3.4), never a second.
+                if ex.code == "connection_failed" and not lost:
+                    lost = True
+                    continue
+                if not server_trouble(ex):
+                    raise  # A 4xx is definite (quote_changed, insufficient_credits, ...).
+                pause = None if cancel.is_set() else next(pauses, None)
+                if pause is None:
+                    raise _unsure(ex) from ex
+                _heard(cancel)
+                _pause(cancel, pause)
         if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs,
                          {k: v for k, v in arguments.items() if k in local},
                          {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}, client=client):
@@ -658,6 +951,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
                     cancel_job(job["id"])
                 return job_status(job["id"])
             return _wait_known(job["id"], cancel, on_progress)
+        with _lock:
+            _registry[job["id"]]["key"] = key  # Its request's, for a replay after 5xx answers (_unsure).
         _update(job, on_progress)
         if descriptor.get("latency") == "long" and job["status"] not in TERMINAL:
             threading.Thread(target=_background, args=(client, copy.deepcopy(job), cancel, on_progress),
@@ -674,6 +969,7 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
     """Resolve names before paths: image buffers and selected object hierarchies are exported."""
     _main_only()
     import bpy
+    from .ownership import TEMP
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     if descriptor.get('apply') == 'apply_rig':
@@ -693,15 +989,28 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
             found[field] = _video_plan(descriptor, arguments, row, value)["path"]
             continue
         image, ob = bpy.data.images.get(value), bpy.data.objects.get(value)
+        if image is not None and image.get(TEMP):
+            # Loopcut's own (a chat preview, ui.draw): never sent as the user's picture (0.2.12's Picture to 3D chip).
+            last = attached_last()
+            raise _input_error("That image is Loopcut's own preview, not the user's; " + (
+                f"images the user attached last, newest first: {', '.join(last)}" if last
+                else "ask them for the picture" + _make_one_first(descriptor)), field)
         if image is not None:
             path = directory / f"input-{n}.png"
-            # Work on a copy: saving must not replace a painted buffer's filepath or format.
+            # Work on a copy: saving must not replace a painted buffer's filepath or format. A copy has no pixels
+            # until first used, when it loads them from its file path: its size is read before repointing it.
             temporary = image.copy()
             try:
-                temporary.filepath_raw, temporary.file_format = str(path), "PNG"
-                temporary.save()
+                empty = not all(temporary.size)
+                if not empty:
+                    temporary.filepath_raw, temporary.file_format = str(path), "PNG"
+                    temporary.save()
+            except RuntimeError as ex:  # 0.2.12: "does not have any image data" ended the turn.
+                raise _input_error(f"The image could not be saved to send: {ex}", field) from ex
             finally:
                 bpy.data.images.remove(temporary)
+            if empty:
+                raise _input_error("The image has no pixels to send", field)
         elif ob is not None:
             from . import glb
             path = directory / f"input-{n}.glb"
@@ -714,9 +1023,88 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
             if not path.is_file():
                 last = attached_last()
                 raise _input_error("Scene reference or file was not found" + (
-                    f". Images the user attached last, newest first: {', '.join(last)}" if last else ""), field)
+                    f". Images the user attached last, newest first: {', '.join(last)}" if last
+                    else _make_one_first(descriptor)), field)
         found[field] = path
     return found
+
+
+MADE_BY = ("image_generate",)  # Tools whose pictures Loopcut made: image_to_3d asks first on one (spending.MADE).
+MADE_LISTED = 3  # A refusal names at most this many made pictures: it reaches the model cut at 400 characters.
+
+
+def picture_field(descriptor: dict) -> str:
+    """image_to_3d's picture input on this route: managed image_to_3d takes image, the own-key adapter reference."""
+    return next((f["field"] for f in descriptor.get("file_inputs") or ()
+                 if any(str(mime).startswith("image/") for mime in f.get("accept") or ())), "image")
+
+
+def _stamp(image) -> dict:
+    try:
+        stamp = json.loads(image.get("loopcut_provenance") or "{}")
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    return stamp if isinstance(stamp, dict) else {}
+
+
+def made_job(name) -> str:
+    """Main thread: the job that made the picture of that name, "" when Loopcut did not make it: by the provenance
+    stamped on its datablock at apply, else by its conversation reference (made, _add_images), which still finds
+    it after Undo, a restore or a reopen took the datablock away (attached_image)."""
+    import bpy
+    from . import state
+    if not isinstance(name, str) or not name:
+        return ""
+    image = bpy.data.images.get(name)
+    if image is not None:
+        stamp = _stamp(image)
+        return str(stamp.get("job_id") or "") if stamp.get("tool") in MADE_BY else ""
+    made = next((r.get("made") for r in reversed(state.session().get("references") or ())
+                 if r.get("name") == name and isinstance(r.get("made"), dict)), None) or {}
+    return str(made.get("job") or "") if made.get("tool") in MADE_BY else ""
+
+
+def made_name(picture: dict) -> str:
+    """Main thread: the name a made picture goes by now: its datablock found by the job that made it (a rename keeps
+    the button working), else the name its card has, which its conversation reference answers to."""
+    import bpy
+    job = picture.get("job")
+    found = next((i.name for i in bpy.data.images if job and _stamp(i).get("job_id") == job
+                  and _stamp(i).get("tool") in MADE_BY), None) if job else None
+    return found or picture["image"]
+
+
+def made_picture(descriptor: dict, arguments: dict) -> dict | None:
+    """Main thread: image_to_3d's picture when Loopcut made it (made_job): {"name", "path", "job"}, path a file of it
+    for the card ("" without one), job the one that made it. Else None."""
+    value = arguments.get(picture_field(descriptor))
+    job = made_job(value) if descriptor.get("name") == "image_to_3d" else ""
+    if not job:
+        return None
+    path = attached_image(value)
+    return {"name": value, "path": str(path) if path else "", "job": job}
+
+
+def made_last() -> list[str]:
+    """Main thread: the newest pictures Loopcut made in this chat that a photo→3D call can take (made_job), at most
+    MADE_LISTED of them."""
+    from . import state
+    references = state.session().get("references") or ()
+    names = dict.fromkeys(r["name"] for r in reversed(references) if r.get("made") and made_job(r.get("name")))
+    return list(names)[:MADE_LISTED]
+
+
+def _make_one_first(descriptor: dict) -> str:
+    """Photo→3D refused with no picture of the user's: the pictures Loopcut made here, by name, else the offer to make
+    one first (nudges.generate_first), or "". A later turn's model may no longer have a made picture's name."""
+    if descriptor.get("name") != "image_to_3d":
+        return ""
+    made = made_last()
+    if made:
+        return f". Pictures Loopcut made in this chat, newest first: {', '.join(made)}"
+    from . import cloud, nudges
+    line = nudges.generate_first(cloud.make_one_prices())
+    return f". {line}" if line else ""
 
 
 def attached_last() -> list[str]:
@@ -860,6 +1248,11 @@ def prepare_inputs(descriptor: dict, arguments: dict, files: dict) -> dict:
         target = motion_target(arguments.get("target_armature"))
         if target is not None:
             out["target_armature"] = target.name
+        if target is not None and descriptor.get("name") == "motion_from_text":
+            from . import autorig
+            free, card = autorig.free_gesture(target, arguments.get("prompt"))
+            if free:  # R7-B1: a wave over the rig's walk is free; nothing is quoted, asked or charged (cloud.execute).
+                raise cloud_http.CloudError(free, "free_gesture", extra={"outcome": card})
     return out
 
 
@@ -1067,13 +1460,34 @@ def _add_images(job):
             if problems:
                 raise cloud_http.CloudError("; ".join(problems), "apply_failed")
             for reference in session["attachments"]:
-                reference.update(name=image.name, pinned=True)
+                # made: the tool and job behind it, so a photo→3D call still knows it is Loopcut's without its
+                # datablock (made_job).
+                reference.update(name=image.name, pinned=True,
+                                 made={"tool": (job.get("provenance") or {}).get("tool") or job.get("tool"),
+                                       "job": job["id"]})
                 session["references"].append(reference)
         finally:
             session["attachments"] = pending
         conversations.save(session)
         names.append(image.name)
     return names
+
+
+def _made_rows(job: dict, names) -> list[dict]:
+    """The pictures a job made, for their card: {"image": datablock name, "job", "path": the chat's own copy for the
+    thumbnail, "" without one}."""
+    from . import conversations, state
+    session = state.session()
+    rows = []
+    for name in names:
+        reference = next((r for r in reversed(session.get("references") or ()) if r.get("name") == name), None)
+        try:
+            path = str(conversations.image_path(session["id"], reference.get("full") or reference["ref"])) \
+                if reference else ""
+        except (conversations.ConversationError, KeyError):
+            path = ""
+        rows.append({"image": name, "job": job["id"], "path": path})
+    return rows
 
 
 def _model_bounds(objects):
@@ -1499,16 +1913,45 @@ def _add_audio(job):
     return placed
 
 
+def frames_folder(job_id):
+    """Where a job's frames are kept for its strip: next to the .blend (//renders/cloud-<job>/, beside a laptop
+    render's //renders), or in Loopcut's data folder for an unsaved file. Never the system temp folder, which is
+    cleared under a saved strip."""
+    import bpy
+    name = "cloud-" + job_id.removeprefix("job_")[:12]
+    if getattr(bpy.data, "filepath", ""):
+        return Path(bpy.path.abspath("//renders")) / name
+    from . import checkpoints
+    return checkpoints.data_root() / "renders" / name
+
+
+ANIMATION = "animation"  # A render's video beside its frames: frames_folder/animation.mp4.
+
+
+def kept_video(job_id):
+    """Main thread: the render's MP4 that Load the frames kept beside its frames, or None (not loaded yet, or gone)."""
+    folder = frames_folder(job_id)
+    return next((path for path in sorted(folder.glob(ANIMATION + ".*")) if path.suffix.lower() in VIDEO_SUFFIXES
+                 and path.is_file()), None)
+
+
 def _load_frames(job):
     import bpy
     names, strips = [], _strips()
     channel = max((strip.channel for strip in strips), default=0) + 1
     start = bpy.context.scene.frame_current
-    images = [o for o in job["outputs"] if o["type"] in {"render_frames", "image"} and o["mime"].startswith("image/")]
+    # A render's chat previews (meta.preview) would land between its frames.
+    images = [o for o in job["outputs"] if o["type"] in {"render_frames", "image"} and o["mime"].startswith("image/")
+              and not preview(o)]
     images.sort(key=lambda o: (o.get("meta", {}).get("frame", 0), o["name"]))
+    # A render's animation.mp4 is kept beside its frames as animation.mp4 and loads as its own strip, as in 0.2.18
+    # (rel019-cloud asked for a video and never got it); job["video_path"] names it in the model's result.
+    movies = [o for o in job["outputs"] if (o["type"] == "video" or o["mime"].startswith("video/")) and not preview(o)]
+    folder = frames_folder(job["id"])
+    folder.mkdir(parents=True, exist_ok=True)
+    saved = bool(getattr(bpy.data, "filepath", ""))
     if images:
         # Blender sequences require every frame in one folder, including BYOK results.
-        folder = Path(tempfile.mkdtemp(prefix="loopcut-frames-"))
         paths = []
         for n, output in enumerate(images):
             target = folder / f"frame-{n:06d}{Path(output['path']).suffix}"
@@ -1518,15 +1961,23 @@ def _load_frames(job):
         for path in paths[1:]:
             strip.elements.append(path.name)
         strip.frame_final_duration = len(paths)
+        if saved:  # Relative, so the .blend and its renders folder move together.
+            strip.directory = bpy.path.relpath(str(folder)) + "/"
         stamp_provenance([strip], job["provenance"])
         names.append(strip.name)
         channel += 1
-    for output in job["outputs"]:
-        if output["type"] == "video" or (output["type"] == "render_frames" and output["mime"].startswith("video/")):
-            strip = strips.new_movie(output["name"], output["path"], channel=channel, frame_start=start)
-            stamp_provenance([strip], job["provenance"])
-            names.append(strip.name)
-            channel += 1
+    for n, output in enumerate(movies):
+        suffix = Path(output['path']).suffix
+        target = folder / ((f"{ANIMATION}{suffix}" if n == 0 else f"{ANIMATION}-{n:02d}{suffix}") if images
+                           else f"video-{n:02d}{suffix}")
+        shutil.copyfile(output["path"], target)
+        if images and n == 0:
+            job["video_path"] = str(target)
+        strip = strips.new_movie(output["name"], bpy.path.relpath(str(target)) if saved else str(target),
+                                 channel=channel, frame_start=start)
+        stamp_provenance([strip], job["provenance"])
+        names.append(strip.name)
+        channel += 1
     return names
 
 
@@ -1667,6 +2118,8 @@ def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
     before = datablock_snapshot(bpy.data)
     try:
         names = handlers[handler](job)
+        if handler == "add_image_reference" and descriptor.get("name") in MADE_BY and details is not None:
+            details["pictures"] = _made_rows(job, names)  # Their card's Turn it into 3D button (cloud.to_3d_offer).
         reports = _reports(job) if handler not in ("none", "apply_motion", "apply_rig") else []
         if reports and details is not None:
             from .cloud import _display, safe_value
@@ -1683,6 +2136,8 @@ def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
                 if details is not None:  # The card's output keeps the JSON, behind its line.
                     details["card_output"] = result_summary(handler, job, names, reports)
                 reports = [table or text for table, text in zip(tables, reports)]
+        if job.get("video_path"):  # So the model can tell the user where the video they asked for is.
+            reports.insert(0, f"The MP4 is saved at {job['video_path']} (also a movie strip beside the frames).")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as ex:
         if isinstance(ex, cloud_http.CloudError):
             raise

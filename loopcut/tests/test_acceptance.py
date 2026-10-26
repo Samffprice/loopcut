@@ -121,6 +121,36 @@ class QuoteTest(unittest.TestCase):
         self.assertTrue(A.quote_found("keep the bottle… unchanged", USER))
         self.assertFalse(A.quote_found("unchanged ... keep the bottle", USER), "in order")
 
+    def test_scripts_without_spaces_match_without_word_boundaries(self):
+        # rel018-ja2: the user's exact words were refused, "あと天井ファンも" being one "word", and the spinning
+        # fan dropped to a default.
+        ja = ("猫と一緒にくつろげる小さな読書コーナーを作って。本物っぽい家具がいい：ひとり掛けソファ、サイドテーブル、"
+              "フロアランプ、本棚、ラグ。あと天井ファンも、回るやつで。")
+        for quote in ("天井ファンも、回るやつで", "天井ファンも回るやつで", "回るやつ", "ひとり掛けソファ、サイドテーブル",
+                      "本物っぽい家具"):
+            self.assertTrue(A.quote_found(quote, [ja]), quote)
+        for quote in ("天井ファンは、回るやつで", "止まるやつで", "ソファ、本棚"):
+            self.assertFalse(A.quote_found(quote, [ja]), quote)
+        zh = "我想要一个红色的沙发，还有一盏落地灯。"
+        self.assertTrue(A.quote_found("红色的沙发", zh))
+        self.assertTrue(A.quote_found("沙发，还有一盏落地灯", zh))
+        self.assertFalse(A.quote_found("蓝色的沙发", zh))
+        self.assertTrue(A.quote_found("โซฟาสีแดง", "อยากได้โซฟาสีแดง"), "Thai")
+
+    def test_mixed_latin_and_cjk_keep_whole_latin_words(self):
+        mixed = "LEDライトを付けて、色はwarm whiteで。bored ライト"
+        for quote in ("LEDライト", "ledライトを付けて", "色はwarm white", "warm whiteで", "bored ライト"):
+            self.assertTrue(A.quote_found(quote, mixed), quote)
+        for quote in ("EDライト", "arm white", "red ライト"):  # A Latin end still stops at a word's edge.
+            self.assertFalse(A.quote_found(quote, mixed), quote)
+        self.assertFalse(A.quote_found("red", ["the room feels bored"]), "spaced scripts: whole words, as before")
+
+    def test_an_ellipsis_skips_text_in_unspaced_scripts_too(self):
+        ja = "猫と一緒にくつろげる小さな読書コーナーを作って。あと天井ファンも、回るやつで。"
+        self.assertTrue(A.quote_found("猫と一緒に…天井ファンも", ja))
+        self.assertTrue(A.quote_found("読書コーナー ... 回るやつ", ja))
+        self.assertFalse(A.quote_found("天井ファンも…猫と一緒に", ja), "in order")
+
 
 class ValidateTest(unittest.TestCase):
     def test_every_kind_has_a_valid_example(self):

@@ -393,6 +393,35 @@ class JobsTest(unittest.TestCase):
         log = next(p for p in display["prims"] if p.get("text") == "process.log")
         self.assertEqual(log["color"], T.TEXT_MUTED)
 
+    def test_what_a_shell_command_left_running_is_a_row_with_its_time_and_stop(self):
+        """Owner, 2026-10-26: a 15-hour render left running by a shell command had no view and no Stop."""
+        row = {"id": "left1", "label": "Render it", "group": 4242, "state": "running", "elapsed": 54_125.0}
+        display = build(view="jobs", jobs=[], cloud_jobs=[], local_processes=[], left_running=[row])
+        text = " ".join(p["text"] for p in display["prims"] if p["t"] == "text")
+        self.assertIn("Running · Render it", text)
+        self.assertIn("15h 02m", text)
+        self.assertIn("process group 4242", text)
+        self.assertNotIn("No background jobs yet", text)
+        self.assertEqual(hit(display, "left.left1.stop")["action"], ("left_stop", "left1"))
+        ended = build(view="jobs", jobs=[], cloud_jobs=[], left_running=[{**row, "state": "finished"}])
+        self.assertIn("Finished · Render it", " ".join(p["text"] for p in ended["prims"] if p["t"] == "text"))
+        self.assertFalse(any(h["id"] == "left.left1.stop" for h in ended["hits"]), "nothing left to stop")
+
+    def test_a_cloud_row_safe_to_close_and_a_left_running_row_draw_together(self):
+        """The merge of 0.2.19's two Background jobs additions: R1's Safe to close note and the left-running row."""
+        cloud = {"id": "job_r", "title": "Render scene", "pct": 40, "message": "Rendering", "cancelable": True,
+                 "note": "640 credits held. Cancel returns them.", "safe": "You can quit Blender: the render keeps going."}
+        left = {"id": "left1", "label": "Render it", "group": 4242, "state": "running", "elapsed": 65.0}
+        display = build(view="jobs", jobs=[], cloud_jobs=[cloud], local_processes=[], left_running=[left])
+        text = " ".join(p["text"] for p in display["prims"] if p["t"] == "text")
+        for shown in ("Render scene", "Safe to close", "the render keeps going", "Running · Render it", "1m 05s"):
+            self.assertIn(shown, text)
+        box = next(p for p in display["prims"] if p["id"] == "cloud.job_r.safe.card")
+        title = next(p for p in display["prims"] if p["id"] == "left.left1.title")
+        self.assertGreaterEqual(title["y"], box["y"] + box["h"], "the process row is below the green note")
+        self.assertEqual(hit(display, "cloud.job_r.cancel")["action"], ("cloud_job_cancel", "job_r"))
+        self.assertEqual(hit(display, "left.left1.stop")["action"], ("left_stop", "left1"))
+
     def test_empty_jobs_still_show_empty_message(self):
         display = build(view="jobs", jobs=[], cloud_jobs=[], local_processes=[])
         text = " ".join(p["text"] for p in display["prims"] if p["t"] == "text")
@@ -468,6 +497,24 @@ class ToolCardLabelTest(unittest.TestCase):
         display = self.display(title)
         self.assertEqual(prim(display, "item0.tool.summary")["text"], title)
         self.assertNotIn("item0.tool.name", ids(display, "prims"))
+
+    def test_a_long_running_step_shows_its_time_beside_its_title(self):
+        session = state.new_session()
+        item = dict(state.item_tool("shell", "Render the animation", ""), started_at=1000.0)
+        session["items"].append(item)
+        for now, shown in ((1005.0, None), (1045.0, "45s"), (1000.0 + 245, "4m 05s"), (1000.0 + 7500, "2h 05m")):
+            with self.subTest(now=now):
+                display = build(session, now=now)
+                self.assertEqual(texts(display).get("item0.tool.running"), shown)
+                self.assertEqual(prim(display, "item0.tool.summary")["text"], "Render the animation")
+        running = prim(build(session, now=1045.0), "item0.tool.running")
+        self.assertLessEqual(right(running), 420)
+        for status in ("done", "failed"):
+            item["status"] = status
+            self.assertNotIn("item0.tool.running", texts(build(session, now=1045.0)), "only while it runs")
+        item.update(status="running", expanded=True)
+        display = build(session, now=1045.0)
+        self.assertLessEqual(right(prim(display, "item0.tool.running")), prim(display, "item0.tool.name")["x"])
 
     def test_expanded_card_retains_the_technical_identifier(self):
         display = self.display("Scene information", expanded=True)
@@ -1256,6 +1303,39 @@ class FooterTest(unittest.TestCase):
         texts = {p["id"]: p["text"] for p in display["prims"] if p["t"] == "text"}
         self.assertEqual(texts["input.hint"], "⏎  note   esc  stop")
         self.assertEqual(texts["input.placeholder"], "Add a note; Loopcut replies when it can")
+
+    def test_busy_esc_stop_hint_is_a_stop_button_and_idle_hint_is_only_text(self):
+        session = state.new_session()
+        session["busy"] = True
+        display = build(session)
+        stop, hint = hit(display, "input.stop"), next(p for p in display["prims"] if p["id"] == "input.hint")
+        self.assertEqual(stop["action"], ("stop_turn", None))
+        stop_left = hint["x"] + measure("ui", hint["size"], "⏎  note   ")
+        self.assertLessEqual(stop["x"], stop_left)
+        self.assertGreaterEqual(stop["x"] + stop["w"], hint["x"] + measure("ui", hint["size"], hint["text"]))
+        self.assertGreater(stop["x"], hint["x"] + measure("ui", hint["size"], "⏎  note"), "a click on note is not Stop")
+        self.assertNotIn("input.stop", ids(display, "prims"), "the same faint hint until the mouse is on it")
+        self.assertIn("input.stop", ids(build(session, hover="input.stop"), "prims"))
+        idle = build()
+        self.assertNotIn("input.stop", ids(idle, "hits"))
+        self.assertEqual(next(p for p in idle["prims"] if p["id"] == "input.hint")["text"], "⏎  send")
+
+    def test_on_a_narrow_panel_the_stop_area_leaves_the_model_button_alone(self):
+        """Review of gate018-ui: at about 280 px with a long model label, the Stop area (added after the model
+        button, so it won where they overlapped) covered the model button."""
+        session = state.new_session()
+        session["busy"] = True
+        for width in (420, 320, 280, 240, 200):
+            with self.subTest(width=width):
+                display = layout.build(session, width, 600, 1.0, measure, "fast", None,
+                                       {"selection": [], "context_budget": 24_000, "account": None,
+                                        "model_label": "ChatGPT plan · GPT-6.1 Sol"})
+                model = hit(display, "input.model")
+                self.assertEqual(layout.hit_test(display, model["x"] + model["w"] - 2, model["y"] + 2),
+                                 ("model_menu", None))
+                stop = next((h for h in display["hits"] if h["id"] == "input.stop"), None)
+                if stop is not None:
+                    self.assertGreater(stop["x"], model["x"] + model["w"])
 
 
 class PickerTest(unittest.TestCase):

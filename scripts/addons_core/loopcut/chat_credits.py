@@ -16,6 +16,9 @@ out-of-credits pop-up and the setup's "Everything Loopcut does" step. No bpy at 
 named when it comes first; upgrade.builds puts offers in builds, and plan credits carry their dollars; a low-credit
 heads-up (agent._warn_low_credits) comes once a refill period. Every one of these needs a field only the experiment
 sends, so other accounts see 0.2.14 (test_chat_credits.FlagOff0214Test).
+
+0.2.19 (owner-approved 2026-10-26): a paid tool the server refuses for credits opens the same pop-up, headed by the
+tool (tool_item), once a turn (agent._Consent._paywall); only for a manifest that says account.billing "credits".
 """
 
 import math
@@ -521,3 +524,91 @@ def low_text(balance, account: dict, now: float | None = None) -> str:
 def used_title(item: dict) -> str:
     """The slim card's title after a variant B pop-up closes (round2 D)."""
     return "Free chat used" if (item.get("plan") or "free") == "free" else "Chat allowance used"
+
+
+# --- A paid tool refused for credits (0.2.19) ----------------------------------------------------------------
+# A free user spent his 100 credits on image edits, saw only the small card of the refused sixth, and left. The
+# owner wants the offer at exactly that moment, with no warning before it. The tool's 402 says only balance and
+# needed, so the chat 402's other fields come from the manifest's account: the plan, the monthly reset and the
+# weekly top-up. The offer is the chat pop-up's: the plan whose month covers the call, on the link the chat's 402
+# names (pricing?from=app&reason=insufficient_credits&plan=pro); on Pro and Max, Add credits, as render_offer's
+# short card does.
+
+def tool_item(title: str, needed, have, account: dict, reason: str = CODE) -> dict | None:
+    """The out-of-credits pop-up's limit item for a paid tool the server refused (cloud_account.error_details), or
+    one the manifest locks for credits (nudges.offer_locked). needed: the call's price (the quote's or the job's);
+    have: the balance the refusal saw, else the manifest's; reason: the links' attribution (the chat 402's, or the
+    locked card's). None without a price to name."""
+    if not (_amount(needed) and needed > 0):
+        return None
+    from . import config, render_offer
+    account = account if isinstance(account, dict) else {}
+    have = have if _amount(have) else balance(account)
+    step = per_step(account)
+    # The locked tiles hold only when chat stops too: below a step's cost (0.4 credits still chat on Fast).
+    paused = _amount(have) and (have < step if step else have == 0)
+    need, have = math.ceil(needed), (math.floor(have) if _amount(have) else None)  # Never "needs 80, you have 80".
+    plan = plan_of(account)
+    name = render_offer._next_plan(plan, have, need)
+    if name is None:  # Pro and Max top up.
+        upgrade = {"url": config.credits_url(reason), "label": "Add credits"}
+    elif name:
+        upgrade = {"url": config.pricing_url(reason, name), "plan": name, "label": f"Get {name.capitalize()}"}
+    else:  # No plan's month covers it: no Upgrade that would still fall short.
+        upgrade = None
+    credits = account.get("credits") if isinstance(account.get("credits"), dict) else {}
+    reset = credits.get("resets_at") if isinstance(credits.get("resets_at"), str) else ""
+    item = state.item_limit("", CODE, plan, reset, upgrade)
+    item.update(tool=str(title), needed=need, balance=have, paused=bool(paused))
+    item["text"] = tool_title(item) + "."
+    refill = account_refill(account)
+    if refill:
+        item["refill"] = refill
+    return item
+
+
+def show_tool_item(session: dict, turn, item: dict, tool: str) -> bool:
+    """A paid tool's refusal (tool_item) in its chat: appended, and made the account's notice, so its pop-up opens
+    at once. Once a turn, and never for a tool this turn already offered (nudges' locked card); tool: its name.
+    Shut (its slim card only) while a card waits for the user's answer, as the question comes first. False when
+    not shown."""
+    if turn is not None:
+        offered = getattr(turn, "credit_offers", None)
+        if getattr(turn, "tool_paywall", False) or (isinstance(offered, set) and tool in offered):
+            return False
+        turn.tool_paywall = True
+        if isinstance(offered, set):
+            offered.add(tool)
+    if any(i.get("status") == "awaiting" for i in session["items"]):
+        item["popup_closed"] = True
+    session["items"].append(item)
+    previous = state.ui.get("allowance_notice") or {}
+    state.ui["allowance_notice"] = {"item": item, "conversation": session.get("id"),
+                                    "windows": dict(previous.get("windows") or {})}
+    return True
+
+
+def is_tool(item) -> bool:
+    """A paid tool's refusal (tool_item), not the chat's own."""
+    return isinstance(item, dict) and item.get("reason") == CODE and isinstance(item.get("tool"), str)
+
+
+def tool_title(item: dict) -> str:
+    """The pop-up's headline: "Not enough credits: Image to 3D needs 80, you have 15"; "" for the chat's own."""
+    if not is_tool(item):
+        return ""
+    have = item.get("balance")
+    return f"Not enough credits: {item['tool']} needs {_n(item.get('needed'))}" + (
+        f", you have {_n(have)}" if _amount(have) else "")
+
+
+def top_up(item) -> bool:
+    """A paid plan's tool refusal: its way on is Add credits, not a plan to subscribe to or wait for."""
+    upgrade = item.get("upgrade") if is_tool(item) else None
+    return isinstance(upgrade, dict) and not upgrade.get("plan")
+
+
+def pauses(item) -> bool:
+    """The pop-up's "These pause until then" tiles hold: for the chat's refusal, and a tool's below a chat step's
+    cost (tool_item's paused). With credits left for chat, a tool's pop-up shows no locked tiles."""
+    return not is_tool(item) or item.get("paused") is True

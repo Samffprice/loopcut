@@ -37,7 +37,7 @@ _ROLES = {"user", "assistant", "tool"}
 # missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
 _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
-              "mode", "codex_thread", "spend", "asset_picks")
+              "mode", "codex_thread", "spend", "asset_picks", "between_turns", "cloud_jobs")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 # This Blender's mark ("turn_running") on a chat saved while its turn runs (save), left out by that turn's last save.
 # Another Blender's mark on load: the turn never reached its end (Blender quit, crashed or was killed mid-turn).
@@ -74,10 +74,11 @@ def _write_atomic(path: Path, text: str) -> None:
 
 def save(session: dict, *, running: bool = False) -> None:
     """Safe from any thread. A conversation nobody has written in is not worth a folder. Offer cards
-    (state.item_offer) are left out: they belong to the moment, and older add-ons refuse unknown items.
+    (state.item_offer) and cloud jobs' "finished while you were away" cards (state.item_cloud_back, built again from
+    cloud_jobs when the chat opens) are left out: they belong to the moment, and older add-ons refuse unknown items.
     running: its turn is about to start (agent._launch); a busy session's saves are marked running too, until the
     turn's last save, made once busy is cleared."""
-    items = [i for i in session["items"] if i.get("kind") != "offer"]
+    items = [i for i in session["items"] if i.get("kind") not in ("offer", "cloud_back")]
     if not items:
         return
     with _lock:
@@ -87,11 +88,12 @@ def save(session: dict, *, running: bool = False) -> None:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
         body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED
-                if key not in ("spend", "asset_picks")}
-        from . import asset_picks, spending
+                if key not in ("spend", "asset_picks", "cloud_jobs")}
+        from . import asset_picks, cloud_restore, spending
         with spending.lock:
             body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
         body["asset_picks"] = asset_picks.snapshot(session)  # Search results' numbers still import after a reload.
+        body["cloud_jobs"] = cloud_restore.snapshot(session)  # Its long cloud jobs, picked up when it opens again.
         body["items"] = items
         if running or session.get("busy"):  # Read under the lock: the turn's last save is written after any of these.
             body["turn_running"] = _LAUNCH
@@ -100,6 +102,22 @@ def save(session: dict, *, running: bool = False) -> None:
                 "turns": sum(1 for i in session["items"] if i["kind"] == "user")}
         _write_atomic(folder / "conversation.json", json.dumps(body))
         _write_atomic(folder / "meta.json", json.dumps(meta))
+
+
+def patch(conversation_id: str, change) -> bool:
+    """Change a conversation that is not on screen in its file: change(body) edits the saved body in place (False
+    leaves the file as it was). Its other fields stay as written, so newer turns are never overwritten by an older
+    copy of the chat (History reopens a chat as a new copy). Safe from any thread."""
+    with _lock:
+        path = _folder(conversation_id) / "conversation.json"
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(body, dict) or body.get("id") != conversation_id or change(body) is False:
+            return False
+        _write_atomic(path, json.dumps(body))
+        return True
 
 
 def _own_image_path(value) -> bool:
@@ -135,6 +153,29 @@ def _validate_preview(item: dict) -> None:
     """A preview is optional: an unsafe or unreadable path must never hide the saved conversation."""
     if not _own_image_path(item.get("image_path", "")):
         print(f"Loopcut: dropping invalid preview path: {item.pop('image_path')!r}")
+
+
+def _validate_pictures(item: dict) -> None:
+    """A made picture's Turn it into 3D button (cloud.to_3d_offer) and a click's card key (agent.turn_into_3d): the
+    panel draws and the click reads them, so a malformed one refuses the file; a picture path that is not the chat's
+    own is dropped, as a preview's is."""
+    offer, click = item.get("to_3d"), item.get("click")
+    if click is not None and not (isinstance(click, list) and len(click) == 2
+                                  and all(isinstance(value, str) and value for value in click)):
+        raise ConversationError("malformed click")
+    if offer is None:
+        return
+    credits = offer.get("credits") if isinstance(offer, dict) else None
+    if (not isinstance(offer, dict) or not isinstance(offer.get("pictures"), list)
+            or (credits is not None and (type(credits) not in (int, float) or not 0 <= credits < float("inf")))
+            or any(not isinstance(p, dict) or not isinstance(p.get("image"), str) or not p["image"]
+                   or p.get("state") not in ("ready", "running", "done")
+                   or any(not isinstance(p.get(key, ""), str) for key in ("job", "unapplied"))
+                   for p in offer["pictures"])):
+        raise ConversationError("malformed picture button")
+    for picture in offer["pictures"]:
+        if not _own_image_path(picture.get("path", "")):
+            print(f"Loopcut: dropping invalid picture path: {picture.pop('path')!r}")
 
 
 def _audio_card(item: dict) -> bool:
@@ -180,6 +221,7 @@ def _validate(body) -> dict:
                 or any(not isinstance(ref.get(key), str) for key in ("name", "target")) for ref in refs):
             raise ConversationError("malformed file references")
         _validate_preview(item)
+        _validate_pictures(item)
         if "audio" in item and not _audio_card(item):
             raise ConversationError("malformed audio item")
         lines = item.get("lines", []) if item["kind"] in ("changes", "merge") else item.get("images", [])
@@ -193,6 +235,9 @@ def _validate(body) -> dict:
                 raise ConversationError("malformed wave item")
             for row in rows:
                 _validate_preview(row)
+    between = body.get("between_turns", [])
+    if not isinstance(between, list) or any(not isinstance(line, str) for line in between):
+        raise ConversationError("malformed between_turns")
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in _ROLES:
             raise ConversationError(f"unknown message: {str(message)[:80]}")
@@ -208,6 +253,9 @@ def _validate(body) -> dict:
         body.pop("spend")  # A damaged ledger starts over rather than losing the conversation.
     if "asset_picks" in body and not asset_picks.valid(body["asset_picks"]):
         body.pop("asset_picks")  # Likewise damaged pick numbers: search again (load starts them anew).
+    if "cloud_jobs" in body:
+        from . import cloud_restore
+        body["cloud_jobs"] = cloud_restore.restored(body["cloud_jobs"])  # Damaged records go, never the chat.
     return body
 
 
@@ -235,8 +283,15 @@ def load(conversation_id: str) -> dict:
     for item in session["items"]:
         if item.get("streaming"):
             item["streaming"], cut = False, True
-        if item.get("status") in ("awaiting", "running"):
+        if item.get("status") in ("awaiting", "running") and tuple(item.get("click") or ()) not in state.running_clicks:
             item["status"], cut = "rejected", True
+            item.pop("click", None)  # Its click ended with Blender: a new click's card is the one with its key.
+        for picture in (item.get("to_3d") or {}).get("pictures") or ():
+            if picture["state"] == "running" and (session["id"], picture.get("job") or picture["image"]) not in \
+                    state.running_clicks:
+                # Its click ended with Blender (a quit or crash mid-conversion): the button is there again, and
+                # a click sends the same job again by its retry key (cloud_account's pending), not a second charge.
+                picture["state"] = "ready"
         for row in item.get("rows", []) if item["kind"] == "wave" else ():
             if row["status"] in state.WAVE_RUNNING:
                 row["status"], cut = "stopped", True

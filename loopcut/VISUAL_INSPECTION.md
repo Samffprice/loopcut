@@ -27,9 +27,16 @@ There are no new dependencies, network calls or model calls in the inspection pi
 
 Freshness is checked before an image reaches the agent: a dependency-graph/frame/file/undo generation
 and explicit scene/output/color settings are compared with the captured token. An edit or restart
-invalidates the result; the tool returns an explicit stale result with no image. A second check at
-the end of a model's tool batch prevents a later edit in that batch from attaching an earlier
-inspection as current evidence. Archived inspection sheets remain available in Jobs, labeled with
+invalidates the result. An animation playing on its timer (each frame played is a change; a scrub is
+not playing) is paused at its frame before the copy is saved, and plays again in the window, scene or
+sequencer it played in after the step's looks are checked or the turn ends, unless the user played,
+stopped, scrubbed or changed the scene meanwhile; the result says so. Pausing and playing again add
+no undo step (no "Frame Change" entry). A stale result is tried once
+more from a new copy. Still stale, the tool returns a plain stale result with no image (the job id is
+for the model only). A second check at the end of a model's tool batch
+prevents a later edit in that batch from attaching an earlier inspection as current evidence.
+More than 5 frames asked (or more than 12 views with several cameras: 4 frames with 3 cameras, 3 with 4)
+are that many spread from the first to the last, and the result names those left out. Archived inspection sheets remain available in Jobs, labeled with
 their saved revision. Native render failures and unsupported engines return errors, not fallback
 images silently presented as equivalent renders.
 
@@ -68,6 +75,7 @@ Run from the repository root:
 python3 -m unittest discover -s loopcut/tests
 Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/inspection_check.py
 Blender -b --factory-startup --python-exit-code 1 --python loopcut/harness/inspection_perfume_check.py -- <saved-perfume.blend> <output>
+Blender --factory-startup --enable-event-simulate --python loopcut/harness/inspection_playback_check.py  # GUI: a scrub, then a keyed cube playing
 ```
 
 Inspection shares durable jobs' boundaries: Cycles uses CPU, external assets must resolve and stay

@@ -126,6 +126,7 @@ class BundledTest(unittest.TestCase):
                 self.assertTrue(text.startswith('Turned on the bundled LoopTools add-on for this session.'))
                 self.assertIn('bl_ext.system.looptools', text)
                 self.assertIn('mesh.looptools_*', text)
+                self.assertIn('In Python it is bl_ext.system.looptools: import looptools fails.', text)
                 self.assertIn('A background Blender (run_blender, blender -b) enables it separately', text)
                 self.assertIn('addon_utils.enable("bl_ext.system.looptools", default_set=True)', text)
                 self.assertIn('not saved on background exit', text)

@@ -1152,15 +1152,12 @@ def wave_3(tmp: Path, live_path: Path) -> None:
     missing = bpy.data.images.new("Lost_Texture", 4, 4)
     missing.source = "FILE"
     missing.filepath = str(tmp / "gone" / "lost.png")
-    from loopcut import job_tools, jobs as job_module
-    try:
-        job_tools.external_assets()
-        refused = ""
-    except job_module.JobError as ex:
-        refused = str(ex)
+    from loopcut import job_tools
+    _, listed = job_tools.external_assets()
     bpy.data.images.remove(missing)
-    check("the missing-file refusal names the datablock and the full path",
-          'image "Lost_Texture"' in refused and str(tmp / "gone" / "lost.png") in refused, refused)
+    check("a missing texture is listed, with the full path and the datablock, for a render to go on without",
+          {"path": str(tmp / "gone" / "lost.png"), "used_by": 'image "Lost_Texture"', "without": "shows magenta"}
+          in listed, listed)
 
 
 def wave_split(tmp: Path, live_path: Path) -> None:

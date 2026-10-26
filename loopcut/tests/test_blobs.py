@@ -62,7 +62,7 @@ class BlobsTest(unittest.TestCase):
         for call in self.service.calls:
             version = ".".join(map(str, bl_info["version"]))
             self.assertTrue(call["headers"]["x-loopcut-client"].startswith(f"loopcut-addon/{version} blender/5.2.0 os/"))
-            self.assertEqual(call["headers"]["x-loopcut-contract"], "0.9")
+            self.assertEqual(call["headers"]["x-loopcut-contract"], "0.10")
             self.assertEqual("authorization" in call["headers"], call["method"] != "PUT")
         self.assertEqual(self.service.calls[-1]["url"], "https://service.test/v1/blobs/check")
 
@@ -623,7 +623,7 @@ class CloudHttpTest(unittest.TestCase):
     def test_signed_out_get_preserves_etag_and_304(self):
         def send(request, *, timeout):
             headers = {k.lower(): v for k, v in request.header_items()}
-            self.assertEqual(headers["x-loopcut-contract"], "0.9")
+            self.assertEqual(headers["x-loopcut-contract"], "0.10")
             self.assertNotIn("authorization", headers)
             self.assertEqual(headers["if-none-match"], "cached")
             return Reply(status=304, headers={"ETag": "cached"})

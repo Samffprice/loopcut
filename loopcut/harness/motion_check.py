@@ -485,9 +485,9 @@ def walk_checks(args):
             check(span < 0.2, f"walk in place: the pelvis stays within {span:.2f} m")
         else:
             check(span > 0.6, f"walk in world: the pelvis travels {span:.2f} m")
-            check((scene.frame_start, scene.frame_end) == (1, 48) and "resampled from 30" in line,
+            check((scene.frame_start, scene.frame_end) == (1, 48) and "over frames 1–48" in line and "at 24 fps" in line,
                   f"walk at 24 fps: 60 frames at 30 fps become frames 1-48 ({scene.frame_start}-{scene.frame_end})")
-            check("fingers set to a relaxed pose; the model doesn't animate fingers" in line,
+            check("Its fingers hold a relaxed pose; this motion does not move them" in line,
                   "walk: the result says the fingers were set to a relaxed pose")
             fingers = [c for c in _curves(ob.animation_data.action) if "HandIndex" in c.data_path]
             check(fingers and all([p.co[0] for p in c.keyframe_points] == [1.0, 48.0]
@@ -579,7 +579,7 @@ def relaxed_checks(args):
             thumb = "thumb" not in rest["l"] or all(
                 sum(d.dot(rest[s]["normal"]) for d in seen[s, frames[0]]["thumb"])
                 > sum(d.dot(rest[s]["normal"]) for d in rest[s]["thumb"]) for s in "lr")
-            check("fingers set to a relaxed pose; the model doesn't animate fingers" in line
+            check("Its fingers hold a relaxed pose; this motion does not move them" in line
                   and lowest > -1.0 and 20.0 <= min(totals.values()) and max(totals.values()) <= 110.0 and gained > 10.0
                   and totals["l", fingers[-1]] >= totals["l", fingers[0]] and drift < 0.5 and mirror < 2.0 and thumb,
                   f"relaxed {kind}: deforming fingers curl toward the palm "

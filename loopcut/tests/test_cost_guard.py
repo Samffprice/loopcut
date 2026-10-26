@@ -321,6 +321,20 @@ class WatchingOpsTest(unittest.TestCase):
         self.assertEqual([n["text"] for n in notes], [G.in_process_refusal("render.render"),
                                                       G.in_process_refusal("render.play_rendered_anim")])
         self.assertTrue(text.startswith("Render refused by the cost guard: render.render"), text)
+        # The workspace agent (the ChatGPT plan's route, or Codex's) is told its own way, not tools it does not have.
+        from loopcut import agent, state
+        for spec in (agent.WORKSPACE_SPEC, agent.CODEX_SPEC):
+            with patch.dict(state.session(), {"mode": "workspace", "turn": types.SimpleNamespace(spec=spec)}):
+                workspace = G.in_process_refusal("render.render")
+            self.assertIn("snapshot_scene, then run_blender", workspace)
+            for tool in ("see_render", "render_job"):
+                self.assertNotIn(tool, workspace)
+        # A chat that began on the ChatGPT plan keeps mode "workspace" after a switch to a loop that has the tools.
+        for turn in (types.SimpleNamespace(spec=agent.SINGLE_SPEC), types.SimpleNamespace(spec=agent.ORCH_SPEC), None):
+            with patch.dict(state.session(), {"mode": "workspace", "turn": turn}):
+                other = G.in_process_refusal("render.render")
+            self.assertIn("see_render with render=true", other)
+            self.assertNotIn("run_blender", other)
 
 
 class RefusalsAndTheStepBudgetTest(unittest.TestCase):

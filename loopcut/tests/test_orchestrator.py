@@ -220,6 +220,13 @@ class QuoteTest(unittest.TestCase):
         self.assertFalse(orchestrator.quote_found("arm", USER), "part of a word is not a word")
         self.assertFalse(orchestrator.quote_found("", USER))
 
+    def test_a_japanese_quote_of_the_users_exact_words_is_taken(self):
+        """rel018-ja2's dry run refused "天井ファンも、回るやつで", and the spinning fan dropped to a default."""
+        words = "本物っぽい家具がいい：ひとり掛けソファ、サイドテーブル、フロアランプ、本棚、ラグ。あと天井ファンも、回るやつで。"
+        self.assertEqual(orchestrator._quote_error("天井ファンも、回るやつで", words), "")
+        self.assertIn("needs a quote", orchestrator._quote_error("回る", words), "still 3 characters at least")
+        self.assertIn("is not in the user's messages", orchestrator._quote_error("止まるやつで", words))
+
     def test_the_users_words_are_their_messages_without_the_scene_context(self):
         session = state.new_session()
         session["items"] += [state.item_user("a red lamp"), state.item_assistant()]
@@ -2409,6 +2416,14 @@ class OwnChecksTest(unittest.TestCase):
         self.assertIn("is not in the user's messages", result.text)
         self.assertEqual(self.ran, [])
         self.assertIsNone(self.turn.job.own.get("o1"))
+
+    def test_a_retire_reason_quotes_the_user_in_their_languages_quote_marks(self):
+        words = "カメラはそのまま\nやっぱりランプを窓辺に"
+        self.assertEqual(orchestrator._reason_error("ユーザーが「ランプを窓辺に」と言った", words), "")
+        self.assertEqual(orchestrator._reason_error("ユーザーが『ランプを窓辺に』と言った", words), "")
+        self.assertEqual(orchestrator._reason_error("they said «ランプを窓辺に» later", words), "")
+        self.assertIn("is not in the user's messages", orchestrator._reason_error("ユーザーが「赤いランプ」と言った", words))
+        self.assertIn("quote the user", orchestrator._reason_error("ユーザーの気が変わった", words))
 
     def test_a_retired_check_leaves_the_gate_and_the_verified_block_says_why(self):
         for retire, problem in (([{"id": "crystal c9", "reason": "x"}], "not a check that runs; they are: crystal c2"),

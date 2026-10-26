@@ -27,6 +27,9 @@ STATUS_GLYPH = {
 }
 
 CODE_TOOLS = {"run_python", "run_blender"}
+# A waiting card's buttons. _chat gives their hits the card's identity, which agent.decide checks (ui.host). The
+# render choice's options and a short card's Upgrade too (render_offer.click, render_offer.upgrade).
+ANSWERS = frozenset({"approve", "approve_always", "reject", "render_choice", "paid_upgrade"})
 # Internal tools whose failure is schema talk for the model (orchestrator.checks refusing a malformed add): the card
 # says so plainly, the output stays behind its toggle. A free-plan beginner read one as "i think something broke?".
 INTERNAL_FAILURES = {"checks": "Loopcut's internal check didn't take; the agent adjusted and went on."}
@@ -72,6 +75,7 @@ class Frame:
         self.prims: list[dict] = []
         self.hits: list[dict] = []
         self.input: dict | None = None
+        self.cards: list[dict] = []  # The waiting cards _chat drew, nearest the input first (ui.host._shown_card).
 
     def px(self, value: float) -> int:
         return round(value * self.scale)
@@ -288,6 +292,14 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.verification", x, cursor, width, verification,
                               f.px(T.FONT_SIZE_SMALL), T.TEXT_MUTED)
+        from .. import rig_gate
+        found = rig_gate.footer_action(item, f.ui.get("watch_rigs") or ())
+        if found:  # R7-D2: "Watch it" runs character_rig show, free; only an allowlisted op on a Loopcut rig.
+            cursor += f.px(6)
+            f.button(f"item{n}.verification.action", x, cursor, found[0], T.BUTTON_GHOST, T.TEXT,
+                     ("verification_action", n))
+            f.hits[-1]["tip"] = "Free: hides the bones and follows the character with a side camera."
+            cursor += f.px(24)
     if not item.get("streaming"):
         cursor += _reference_rows(f, n, item.get("file_references", []), x, cursor, width)
         line = chat_credits.turn_line(item)
@@ -371,9 +383,26 @@ def failure_reason(output: str, exit_code=None) -> str:
     return f"Failed with no error output{suffix}."
 
 
+RUNNING_SHOWN = 10  # Seconds a step runs before its card shows the time it has taken.
+
+
+def _running_time(item: dict, now) -> str:
+    """A running step's time so far, once it has run RUNNING_SHOWN seconds: "45s", "4m 05s", "2h 05m". A long
+    shell command or render otherwise showed only a dot while it ran, up to an hour."""
+    started = item.get("started_at")
+    if item["status"] != "running" or started is None or now is None or now - started < RUNNING_SHOWN:
+        return ""
+    minutes, seconds = divmod(int(now - started), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+
+
 def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     status = item["status"]
+    if status == "awaiting" and item.get("render_choice"):
+        from . import render_choice  # A long render's ask: the cloud or this computer (render_offer.py).
+        return render_choice.card(f, n, item, x, y, width)
     rig = item["name"] in ("loopcut_cloud__auto_rig", "loopcut_cloud.auto_rig")
     glyph, glyph_color = STATUS_GLYPH[status]
     plan_repair = item.get("plan_repair")
@@ -400,6 +429,8 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     f.text(f"item{n}.tool.glyph", inner_x, cursor, glyph, size, glyph_color)
     label_x = inner_x + f.px(18)
     summary = "Rig your character" if rig else item["summary"] or item["name"]
+    if awaiting and item.get("ask_title"):  # What the ask is about, in place of the tool (spending.ask_title).
+        summary = item["ask_title"]
     if plan_repair:
         summary = {"resolved": "Helper started", "retried": "Adjusted the helper plan and retried",
                    "adjusting": "Adjusting the helper plan…", "capped": "Helper limit for this turn"}.get(
@@ -414,13 +445,18 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     else:
         name_width = round(f.measure("ui", small, item["name"])) if show_name else 0
         detail_width = name_width + pad + f.px(10) if show_name else 0
-        label = wrap(summary, "ui", size, inner_w - f.px(18) - detail_width, f.measure)[0][1].rstrip()
+        running = _running_time(item, f.ui.get("now"))
+        running_width = round(f.measure("ui", small, running)) + f.px(10) if running else 0
+        label = wrap(summary, "ui", size, inner_w - f.px(18) - detail_width - running_width, f.measure)[0][1].rstrip()
         if len(label) < len(summary.strip()):
             label += "…"
         f.text(f"item{n}.tool.summary", label_x, cursor, label, size, T.TEXT_MUTED)
         if show_name:
             f.text(f"item{n}.tool.name", x + width - pad - name_width, cursor + (row - f.line_height(small)) // 2,
                    item["name"], small, T.TEXT_FAINT)
+        if running:
+            f.text(f"item{n}.tool.running", x + width - pad - detail_width - running_width + f.px(10),
+                   cursor + (row - f.line_height(small)) // 2, running, small, T.TEXT_MUTED)
         cursor += row
 
     if code_failure:
@@ -466,11 +502,18 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     if internal and not expanded:
         cursor += f.paragraph(f"item{n}.tool.reason", inner_x, cursor, inner_w, internal, small, T.TEXT_MUTED)
     elif status == "failed" and not expanded and not plan_repair and not code_failure and not rig:
-        reason = failure_reason(item.get("output") or "", item.get("exit_code"))
+        # A cloud refusal's readable line (cloud_account.error_details), where the model's text is for the model.
+        reason = ((item.get("cloud_error") or {}).get("message")
+                  or failure_reason(item.get("output") or "", item.get("exit_code")))
         f.text(f"item{n}.tool.reason", inner_x, cursor, _ellipsize(f, reason, small, inner_w),
                small, T.TEXT_MUTED)
         cursor += f.line_height(small)
-    if item.get("outcome") and not rig:  # A cloud report's line (cloud_jobs.report_line); its JSON is the output's.
+    local = 0
+    if item.get("local_job"):  # "Render on my laptop": its local job's frames, in place of the outcome line.
+        from . import render_choice
+        local = render_choice.local_progress(f, n, item, inner_x, cursor, inner_w)
+        cursor += local
+    if item.get("outcome") and not rig and not local:  # A cloud report's line (cloud_jobs.report_line); its JSON is the output's.
         cursor += f.paragraph(f"item{n}.tool.outcome", inner_x, cursor, inner_w, item["outcome"], small, T.TEXT_MUTED)
 
     # Provider credit must remain visible beside the search summary when its card is collapsed.
@@ -480,10 +523,18 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
                               "Powered by Poly Haven", small, T.TEXT_MUTED)
     if item.get("cost") and not rig:
         cursor += f.paragraph(f"item{n}.tool.cost", inner_x, cursor, inner_w, item["cost"], small, T.TEXT)
+    upgrade = None
     if awaiting and item.get("ask") and not rig:  # A paid step's ask (spending.py): what was hit, the balance before → after.
         for k, line in enumerate(item.get("ask_lines") or ()):
             cursor += f.paragraph(f"item{n}.tool.ask{k}", inner_x, cursor, inner_w, line, small,
                                   T.TEXT_MUTED if k == 0 and item.get("worker") else T.TEXT)
+        from .. import render_offer  # Short of its price (0.2.19): what the next plan gives, and its Upgrade.
+        upgrade = render_offer.price_shortfall(item, f.ui.get("credit_balance"))
+        if upgrade and upgrade["note"]:
+            cursor += f.paragraph(f"item{n}.tool.plan_note", inner_x, cursor, inner_w, upgrade["note"], small,
+                                  T.TEXT_MUTED)
+        if upgrade and not upgrade["label"]:
+            upgrade = None  # No plan's month covers it: the note says so, with no Upgrade.
     delegate = item["name"] == "delegate"
     if expanded and delegate and (item["code"] or item["output"]):
         cursor += f.px(6)
@@ -544,6 +595,8 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         if error.get("stop") and f.session.get("busy"):
             buttons.append((f"item{n}.tool.stop", "Stop", T.BUTTON_GHOST, T.TEXT, ("stop_turn", n)))
         cursor += f.px(4) + _button_row(f, inner_x, cursor + f.px(4), inner_w, buttons) + f.px(4)
+    if not awaiting and (item.get("to_3d") or {}).get("pictures"):
+        cursor += f.px(6) + _to_3d_buttons(f, n, item, inner_x, cursor + f.px(6), inner_w)
     if awaiting and item.get("install"):
         cursor += f.px(6)
         cursor += f.paragraph(f"item{n}.tool.install", inner_x, cursor, inner_w, INSTALL_NOTE, small, T.TEXT)
@@ -553,7 +606,12 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(8)
         buttons = [(f"item{n}.tool.run", f"{item.get('ask_label') or 'Approve'}  ⏎", T.BUTTON, T.BUTTON_TEXT,
                     ("approve", n)),
-                   (f"item{n}.tool.reject", f"{spending.SKIP}  esc", T.BUTTON_GHOST, T.TEXT, ("reject", n))]
+                   (f"item{n}.tool.reject", f"{item.get('ask_skip') or spending.SKIP}  esc", T.BUTTON_GHOST, T.TEXT,
+                    ("reject", n))]
+        if upgrade:  # The way to the credits leads; Approve stays, as the server has the last word on the balance.
+            buttons[0] = buttons[0][:2] + (T.BUTTON_GHOST, T.TEXT, ("approve", n))
+            buttons.insert(0, (f"item{n}.tool.plan_upgrade", upgrade["label"], T.BUTTON, T.BUTTON_TEXT,
+                               ("paid_upgrade", n)))
         if item.get("ask_link"):
             buttons.append((f"item{n}.tool.link", "Change daily limit ↗", T.BUTTON_GHOST, T.TEXT,
                             ("open_web", item["ask_link"])))
@@ -709,12 +767,15 @@ HOSTED_LIMITS = state.HOSTED_LIMITS
 
 def _button_row(f: Frame, x, y, width, buttons) -> int:
     """Buttons left to right, wrapping onto another row when the panel is too narrow; one too wide for
-    the panel on its own is shortened. buttons: (id, label, fill, color, action). Returns the height."""
+    the panel on its own is shortened, its words before a " · <price>" ending and never the price.
+    buttons: (id, label, fill, color, action). Returns the height."""
     size, gap, row_h = f.px(T.FONT_SIZE_SMALL), f.px(8), f.px(30)
     bx, by = x, y
     for id, label, fill, color, action in buttons:
         if round(f.measure("ui", size, label)) + f.px(20) > width:
-            label = _ellipsize(f, label, size, width - f.px(20))
+            words, dot, price = label.rpartition(" · ")
+            label = (_ellipsize(f, words, size, width - f.px(20) - f.measure("ui", size, dot + price)) + dot + price
+                     if dot else _ellipsize(f, label, size, width - f.px(20)))
         used = round(f.measure("ui", size, label)) + f.px(20)
         if bx > x and bx + used > x + width:
             bx, by = x, by + row_h
@@ -753,6 +814,108 @@ def _item_offer(f: Frame, n: int, item: dict, x, y, width) -> int:
     height = cursor + pad - y
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.offer.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1, "border_color": T.CARD_BORDER})
+    return height
+
+
+def _to_3d_buttons(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """A made picture, small, and its Turn it into 3D button (agent.turn_into_3d), priced from the catalog: the
+    click approves that price, and passes it. Turning into 3D… while its call runs, Turned into 3D ✓ once done, and
+    nothing while a turn runs. After Make it again, each picture shows which one its button converts. Returns the
+    height."""
+    offer, cursor = item["to_3d"], y
+    pictures, credits = offer["pictures"], offer.get("credits")
+    for k, picture in enumerate(pictures):
+        what = "it" if len(pictures) == 1 else f"picture {k + 1}"
+        id, path = f"item{n}.tool.to3d{k}", picture.get("path")
+        if path and path not in f.ui.get("missing_paths", ()):
+            side = min(width, f.px(120))
+            f.prims.append({"t": "image", "id": f"{id}.picture", "path": path, "x": x, "y": cursor, "w": side,
+                            "h": side})
+            cursor += side + f.px(6)
+        state = picture.get("state")
+        if state == "done":
+            button = (id, f"Turned {'' if what == 'it' else what + ' '}into 3D ✓", T.BUTTON_GHOST, T.OK, None)
+        elif state == "running":
+            button = (id, f"Turning {'' if what == 'it' else what + ' '}into 3D…", T.BUTTON_GHOST, T.TEXT_MUTED, None)
+        elif state != "ready" or f.session.get("busy"):
+            button = (id, f"Turn {what} into 3D", T.BUTTON_GHOST, T.TEXT_FAINT, None)
+        else:
+            price = f" · about {credits:,g} credits" if credits else ""
+            button = (id, f"Turn {what} into 3D{price}", T.BUTTON, T.BUTTON_TEXT, ("to_3d", (n, k, credits)))
+        cursor += _button_row(f, x, cursor, width, [button])
+    return cursor - y
+
+
+_BACK_MARKS = {"succeeded": (T.OK, "✓"), "canceled": (T.WARN, "–"), "failed": (T.ERROR, "!")}
+
+
+def _thumbnails(f: Frame, id: str, x, y, width, paths: list, labels: list, columns: int) -> int:
+    """Frame thumbnails in a row of 16:9 tiles (the credits pop-up's tile style), each named on a dark strip."""
+    gap, label_size = f.px(5), f.px(10)
+    tile_w = (width - gap * (columns - 1)) // columns
+    tile_h = round(tile_w * 9 / 16)
+    for k, path in enumerate(paths):
+        tx, ty = x + (k % columns) * (tile_w + gap), y + (k // columns) * (tile_h + gap)
+        f.rect(f"{id}{k}.bg", tx, ty, tile_w, tile_h, TILE_BG, f.px(4))
+        f.prims.append({"t": "image", "id": f"{id}{k}", "path": path, "x": tx, "y": ty, "w": tile_w, "h": tile_h})
+        label = labels[k] if k < len(labels) else ""
+        if label:
+            strip = f.line_height(label_size) + f.px(4)
+            f.rect(f"{id}{k}.strip", tx, ty + tile_h - strip, tile_w, strip, (0.0, 0.0, 0.0, 0.55))
+            f.text(f"{id}{k}.label", tx + f.px(5), ty + tile_h - strip + f.px(2),
+                   _ellipsize(f, label, label_size, tile_w - f.px(10)), label_size, T.TEXT)
+        f.rect(f"{id}{k}.border", tx, ty, tile_w, tile_h, T.NONE, f.px(4), 1, T.CARD_BORDER)
+    rows = -(-len(paths) // columns)
+    return rows * tile_h + (rows - 1) * gap
+
+
+def _item_cloud_back(f: Frame, n: int, item: dict, x, y, width) -> int:
+    """A cloud job that finished while its chat was closed (cloud_restore.card): a ring, what it was, its frames,
+    and what to do next. Load the frames applies them here; Make the MP4 asks the agent; Open the MP4 (a render
+    that returned one) stays once the frames are in."""
+    pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
+    id = f"item{n}.back"
+    mark = len(f.prims)
+    ring = f.px(20)
+    ix, iw = x + pad, width - 2 * pad
+    text_x = ix + ring + f.px(10)
+    text_w = x + width - pad - text_x
+    cursor = y + pad
+    cursor += f.paragraph(id + ".title", text_x, cursor, text_w, item["title"], size, T.TEXT)
+    for k, line in enumerate(item.get("detail", "").split("\n")):
+        if line:
+            cursor += f.paragraph(f"{id}.detail{k}", text_x, cursor, text_w, line, small,
+                                  T.TEXT_MUTED if k == 0 else T.WARN)
+    color, glyph = _BACK_MARKS.get(item.get("status"), (T.TEXT_MUTED, ""))
+    ring_y = y + pad + f.px(1)
+    f.ring(id + ".ring", ix, ring_y, ring, 1.0, f.px(3.5), color)
+    glyph_w = round(f.measure("ui", small, glyph))
+    f.text(id + ".mark", ix + (ring - glyph_w) // 2, ring_y + (ring - f.line_height(small)) // 2, glyph, small, color)
+    cursor = max(cursor, ring_y + ring)
+    if item.get("thumbnails"):
+        cursor += f.px(10) + _thumbnails(f, id + ".frame", ix, cursor + f.px(10), iw, item["thumbnails"],
+                                         item.get("thumbnail_labels", []), 4)
+    if item.get("note") and not item.get("resolved"):  # "Asked Loopcut to make the MP4." while Load stays.
+        cursor += f.px(10) + f.paragraph(id + ".note", ix, cursor + f.px(10), iw, item["note"], small, T.TEXT_MUTED)
+    if item.get("busy"):
+        cursor += f.px(10) + f.paragraph(id + ".busy", ix, cursor + f.px(10), iw, item["busy"], small, T.TEXT_MUTED)
+    elif item.get("resolved"):
+        cursor += f.px(10) + f.paragraph(id + ".resolved", ix, cursor + f.px(10), iw, item["resolved"], small, T.OK)
+        opens = [(f"{id}.a{k}", action["label"], T.BUTTON_GHOST, T.TEXT, ("cloud_back", (n, k)))
+                 for k, action in enumerate(item.get("actions") or ()) if action["do"] == "open_mp4"]
+        if opens:  # The render's MP4 stays a click away once its frames are in.
+            cursor += f.px(10) + _button_row(f, ix, cursor + f.px(10), iw, opens)
+    elif item.get("actions"):
+        buttons = [(f"{id}.a{k}", action["label"], T.BUTTON if k == 0 else T.BUTTON_GHOST,
+                    T.BUTTON_TEXT if k == 0 else T.TEXT, ("cloud_back", (n, k)))
+                   for k, action in enumerate(item["actions"])]
+        cursor += f.px(10) + _button_row(f, ix, cursor + f.px(10), iw, buttons)
+    if item.get("error"):
+        cursor += f.px(6) + f.paragraph(id + ".error", ix, cursor + f.px(6), iw, item["error"], small, T.ERROR)
+    height = cursor + pad - y
+    f.prims.insert(mark, {"t": "rect", "id": id + ".card", "x": x, "y": y, "w": width, "h": height,
+                          "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1,
+                          "border_color": FREE_BORDER if item.get("status") == "succeeded" else T.CARD_BORDER})
     return height
 
 
@@ -920,8 +1083,11 @@ def _slim_text(f: Frame, item: dict, kind: str) -> tuple[str, str, tuple]:
     if kind == "credits" and _limit_over(f, item):  # The reset or the top-up came: say so (0.2.15).
         n = _notice_index(f, item)
         resumable = (isinstance(n, int) and n == state.latest_limit(f.session["items"]) and state.can_resume(f.session)
-                     and (f.ui.get("allowance_notice") or {}).get("item") is item)  # Its Continue shows.
+                     and (f.ui.get("allowance_notice") or {}).get("item") is item  # Its Continue shows.
+                     and not chat_credits.is_tool(item))
         return "Credits are back", "Continue where it stopped." if resumable else "Free credits came back.", T.OK
+    if kind == "credits" and chat_credits.is_tool(item):  # A paid tool's refusal (0.2.19): chat may still go on.
+        return f"Not enough credits for {item['tool']}", _come_back(f, item, short=True), T.WARN
     if kind == "credits":
         return "You're out of credits", _come_back(f, item, short=True), T.WARN
     when = chat_credits.short_reset(item.get("resets_at"), f.ui.get("now"))
@@ -955,18 +1121,25 @@ def _draw_slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, bu
     status = item.get("status", "") if config.billing_open() else ""
     over = kind == "credits" and _limit_over(f, item)
     if over:  # Credits back (or a new plan): only the stopped turn's Continue, while there is one.
-        if buttons and isinstance(n, int) and state.can_resume(f.session) and not f.session.get("busy"):
+        if (buttons and isinstance(n, int) and state.can_resume(f.session) and not f.session.get("busy")
+                and not chat_credits.is_tool(item)):
             actions.append((id + ".retry", "Continue", T.BUTTON_GHOST, T.TEXT, ("limit_retry", n)))
-    elif buttons and status in ("", "waiting") and not f.session.get("busy"):
+    elif (buttons and status in ("", "waiting") and (not f.session.get("busy") or chat_credits.is_tool(item))
+          and not (chat_credits.is_tool(item) and _waiting(f))):
+        # A paid tool's refusal came mid-turn (0.2.19): its pop-up can open again while the turn runs, but not over
+        # a card that waits for the user's answer.
         plan = str((item.get("upgrade") or {}).get("plan") or "pro").capitalize()
         upgrade = status == "" and config.billing_open() and (item.get("upgrade") or {}).get("url")
+        label = "Add credits" if chat_credits.top_up(item) else f"See {plan}"
         # While an upgrade waits, the free ways on stay one click away (an abandoned checkout never resets it).
-        actions.append((id + ".open", f"See {plan}" if upgrade else "Options", T.BUTTON if upgrade else T.BUTTON_GHOST,
+        actions.append((id + ".open", label if upgrade else "Options", T.BUTTON if upgrade else T.BUTTON_GHOST,
                         T.BUTTON_TEXT if upgrade else T.TEXT, ("limit_popup_open", n)))
         if kind == "offer" and isinstance(n, int) and state.can_resume(f.session):
             actions.append((id + ".retry", "Try again", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
-        elif kind == "credits" and isinstance(n, int) and state.can_resume(f.session):
-            # The stopped turn goes on from where it was once credits are back (0.2.15, the pop-up's promise).
+        elif (kind == "credits" and isinstance(n, int) and state.can_resume(f.session)
+              and not chat_credits.is_tool(item)):
+            # The stopped turn goes on from where it was once credits are back (0.2.15, the pop-up's promise). A paid
+            # tool's refusal never stopped its turn: nothing of it to continue.
             actions.append((id + ".retry", "Continue", T.BUTTON_GHOST, T.TEXT_MUTED, ("limit_retry", n)))
     widths = [round(f.measure("ui", small, label)) + f.px(20) for _, label, *_ in actions]
     side = sum(widths) + f.px(8) * max(0, len(actions) - 1)
@@ -992,12 +1165,27 @@ def _draw_slim_card(f: Frame, id: str, n, item: dict, kind: str, x, y, width, bu
     return height
 
 
+def _own_notice(f: Frame, notice) -> bool:
+    """A paid tool's refusal belongs to its conversation (0.2.19); the chat's own refusals are the account's."""
+    item = (notice or {}).get("item")
+    return not chat_credits.is_tool(item) or notice.get("conversation") == f.session.get("id")
+
+
+def _waiting(f: Frame) -> bool:
+    """A card waits for the user's answer: a paid tool's pop-up stays shut over it, so Enter and Esc only ever
+    answer what the user sees (a worker's ask can wait before its card is in the chat's list)."""
+    return any(i.get("status") == "awaiting" for i in f.session.get("items", ()))
+
+
 def _popup_item(f: Frame) -> tuple[dict | None, str]:
     """The account's refusal whose pop-up is open now, and its kind; (None, "") when none is."""
     notice = f.ui.get("allowance_notice") or {}
     item = notice.get("item")
-    if (not item or f.ui.get("view", "chat") != "chat" or f.session.get("busy") or item.get("popup_closed")
-            or item.get("status", "") not in ("", "waiting")):
+    # A paid tool's refusal opens at once, in the turn that runs on (0.2.19); the chat's own stops its turn.
+    tool = chat_credits.is_tool(item)
+    busy = f.session.get("busy") and not tool
+    if (not item or f.ui.get("view", "chat") != "chat" or busy or item.get("popup_closed")
+            or item.get("status", "") not in ("", "waiting") or not _own_notice(f, notice) or (tool and _waiting(f))):
         return None, ""
     kind = _offer_card(f, item)
     if not kind or _limit_over(f, item):
@@ -1060,7 +1248,10 @@ def _keep_chatting(f: Frame, id: str, n, x, y, width) -> int:
 def _request_line(f: Frame, item: dict, n) -> str:
     """What became of the request the refusal stopped (0.2.15), said only where it is true. A stop mid-turn keeps
     the turn: upgrading resumes it (host._start_upgrade), and the slim card's Continue does once credits are back.
-    A new message refused before anything ran went back into the input box, which the conversation saves."""
+    A new message refused before anything ran went back into the input box, which the conversation saves. A paid
+    tool's refusal (0.2.19) stopped nothing, so it has no such line."""
+    if chat_credits.is_tool(item):
+        return ""
     if isinstance(n, int) and state.can_resume(f.session):
         return "Your request is saved; it picks up when you continue."
     if n == f.session.get("id") and str(f.session.get("input") or "").strip():
@@ -1069,7 +1260,8 @@ def _request_line(f: Frame, item: dict, n) -> str:
 
 
 def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) -> int:
-    """Round3 #3: out of credits. What stops (the same tools, locked), Pro first, then the free way on."""
+    """Round3 #3: out of credits. What stops (the same tools, locked), Pro first, then the free way on. A paid tool's
+    refusal (0.2.19) is headed by the tool and what it needs, and shows the locked tiles only at no balance."""
     pad, small, title = f.px(14), f.px(T.FONT_SIZE_SMALL), f.px(T.FONT_SIZE_TITLE)
     inner_x, inner_w = x + pad, width - 2 * pad
     cursor = y + pad
@@ -1078,14 +1270,15 @@ def _credits_sheet(f: Frame, item: dict, n, x, y, width, compact: bool = False) 
     text_x = inner_x + ring + f.px(10)
     text_w = inner_w - ring - f.px(10) - f.px(22)
     top = cursor
-    cursor += f.paragraph("popup.title", text_x, cursor, text_w, "You're out of credits", title, T.BUTTON_TEXT)
+    headline = chat_credits.tool_title(item) or "You're out of credits"
+    cursor += f.paragraph("popup.title", text_x, cursor, text_w, headline, title, T.BUTTON_TEXT)
     cursor += f.paragraph("popup.text", text_x, cursor, text_w, _come_back(f, item), small, T.TEXT_MUTED)
     saved = _request_line(f, item, n)
     if saved:
         cursor += f.paragraph("popup.saved", text_x, cursor, text_w, saved, small, T.TEXT_MUTED)
     _close(f, "popup.close", x + width - f.px(6), y + f.px(6))
     cursor = max(cursor, top + ring + f.px(4)) + f.px(10)
-    if compact:
+    if compact or not chat_credits.pauses(item):
         return _credits_actions(f, item, n, inner_x, cursor, inner_w) + pad - y
     f.text("popup.pause", inner_x, cursor, "These pause until then:", small, T.TEXT_MUTED)
     cursor += f.line_height(small) + f.px(4)
@@ -1123,13 +1316,15 @@ def _credits_actions(f: Frame, item: dict, n, inner_x, cursor, inner_w) -> int:
         _wide_button(f, "popup.upgrade", inner_x, cursor, inner_w, f.px(34), label,
                      ("limit_upgrade", n), chat_credits.upgrade_button(upgrade, short=True))
         cursor += f.px(34) + f.px(8)
-        cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Cancel anytime · Asset search stays free",
-                            small, T.TEXT_MUTED)
+        fine = "Asset search stays free" if chat_credits.top_up(item) else "Cancel anytime · Asset search stays free"
+        cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, fine, small, T.TEXT_MUTED)
     else:
         cursor += _centered(f, "popup.fine", inner_x, cursor, inner_w, "Asset search stays free", small,
                             T.TEXT_MUTED)
     if _own_ai(f):  # Already chatting on their own AI: nothing to switch to.
         return cursor
+    if chat_credits.is_tool(item) and f.session.get("busy"):
+        return cursor  # A paid tool's pop-up mid-turn: switching the chat's AI waits for the turn to end (0.2.19).
     cursor += f.px(10)
     return cursor + _keep_chatting(f, "popup.free", n, inner_x, cursor, inner_w)
 
@@ -1479,7 +1674,7 @@ def _item_merge(f: Frame, n: int, item: dict, x, y, width) -> int:
 
 _ITEM_LAYOUT = {"changes": _item_changes, "notice": _item_notice, "user": _item_user, "assistant": _item_assistant,
                 "tool": _item_tool, "error": _item_error, "limit": _item_limit, "wave": _item_wave,
-                "merge": _item_merge, "offer": _item_offer}
+                "merge": _item_merge, "offer": _item_offer, "cloud_back": _item_cloud_back}
 
 
 # Starter prompts on an empty conversation: one click sends one (or fills the input while no model is connected).
@@ -1735,12 +1930,21 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     code_repairs = _code_repairs(items, session.get("busy", False), session.get("active_turn_id"))
     first_prim, first_hit, cursor = len(f.prims), len(f.hits), 0
 
-    for n, item in enumerate(items):
+    for n, original in enumerate(items):
+        item = original
         if n in repairs:
             item = {**item, "plan_repair": repairs[n]}
         if item.get("kind") == "tool" and item.get("name") in CODE_TOOLS:
             item = {**item, "code_repair": code_repairs.get(n)}
+        mark = len(f.hits)
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
+        if original.get("status") == "awaiting":  # Which card, in which ask, this frame's answer buttons are for.
+            for hit in f.hits[mark:]:
+                if (hit["action"] or ("",))[0] in ANSWERS:
+                    hit["card"] = (id(original), original.get("ask_serial"))
+        for hit in f.hits[mark:]:
+            if (hit["action"] or ("",))[0] == "to_3d":  # A made picture's button: the card this frame drew it on.
+                hit["card"] = (id(original), None)
     owned_jobs = {item.get('cloud_job_id') for item in items
                   if item.get('name') in ('loopcut_cloud__auto_rig', 'loopcut_cloud.auto_rig')}
     cursor = _cloud_jobs(f, cursor, exclude=owned_jobs)
@@ -1778,6 +1982,24 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
         prim["y"] += shift
     for hit in f.hits[first_hit:]:
         hit["y"] += shift
+    # A waiting card is on screen for Enter and Esc only with its whole answer row in the chat area, not a sliver of
+    # it at the header or the input, its price or summary scrolled away. scroll: the session's scroll that brings
+    # the card in, its row whole and as much of the card above it as fits, for Enter on one out of view.
+    rows: dict = {}
+    for hit in f.hits[first_hit:]:
+        # The render choice's row: its cloud button (hit["answer"], ui.render_choice) and "Not now" (reject).
+        if hit.get("card") and (hit["action"][0] in ("approve", "reject") or "answer" in hit):
+            rows.setdefault(hit.get("answer", hit["action"][1]), []).append(hit)
+    for n, row in rows.items():
+        row_top, row_bottom = min(h["y"] for h in row), max(h["y"] + h["h"] for h in row)
+        shown = len(row) == row[0].get("answer_row", 2) and top <= row_top and row_bottom <= bottom
+        card_top = next((p["y"] for p in f.prims[first_prim:]
+                         if p["id"] in (f"item{n}.tool.card", f"item{n}.choice.card")), row_top)
+        move = 0 if shown else bottom - pad - row_bottom if row_bottom > bottom else \
+            min(top + pad - card_top, bottom - pad - row_bottom)
+        f.cards.append({"index": n, "card": row[0]["card"], "bottom": row_bottom, "shown": shown,
+                        "scroll": min(max(scroll + move, 0.0), max_scroll)})
+    f.cards.sort(key=lambda card: -card["bottom"])
     # Cull what is scrolled away; the header and input paint over any partial overlap.
     f.prims[first_prim:] = [p for p in f.prims[first_prim:] if p["y"] + p["h"] > top and p["y"] < bottom]
     f.hits[first_hit:] = [h for h in f.hits[first_hit:] if h["y"] + h["h"] > top and h["y"] < bottom]
@@ -1906,7 +2128,7 @@ def _input_notice(f: Frame, y: int) -> int:
     width = f.width - 2 * pad
     usage = ""
     notice = f.ui.get("allowance_notice")
-    item = notice.get("item") if notice else None
+    item = notice.get("item") if notice and _own_notice(f, notice) else None  # Another chat's tool refusal: none.
     kind = _offer_card(f, item) if item else ""
     # No windows apply to credits; a refusal's own card (variant B's) already says what ran out.
     if f.ui.get("provider", "LOOPCUT") == "LOOPCUT" and not _credits_arm(f) and not (kind and not _limit_over(f, item)):
@@ -2450,6 +2672,14 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     f.hit("input.model", inner_x, button_y, button_w, button_h, ("model_menu", None), tip="Choose the model")
     hint = "⏎  note   esc  stop" if busy else "⏎  send"
     hint_x = inner_x + inner_w - round(f.measure("ui", small, hint))
+    if busy:  # "esc  stop" is also Stop's button: people click it (rel018-app, rel018-ja2), and the click stops.
+        # Never over the model button: on a narrow panel the hint runs into it, and a click there opens the menu.
+        stop_x = max(hint_x + round(f.measure("ui", small, "⏎  note   ")) - f.px(4), inner_x + button_w + f.px(4))
+        stop_w = inner_x + inner_w + f.px(4) - stop_x
+        if hover == "input.stop" and stop_w > 0:
+            f.rect("input.stop", stop_x, button_y, stop_w, button_h, T.BUTTON_GHOST, f.px(T.RADIUS_SMALL))
+        if stop_w > 0:
+            f.hit("input.stop", stop_x, button_y, stop_w, button_h, ("stop_turn", None), tip="Stop Loopcut")
     f.text("input.hint", hint_x, text_y, hint, small, T.TEXT_FAINT)
     _rings(f, session, hint_x - f.px(16), button_y, button_h)
     if credit_lines:
@@ -2626,8 +2856,32 @@ def _cloud_jobs(f: Frame, cursor, *, exclude=()):
         cursor += f.paragraph(f"cloud.{id}.progress", pad, cursor, f.width - pad * 2, row["message"], small, T.TEXT_MUTED)
         if row.get("note") and not row.get("rig"):  # "80 credits held. Cancel returns them." or why it can't be canceled now (C47).
             cursor += f.paragraph(f"cloud.{id}.note", pad, cursor, f.width - pad * 2, row["note"], small, T.TEXT_FAINT)
+        if row.get("safe"):  # A job its conversation picks up after a restart (cloud_restore): quitting is fine.
+            cursor += f.px(6) + _safe_note(f, f"cloud.{id}.safe", pad, cursor + f.px(6), f.width - pad * 2,
+                                           "Safe to close", row["safe"])
         cursor += pad
     return cursor
+
+
+def _safe_note(f: Frame, id: str, x, y, width, title: str, text: str) -> int:
+    """The green box (_keep_chatting's colours): what the user may do while a job runs."""
+    pad, small = f.px(10), f.px(T.FONT_SIZE_SMALL)
+    mark = len(f.prims)
+    cursor = y + f.px(8)
+    f.text(id + ".glyph", x + pad, cursor, "✓", small, T.OK)
+    f.text(id + ".title", x + pad + f.px(14), cursor, title, small, T.OK)
+    cursor += f.line_height(small)
+    cursor += f.paragraph(id + ".text", x + pad, cursor, width - 2 * pad, text, small, T.TEXT)
+    height = cursor + f.px(8) - y
+    f.prims.insert(mark, {"t": "rect", "id": id + ".card", "x": x, "y": y, "w": width, "h": height, "color": FREE_BG,
+                          "radius": f.px(T.RADIUS_SMALL), "border": 1, "border_color": FREE_BORDER})
+    return height
+
+
+def _duration(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {secs:02d}s"
 
 
 def _jobs(f: Frame, top, bottom):
@@ -2646,12 +2900,29 @@ def _jobs(f: Frame, top, bottom):
         f.text(f"process.{id}.log", pad, cursor,
                _ellipsize(f, Path(row["log"]).name, small, f.width - pad * 2), small, T.TEXT_MUTED)
         cursor += f.line_height(small) + pad
+    for row in f.ui.get("left_running", []):  # What a shell command left running (workspace.track_left).
+        id, right = row["id"], f.width - pad
+        if row["state"] == "running":
+            stop_w = round(f.measure("ui", small, "Stop")) + f.px(20)
+            f.button(f"left.{id}.stop", right - stop_w, cursor, "Stop", T.BUTTON_GHOST, T.TEXT, ("left_stop", id))
+            right -= stop_w + f.px(8)
+        elapsed = _duration(row["elapsed"])
+        elapsed_w = round(f.measure("ui", small, elapsed))
+        f.text(f"left.{id}.elapsed", right - elapsed_w, cursor + f.px(3), elapsed, small, T.TEXT_MUTED)
+        f.text(f"left.{id}.title", pad, cursor + f.px(3),  # Running, Stopping, Stopped or Finished.
+               _ellipsize(f, f"{row['state'].title()} · {row['label']}", small, right - elapsed_w - f.px(8) - pad),
+               small, T.TEXT)
+        cursor += f.px(26)
+        f.text(f"left.{id}.detail", pad, cursor,
+               _ellipsize(f, f"Left running by a command · process group {row['group']}", small, f.width - pad * 2),
+               small, T.TEXT_MUTED)
+        cursor += f.line_height(small) + pad
     error = f.ui.get("job_error")
     if error:
         cursor += f.paragraph("jobs.error", pad, cursor, f.width - 2 * pad, error, small, T.ERROR) + pad
     rows = f.ui.get("jobs", [])
     if not rows:
-        if f.ui.get("cloud_jobs") or f.ui.get("local_processes"):
+        if f.ui.get("cloud_jobs") or f.ui.get("local_processes") or f.ui.get("left_running"):
             return
         f.paragraph("jobs.empty", pad, cursor, f.width - 2 * pad,
                     "No background jobs yet. Ask Loopcut to render or export a scene.", small, T.TEXT_MUTED)
@@ -2733,7 +3004,7 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
         _popup(f, header_bottom)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
-            "prims": f.prims, "hits": f.hits, "input": f.input}
+            "prims": f.prims, "hits": f.hits, "input": f.input, "cards": f.cards}
 
 
 def hit_at(display: dict, x: float, y_top: float) -> dict | None:

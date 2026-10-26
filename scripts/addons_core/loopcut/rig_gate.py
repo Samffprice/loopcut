@@ -19,6 +19,11 @@ agent._final_reply calls finish_gate once per final reply, after the spec's own 
 It never blocks: any error, a helper's loop, a Stop, or a turn that changed no Loopcut rig gives None and nothing; nor
 does a final reply with nothing marked since the turn's stamp (contact sent the turn on after it).
 Rigs a helper animated in its own process and the orchestrator merged are not marked (not seen in round 6).
+
+R7-D2/B2: character_rig show got 0 calls over both round 7 runs and all of round 6, with result facts pointing at it,
+and both users hunted for a character that walked out of the front view. So the stamp of an animated rig says how to
+play it, and its reply carries a "Watch it" button (verification_action) that runs show itself. A saved conversation
+is untrusted when it loads: the footer runs only an op in ACTIONS, on a rig that is a Loopcut armature in the file.
 """
 import json
 
@@ -33,6 +38,9 @@ KINDS = ('animation', 'weights', 'gesture', 'motion')
 MARKS = 'loopcut_rig_marks'      # How many marks the turn has had,
 STAMPED = 'loopcut_rig_stamped'  # and that count when its last stamp went on a reply: nothing new, no second stamp.
 HEAD = '{head}: {passed} of {total} checks.'  # completion_guard._UI_RECORD reads it.
+PLAY = 'Press Space over the 3D view to play it.'
+ACTIONS = {'loopcut.rig_show': 'Watch it'}  # The only ops a reply's footer button may run, and their labels.
+ACTION = 'verification_action'  # On the reply item: {'label', 'op', 'rig'}.
 
 
 def _request(messages):
@@ -128,7 +136,17 @@ def verdict(arm, kinds):
         detail = [lines[0]] + [l for l in lines if l.startswith('- ') and 'PROBLEM' in l][:3] if flagged else lines[:1]
         checks.append({'ok': not flagged, 'kind': 'bend', 'line': line if not flagged or animation else f'{pose}, {line}',
                        'detail': '\n'.join(detail)})
-    return {'rig': arm.name, 'checks': checks, 'unplayed': unplayed} if checks else None
+    return {'rig': arm.name, 'checks': checks, 'unplayed': unplayed, 'animated': bool(span),
+            'watch': bool(span) and _shows(arm)} if checks else None
+
+
+def _shows(arm):
+    """Whether character_rig show can frame this rig: it has a skinned mesh."""
+    from . import autorig
+    try:
+        return bool(autorig._rig_meshes(arm))
+    except Exception:  # A damaged rig record: no button, the stamp as before.
+        return False
 
 
 def check(changed):
@@ -162,6 +180,8 @@ def stamp(verdicts, head='Verified by Loopcut on this scene'):
             else ('it' if len(verdicts) == 1 else v['rig'])
         text = _sentence(subject, c['line'])
         lines.append(text if c['ok'] else 'Failed: ' + text[0].lower() + text[1:])
+    if any(v.get('animated') for v in verdicts):
+        lines.append(PLAY)
     return '\n'.join(lines)
 
 
@@ -215,6 +235,10 @@ def finish_gate(session, turn, completion, role, run_on_main):
         orchestrator._append_to_reply(session, completion,
                                       stamp(verdicts, orchestrator.block_head(session, 'Rig checked this turn')))
         request[STAMPED] = request.get(MARKS, 0)
+        watched = next((v['rig'] for v in verdicts if v.get('watch')), None)
+        reply = session['items'][-1] if session['items'] else {}
+        if watched and reply.get('kind') == 'assistant' and reply.get('verification'):
+            reply[ACTION] = {'label': ACTIONS['loopcut.rig_show'], 'op': 'loopcut.rig_show', 'rig': watched}
     except Exception as ex:  # Never in the way of the reply.
         print(f'Loopcut: rig check not run: {type(ex).__name__}: {ex}')
     return None
@@ -228,3 +252,48 @@ def _may_bounce(session, turn, request, completion):
         return False
     return not any(item.get('status') == 'awaiting' or (item.get('kind') == 'offer' and not item.get('resolved'))
                    for item in agent._turn_items(session, request))
+
+
+def footer_action(item, rigs):
+    """(label, rig) of a reply's footer button, or None. No bpy (ui.layout draws it): only an op in ACTIONS, with
+    the label from ACTIONS, never the item's, for a rig named in rigs (watchable's, from ui.host)."""
+    action = item.get(ACTION) if isinstance(item, dict) else None
+    if not isinstance(action, dict) or not isinstance(action.get('op'), str) or action['op'] not in ACTIONS:
+        return None
+    rig = action.get('rig')
+    return (ACTIONS[action['op']], rig) if isinstance(rig, str) and rig in rigs else None
+
+
+def watchable(session):
+    """Main thread: the rigs the session's footer buttons name that are Loopcut armatures in the file now. The panel
+    draws with it, so it never raises."""
+    out = set()
+    try:
+        import bpy
+        from . import autorig
+        for item in session.get('items') or ():
+            action = item.get(ACTION) if isinstance(item, dict) else None
+            rig = action.get('rig') if isinstance(action, dict) else None
+            ob = bpy.data.objects.get(rig) if isinstance(rig, str) else None
+            if ob is not None and ob.type == 'ARMATURE' and autorig._KEY in ob:
+                out.add(rig)
+    except Exception:  # No button, never a broken panel.
+        return frozenset()
+    return frozenset(out)
+
+
+def run_footer(session, index):
+    """Main thread, the footer button's click (ui.host): checked again, then the op, free. Returns the line the panel
+    shows for a moment, or '' for a button that is not (or no longer) valid, which runs nothing."""
+    items = session.get('items') or []
+    item = items[index] if isinstance(index, int) and 0 <= index < len(items) else None
+    found = footer_action(item, watchable(session))
+    if found is None:
+        return ''
+    from . import autorig
+    result = autorig.tool('show', rig=found[1])  # The only op in ACTIONS.
+    if session.get('turn') is not None:  # A running turn's reads may say something new now.
+        session['turn'].ledger.scene_changed()
+    if not result.ok:
+        return result.text
+    return f'Watching {found[1]} through Follow Camera, with its bones hidden. ' + PLAY

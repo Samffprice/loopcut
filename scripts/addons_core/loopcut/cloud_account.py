@@ -27,6 +27,9 @@ OVERRIDES = ("inherit", "on", "off")
 DEFAULTS = {"no_generation": False, "private_mode": True}
 _approval = threading.local()
 MAX_PENDING = 32
+# A paid tool refused for credits in the credits arm (0.2.19): what the model hears while the panel shows the offer.
+TOOL_REFUSED = "insufficient_credits: not enough credits for this. Tell the user; the panel shows how to get more."
+NOT_ENOUGH = "Not enough credits."  # refusal()'s line for a tool the manifest locks for credits.
 
 
 class _Authorized(dict):
@@ -232,7 +235,7 @@ def refusal(descriptor, policy):
     if not config.billing_open() and reason in ("sign_in", "credits", "plan"):
         return "Coming soon."  # Billing closed: no credits or plans to point at.
     return {"no_generation": "No generation is on for this account or project.",
-            "sign_in": "Sign in to use credits.", "credits": "Not enough credits.",
+            "sign_in": "Sign in to use credits.", "credits": NOT_ENOUGH,
             "plan": "Requires a different plan.", "region": "Unavailable in your region.",
             "disabled": "Tool unavailable."}.get(reason, "")
 
@@ -325,6 +328,9 @@ def _check_cancel(cancel):
         raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
 
 
+MAX_ESTIMATED_SECONDS = 30 * 86400  # A render quote's estimated_seconds is kept to 30 days: a card's "About … h".
+
+
 def _quote(module, descriptor, arguments, files, project, cancel, runtime, client, on_progress=None):
     _check_cancel(cancel)
     clean = {k: v for k, v in arguments.items() if k not in ("quote_id", "idempotency_key")}
@@ -338,6 +344,9 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
         if ex.code != "quote_required":
             raise
         quote = {k: ex.extra.get(k) for k in ("quote_id", "credits", "expires_at")}
+        seconds = ex.extra.get("estimated_seconds")  # Contract 0.10, render only: the cloud's time on the choice card.
+        if type(seconds) is int and seconds >= 1:
+            quote["estimated_seconds"] = min(seconds, MAX_ESTIMATED_SECONDS)
         approval_details(descriptor, quote)
         runtime.handle_error(ex)
         return quote
@@ -345,8 +354,11 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
 
 
 def authorize(module, descriptor, arguments, files, *, project, cancel, runtime, client, notice='', notice_first=False,
-              on_progress=None):
-    """Worker: resolve a runtime quote before consent, then forward its ID."""
+              on_progress=None, offer=None, made_picture=None):
+    """Worker: resolve a runtime quote before consent, then forward its ID. offer: a long render's local time
+    (render_offer.prepare), which makes its card the choice between the cloud and this computer. made_picture:
+    image_to_3d's input is a picture Loopcut made (cloud_jobs.made_picture), so its card asks whatever the
+    thresholds (spending.MADE)."""
     _check_cancel(cancel)
     arguments = _Authorized(arguments)
     key = arguments.get('idempotency_key')
@@ -383,6 +395,11 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
     if isinstance(getattr(runtime, "manifest", None), dict):
         with runtime.lock:
             details["balance"] = balance(runtime.manifest)  # The card's "Balance 1,840 → 1,760".
+    if offer and quote is not None:
+        from . import render_offer
+        details["render_offer"] = render_offer.choice(offer, quote)
+    if made_picture:
+        details["made_picture"] = made_picture
     _check_cancel(cancel)
     confirm(details)
     _check_cancel(cancel)
@@ -598,11 +615,21 @@ def error_details(error):
             url = ""
         hint = " Add credits or use your own vendor key." if config.billing_open() else ""
         from . import chat_credits
-        if hint and chat_credits.active() and chat_credits.plan_of(chat_credits._account()[0]) not in ("pro", "max"):
-            hint = " Use your own vendor key, or tell the user."  # Free credits accounts cannot buy credits.
         price = f"{needed:g} ({dollars(needed)})" if needed != "?" else "more"
+        message = f"Not enough credits: this needs {price}, you have {balance}."
+        try:
+            account, signed_in = chat_credits._account()
+        except Exception:  # A runtime half way through starting is not a credits account yet.
+            account, signed_in = {}, False
+        if needed != "?" and chat_credits.billing({"account": account}, signed_in) == chat_credits.CREDITS:
+            # The credits arm (0.2.19): the panel opens the chat's out-of-credits pop-up for this tool
+            # (agent._Consent._paywall), so the model hears only that, and the card keeps its line, without buttons.
+            return {"text": TOOL_REFUSED, "message": message, "upgrade": "",
+                    "paywall": {"needed": needed, "balance": None if balance == "?" else balance}}
+        if hint and chat_credits.active() and chat_credits.plan_of(account) not in ("pro", "max"):
+            hint = " Use your own vendor key, or tell the user."  # Free credits accounts cannot buy credits.
         return {"text": f"insufficient_credits: balance {balance}, needed {needed}." + hint,
-                "message": f"Not enough credits: this needs {price}, you have {balance}.", "upgrade": url}
+                "message": message, "upgrade": url}
     if code == "daily_limit_reached":
         # Server C47 (HTTP 402): the user's optional daily limit. With a confirm_token the card asked first
         # (_confirmed); this is the refusal without one, or after its one retry.

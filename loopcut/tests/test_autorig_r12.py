@@ -408,8 +408,7 @@ class WeightFact(unittest.TestCase):
 
 class SmallHints(unittest.TestCase):
     def test_root_travel_says_how_far_and_how_to_keep_it_in_view(self):
-        self.assertEqual(motion_retarget.travel_note(5.5), "it travels 5.5 m from where it starts; character_rig show "
-                                                           "(free) sets up the user's view to follow it")  # R13
+        self.assertEqual(motion_retarget.travel_note(5.5, 'forward'), 'it moves 5.5 m forward from where it starts')  # R14
         self.assertEqual(motion_retarget.travel_note(.4), '', 'a dance that drifts a little says nothing')
 
 

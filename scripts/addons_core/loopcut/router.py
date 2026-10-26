@@ -313,10 +313,13 @@ NUDGE = ("[Loopcut] Routing planned workers for {what}; delegate them, or say in
 
 def nudge(turn, completion) -> str | None:
     """Once per turn, at a final reply of a level-3 turn that delegated nothing: the nudge. Not at the
-    end of a guard or budget, where nothing can follow."""
+    end of a guard or budget, where nothing can follow, nor when the user is to answer: the reply asks them
+    something, or they declined one of the turn's calls (rel018-app: after a declined import the model asked
+    "build from scratch, or use the numbered assets?", and the nudge sent it on to build without them)."""
     decision = getattr(turn, "routed", None)
     if (decision is None or decision.level < 3 or turn.delegations or getattr(turn, "nudged", False)
-            or completion is None or turn.cancel.is_set() or turn.outcome in ("step_limit", "budget", "no_progress")):
+            or completion is None or turn.cancel.is_set() or turn.outcome in ("step_limit", "budget", "no_progress")
+            or getattr(turn, "declined", False) or asked(completion.text or "")):
         return None
     turn.nudged = True
     names = [name for name, *_ in decision.deliverables]

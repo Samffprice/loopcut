@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import cost_guard, scratch
+from . import cost_guard, render_offer, scratch
 from .tools import MAX_OUTPUT_CHARS, ToolError, ToolResult, _clip
 
 READ_TOOLS = {"list_files", "read_file"}
@@ -421,6 +421,7 @@ def _render_now(scene, out: Path, full: bool) -> str:
                 if owner is not None and hasattr(owner, attribute):
                     samples.append((owner, attribute, getattr(owner, attribute)))
                     setattr(owner, attribute, min(getattr(owner, attribute), PREVIEW_SAMPLES))
+        rendered = render_offer.settings(scene)  # What this frame's time measures, for a long render's choice.
         started = time.monotonic()
         bpy.ops.render.render(write_still=True)
         seconds = time.monotonic() - started
@@ -433,6 +434,7 @@ def _render_now(scene, out: Path, full: bool) -> str:
             setattr(settings if key in ("media_type", "file_format", "color_depth", "color_mode") else render, key, value)
     if not out.is_file():
         raise ToolError("The render produced no image.")
+    render_offer.record(render_offer.scene_key(scene), rendered, seconds)
     return (f"a {'full' if full else 'preview'} render through {scene.camera.name} with {render.engine}"
             f", {seconds:.0f} s")
 
@@ -479,14 +481,19 @@ def see_render(render: bool = False, full: bool = False) -> ToolResult:
         refusal = cost_guard.render_refusal()  # Render levels are only ever evaluated by a render.
         if refusal:
             raise ToolError(refusal)
+        render_offer.take_last()
         what = _render_now(scene, out, bool(full))
+        timing = render_offer.take_last()
     else:
-        what, out = _last_render(), LAST_RENDER
+        what, out, timing = _last_render(), LAST_RENDER, None
     try:
         width, height = attachments._to_png(out, shown, IMAGE_SIDE)
     except attachments.AttachmentError as ex:
         raise ToolError(str(ex)) from ex
-    return ToolResult(f"Image attached: {what}, {width}x{height} px.", image_path=shown, file_image=True)
+    # A full render is a test frame of the user's own settings: its card says what a frame takes here.
+    outcome = render_offer.frame_line(timing["seconds"]) if timing and full else ""
+    return ToolResult(f"Image attached: {what}, {width}x{height} px.", image_path=shown, file_image=True,
+                      outcome=outcome)
 
 
 DISPATCH = {

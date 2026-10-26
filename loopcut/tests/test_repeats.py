@@ -129,6 +129,31 @@ class NoProgressTest(unittest.TestCase):
             elif refusal == 14:
                 guard.reset()  # A user note or an approval rejection.
 
+    def test_steps_where_every_call_failed_are_counted_in_a_row(self):
+        guard = repeats.NoProgress()
+        counts = []
+        for n in range(6):
+            guard.record(run_key(f"Try {n}"), False, False)
+            if n == 1:
+                guard.skip(run_key("Again"))  # A refusal in the same step: still one step.
+            counts.append(guard.end_step())
+        self.assertEqual(counts, [1, 2, 3, 4, 5, 6])
+        guard.record(run_key("Fail"), False, False)
+        guard.record(("get_scene_info", "{}"), True, False)  # Anything that works in the step starts it again.
+        self.assertEqual(guard.end_step(), 0)
+        for reset in (lambda: guard.record(run_key("Change"), False, True), guard.reset):
+            guard.record(run_key("Fail"), False, False)
+            self.assertEqual(guard.end_step(), 1)
+            reset()
+            self.assertEqual(guard.end_step(), 0, "a scene change or a user's note")
+        self.assertEqual(guard.end_step(), 0, "a step with no calls leaves it")
+
+    def test_printed_tracebacks_of_run_python_are_failures(self):
+        caught = "{'err': 'Traceback (most recent call last):\\n  File ...'}\n\nScene changes: none."
+        self.assertTrue(repeats.printed_traceback("run_python", caught))
+        self.assertFalse(repeats.printed_traceback("shell", caught))
+        self.assertFalse(repeats.printed_traceback("run_python", "made the plane\n\nScene changes: none."))
+
     def test_refused_repeats_of_one_call_still_stop_at_eight(self):
         guard = repeats.NoProgress()
         for attempt in range(1, 9):

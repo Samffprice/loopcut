@@ -126,6 +126,20 @@ class InputMouseTest(unittest.TestCase):
         self.operator.modal(self.context, self.event(2, "MOUSEMOVE", "NOTHING"))
         self.assertEqual(self.session["cursor"], 13)
 
+    def test_a_click_on_a_waiting_cards_button_answers_the_card_this_frame_drew(self):
+        """The click names the card and its ask as drawn (agent.decide checks them): a frame from before an item
+        moved, or before the card asked again, then answers no card."""
+        card = state.awaiting(state.item_tool("run_python", "Add a lamp", "lamp()"))
+        self.session["items"].append(card)
+        self.session["busy"] = True
+        self.displays[1] = layout.build(self.session, 420, 600, 1, measure)
+        hit = next(h for h in self.displays[1]["hits"] if h["id"] == "item0.tool.run")
+        event = self.event(2)
+        event.mouse_x = self.region.x + hit["x"] + hit["w"] / 2
+        event.mouse_y = self.region.y + self.region.height - hit["y"] - hit["h"] / 2
+        self.operator.invoke(self.context, event)
+        self.action.assert_called_once_with(self.session, ("approve", 0), drawn=(id(card), card["ask_serial"]))
+
     def test_shift_click_outside_input_passes_through_without_starting_modal(self):
         for target in ("header.new", "input.model", "background", "outside"):
             with self.subTest(target=target):

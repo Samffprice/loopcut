@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import checkpoints, cost_guard, jobs, state, tools
+from . import checkpoints, cost_guard, jobs, render_offer, state, tools
 from .tools import ToolError, ToolResult
 
 WAIT_CAP = 240   # Seconds one status call waits at most; the schema says so too.
@@ -121,25 +121,83 @@ def _label(idb) -> str:
     return f'{kind} "{idb.name}"' + (f" (linked from {Path(idb.library.filepath).name})" if idb.library else "")
 
 
-def external_assets() -> list[dict]:
+def external_assets() -> tuple[list[dict], list[dict]]:
     """The files outside the .blend that the scene reads (images, fonts, sounds, volumes, caches,
-    libraries), each with its hash. One that is missing, or a sequence/tile pattern, raises
-    JobError naming it in full and the datablocks that use it. Packed data is inside the file;
-    weak references (the file an appended datablock came from, which Blender keeps only to reuse
-    it on a later append) are never read, so neither counts."""
+    libraries): each one there with its hash, and each one missing that the render can go on without
+    (_without), with the datablocks that use it and what the render does without it. A BlenderKit
+    model's 1K .blend named an unpacked roughness map that was never downloaded and its author's C:\\
+    IES profile, and every look at the room was refused (rel018-ru-en). The job checks that each
+    stays missing (jobs.assets_changed), so no attempt mixes it in. Anything else not a file raises
+    JobError naming it in full and its users: a missing path an object or modifier owns (a fluid,
+    ocean or point cache folder, which the job's simulation would write into the user's project, or
+    a mesh cache), one frame of a sequence or tile set, a folder. Packed data is inside the file;
+    weak references (the file an appended datablock came from, which Blender keeps only to reuse it
+    on a later append) are never read, so neither counts."""
     import bpy
-    users: dict[str, set] = {}
+    users: dict[str, list] = {}
     for idb, paths in bpy.data.file_path_map().items():  # Skips packed data and weak references.
         for raw in paths:
-            users.setdefault(os.path.normpath(bpy.path.abspath(raw, library=idb.library)), set()).add(_label(idb))
-    missing = [path for path in sorted(users) if not Path(path).is_file()]
-    if missing:
-        named = [f"{path} (used by {', '.join(sorted(users[path])[:3])}{' and more' if len(users[path]) > 3 else ''})"
-                 for path in missing[:3]]
-        raise jobs.JobError("External asset is missing or uses a sequence/tile pattern: " + "; ".join(named)
-                            + (f"; and {len(missing) - 3} more" if len(missing) > 3 else "")
+            users.setdefault(_absolute(raw, idb), []).append(idb)
+    without = {path: [_without(idb, path) for idb in owners] for path, owners in users.items()
+               if not os.path.exists(path)}
+    refused = [path for path in sorted(users)
+               if not Path(path).is_file() and not (path in without and all(without[path]))]
+    if refused:
+        named = [f"{path} (used by {_users(users[path])})" for path in refused[:3]]
+        raise jobs.JobError("External asset is missing, a folder or a sequence/tile pattern: " + "; ".join(named)
+                            + (f"; and {len(refused) - 3} more" if len(refused) > 3 else "")
                             + ". Pack/resolve it before creating a durable job.")
-    return [{"path": str(Path(path).resolve()), "sha256": jobs.digest(Path(path))} for path in sorted(users)]
+    return ([{"path": str(Path(path).resolve()), "sha256": jobs.digest(Path(path))}
+             for path in sorted(users) if path not in without],
+            [{"path": path, "used_by": _users(users[path]), "without": without[path][0]} for path in sorted(without)])
+
+
+def _absolute(raw: str, idb) -> str:
+    import bpy
+    return os.path.normpath(bpy.path.abspath(raw, library=idb.library))
+
+
+# What a node does without its missing file, for the nodes that read one (IES, OSL script).
+_NODE_FILES = {"ShaderNodeTexIES": "no IES profile", "ShaderNodeScript": "no OSL script"}
+
+
+def _without(idb, path: str) -> str:
+    """What the render does without idb's missing file at path, or "" when it must not go on: a datablock
+    that reads that one file (a single image, an IES or script node, a sound, a movie clip, a font, a
+    cache file or volume that isn't a sequence, a library) can be rendered without it; anything else
+    can't (an object's or modifier's cache folder, one frame of a sequence or tile set)."""
+    kind = idb.id_type
+    if kind == "IMAGE":
+        return "shows magenta" if idb.source in {"FILE", "MOVIE"} else ""
+    if kind in {"CACHEFILE", "VOLUME"}:
+        return "" if idb.is_sequence else "left out"
+    if kind == "MOVIECLIP":
+        return "left out" if idb.source == "MOVIE" else ""
+    if kind in {"SOUND", "FONT"}:
+        return "left out"
+    if kind == "LIBRARY":
+        return "its objects are absent"
+    tree = idb if kind == "NODETREE" else getattr(idb, "node_tree", None)  # A light's, material's or world's.
+    for node in getattr(tree, "nodes", ()):
+        if node.bl_idname in _NODE_FILES and node.mode == "EXTERNAL" and _absolute(node.filepath, idb) == path:
+            return _NODE_FILES[node.bl_idname]
+    return ""
+
+
+def _users(owners) -> str:
+    labels = sorted({_label(idb) for idb in owners})
+    return ", ".join(labels[:3]) + (" and more" if len(labels) > 3 else "")
+
+
+def missing_note(row: dict) -> str:
+    """The files a job's scene names that weren't there, for its start, status and inspection results:
+    what the render goes on without, and what that does to it."""
+    missing = row.get("missing_assets") or []
+    if not missing:
+        return ""
+    named = [f"{asset['path']} ({asset['used_by']}: {asset.get('without') or 'left out'})" for asset in missing[:5]]
+    return (f"\n{'Rendered' if row.get('state') == 'complete' else 'Renders'} without these missing files: "
+            + "; ".join(named) + (f"; and {len(missing) - 5} more" if len(missing) > 5 else "") + ".")
 
 
 def save_snapshot(spec: dict, path: Path) -> None:
@@ -149,7 +207,7 @@ def save_snapshot(spec: dict, path: Path) -> None:
     bpy.context.view_layer.update()
     # Keep external dependencies evidence-bound. A changed asset invalidates resume rather than
     # silently mixing two versions of a texture or linked scene into one sequence.
-    assets = external_assets()
+    assets, missing = external_assets()
     # The output holds only renders: the job knows its folder by identity, and its records stay in path.
     output = Path(spec["output"])
     jobs.ensure_empty(output)
@@ -159,7 +217,8 @@ def save_snapshot(spec: dict, path: Path) -> None:
     result = bpy.ops.wm.save_as_mainfile(filepath=str(snapshot), copy=True, compress=True, relative_remap=True)
     if result != {"FINISHED"}:
         raise jobs.JobError("Blender could not save the job's scene copy.")
-    spec.update(scene_revision=jobs.digest(snapshot), assets=assets, output_identity=jobs.identity(output))
+    spec.update(scene_revision=jobs.digest(snapshot), assets=assets, missing_assets=missing,
+                output_identity=jobs.identity(output))
     jobs.atomic_json(path / "spec.json", spec)
 
 
@@ -204,7 +263,7 @@ def start_render_job(budget_seconds, output_dir=None, frames=None, camera=None, 
     except (jobs.JobError, OSError, ValueError, RuntimeError) as ex:
         raise ToolError(str(ex)) from ex
     from . import files
-    return ToolResult(json.dumps(_summary(row)) + STARTED_NOTE
+    return ToolResult(json.dumps(_summary(row)) + missing_note(spec) + STARTED_NOTE
                       + files.relative_note(*(raw for raw in (output_dir, folder) if raw is not None)))
 
 
@@ -254,7 +313,8 @@ def _status(row: dict, preview: bool, waited: float | None = None) -> ToolResult
             image = scratch.folder() / f"job-{row['id']}-{jobs.digest(source)[:12]}.png"
             attachments._to_png(source, image, files.IMAGE_SIDE)
     return ToolResult(json.dumps(_summary(row)) + "\nAny preview is from this job's SAVED revision, not the live scene."
-                      + progress_note(row, waited), image_path=image, file_image=True)
+                      + missing_note(row) + progress_note(row, waited), image_path=image, file_image=True,
+                      outcome=render_offer.job_line(row))  # "31 s a frame": what a long render's choice reads.
 
 
 def render_job_status(job_id: str | None = None, preview: bool = False, wait: int = 0) -> ToolResult:
@@ -314,7 +374,8 @@ def cancel_render_job(job_id: str) -> ToolResult:
 
 def resume_render_job(job_id: str) -> ToolResult:
     try:
-        return ToolResult(json.dumps(_summary(jobs.launch(_path(job_id)))) + STARTED_NOTE)
+        row = jobs.launch(_path(job_id))
+        return ToolResult(json.dumps(_summary(row)) + missing_note(row) + STARTED_NOTE)
     except (jobs.JobError, OSError, ValueError) as ex:
         raise ToolError(str(ex)) from ex
 

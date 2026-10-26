@@ -234,6 +234,7 @@ class WorkspaceNotes(unittest.TestCase):
                                                "--python", str(workspace.SHAPE_KEY_GUARD),
                                                "--python", str(workspace.OP_NOTES),
                                                "--python", str(workspace.RENDER_PATH_GUARD),
+                                               "--python", str(workspace.RENDER_TIMING),
                                                "--python", str(self.ws / "pack.py"), "--", "extra"])
                     log.write_text(output, encoding="utf-8")
                     return 0, 0.1, False

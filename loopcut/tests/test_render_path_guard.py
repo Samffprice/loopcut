@@ -189,7 +189,7 @@ class WorkspaceLaunches(unittest.TestCase):
                 self.assertLess(shim.index(str(PRELUDE)), shim.index(arguments))
 
     def test_shell_starts_in_workspace(self):
-        def run(command, cwd, env, seconds, log, is_cancelled, label=""):
+        def run(command, cwd, env, seconds, log, is_cancelled, label="", left_running=None):
             self.assertEqual(label, "blender -b")
             self.assertEqual(cwd, self.ws)
             log.write_text("", encoding="utf-8")

@@ -376,10 +376,20 @@ def render_refusal() -> str:
 
 
 def in_process_refusal(idname: str) -> str:
-    """Why the model's code may not run this final-render operator; see IN_PROCESS_RENDERS."""
-    return (f"Render refused by the cost guard: {idname} in run_python holds Blender until it ends, and "
-            f"nothing can stop it. Use see_render with render=true for a still to look at, or render_job "
-            f"to write stills or animations to disk.")
+    """Why the model's code may not run this final-render operator; see IN_PROCESS_RENDERS. The workspace agent
+    (the ChatGPT plan's route) has neither see_render nor render_job: told to use them, it rendered from its shell.
+    Read from the running turn's loop, not session["mode"]: that stays "workspace" when the chat moves to a
+    provider whose loop has both."""
+    from . import agent, state
+    spec = getattr(state.session().get("turn"), "spec", None)
+    if spec is agent.WORKSPACE_SPEC or spec is agent.CODEX_SPEC:
+        way = ("Render in a background Blender instead: snapshot_scene, then run_blender with a script that "
+               "renders source.blend; Stop ends it.")
+    else:
+        way = ("Use see_render with render=true for a still to look at, or render_job to write stills or "
+               "animations to disk.")
+    return (f"Render refused by the cost guard: {idname} in run_python holds Blender until it ends, and nothing "
+            f"can stop it. {way}")
 
 
 def _before_operator(idname: str) -> None:

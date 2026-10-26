@@ -189,6 +189,68 @@ class ConversationsTest(unittest.TestCase):
             self.assertEqual(cv.load(session["id"])["items"], loaded["items"], "no second card")
             uploaded.assert_called_once()
 
+    def test_a_turn_it_into_3d_click_running_keeps_its_card_and_notes_through_a_reopen(self):
+        """Owner, 2026-10-26: a chat reopened while its Turn it into 3D click runs (agent.turn_into_3d) shows it
+        running, not as cut short; once nothing runs it in this Blender, it is. Its notes for the model are saved."""
+        session = self.session("/work/desk.blend", "make a lantern")
+        card = state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", "")
+        key = (session["id"], "job_1")
+        card["click"] = list(key)
+        session["items"].append(card)
+        session["between_turns"] = ["since your last turn: the user pressed Turn it into 3D on the picture P; it ran."]
+        cv.save(session)
+        with mock.patch.dict(state.running_clicks, {key: "P"}):
+            reopened = cv.load(session["id"])
+        self.assertEqual(reopened["items"][-1]["status"], "running")
+        self.assertNotIn(cv.CLOSED_MESSAGE, [i.get("text") for i in reopened["items"]])
+        self.assertEqual(reopened["between_turns"], session["between_turns"])
+        self.assertEqual(cv.load(session["id"])["items"][-2]["status"], "rejected", "nothing runs it here now")
+        self.assertEqual(state.new_session()["between_turns"], [])
+
+    def test_a_picture_saved_turning_into_3d_is_ready_again_once_its_click_ended_with_blender(self):
+        """Re-review F2, 2026-10-26: saved running at the click, a picture whose click ended with Blender (a quit or
+        crash) stayed "Turning into 3D…" for good. Loaded with no click running it, it is ready."""
+        session = self.session("/work/desk.blend", "make a lantern")
+        picture = {**state.item_tool("loopcut_cloud__image_generate", "Generate image", ""), "status": "done"}
+        picture["to_3d"] = {"pictures": [{"image": "P", "job": "job_1", "path": "", "state": "running"}],
+                            "credits": 80}
+        session["items"].append(picture)
+        cv.save(session)
+        with mock.patch.dict(state.running_clicks, {(session["id"], "job_1"): "P"}):
+            self.assertEqual(cv.load(session["id"])["items"][-1]["to_3d"]["pictures"][0]["state"], "running")
+        self.assertEqual(cv.load(session["id"])["items"][-1]["to_3d"]["pictures"][0]["state"], "ready")
+
+    def test_a_pictures_saved_button_and_click_are_checked_on_load(self):
+        """Re-review F7, 2026-10-26: picture data was drawn and clicked as saved. A malformed button or click refuses
+        the file; a picture path that is not the chat's own is dropped, as a preview's is."""
+        session = self.session("/work/desk.blend", "make a lantern")
+        good = {"image": "P", "job": "job_1", "path": "", "state": "ready"}
+        card = {**state.item_tool("loopcut_cloud__image_generate", "Generate image", ""), "status": "done"}
+        session["items"].append(card)
+        path = cv.root() / session["id"] / "conversation.json"
+        for offer, click, ok in (({"pictures": [good], "credits": 80}, None, True),
+                                 ({"pictures": [{**good, "path": "/etc/passwd"}], "credits": None}, None, True),
+                                 ({"pictures": "P"}, None, False),
+                                 ({"pictures": [{**good, "state": "lost"}]}, None, False),
+                                 ({"pictures": [{**good, "image": 3}]}, None, False),
+                                 ({"pictures": [good], "credits": float("nan")}, None, False),
+                                 (None, ["only one"], False), (None, [session["id"], 4], False)):
+            with self.subTest(offer=offer, click=click):
+                card.pop("to_3d", None)
+                card.pop("click", None)
+                if offer is not None:
+                    card["to_3d"] = offer
+                if click is not None:
+                    card["click"] = click
+                cv.save(session)
+                if ok:
+                    loaded = cv.load(session["id"])["items"][-1]["to_3d"]["pictures"][0]
+                    self.assertEqual(loaded.get("path", ""), "")
+                else:
+                    body = json.loads(path.read_text())
+                    with self.assertRaises(cv.ConversationError):
+                        cv._validate(body)
+
     def test_a_closed_chat_opened_again_before_its_next_save_is_closed_and_sent_once(self):
         """History loads the chat it opens before the one on screen is saved (host._switch, then lifecycle.switch_to):
         the same chat reopened that way, or after another crash, must not close (and upload) its turn again."""

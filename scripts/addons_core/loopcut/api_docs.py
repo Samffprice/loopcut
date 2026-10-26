@@ -648,7 +648,9 @@ def inspect_api(path: str = "", search: str = "") -> str:
                     raise ApiError(notice + "\n" + str(ex)) from ex
                 raise
             if package and path == package["module"]:
-                lines.insert(0, bundled_addons.hint(package))
+                # Its Python name too: "mpfb.* and HumanService" read as import mpfb, seven failed tries (0.2.14).
+                lines.insert(0, f"{bundled_addons.hint(package)}. In Python it is {path}: "
+                                f"import {package['id']} fails.")
             if notice:
                 lines.insert(0, notice)
     except (bundled_addons.BundledAddonError, OSError, ValueError) as ex:
