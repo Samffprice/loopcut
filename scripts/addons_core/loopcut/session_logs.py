@@ -301,9 +301,11 @@ def _user_kind(message: dict, text: str) -> str:
     return "turn"
 
 
-def _message_entries(message: dict, kind: str, names: dict, images: Path | None) -> list:
+def _message_entries(message: dict, kind: str, names: dict, images: Path | None, results: Path | None = None) -> list:
     """One message as transcript entries. The add-on's private markers (context.PRIVATE_PREFIX) are never copied;
-    what they say about the message is in data."""
+    what they say about the message is in data. A tool result cut short for the model keeps that text, which is
+    what the model worked from, and the whole result from `results` in data.full_result (owner, 2026-10-26: logs
+    keep the full text)."""
     from . import context
     role = message.get("role")
     text, others = _parts(message.get("content"))
@@ -332,6 +334,13 @@ def _message_entries(message: dict, kind: str, names: dict, images: Path | None)
         if names.get(call_id):
             entry["name"] = names[call_id]
         entry["text"] = text
+        from . import result_store
+        ref = result_store.ref_in(text) if results is not None else ""
+        if ref:
+            try:
+                data["full_result"] = _clean(result_store.whole(results, ref))
+            except result_store.StoreError:
+                pass  # Gone with a cleared store: the cut text above is all there is.
     else:
         entry["text"] = text
         if kind != "turn":
@@ -390,9 +399,12 @@ def _event(item: dict) -> dict | None:
     return {"role": "event", "text": text, "data": data}
 
 
-def build_transcript(messages: list, items: list, *, images: Path | None = None, workers: list = ()) -> list:
+def build_transcript(messages: list, items: list, *, images: Path | None = None, workers: list = (),
+                     results: Path | None = None) -> list:
     """The conversation as transcript entries: every message in order, with the chat's cards (errors, notices,
     limits, scene changes, waves, merges, offers) as events where they happened, as far as that is known.
+    `results` is the conversation's result store (result_store): a tool result the model saw cut short carries
+    the whole of it in data.full_result.
 
     Messages and chat items are separate lists with no shared clock, so they are lined up by what both have: each
     message the user sent (a turn or a note sent mid-turn) opens a segment in both, and inside a segment the n-th
@@ -416,7 +428,7 @@ def build_transcript(messages: list, items: list, *, images: Path | None = None,
                 segment += 1
                 turn += kind == "turn"
                 tools = 0
-        entries.extend(_message_entries(message, kind, names, images))
+        entries.extend(_message_entries(message, kind, names, images, results))
         if kind in ("turn", "steer"):
             after_tool[(segment, 0)] = len(entries)
             segment_turn[segment] = turn
@@ -555,6 +567,9 @@ def _trim_entry(entry: dict, side: int, tool_side: int | None = None) -> dict:
     for call in entry.get("tool_calls") or []:
         if isinstance(call, dict) and isinstance(call.get("arguments"), str):
             call["arguments"] = trim_text(call["arguments"], tool_side)
+    data = entry.get("data")
+    if isinstance(data, dict) and isinstance(data.get("full_result"), str):
+        data["full_result"] = trim_text(data["full_result"], own)
     return entry
 
 
@@ -798,7 +813,7 @@ def _worker_outcome(outcome: str) -> str:
 
 def _worker_snapshot(worker: dict, provider: str, fallback_model: str) -> dict | None:
     """One worker conversation from its folder, as an upload of its own."""
-    from . import telemetry
+    from . import result_store, telemetry
     body = _read_json(worker["folder"] / "conversation.json")
     if not isinstance(body, dict) or body.get("id") != worker["session"]:
         return None
@@ -818,7 +833,8 @@ def _worker_snapshot(worker: dict, provider: str, fallback_model: str) -> dict |
                      "turns": max(1, sum(1 for item in items if isinstance(item, dict) and item.get("kind") == "user")),
                      "outcome": _worker_outcome(worker["outcome"])},
             "transcript": cap_entries(build_transcript(body.get("messages") or [], items,
-                                                       images=worker["folder"] / "images")),
+                                                       images=worker["folder"] / "images",
+                                                       results=worker["folder"] / result_store.FOLDER)),
             "log": log}
 
 
@@ -836,10 +852,11 @@ def snapshot(session: dict, turn, start: dict) -> list[dict]:
     workers = worker_folders(session["id"])
     try:
         images = conversations._folder(session["id"]) / "images"
+        results = conversations.results_folder(session)
     except Exception:
-        images = None
+        images = results = None
     transcript = build_transcript(list(session.get("messages") or []), list(session.get("items") or []),
-                                  images=images, workers=workers)
+                                  images=images, workers=workers, results=results)
     provider, model = start["provider"], start["model"]
     turns = number or sum(1 for item in list(session.get("items") or []) if item.get("kind") == "user")
     uploads = [{"session_id": session_id,
@@ -1115,6 +1132,7 @@ def recent_conversations(root: Path, limit: int = REPORT_SESSIONS) -> list[tuple
 
 def report_session(folder: Path, meta: dict, route: tuple[str, str]) -> dict | None:
     """One saved conversation as a report's session (a /v1/logs body without install_id and app_version)."""
+    from . import result_store
     body = _read_json(folder / "conversation.json")
     session_id = session_uuid(meta.get("id"))
     if not isinstance(body, dict) or not session_id or body.get("id") != meta["id"]:
@@ -1127,7 +1145,8 @@ def report_session(folder: Path, meta: dict, route: tuple[str, str]) -> dict | N
                      "started_at": rfc3339(meta.get("created", body.get("created"))),
                      "turns": max(0, min(10_000, turns)), "outcome": seen.get("outcome") or _items_outcome(items)},
             "transcript": cap_entries(build_transcript(body.get("messages") or [], items, images=folder / "images",
-                                                       workers=worker_folders(meta["id"])))}
+                                                       workers=worker_folders(meta["id"]),
+                                                       results=folder / result_store.FOLDER))}
 
 
 def report_body(note: str, email: str, include: bool, context: dict) -> dict:

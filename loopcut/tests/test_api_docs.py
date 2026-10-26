@@ -304,6 +304,72 @@ class LookupTest(unittest.TestCase):
         self.assertFalse(any("rename" in line for line in lines[:4]), lines)
 
 
+def prop(identifier, kind="FLOAT", description="", **extra):
+    """A fake RNA property, as _property_line reads one."""
+    entry = dict(identifier=identifier, type=kind, description=description, is_readonly=False, fixed_type=None,
+                 default=0.5, array_length=0, subtype="NONE", hard_min=0.0, hard_max=1.0, is_enum_flag=False)
+    entry.update(extra)
+    return types.SimpleNamespace(**entry)
+
+
+class ConciseTest(unittest.TestCase):
+    """inspect_api is concise unless asked for detail: an Object's listing filled 6,000 characters and the model
+    is shown 1,200 (result_store); its descriptions were most of it."""
+
+    def setUp(self):
+        modes = prop("affect", "ENUM", "Affect edges or vertices", default="EDGES",
+                     enum_items=[types.SimpleNamespace(identifier=f"MODE_{n}") for n in range(12)])
+        width = prop("width", description="Bevel amount, in meters")
+        modifier = rna("Modifier")
+        bevel = rna("BevelModifier", modifier)
+        bevel.properties = Properties({"width": width, "affect": modes})
+        bevel.description = "Bevel modifier to make edges and vertices more rounded"
+        node = type("Node", (), {})
+        self.types = types.SimpleNamespace(BevelModifier=type("BevelModifier", (), {"bl_rna": bevel}), Node=node,
+                                           Modifier=type("Modifier", (), {"bl_rna": modifier}))
+        notes = mock.patch.dict(api_docs.NOTES, {"BevelModifier": "Width is in meters, not a percentage."})
+        notes.start()
+        self.addCleanup(notes.stop)
+
+    def inspect(self, path, detail=False):
+        with mock.patch.object(api_docs.bpy, "types", self.types, create=True):
+            return api_docs.inspect_api(path, detail=detail).splitlines()
+
+    def test_a_type_lists_names_types_and_defaults_with_its_note_first(self):
+        lines = self.inspect("bpy.types.BevelModifier")
+        self.assertEqual(lines[:4], ["bpy.types.BevelModifier(Modifier)",
+                                     "Bevel modifier to make edges and vertices more rounded",
+                                     "NOTE: Width is in meters, not a percentage.", "properties:"])
+        self.assertEqual(lines[4:6], ["  width: float in [0, 1] = 0.5",
+                                      "  affect: enum ['MODE_0', 'MODE_1', 'MODE_2', 'MODE_3', 'MODE_4', 'MODE_5', "
+                                      "'MODE_6', 'MODE_7', ... 4 more] = 'EDGES'"])
+        self.assertFalse(api_docs._concise, "a call's mode ends with it")
+
+    def test_detail_or_the_propertys_own_path_gives_descriptions_and_every_value(self):
+        detailed = self.inspect("bpy.types.BevelModifier", detail=True)
+        self.assertEqual(detailed[4], "  width: float in [0, 1] = 0.5  # Bevel amount, in meters")
+        self.assertIn("'MODE_11'] = 'EDGES'  # Affect edges or vertices", detailed[5])
+        own = self.inspect("BevelModifier.affect")
+        self.assertIn("'MODE_11'] = 'EDGES'  # Affect edges or vertices", own[1])
+        self.assertEqual(own[2], "NOTE: Width is in meters, not a percentage.")
+
+    def test_a_search_lists_what_fits_what_the_model_is_shown(self):
+        index = [(f"bpy.types.Thing{n}", f"thing{n} bevel") for n in range(60)]
+        with mock.patch.object(api_docs, "_registered_key", return_value="key"), \
+                mock.patch.multiple(api_docs, _index=index, _index_key="key"):
+            concise = api_docs.inspect_api(search="bevel")
+            detailed = api_docs.inspect_api(search="bevel", detail=True)
+        self.assertEqual(len(concise.splitlines()), 1 + api_docs.CONCISE_SEARCH_RESULTS)
+        self.assertLessEqual(len(concise), 1200)
+        self.assertEqual(len(detailed.splitlines()), 1 + api_docs.MAX_SEARCH_RESULTS)
+
+    def test_the_tool_passes_detail_through(self):
+        with mock.patch.object(api_docs, "inspect_api", return_value="listed") as inspected:
+            tools.inspect_api(path="Object", detail=True)
+            tools.inspect_api(path="Object")
+        self.assertEqual([c.args for c in inspected.call_args_list], [("Object", "", True), ("Object", "", False)])
+
+
 class SearchTest(unittest.TestCase):
     INDEX = [("bpy.types.ActionLayers", "actionlayers collection of animation layers"),
              ("bpy.types.ActionChannelbag.fcurves", "actionchannelbag.fcurves f-curves the list of f-curves"),

@@ -18,6 +18,9 @@ import autorig_contract
 
 # The platform's quote line (contract 0.9 schema const). The card shows rig_text.QUOTE instead (R10).
 PLATFORM_NOTICE = 'Best on humanoid characters; others get an experimental rig that may bend oddly.'
+# Every line a platform quote may carry until the web const takes rig_text.QUOTE's words (R7-D3): 0.9's, then R10's
+# card line, which contract 0.9.x and 0.10 carry.
+PLATFORM_NOTICES = (PLATFORM_NOTICE, 'Body bones with automatic weights, and finger bones when it can find them; best on humanoids, others may bend oddly.')
 
 
 def descriptor(skeleton='tokenrig-native-273b691-v1'):

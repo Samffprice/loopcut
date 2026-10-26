@@ -303,6 +303,86 @@ class JobsTest(unittest.TestCase):
         self.assertEqual(error.extra["idempotency_key"], transport.posts[0]["idempotency_key"])
         self.assertIn(f'idempotency_key "{transport.posts[0]["idempotency_key"]}"', cloud.error_text(error))
 
+    def test_a_replay_with_its_key_sends_the_first_requests_quote_id(self):
+        transport = Busy({("POST", "/jobs"): 99})
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            self.run_busy(transport, arguments={"prompt": "prop", "quote_id": "qt_first"})
+        key = caught.exception.extra["idempotency_key"]
+        transport.fails.clear()
+        result, _ = self.run_busy(transport, arguments={"prompt": "prop", "quote_id": "qt_fresh", "idempotency_key": key})
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(transport.posts[-1]["quote_id"], "qt_first")
+        self.assertEqual(transport.posts[-1], transport.posts[0], "the identical body, so the server returns its job")
+        self.assertEqual(cloud_jobs.sent(key), {"quote_id": "qt_first", "bundle": None})
+        self.assertIsNone(cloud_jobs.sent("never-sent"))
+
+    # 0.2.20: a 5xx while downloading a succeeded, charged job's files.
+    STORAGE = ("GET", "signature=test")
+
+    def own_folders(self):
+        """Each download its own folder under the root: a failed one removes its folder."""
+        make = tempfile.mkdtemp  # The one patched is this same module's.
+        return patch.object(cloud_jobs.tempfile, "mkdtemp", side_effect=lambda **_: make(dir=self.root))
+
+    def run_own(self, transport, **options):
+        with self.own_folders(), patch.object(cloud_jobs, "_client", return_value=transport.client()), \
+                patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)):
+            return cloud_jobs.run(options.pop("descriptor", DESCRIPTOR), options.pop("arguments", {"prompt": "prop"}),
+                                  {}, project=PROJECT, **options)
+
+    def test_a_503_downloading_a_finished_jobs_file_is_asked_again_then_saved(self):
+        transport = Busy({self.STORAGE: 2}, status=503, code="http_error")
+        result, slept = self.run_busy(transport)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertEqual(sum(url.startswith("https://storage.test") for _, url, _ in transport.calls), 3)
+        self.assertEqual(slept, sum(cloud_jobs.SERVER_RETRY_SECONDS[:2]))
+        self.assertEqual(len(transport.posts), 1)
+
+    def test_5xx_downloading_throughout_say_the_job_succeeded_and_was_charged(self):
+        transport = Busy({self.STORAGE: 99}, status=500)
+        with self.assertRaises(cloud_http.CloudError) as caught:
+            self.run_own(transport)
+        error = caught.exception
+        self.assertEqual(error.code, cloud_jobs.UNFETCHED)
+        self.assertEqual(error.extra["job"]["status"], "succeeded")
+        self.assertEqual(sum(url.startswith("https://storage.test") for _, url, _ in transport.calls),
+                         1 + len(cloud_jobs.SERVER_RETRY_SECONDS))
+        self.assertEqual(list(self.root.iterdir()), [], "no partial file or folder is left behind")
+        key = transport.posts[0]["idempotency_key"]
+        text = cloud.error_text(error)
+        for said in ("job job_test succeeded and was charged 2 credits", "not a failed job", "do not start another",
+                     f'idempotency_key "{key}"', "no new charge"):
+            self.assertIn(said, text)
+        self.assertFalse(text.startswith(("server_error", "http_error")))
+        # The call's replay with its key gets the same job back and downloads its files.
+        transport.fails.clear()
+        result = self.run_own(transport, arguments={"prompt": "prop", "idempotency_key": key})
+        self.assertEqual(Path(result["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertEqual(len({post["idempotency_key"] for post in transport.posts}), 1)
+
+    def test_a_long_jobs_unfetched_files_come_with_job_status(self):
+        transport = Busy({self.STORAGE: 99}, status=502, code="http_error",
+                         streams=[urllib.error.HTTPError("events", 405, "unsupported", {}, io.BytesIO())])
+        with patch.object(cloud_jobs, "time", types.SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)), \
+                self.own_folders():
+            self.run_own(transport, descriptor={**DESCRIPTOR, "latency": "long"})
+            for thread in [t for t in threading.enumerate() if t.name == "Loopcut cloud job"]:
+                thread.join(timeout=5)
+            with patch.object(cloud, "_jobs", {"job_test": {}}):
+                error = cloud_jobs._registry["job_test"]["error"]
+                self.assertEqual(error.code, cloud_jobs.UNFETCHED)
+                self.assertIn('Call job_status with job_id "job_test"', cloud.error_text(error))
+            transport.fails.clear()
+            status = cloud_jobs.job_status("job_test")
+            self.assertEqual(status["status"], "running", "fetched anew, not the stored failure")
+            for thread in [t for t in threading.enumerate() if t.name == "Loopcut cloud job"]:
+                thread.join(timeout=5)
+        done = cloud_jobs.job_status("job_test")
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(Path(done["outputs"][0]["path"]).read_bytes(), DATA)
+        self.assertEqual(len(transport.posts), 1, "nothing bought again")
+
     def test_cancel_during_progress_posts_cancel_and_exposes_refund(self):
         cancel = threading.Event()
         stream = event("progress", {"pct": 10, "message": "Working"}, 1)

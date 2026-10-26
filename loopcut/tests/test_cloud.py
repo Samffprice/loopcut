@@ -1038,6 +1038,22 @@ class DispatchTest(RuntimeFixture):
         self.assertEqual(result.text, 'No generation is on for this account or project.')
         self.assertEqual(self.calls, [])
 
+    def test_arguments_the_tool_does_not_take_are_the_models_mistake_and_a_credits_refusal_is_not(self):
+        # rel019-cloud: the model gave the render a video format; its card read the schema text (ui.layout).
+        self.ready()
+        for arguments, text in (({'prompt': 'prop', 'format': 'mp4'}, "Unknown tool input; use the fields in this "
+                                                                        "tool's schema."),
+                                ({}, 'Required tool input missing: prompt'),
+                                ({'prompt': 7}, "Invalid prompt: use the type described in this tool's schema.")):
+            with self.subTest(arguments=arguments):
+                result = cloud.execute(cloud.PREFIX + 'image_generate', arguments)
+                self.assertEqual((result.ok, result.text, result.input_mistake), (False, text, True))
+        self.assertEqual(self.calls, [])
+        with patch.object(config, 'billing_open', lambda: True):
+            self.ready(available=False, unavailable_reason='credits')
+            result = cloud.execute(cloud.PREFIX + 'image_generate', {'prompt': 'prop'})
+        self.assertEqual((result.ok, result.text, result.input_mistake), (False, 'Not enough credits.', False))
+
     @staticmethod
     def quoting(run):
         """A fake run that first answers authorize's quote as the server does (every paid call is quoted)."""

@@ -394,13 +394,28 @@ class CloudOfferTest(RuntimeFixture):
         self.assertFalse(cloud.approval(cloud.PREFIX + cloud.OFFER, {"tool": "sfx"}))
         result = cloud.execute(cloud.PREFIX + cloud.OFFER, {"tool": "sfx"})
         self.assertTrue(result.ok)
-        self.assertIn("needs Loopcut credits", result.text)
+        self.assertIn("Sound effects needs about 2 credits; you have 0.", result.text)
         card = state.session()["items"][-1]
         self.assertEqual((card["kind"], card["nudge"]), ("offer", "locked_tool"))
         self.assertIn("You have 0.", card["text"])
         self.assertFalse(cloud.execute(cloud.PREFIX + cloud.OFFER, {"tool": "image_generate"}).ok)
         self.assertEqual(cloud.describe(cloud.PREFIX + cloud.OFFER, {"tool": "sfx"})[0], "How to unlock Sound effects")
         self.assertEqual(self.transport.replies, [], "the offer itself calls no service")
+
+    def test_a_tool_locked_for_credits_says_its_price_and_the_balance_not_that_it_is_unavailable(self):
+        """rel019-lowcredit (2026-10-26): at 15 credits, image_to_3d (about 80) reached the model as "Locked Loopcut
+        cloud tools: Image to 3D", which it told the user as "photo-to-3D isn't available in this session", right
+        after the free Try it had made a model from a photo. Now the plain fact, with no advice about credits."""
+        self.locked(tool("image_to_3d", kind="gen", title="Image to 3D", available=False, unavailable_reason="credits",
+                         cost={"credits_estimate": 80, "quote_required": False}), balance=15)
+        offer = {s["function"]["name"]: s for s in cloud.tool_schemas()}[cloud.PREFIX + cloud.OFFER]["function"]
+        self.assertTrue(offer["description"].startswith(
+            "Loopcut cloud tools that need something first: Image to 3D needs about 80 credits. "), offer["description"])
+        self.assertNotIn("15", offer["description"], "the balance changes each turn; the tools (a cached prefix) don't")
+        result = cloud.execute(cloud.PREFIX + cloud.OFFER, {"tool": "image_to_3d"}).text
+        self.assertIn("Image to 3D needs about 80 credits; you have 15.", result)
+        for words in ("locked", "available", "save", "avoid", "careful"):
+            self.assertNotIn(words, (offer["description"] + result).lower())
 
     def test_model_source_header_only_when_signed_in(self):
         for signed_in in (True, False):

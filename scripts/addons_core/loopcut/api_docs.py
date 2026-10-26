@@ -18,15 +18,24 @@ import bpy
 from . import bundled_addons, capabilities, op_notes, scene_diff
 
 MAX_CHARS = 6000
-MAX_SEARCH_RESULTS = 40
+MAX_SEARCH_RESULTS = 40   # With detail; 25 without, within result_store.LIMIT.
+CONCISE_SEARCH_RESULTS = 25
+CONCISE_ENUM = 8          # Enum values a concise listing shows; detail, or the property's own path, shows them all.
 MAX_PARTIAL_RESULTS = 10  # When nothing matches every word: the best few by words matched.
 _NODE_TREES = ("ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree")
+# Concise unless the call asked for detail: set by inspect_api for its own call (main thread, one at a time). The
+# helpers below default to detail, as harness/api_docs_check.py and error_note read them.
+_concise = False
 _index: list[tuple[str, str]] | None = None  # (path, lowercased text to match against)
 _index_key: tuple = ()  # What was registered when the index was built; an add-on enabled since rebuilds it.
 
 
 class ApiError(Exception):
     """The path or query made no sense; the message says what would."""
+
+
+class ArgumentError(ApiError):
+    """Neither or both of path and search, or an empty search: the call's arguments (tools.InputMistake)."""
 
 
 def _socket_types() -> list[str]:
@@ -268,7 +277,8 @@ def _type_of(prop, owner: tuple[str, str] = ("", "")) -> str:
             values = dynamic()
         elif len(values) <= 1:
             return "enum (values are computed at run time; assigning a wrong one raises a TypeError listing the valid ones)"
-        shown = ", ".join(repr(v) for v in values[:24]) + (", ..." if len(values) > 24 else "")
+        cap = CONCISE_ENUM if _concise else 24
+        shown = ", ".join(repr(v) for v in values[:cap]) + (f", ... {len(values) - cap} more" if len(values) > cap else "")
         return ("set of " if prop.is_enum_flag else "enum ") + f"[{shown}]"
     if kind in ("POINTER", "COLLECTION"):
         target = prop.fixed_type.identifier if prop.fixed_type else "?"
@@ -310,7 +320,7 @@ def _property_line(prop, with_default=True, owner: tuple[str, str] = ("", "")) -
         line += " (read-only)"
     if getattr(prop, "is_deprecated", False):
         line += f" (DEPRECATED: {prop.deprecated_note})"
-    if prop.description:
+    if prop.description and not _concise:
         line += f"  # {prop.description}"
     return line
 
@@ -322,7 +332,7 @@ def _function_line(function) -> str:
     line = f"  {function.identifier}({arguments})"
     if outputs:
         line += " -> " + ", ".join(_type_of(p) for p in outputs)
-    if function.description:
+    if function.description and not _concise:
         line += f"  # {function.description}"
     return line
 
@@ -351,7 +361,7 @@ def _python_line(name: str, value) -> str:
         except (TypeError, ValueError):
             line = f"  {name}(...)"
     doc = (inspect.getdoc(function) or "").splitlines()
-    return line + (f"  # {doc[0]}" if doc else "")
+    return line + (f"  # {doc[0]}" if doc and not _concise else "")
 
 
 def _own_properties(rna) -> list:
@@ -398,7 +408,10 @@ def _describe_rna(rna, cls=None) -> list[str]:
     lines = [f"bpy.types.{rna.identifier}" + (f"({rna.base.identifier})" if rna.base else "")]
     if rna.description:
         lines.append(rna.description)
-    # First: a few lines, and a long type (Mesh, Object) is cut at MAX_CHARS long before its end.
+    # Right after the head: a long type (Mesh, Object) is cut long before its end (MAX_CHARS, and the 1,200
+    # characters the model is shown, result_store), and the tested note is what it most needs.
+    if note_for(rna):
+        lines.append("NOTE: " + note_for(rna))
     python = _python_members(cls, rna) if cls else {}
     if python and rna.base:  # Only what this class adds: Panel.append is not repeated on every panel.
         base = getattr(bpy.types, rna.base.identifier, None)
@@ -419,13 +432,12 @@ def _describe_rna(rna, cls=None) -> list[str]:
         names = [p.identifier for p in rna.base.properties if p.identifier != "rna_type"]
         lines.append(f"inherited from {rna.base.identifier} (inspect it for details): {', '.join(names)}")
     subclasses = sorted(c.bl_rna.identifier for c in cls.__subclasses__() if hasattr(c, "bl_rna")) if cls else []
+    cap = 20 if _concise else 60
     if subclasses:
-        lines.append(f"subtypes ({len(subclasses)}): {', '.join(subclasses[:60])}"
-                     + (", ..." if len(subclasses) > 60 else ""))
+        lines.append(f"subtypes ({len(subclasses)}): {', '.join(subclasses[:cap])}"
+                     + (", ..." if len(subclasses) > cap else ""))
     if cls and issubclass(cls, bpy.types.Node):
         lines += _node_sockets(rna.identifier)
-    if note_for(rna):
-        lines.append("NOTE: " + note_for(rna))
     return lines
 
 
@@ -476,19 +488,32 @@ def _closest(name: str) -> str:
     return f" Closest type names: {', '.join(close[:10])}." if close else ""
 
 
+def _full(build):
+    """build() in detail, whatever the call asked: one property or function is asked about for its description and
+    every value it takes."""
+    global _concise
+    was, _concise = _concise, False
+    try:
+        return build()
+    finally:
+        _concise = was
+
+
 def _walk_rna(cls, names: list[str], rna=None) -> list[str]:
     """Follow property names from an RNA type: Object -> modifiers -> (the collection's type).
     rna without cls: a struct with no bpy.types class (_unexposed)."""
     rna = cls.bl_rna if rna is None else rna
     for position, name in enumerate(names):
         if name in rna.functions:
-            return [f"bpy.types.{rna.identifier}.{name}", _function_line(rna.functions[name]).strip(),
-                    *("  " + _property_line(p, with_default=False, owner=(rna.identifier, name)).strip()
-                      for p in rna.functions[name].parameters)]
+            function = rna.functions[name]
+            return _full(lambda: [f"bpy.types.{rna.identifier}.{name}", _function_line(function).strip(),
+                                  *("  " + _property_line(p, with_default=False, owner=(rna.identifier, name)).strip()
+                                    for p in function.parameters)])
         prop = rna.properties.get(name)
         python = _python_members(cls, rna) if prop is None and cls else {}
         if name in python:
-            return [f"bpy.types.{rna.identifier}.{name} (defined in Python)", _python_line(name, python[name]).strip()]
+            return _full(lambda: [f"bpy.types.{rna.identifier}.{name} (defined in Python)",
+                                  _python_line(name, python[name]).strip()])
         if prop is None:
             note = note_for(rna)  # Action.fcurves: the note says where they went.
             raise ApiError(f"bpy.types.{rna.identifier} has no property or function {name!r}. "
@@ -496,7 +521,8 @@ def _walk_rna(cls, names: list[str], rna=None) -> list[str]:
                            + ", ".join([p.identifier for p in rna.properties if p.identifier != "rna_type"]
                                        + list(python)))
         if prop.type not in ("POINTER", "COLLECTION") or prop.fixed_type is None:
-            lines = [f"bpy.types.{rna.identifier}.{name}", _property_line(prop, owner=(rna.identifier, "")).strip()]
+            lines = _full(lambda: [f"bpy.types.{rna.identifier}.{name}",
+                                   _property_line(prop, owner=(rna.identifier, "")).strip()])
             if note_for(rna):
                 lines.append("NOTE: " + note_for(rna))
             return lines
@@ -602,7 +628,7 @@ def _search(query: str) -> list[str]:
     global _index, _index_key
     terms = query.lower().split()
     if not terms:
-        raise ApiError("search needs at least one word.")
+        raise ArgumentError("search needs at least one word.")
     key = _registered_key()
     if _index is None or key != _index_key:
         _index, _index_key = _build_index(), key
@@ -621,16 +647,29 @@ def _search(query: str) -> list[str]:
                  "best first; pass one as `path` for details:"]
                 + hints
                 + [f"  {path} ({-matched} of {len(terms)} words)" for matched, _, _, path in scored[:MAX_PARTIAL_RESULTS]])
-    lines = [f"{len(hits)} match(es) for {query!r}" + (f", first {MAX_SEARCH_RESULTS}" if len(hits) > MAX_SEARCH_RESULTS else "")
+    cap = CONCISE_SEARCH_RESULTS if _concise else MAX_SEARCH_RESULTS
+    lines = [f"{len(hits)} match(es) for {query!r}" + (f", first {cap}" if len(hits) > cap else "")
              + "; pass one as `path` for details:"]
-    return lines + ["  " + path for _, _, path in hits[:MAX_SEARCH_RESULTS]]
+    return lines + ["  " + path for _, _, path in hits[:cap]]
 
 
-def inspect_api(path: str = "", search: str = "") -> str:
-    """Raises ApiError with a message meant for the model."""
+def inspect_api(path: str = "", search: str = "", detail: bool = False) -> str:
+    """Raises ApiError with a message meant for the model. Concise unless `detail`: signatures, types, defaults and
+    the first CONCISE_ENUM enum values, without the descriptions, which were most of a type's listing and pushed
+    its later properties past what the model is shown (lean-context, 2026-10-26). The tested notes (NOTES,
+    op_notes) show either way, near the top; one property's or function's own path is always in detail (_full)."""
+    global _concise
     path, search = path.strip(), search.strip()
     if bool(path) == bool(search):
-        raise ApiError("Pass exactly one of `path` (describe it) or `search` (find names).")
+        raise ArgumentError("Pass exactly one of `path` (describe it) or `search` (find names).")
+    _concise = not detail
+    try:
+        return _inspect(path, search)
+    finally:
+        _concise = False
+
+
+def _inspect(path: str, search: str) -> str:
     try:
         if search:
             lines = _search(search)

@@ -1446,14 +1446,15 @@ class RoleTypesTest(unittest.TestCase):
 
 
 class PromptTest(unittest.TestCase):
-    def test_the_orchestrators_fixed_cost_stays_under_10555_tokens(self):
+    def test_the_orchestrators_fixed_cost_stays_under_10830_tokens(self):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
         fixed = context.fixed_tokens("", agent._orchestrator_schemas(), prompt_id="orchestrator", index=index)
         # 10,534 on 2026-10-17 with the captures' labels switch; 10,549 on 2026-10-24, when the tool summaries
-        # were asked for in the user's language.
-        self.assertLessEqual(fixed, 10555)
+        # were asked for in the user's language; 10,654 on 2026-10-26 with set_extras (0.2.20, paid extras); 10,825
+        # with read_result as well (rc/0.2.20).
+        self.assertLessEqual(fixed, 10830)
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
 
     def test_step_titles_are_in_the_language_the_user_writes_in(self):
@@ -1498,11 +1499,13 @@ class PromptTest(unittest.TestCase):
         self.assertNotIn("steps", worker)
         self.assertIn("letters and digits", worker["prefix"]["description"])
 
-    def test_the_workers_fixed_cost_stays_under_6255_tokens(self):
+    def test_the_workers_fixed_cost_stays_under_6430_tokens(self):
         """Service worker prompt size and public schemas stay within the worker cap."""
         from prompt_index_fixture import built_index
         fixed = context.fixed_tokens("", workers.schemas(), prompt_id="worker", index=built_index())
-        self.assertLessEqual(fixed, 6255)  # 6,243 on 2026-10-17 with capture_viewport's labels.
+        # 6,243 on 2026-10-17 with capture_viewport's labels; 6,388 on 2026-10-26 with read_result; 6,425 on rc/0.2.20
+        # with the 0.2.20 lanes' tool texts.
+        self.assertLessEqual(fixed, 6430)
 
     def test_uv_and_texture_tools_reach_every_role_and_run_in_the_child(self):
         from loopcut import tools, worker_host
@@ -2288,7 +2291,9 @@ class FinishGateTest(unittest.TestCase):
         passing = lambda checks: [{"status": "pass"} for _ in checks]
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, self.reply("All set."), passing))
         self.assertEqual(self.session["items"][-1]["text"], "All set.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
-                                                            "Requirements (the user's words): 2 of 2 covered.")
+                                                            "Requirements (your words): 2 of 2 covered.")
+        self.assertEqual(self.session["messages"][-1]["content"], "All set.\n\nVerified by Loopcut on this scene: 2 of 2 "
+                         "checks.\nRequirements (the user's words): 2 of 2 covered.", "the model's copy is unchanged")
 
     def test_the_verified_block_names_the_requirements_no_check_covers(self):
         """GPT-6.1 Sol's asset pack (20260929-230207): "Verified 35/35" while the sign stood on the ground,
@@ -2307,7 +2312,7 @@ class FinishGateTest(unittest.TestCase):
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, self.reply("Done."), passing), "no bounce")
         self.assertEqual(self.session["items"][-1]["text"].split("\n\n", 1)[1],
                          "Verified by Loopcut on this scene: 3 of 3 checks.\n"
-                         "Requirements (the user's words): 2 of 4 covered, 1 partly covered, 1 unverified.\n"
+                         "Requirements (your words): 2 of 4 covered, 1 partly covered, 1 unverified.\n"
                          "- partly covered: \"a hanging sign\": sign c1 pass; nothing measures \"hanging\" (a suspended "
                          "check would)\n"
                          "- unverified: \"Use a consistent hand-painted look\": no check")
@@ -2417,6 +2422,27 @@ class OwnChecksTest(unittest.TestCase):
         self.assertEqual(self.ran, [])
         self.assertIsNone(self.turn.job.own.get("o1"))
 
+    def test_the_panel_says_your_words_and_each_quote_is_still_the_users_exact_words(self):
+        """Guard (0.2.20): only the requirements line's framing turned second person in the panel. A check still
+        quotes the user word for word, a paraphrase is still refused, and the quote reaches both copies as written."""
+        crystal = {"kind": "exists", "name": "Crystal"}
+        paraphrase = orchestrator.checks(add=[{**crystal, "quote": "crystals placed on the carpet"}])
+        self.assertFalse(paraphrase.ok)
+        self.assertIn("is not in the user's messages; quote them word for word", paraphrase.text)
+        self.assertTrue(orchestrator.checks(add=[{**crystal, "quote": "Crystals on the rug"}]).ok)
+        self.session["items"].append({**state.item_assistant(), "text": "Done.", "streaming": False})
+        self.session["messages"].append({"role": "assistant", "content": "Done."})
+        passing = lambda checks: [{"status": "pass"} for _ in checks]
+        self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, types.SimpleNamespace(text="Done."), passing))
+        shown, model = self.session["items"][-1]["verification"], self.session["messages"][-1]["content"]
+        quoted = '- partly covered: "Crystals on the rug": o1 pass; nothing measures "on" (a contact check would)'
+        self.assertIn(quoted, shown.split("\n"))
+        self.assertIn(quoted, model.split("\n"))
+        self.assertIn("Requirements (your words): 1 of 2 covered, 1 partly covered.", shown)
+        self.assertNotIn("the user", shown)
+        self.assertTrue(model.endswith(shown.replace(orchestrator.YOUR_REQUIREMENTS, orchestrator.REQUIREMENTS)),
+                        "the panel's copy differs from the model's in the framing alone")
+
     def test_a_retire_reason_quotes_the_user_in_their_languages_quote_marks(self):
         words = "カメラはそのまま\nやっぱりランプを窓辺に"
         self.assertEqual(orchestrator._reason_error("ユーザーが「ランプを窓辺に」と言った", words), "")
@@ -2424,6 +2450,9 @@ class OwnChecksTest(unittest.TestCase):
         self.assertEqual(orchestrator._reason_error("they said «ランプを窓辺に» later", words), "")
         self.assertIn("is not in the user's messages", orchestrator._reason_error("ユーザーが「赤いランプ」と言った", words))
         self.assertIn("quote the user", orchestrator._reason_error("ユーザーの気が変わった", words))
+        for problem in (orchestrator._reason_error("ユーザーの気が変わった", words), orchestrator._reason_error("wrong", words)):
+            self.assertIn("in quotes", problem, "「」『』«» count too, so the refusal says quotes, not double quotes")
+            self.assertNotIn("double", problem)
 
     def test_a_retired_check_leaves_the_gate_and_the_verified_block_says_why(self):
         for retire, problem in (([{"id": "crystal c9", "reason": "x"}], "not a check that runs; they are: crystal c2"),

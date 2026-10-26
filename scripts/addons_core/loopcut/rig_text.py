@@ -1,8 +1,9 @@
 """Short auto-rig copy shared by chat, Jobs, and tool results."""
 
 # What the 20 credits buy, in one sentence (ar-artist-1 asked about fingers and weights at the card). Fingers
-# only when found: 19- and 22-bone standard rigs have none. The platform's quote still carries its own line.
-QUOTE = 'Body bones with automatic weights, and finger bones when it can find them; best on humanoids, others may bend oddly.'
+# only when found: 19- and 22-bone standard rigs have none. R7-D3: a beginner read "automatic weights" as jargon;
+# the owner approved these words (2026-10-26). The platform's quote still carries its own line.
+QUOTE = 'Gives your character a skeleton so it can move, with fingers when it can find the hands; made for human shapes, so others may bend in odd places.'
 TIME_HINT = 'usually under a minute'
 # The credits arm's refusal (0.2.19, cloud.error_text): the panel's out-of-credits pop-up has the way on, so no
 # "Add credits, then retry" (the free plan cannot buy credits) and no retry.

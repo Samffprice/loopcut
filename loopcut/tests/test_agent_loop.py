@@ -176,7 +176,7 @@ class AgentLoopTest(unittest.TestCase):
         # Put back after the class: test_workspace measures the real _tool_schemas.
         cls.replaced = {name: getattr(agent, name) for name in (
             "_scene_snapshot", "_addons_line", "_project_roots", "_alike_on_main", "_update_account",
-            "_keeps_context", "_redraw", "_tool_schemas", "_changes_scene", "_motion_on_main")}
+            "_keeps_context", "_keeps_reasoning", "_redraw", "_tool_schemas", "_changes_scene", "_motion_on_main")}
         agent._scene_snapshot = lambda: None
         agent._addons_line = lambda: ""  # Reads bpy; the prompt test sets its own line.
         agent._project_roots = lambda: ()  # Reads bpy on the main thread; the file tests set roots themselves.
@@ -184,6 +184,7 @@ class AgentLoopTest(unittest.TestCase):
         agent._motion_on_main = lambda text, is_cancelled: None  # Steps the scene's frames; MotionClaimTest's own.
         agent._update_account = lambda info: state.ui.__setitem__("account", info)  # account.py needs bpy.
         agent._keeps_context = lambda cfg: False  # account.py needs bpy.
+        agent._keeps_reasoning = lambda cfg: None
         agent._redraw = lambda: None
         agent._tool_schemas = lambda: []
         agent._changes_scene = lambda name, arguments="": name == "run_python"
@@ -222,7 +223,8 @@ class AgentLoopTest(unittest.TestCase):
         self.ran.append((name, arguments))
         return types.SimpleNamespace(text="cube added", ok=True, image_path=None)
 
-    def start(self, text: str, roots: tuple = (), spec=None, try_it: str = "", routed=None) -> agent.Turn:
+    def start(self, text: str, roots: tuple = (), spec=None, try_it: str = "", routed=None,
+              spending=None) -> agent.Turn:
         session = self.session
         session["items"].append(state.item_user(text))
         session["messages"].append({"role": "user", "content": text})
@@ -231,6 +233,7 @@ class AgentLoopTest(unittest.TestCase):
         turn.routed = routed  # The router's decision, as a hosted turn has it (LOOPCUT_ROUTER is off here).
         turn.try_it = try_it  # send() sets it when a setup card's prompt went unedited.
         turn.roots = roots  # Before the thread starts, as send() does; setting it after races the first call.
+        turn.spending = spending  # send()'s _configure reads the user's (config.spending); None: the defaults.
         session["busy"], session["turn"] = True, turn
         turn.thread = threading.Thread(target=agent._run, daemon=True,
                                        args=(session, turn, lambda *a: self.run_tool(*a), self.ensure_checkpoint))
@@ -254,6 +257,29 @@ class AgentLoopTest(unittest.TestCase):
         self.assertFalse(self.session["busy"])
         self.assertEqual(SCRIPT.requests[0]["_auth"], "Bearer test-key")
         self.assertEqual(SCRIPT.requests[0]["messages"][0]["role"], "system")
+
+    def test_a_long_result_is_cut_for_the_model_and_read_back_from_the_conversation(self):
+        """result_store: the model is shown a long result's start and a pointer, the card and the conversation's
+        store keep all of it, and read_result is answered by the loop from that store, never by a tool."""
+        from loopcut import result_store
+        whole = "\n".join(f"modifier {n}: Bevel width 0.0{n % 10}" for n in range(200))
+        self.run_tool = lambda name, arguments: (self.ran.append((name, arguments))
+                                                 or types.SimpleNamespace(text=whole, ok=True, image_path=None))
+        SCRIPT.replies += [tool_reply("get_object_info", {"names": ["Cube"]}),
+                           tool_reply("read_result", {"id": "r1", "grep": "modifier 150:"}), text_reply("Done.")]
+        self.start("What does the bevel do?").thread.join(5)
+        shown = SCRIPT.requests[1]["messages"][-1]["content"]
+        self.assertTrue(shown.startswith("modifier 0: Bevel width 0.00\n"))
+        self.assertIn('stored as r1: read_result("r1", grep="…")', shown)
+        self.assertLessEqual(len(shown), result_store.LIMIT + 150)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual(cards[0]["output"], whole, "the card shows the whole result")
+        self.assertEqual(SCRIPT.requests[2]["messages"][-1]["content"],
+                         "r1: 1 of 200 lines match 'modifier 150:':\n151: modifier 150: Bevel width 0.00")
+        self.assertEqual([name for name, _ in self.ran], ["get_object_info"])
+        stored = json.loads((conversations.results_folder(self.session) / "r1.json").read_text())
+        self.assertEqual(stored["text"], whole)
+        self.assertEqual(self.session["items"][-1]["text"], "Done.")
 
     def test_sends_conversation_and_role_headers_for_the_gateway(self):
         """Loopcut's gateway correlates a usage row with the conversation and role that made it
@@ -581,7 +607,7 @@ class AgentLoopTest(unittest.TestCase):
         result, or the refusal as the tool's text."""
         from loopcut import cloud, cloud_account, cloud_http
         try:
-            cloud_account.confirm({"required": False, "text": "About 80 credits ($0.80)", "credits": 80,
+            cloud_account.confirm({"required": True, "text": "About 120 credits ($1.20)", "credits": 120,
                                    "threshold": 100})
         except cloud_http.CloudError as ex:
             return tools.ToolResult(cloud.error_text(ex), ok=False)
@@ -601,7 +627,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(turn.outcome, "completed", "a skipped paid call never ends the turn")
         self.assertEqual((card["status"], self.ran), ("rejected", []))
         result = next(m for m in SCRIPT.requests[1]["messages"] if m["role"] == "tool")
-        self.assertTrue(result["content"].startswith("declined: The user declined this paid call (it costs 80"))
+        self.assertTrue(result["content"].startswith("declined: The user declined this paid call (it costs 120"))
         self.assertEqual(self.session["items"][-1]["text"], "Skipped the model; here is how to block it out instead.")
         self.assertEqual(self.session["spend"]["credits"], 0)
 
@@ -616,7 +642,45 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual((turn.outcome, len(self.ran)), ("completed", 1))
         card = next(i for i in self.session["items"] if i.get("name") == "loopcut_cloud__image_to_3d")
         self.assertEqual(card["status"], "done")
-        self.assertEqual(self.session["spend"], {"credits": 80, "auto": 0, "allowed": 0})
+        self.assertEqual(self.session["spend"], {"credits": 120, "auto": 0, "allowed": 0})
+
+    def extra_run_tool(self, name, arguments):
+        """A 4-credit sound effect the model starts on its own, as cloud.execute's finish makes it."""
+        from loopcut import cloud, cloud_account, cloud_http
+        try:
+            cloud_account.confirm({"required": False, "text": "About 4 credits ($0.04)", "credits": 4,
+                                   "threshold": 100})
+        except cloud_http.CloudError as ex:
+            return tools.ToolResult(cloud.error_text(ex), ok=False)
+        self.ran.append((name, arguments))
+        return tools.ToolResult("Added a sound strip.")
+
+    def test_model_a_typewriter_spends_nothing_when_paid_tools_run_only_when_asked(self):
+        """The 0.2.20 screen's counter-case, "Model a typewriter": 0 paid calls. Under "Use when it helps" an extra
+        under Ask above runs (below), so there the 0 comes from the guidance and the model; the client's own rule is
+        "Only when I ask": a stand-in model that adds typing sounds is refused with no card, and the turn goes on."""
+        self.run_tool = self.extra_run_tool
+        SCRIPT.replies += [tool_reply("loopcut_cloud__sfx", {"prompt": "typewriter keys clacking"}),
+                           text_reply("Modeled the typewriter.")]
+        with mock.patch.dict(os.environ, {"LOOPCUT_EXTRAS": "ONLY_ASKED"}):
+            turn = self.start("model a typewriter", spending=config.spending())
+        turn.thread.join(5)
+        self.assertEqual((turn.outcome, self.ran), ("completed", []))
+        card = next(i for i in self.session["items"] if i.get("name") == "loopcut_cloud__sfx")
+        self.assertEqual(card["status"], "rejected", "shown as skipped, never an approval card")
+        self.assertNotIn("ask", card)
+        result = next(m for m in SCRIPT.requests[1]["messages"] if m["role"] == "tool")
+        self.assertTrue(result["content"].startswith("declined: Not run: the user wants paid tools only when they "
+                                                     "ask for one."), result["content"])
+        self.assertEqual(self.session["spend"]["credits"], 0)
+
+    def test_under_use_when_it_helps_an_extra_under_ask_above_runs_without_a_card(self):
+        self.run_tool = self.extra_run_tool
+        SCRIPT.replies += [tool_reply("loopcut_cloud__sfx", {"prompt": "rain on a window"}), text_reply("Done.")]
+        turn = self.start("a rainy window for my trailer")
+        turn.thread.join(5)
+        self.assertEqual((turn.outcome, len(self.ran)), ("completed", 1))
+        self.assertEqual(self.session["spend"], {"credits": 4, "auto": 4, "allowed": 0})
 
     def test_a_note_sent_mid_turn_is_folded_in_before_the_next_request(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "add_cube()", "summary": "Add a cube"}),
@@ -684,6 +748,53 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(self.session["items"][-1]["text"], "OK.")
         self.session["turn_outcome"] = "cancelled"  # "Send now" stops helpers to send the user's waiting notes.
         self.assertNotIn(agent.STOPPED_LINE, sent("and blue", note_items=[state.item_user("and blue")]))
+
+    def test_the_extras_preference_is_a_line_of_the_scene_context_when_it_is_not_auto(self):
+        """Lane H (cloud-tools-implicit-use section 3): "Ask me first" and "Only when I ask" reach the model as one
+        sentence of the turn's scene context, never the cached system prompt; nothing at AUTO (Use when it helps),
+        and nothing on the user's own key without Loopcut's paid tools. The prices are the gateway's line."""
+        scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\nfile: unsaved\n"
+                                                                                     "</scene_context>")
+        scene.start()
+        self.addCleanup(scene.stop)
+        prefs = types.SimpleNamespace()  # settings.py needs bpy: a stand-in with its preferences().
+        patch = mock.patch.dict(sys.modules, {"loopcut.settings": types.SimpleNamespace(
+            preferences=lambda: prefs, values=lambda: {})})
+        patch.start()
+        self.addCleanup(patch.stop)
+        url = os.environ["LOOPCUT_BASE_URL"]
+
+        def sent(mode, hosted=True):
+            if mode is None:
+                prefs.__dict__.pop("extras_mode", None)  # Before lane H-a's preference: AUTO.
+            else:
+                prefs.extras_mode = mode
+            SCRIPT.requests.clear()
+            SCRIPT.replies.append(text_reply("OK."))
+            with mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": url if hosted else ""}):
+                self.assertTrue(agent.send("make a trailer shot"))
+                self.session["turn"].thread.join(5)
+            request = SCRIPT.requests[0]
+            system = "\n".join(str(m["content"]) for m in request["messages"] if m["role"] == "system")
+            for line in agent.EXTRAS_LINES.values():
+                self.assertNotIn(line, system, "never in the cached prefix")
+                self.assertNotIn(line, json.dumps(request.get("tools") or []))
+            return [m for m in request["messages"] if m["role"] == "user"][-1]["content"]
+        for mode, line in (("ASK", "Paid tools: ask the user before each one."),
+                           ("ONLY_ASKED", "Paid tools: only when the user asks for one by name.")):
+            with self.subTest(mode=mode):
+                self.assertEqual(sent(mode), f"<scene_context>\nfile: unsaved\n{line}\n</scene_context>\n\n"
+                                             "make a trailer shot")
+        for mode in ("AUTO", None):
+            with self.subTest(mode=mode):
+                self.assertEqual(sent(mode), "<scene_context>\nfile: unsaved\n</scene_context>\n\nmake a trailer shot")
+        self.assertNotIn("Paid tools", sent("ASK", hosted=False), "an own key without Loopcut's paid tools")
+        self.assertEqual(agent._extras_line(dataclasses.replace(agent.config.load(), base_url="chatgpt-plan")),
+                         agent.EXTRAS_LINES["ASK"], "a ChatGPT-plan turn's cloud tools are Loopcut's")
+        from loopcut import cloud
+        with mock.patch.object(cloud, "_runtime", types.SimpleNamespace(descriptors=lambda: [{"backend": "managed"}])):
+            self.assertEqual(agent._extras_line(agent.config.load()), agent.EXTRAS_LINES["ASK"],
+                             "an own key with Loopcut's paid cloud tools")
 
     def test_a_note_left_over_after_a_stop_goes_back_to_the_input(self):
         restored = []
@@ -1793,6 +1904,35 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual([c["status"] for c in cards], ["failed", "failed"])
         self.assertEqual(cards[0]["timed_out"], 30.0)
         self.assertNotIn("timed_out", cards[1])
+
+    def test_a_refusal_of_the_models_arguments_marks_its_card_and_the_model_keeps_the_precise_text(self):
+        # rel019-cloud: the render's card read "Unknown tool input; use the fields in this tool's schema."
+        refusal = "Unknown tool input; use the fields in this tool's schema."
+        results = iter([tools.ToolResult(refusal, ok=False, input_mistake=True),
+                        tools.ToolResult("No 3D viewport is open; open one and try again.", ok=False)])
+        self.run_tool = lambda name, arguments: next(results)
+        SCRIPT.replies += [tool_reply("get_scene_info", {"format": "mp4"}), tool_reply("get_scene_info", {}),
+                           text_reply("Done.")]
+        self.start("read the scene").thread.join(5)
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertEqual([c["status"] for c in cards], ["failed", "failed"])
+        self.assertTrue(cards[0]["input_mistake"])
+        self.assertNotIn("input_mistake", cards[1], "any other failure keeps its own line")
+        self.assertTrue(cards[0]["output"].startswith(refusal), "the card's details keep it")
+        self.assertTrue(next(m["content"] for m in self.session["messages"] if m["role"] == "tool").startswith(refusal),
+                        "the model gets the precise text to correct itself")
+
+    def test_a_failed_calls_card_drops_the_quote_it_never_got(self):
+        # rel019-cloud: "Render scene · Getting a credit quote…" stayed on a call refused before any quote.
+        for ok, summary in ((False, "Render scene"), (True, "Render scene" + agent.QUOTING)):
+            with self.subTest(ok=ok):
+                card = state.item_tool("loopcut_cloud__render", "Render scene" + agent.QUOTING, "")
+                agent._failed_card(card, tools.ToolResult("refused", ok=ok))
+                self.assertEqual(card["summary"], summary)
+                self.assertNotIn("input_mistake", card)
+        card = state.item_tool("loopcut_cloud__render", "Render scene · 29 credits", "")
+        agent._failed_card(card, tools.ToolResult("Cloud job failed", ok=False))
+        self.assertEqual(card["summary"], "Render scene · 29 credits", "a quote that came stays")
 
     def test_a_refused_render_keeps_its_guard_notice_and_gets_the_step_budget_s_note(self):
         from unittest.mock import patch

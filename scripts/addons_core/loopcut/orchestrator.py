@@ -1663,17 +1663,17 @@ _QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”|「([^」]+)」|『([^』]+)』
 
 
 def _reason_error(reason, words: str) -> str:
-    """Why a retire reason will not do, or "": the user's words in double quotes (checked against
-    their messages), or numbers measured on the scene."""
+    """Why a retire reason will not do, or "": the user's words in quotes (checked against their
+    messages), or numbers measured on the scene."""
     if not isinstance(reason, str) or len(reason.strip()) < 8:
-        return "say why: the user's words in double quotes, or what you measured"
+        return "say why: the user's words in quotes, or what you measured"
     quotes = ["".join(groups) for groups in _QUOTED.findall(reason)]
     for quote in quotes:
         if not quote_found(quote, words):
             return f"{quote[:60]!r} is not in the user's messages; quote them word for word"
     if quotes or re.search(r"\d", reason):
         return ""
-    return ("quote the user (in double quotes) where they changed their mind, or give the numbers you measured "
+    return ("quote the user (in quotes) where they changed their mind, or give the numbers you measured "
             "that show the check is wrong")
 
 
@@ -1976,6 +1976,12 @@ def coverage(requirements: list[str], results: list, retired: list = ()) -> list
     return out
 
 
+# Whose words the requirements line quotes: the model reads "the user's", the panel says "your" (for_user; 0.2.19
+# gate: personas read "the user's words" as a report about someone else). Only the framing: each quote is still the
+# user's own words, word for word (acceptance.validate).
+REQUIREMENTS, YOUR_REQUIREMENTS = "Requirements (the user's words)", "Requirements (your words)"
+
+
 def coverage_lines(entries: list[dict]) -> list[str]:
     """How many of the user's requirements the checks cover, then each only partly covered or not at all."""
     counted = [e for e in entries if e["status"] != "retired"]
@@ -1985,7 +1991,7 @@ def coverage_lines(entries: list[dict]) -> list[str]:
     rest = [f"{n} {word}" for word, n in (("partly covered", sum(e["status"] == "partly" for e in counted)),
                                           ("unverified", sum(e["status"] == "unverified" for e in counted)),
                                           ("failed", sum(e["status"] == "failed" for e in counted))) if n]
-    lines = [f"Requirements (the user's words): {covered} of {len(counted)} covered" + "".join(f", {r}" for r in rest) + "."]
+    lines = [f"{REQUIREMENTS}: {covered} of {len(counted)} covered" + "".join(f", {r}" for r in rest) + "."]
     return lines + [f"- {'partly covered' if e['status'] == 'partly' else e['status']}: \"{e['quote'][:80]}\": "
                     f"{e['evidence'][:160]}" for e in counted if e["status"] in ("partly", "unverified")]
 
@@ -2024,8 +2030,38 @@ def verified_block(results: list[tuple[str, dict, dict]], retired: list[tuple[st
     return "\n".join(lines)
 
 
+def for_user(block: str) -> str:
+    """The panel's wording of a block: its requirements line in the second person (REQUIREMENTS). The quotes and every
+    other line are the model's, unchanged."""
+    return re.sub(rf"(?m)^{re.escape(REQUIREMENTS)}:", f"{YOUR_REQUIREMENTS}:", block)
+
+
+# Each block's head with its count (verified_block, rig_gate.HEAD, contact.finish_gate; block_head's later heads), and
+# the requirements line in either wording: what checked_line sums.
+_COUNTED = re.compile(rf"^(?:{VERIFIED}|(?:Placement measured|Rig checked|Checked again) this turn): "
+                      r"(\d+) of (\d+) checks\.$", re.M)
+_SHORT = re.compile(r"^Requirements \((?:the user's|your) words\): \d+ of \d+ covered(.*)\.$", re.M)
+
+
+def checked_line(verification: str, alone: bool = False) -> str:
+    """The panel's one line for a reply's blocks, folded under the model's own summary (0.2.19 gate: the final reply
+    read as a checklist): "✓ Checked: 4 of 4 pass", "Checked: 2 of 2 pass, 1 partly covered", or "Not checked" when
+    no block counted a check. alone: the reply has no text of its own, so an all-pass line opens with "Done."."""
+    counts = [(int(p), int(t)) for p, t in _COUNTED.findall(verification)]
+    passed, total = sum(p for p, _ in counts), sum(t for _, t in counts)
+    if not total:
+        return "Not checked"
+    short: dict[str, int] = {}
+    for tail in _SHORT.findall(verification):
+        for n, word in re.findall(r", (\d+) (partly covered|unverified)", tail):
+            short[word] = short.get(word, 0) + int(n)
+    line = f"Checked: {passed} of {total} pass" + "".join(f", {n} {word}" for word, n in short.items())
+    return line if passed < total or short else ("Done. " if alone else "") + "✓ " + line
+
+
 def _append_to_reply(session: dict, completion, block: str) -> None:
-    """The block goes on the reply the user sees and on the message the model sees next turn."""
+    """The block goes on the reply the user sees, in for_user's wording, and on the message the model sees next turn
+    as it is."""
     items, messages = session["items"], session["messages"]
     request = _turn_request(session)
     if request:
@@ -2035,13 +2071,13 @@ def _append_to_reply(session: dict, completion, block: str) -> None:
         reply = state.item_assistant()
         reply["streaming"] = False
         items.append(reply)
-    earlier = reply.get("verification")
-    reply["text"] = f"{reply['text'].rstrip()}\n\n{block}" if reply["text"].strip() else block
+    earlier, shown = reply.get("verification"), for_user(block)
+    reply["text"] = f"{reply['text'].rstrip()}\n\n{shown}" if reply["text"].strip() else shown
     # Only the runtime sets this field. Text from the model (including an identical line)
     # stays ordinary prose; old conversations without provenance do too. A second gate's block (rig_gate's,
     # then contact's) joins the first, so both stay in the one muted footer the panel draws.
-    joined = isinstance(earlier, str) and earlier and reply["text"].endswith(f"{earlier}\n\n{block}")
-    reply["verification"] = f"{earlier}\n\n{block}" if joined else block
+    joined = isinstance(earlier, str) and earlier and reply["text"].endswith(f"{earlier}\n\n{shown}")
+    reply["verification"] = f"{earlier}\n\n{shown}" if joined else shown
     last = messages[-1] if messages else {}
     if last.get("role") == "assistant" and not last.get("tool_calls") and completion is not None:
         last["content"] = f"{(last.get('content') or '').rstrip()}\n\n{block}".lstrip()

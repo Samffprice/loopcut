@@ -110,12 +110,41 @@ class JobTests(unittest.TestCase):
         describe = job_tools.describe
         self.assertEqual(describe("render_job", {"action": "start", "folder": "renders/spin", "start": 1, "end": 48,
                                                  "budget_seconds": 600})[0],
-                         "Background PNG render · frames 1-48 · 600s budget")
+                         "Render frames 1-48 on this computer, up to about 10 min. "
+                         "Blender must stay open and this computer awake until it's done.")
         self.assertEqual(describe("render_job", {"action": "start", "folder": "f", "budget_seconds": 60})[0],
-                         "Background PNG render · the scene's frames · 60s budget")
+                         "Render the scene's frames on this computer, up to about 1 min. "
+                         "Blender must stay open and this computer awake until it's done.")
         properties = job_tools.SCHEMAS[0]["function"]["parameters"]["properties"]
         self.assertTrue({"folder", "start", "end"} <= set(properties))
         self.assertIn("folder (by the .blend; new or empty)", job_tools.SCHEMAS[0]["function"]["description"])
+
+    def test_a_render_jobs_card_says_it_renders_on_this_computer_what_stays_on_and_for_how_long(self):
+        """rel019-cloud2: asked to render "in the cloud, I want to close my laptop", the model started a render job,
+        whose card read "Background MP4 render · frames 1-120 · 900s budget": nothing said it ran on the laptop."""
+        from loopcut import job_tools, state
+        from loopcut.ui import layout
+        call = {"action": "start", "folder": "BouncingBall_5s", "start": 1, "end": 120, "format": "MP4", "width": 1920,
+                "height": 1080, "samples": 64, "budget_seconds": 900, "camera": "Camera"}
+        summary, code = job_tools.describe("render_job", call)
+        self.assertEqual(summary, "Render frames 1-120 as an MP4 on this computer, up to about 15 min. "
+                                  "Blender must stay open and this computer awake until it's done.")
+        self.assertEqual(json.loads(code)["budget_seconds"], 900, "the settings stay behind Show code")
+        self.assertEqual(job_tools.describe("render_job", {**call, "budget_seconds": 30})[0].split(". ")[0],
+                         "Render frames 1-120 as an MP4 on this computer, in under a minute")
+        self.assertEqual(job_tools.describe("render_job", {"action": "resume", "job_id": "abc"})[0],
+                         "Continue the render on this computer where it stopped. "
+                         "Blender must stay open and this computer awake until it's done.")
+        session = state.new_session()
+        card = state.item_tool("render_job", summary, code)
+        session["items"] = [card]
+        card.update(status="awaiting", heavy=True)  # Its ask, as the panel draws it.
+        drawn = layout.build(session, 420, 700, 1.0, lambda font, size, text: len(text) * size * 0.6, "fast", None,
+                             {"selection": [], "context_budget": 24_000, "account": None})
+        text = " ".join(p["text"] for p in drawn["prims"] if p["t"] == "text")
+        for words in ("on this computer", "up to about 15 min", "awake until it's done", "Run"):
+            self.assertIn(words, text)
+        self.assertNotIn("budget", text)
 
     def test_mp4_requires_even_dimensions(self):
         with self.assertRaises(jobs.JobError):

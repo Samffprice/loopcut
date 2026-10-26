@@ -37,23 +37,45 @@ class InputMouseTest(unittest.TestCase):
                      "state": SimpleNamespace(session=lambda: self.session, ui={}),
                      "layout": layout, "textedit": textedit, "draw": SimpleNamespace(measure=measure),
                      "_displays": self.displays, "_close_popups": self.close_popups, "_do_action": self.action,
-                     "_update_mentions": Mock()}
+                     "_update_mentions": Mock(), "is_host": lambda area: area is self.area,
+                     "tag_redraw_all": Mock()}
+        self.ui = namespace["state"].ui
         # Load just the event router and its coordinate helpers, without importing Blender or services.
         source = ADDONS / "loopcut" / "ui" / "host.py"
         tree = ast.parse(source.read_text())
-        names = {"LOOPCUT_OT_interact", "_local", "_window_region", "_find_area"}
+        names = {"LOOPCUT_OT_interact", "LOOPCUT_OT_hover", "_local", "_window_region", "_find_area"}
         nodes = [node for node in tree.body if getattr(node, "name", None) in names or
                  (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "POPUP_ACTIONS"
                                                        for t in node.targets))]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
         self.operator = namespace["LOOPCUT_OT_interact"]()
         self.operator.keyboard = False
+        self.hover = namespace["LOOPCUT_OT_hover"]()
 
     def event(self, index=0, kind="LEFTMOUSE", value="PRESS", shift=False):
         line = next(p for p in self.displays[1]["prims"] if p["id"] == "input.l0")
         return SimpleNamespace(type=kind, value=value, shift=shift,
                                mouse_x=self.region.x + line["x"] + measure("ui", line["size"], "a" * index),
                                mouse_y=self.region.y + self.region.height - line["y"] - line["h"] / 2)
+
+    def test_a_click_puts_the_hovered_tooltip_away_until_the_pointer_moves_to_another_hit(self):
+        # The 0.2.19 gate: "Background jobs" and "Back to chat" stayed over the chat where its clicks had landed.
+        self.hover.invoke(self.context, self.event(5, "MOUSEMOVE", "NOTHING"))
+        hovered = self.ui["hover"]
+        self.assertTrue(hovered)
+        self.assertNotIn("tip_dismissed", self.ui)
+        self.operator.invoke(self.context, self.event(5))
+        self.assertEqual(self.ui["tip_dismissed"], hovered)
+        self.hover.invoke(self.context, self.event(7, "MOUSEMOVE", "NOTHING"))  # Still on that hit: still away.
+        self.assertEqual((self.ui["hover"], self.ui["tip_dismissed"]), (hovered, hovered))
+        outside = SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_x=0, mouse_y=0)
+        self.hover.invoke(self.context, outside)  # Off the panel: the next hover may show its tip again.
+        self.assertEqual((self.ui["hover"], self.ui.get("tip_dismissed")), (None, None))
+        self.operator.modal(self.context, self.event(5))  # A click while the panel's modal runs, too.
+        self.assertIsNone(self.ui["tip_dismissed"])
+        self.hover.invoke(self.context, self.event(5, "MOUSEMOVE", "NOTHING"))
+        self.operator.modal(self.context, self.event(5))
+        self.assertEqual(self.ui["tip_dismissed"], hovered)
 
     def test_first_click_and_modal_click_move_caret(self):
         self.assertEqual(self.operator.invoke(self.context, self.event(5)), {"RUNNING_MODAL"})

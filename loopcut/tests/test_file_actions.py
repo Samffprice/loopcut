@@ -562,6 +562,7 @@ class HostActionsTest(unittest.TestCase):
             'cloud_jobs': SimpleNamespace(ui_rows=lambda: []),
             'chatgpt_ui': SimpleNamespace(status=lambda: None),
             'onboarding': SimpleNamespace(hints_dismissed=lambda: True),
+            'own_key_ui': SimpleNamespace(panel_line=lambda: ''),
         }
         with patch.object(Path, 'exists', return_value=False) as exists:
             self.host['tag_redraw_all']()

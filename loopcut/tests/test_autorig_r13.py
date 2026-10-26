@@ -451,6 +451,10 @@ class SharedFinishGates(unittest.TestCase):
         item = session['items'][0]
         self.assertEqual(item['verification'], f'{rig}\n\n{contact}')
         self.assertEqual(session['messages'][0]['content'], f'He runs.\n\n{rig}\n\n{contact}')
+        folded = layout.build(session, 420, 900, 1, lambda font, size, text: len(text) * size * .6)
+        self.assertEqual([p['text'] for p in folded['prims'] if p['id'].startswith('item0.verification.summary.l')],
+                         ['✓ Checked: 3 of 3 pass ▸'], 'one line for both blocks until it is opened')
+        item['expanded'] = True
         drawn = layout.build(session, 420, 900, 1, lambda font, size, text: len(text) * size * .6)
         prose = [p for p in drawn['prims'] if p['id'].startswith('item0.p')]
         footer = [p for p in drawn['prims'] if p['id'].startswith('item0.verification.l')]

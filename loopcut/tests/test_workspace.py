@@ -535,13 +535,15 @@ class LeftRunningTest(Folder):
                 if error:
                     raise error
             return run
-        for failing in ("refresh_ui", "poll_left", "tag_redraw_all"):
+        for failing in ("refresh_ui", "poll_left", "tag_redraw_all", "sync_topbars"):
             with self.subTest(failing=failing):
                 calls.clear()
                 jobs = types.SimpleNamespace(refresh_ui=step("refresh_ui", OSError(5, "I/O error")
                                                              if failing == "refresh_ui" else None))
                 host = types.SimpleNamespace(tag_redraw_all=step("tag_redraw_all", RuntimeError("redraw")
-                                                                 if failing == "tag_redraw_all" else None))
+                                                                 if failing == "tag_redraw_all" else None),
+                                             sync_topbars=step("sync_topbars", RuntimeError("msgbus")
+                                                               if failing == "sync_topbars" else None))
                 with self.lifecycle() as (lifecycle, _), \
                         mock.patch.dict(sys.modules, {"loopcut.job_tools": jobs, "loopcut.ui.host": host}), \
                         mock.patch.object(loopcut, "job_tools", jobs, create=True), \
@@ -550,7 +552,8 @@ class LeftRunningTest(Folder):
                                                                        if failing == "poll_left" else None)), \
                         contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(lifecycle._poll_jobs(), 1.0, "still registered")
-                self.assertEqual(calls, ["refresh_ui", "poll_left", "tag_redraw_all"], "the others still ran")
+                self.assertEqual(calls, ["refresh_ui", "poll_left", "tag_redraw_all", "sync_topbars"],
+                                 "the others still ran")
 
     def test_quitting_blender_stops_every_tracked_group(self):
         _, first = self.leave("Render it")
@@ -1111,6 +1114,7 @@ class ChoosingTheLoopTest(unittest.TestCase):
     def configure(self, session, **env):
         from loopcut import cloud
         with mock.patch.dict(os.environ, env), mock.patch.object(agent, "_keeps_context", return_value=False), \
+                mock.patch.object(agent, "_keeps_reasoning", return_value=None), \
                 mock.patch.object(cloud, 'prompt_index_available', return_value=True):
             turn = agent.Turn()
             agent._configure(turn, session)

@@ -101,6 +101,9 @@ def new_session() -> dict:
         "between_turns": [],
         # Managed long cloud jobs this chat started (cloud_restore): plain records, picked up when it opens; saved.
         "cloud_jobs": [],
+        # Paid outputs the model added unasked in this chat (spending.note_implied): {tool, job, removed}; saved,
+        # so one the user deleted or undid is not added again in this chat (undone means no).
+        "implied": [],
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},

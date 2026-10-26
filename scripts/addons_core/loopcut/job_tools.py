@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from . import checkpoints, cost_guard, jobs, render_offer, state, tools
-from .tools import ToolError, ToolResult
+from .tools import InputMistake, ToolError, ToolResult
 
 WAIT_CAP = 240   # Seconds one status call waits at most; the schema says so too.
 WAIT_READ = 1.0  # Seconds between reads of the job's state file while waiting.
@@ -386,7 +386,7 @@ ACTIONS = {"start": start_render_job, "status": render_job_status, "cancel": can
 
 def render_job(action: str = "", **arguments) -> ToolResult:
     if not isinstance(action, str) or action not in ACTIONS:
-        raise ToolError(f"action must be one of {', '.join(ACTIONS)}")
+        raise InputMistake(f"action must be one of {', '.join(ACTIONS)}")
     return tools.forward(ACTIONS[action], arguments, f"render_job {action}",
                          SCHEMAS[0]["function"]["parameters"]["properties"], ACTIONS)
 
@@ -394,22 +394,32 @@ def render_job(action: str = "", **arguments) -> ToolResult:
 DISPATCH = {"render_job": render_job}
 
 
+STAYS_ON = "Blender must stay open and this computer awake until it's done."
+
+
 def describe(name: str, arguments: dict):
+    """A render's card says where it runs, what to keep on and for about how long, in plain words (rel019-cloud2:
+    "Background MP4 render · frames 1-120 · 900s budget" for a user who asked for the cloud so they could close their
+    laptop). Its time is the job's limit (budget_seconds): it stops by then. Its settings stay behind Show code."""
     if name != "render_job":
         return None
     action, settings = arguments.get("action"), {k: v for k, v in arguments.items() if k != "action"}
     if action == "start":
         frames, start, end = arguments.get("frames"), arguments.get("start"), arguments.get("end")
         if frames is not None:
-            count = f"{len(frames) if isinstance(frames, list) else '?'} frames"
+            count = (f"{len(frames)} frame{'' if len(frames) == 1 else 's'}" if isinstance(frames, list)
+                     else "the chosen frames")
         elif start is None and end is None:
             count = "the scene's frames"
         else:
             count = f"frames {start if start is not None else 'start'}-{end if end is not None else 'end'}"
-        return (f"Background {arguments.get('format', 'PNG')} render · {count} · "
-                f"{arguments.get('budget_seconds', '?')}s budget", json.dumps(settings, indent=2))
+        what = " as an MP4" if arguments.get("format") == "MP4" else ""
+        limit = arguments.get("budget_seconds")
+        took = render_offer.about(limit) if type(limit) is int and limit > 0 else ""
+        took = ", in under a minute" if took == "under a minute" else f", up to about {took}" if took else ""
+        return f"Render {count}{what} on this computer{took}. {STAYS_ON}", json.dumps(settings, indent=2)
     if action == "resume":
-        return "Resume saved render job (same settings and time budget)", json.dumps(settings, indent=2)
+        return f"Continue the render on this computer where it stopped. {STAYS_ON}", json.dumps(settings, indent=2)
     if action == "cancel":
         return f"Cancel render job {arguments.get('job_id', '?')}", ""
     if action == "status":

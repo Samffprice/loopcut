@@ -52,7 +52,7 @@ import json
 import re
 from typing import Callable
 
-from . import completion_guard, llm
+from . import completion_guard, llm, result_store
 
 PRIVATE_PREFIX = "loopcut_"  # Keys we keep on stored messages. conversations.wire_messages drops them.
 FOLDED = "loopcut_folded"     # On an assistant message with tool calls: the step is sent as its record.
@@ -88,26 +88,29 @@ LIVE_STEPS = 3       # The newest steps of a turn are never folded mid-turn.
 FOLD_AT = 0.75       # Mid-turn folding starts when a request would exceed this share of the budget...
 FOLD_TO = 0.5        # ...and folds the oldest steps of the turn until the request is under this share.
 COMPACT_TO = 0.5     # After a compaction the kept tail is at most this share of the budget.
-RECORD_PRINTED = 400  # Characters of what a step's code printed that its record keeps.
-RECORD_READ = 300     # Characters of any other tool's result that its record keeps.
-RECORD_CHANGES = 15   # Scene-change lines a record keeps.
+# Halved on 2026-10-26 (lean-context: records were 24% of a request's tokens in the replay of 12 conversations); the
+# whole result of a step whose result was cut stays readable by the id its record names (result_store).
+RECORD_PRINTED = 200  # Characters of what a step's code printed that its record keeps.
+RECORD_READ = 150     # Characters of any other tool's result that its record keeps.
+RECORD_CHANGES = 6    # Scene-change lines a record keeps; the rest by name.
 RECORD_LOOK = 300     # Characters of what a dropped capture showed.
 RECORD_ARGUMENTS = 100  # Characters of a call's arguments that its record keeps.
 # Measured on the Loopcut gateway (Meta upstream) against 56 logged requests, within 7%:
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 8500     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 8600     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
                         # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures;
                         # 8,194 on 2026-10-17 with the captures' labels switch; 8,198 in 0.2.13; 8,199 on
                         # 2026-10-23 with asset pick numbers; 8,407 with auto-rig's tools on 2026-10-22, which only
-                        # accounts with auto-rig access get).
+                        # accounts with auto-rig access get; 8,340 on 2026-10-26 with read_result, 8,551 with auto-rig's).
 WORKSPACE_FIXED_TOKENS = 4400  # Workspace prompt/tools including character_rig: 4,280 on 2026-10-22,
                                # 3,833 on 2026-10-09 with live inspect_api,
                                # 4,012 on 2026-10-10 with the asset libraries note; 4,044 on 2026-10-15 with
-                               # shell's summary; 4,067 on 2026-10-17 with capture_viewport's labels.
+                               # shell's summary; 4,067 on 2026-10-17 with capture_viewport's labels;
+                               # 4,223 on 2026-10-26 with read_result (without character_rig).
 WORKSPACE_BUDGET = 200_000     # The least budget a workspace turn gets (agent._workspace_config), so a long build
                                # is not folded into records at the 40k default. A model with a smaller window needs
                                # LOOPCUT_WORKSPACE off.
@@ -269,6 +272,10 @@ def _size(message: dict, skill_index=None) -> tuple[int, int]:
         chars += _skill_delta(message, skill_index)
     for call in message.get("tool_calls") or []:
         chars += len(call["function"].get("name", "")) + len(call["function"].get("arguments", ""))
+    if isinstance(message.get("reasoning_content"), str):
+        chars += len(message["reasoning_content"])
+    for detail in message.get("reasoning_details") or []:  # Sent back whole (llm.merge_reasoning_details).
+        chars += sum(len(detail[k]) for k in ("text", "summary", "data") if isinstance(detail.get(k), str))
     return chars, images
 
 
@@ -424,9 +431,11 @@ def _call(call: dict) -> tuple[str, dict]:
 
 
 def _call_lines(call: dict, result: dict | None) -> list[str]:
-    """A call's record: one sentence of Loopcut's, never a call's shape (see the module docstring)."""
+    """A call's record: one sentence of Loopcut's, never a call's shape (see the module docstring). A result the
+    model was shown cut short (result_store) is named by its id, so a folded step's whole result stays readable."""
     name, arguments = _call(call)
-    text = str((result or {}).get("content") or "")
+    text, stored = result_store.unpointed(str((result or {}).get("content") or ""))
+    whole = f" Its whole result: {stored}." if stored else ""
     if name == "run_python":
         summary = arguments.get("summary") or "code"
         outcome, why, printed, changes = _run_python_parts(text)
@@ -439,7 +448,7 @@ def _call_lines(call: dict, result: dict | None) -> list[str]:
             line += " It changed nothing in the scene."
         elif changes:
             line += " Scene changes: " + _stop("; ".join(changes))
-        return [line]
+        return [line + whole]
     given = ", ".join(f"{key} {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
                       for key, value in arguments.items() if key != "code")
     given = given if len(given) <= RECORD_ARGUMENTS else given[:RECORD_ARGUMENTS].rstrip() + " …"
@@ -448,7 +457,7 @@ def _call_lines(call: dict, result: dict | None) -> list[str]:
     if not first:
         return [line + "; it returned nothing."]
     line += f"; it returned: {_clause(first, RECORD_LOOK)}"
-    return [line + (f" / {_flat(more, RECORD_READ)}" if more.strip() else "")]
+    return [line + (f" / {_flat(more, RECORD_READ)}" if more.strip() else "") + whole]
 
 
 def _old_call_lines(call: dict, result: dict | None) -> list[str]:

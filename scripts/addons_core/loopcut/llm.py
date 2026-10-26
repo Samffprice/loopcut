@@ -35,6 +35,10 @@ class Cancelled(Exception):
 
 # Worth another try: rate limits and the provider being briefly unwell. Anything else (bad key,
 # bad request, no credit) will fail the same way again, so it is shown at once.
+# Some providers (Kimi Code's membership keys) check which client is calling, so say so honestly
+# instead of urllib's default.
+USER_AGENT = "Loopcut (Blender add-on)"
+
 RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 RETRY_DELAYS = (1.0, 3.0, 8.0)
 MAX_RETRY_AFTER = 30.0
@@ -120,6 +124,32 @@ def connection_lost(service: str, cause=None, while_replying: bool = False) -> L
                     code=CONNECTION_LOST)
 
 
+REASONING_MODEL = "loopcut_reasoning_model"  # On a stored assistant message: the model its reasoning_details are from.
+REASONING_FIELDS = ("reasoning_details", "reasoning_content")  # The message fields kept and sent back per model.
+_DETAIL_TEXT = ("text", "summary", "data")  # The fields of a reasoning detail that a stream sends in pieces.
+
+
+def merge_reasoning_details(merged: list[dict], pieces) -> None:
+    """Fold one chunk's delta.reasoning_details into merged, as OpenRouter describes: the entries of one
+    (type, index) are one block whose text/summary/data pieces are concatenated in order; id, format and
+    signature (sent whole, on the last piece) replace. Any other field is kept as the first piece had it, and an
+    entry of a new (type, index) starts a block, so the list keeps the order the model produced. Anything not a
+    dict is skipped: a server's odd chunk must not lose the reply."""
+    for piece in pieces if isinstance(pieces, list) else []:
+        if not isinstance(piece, dict):
+            continue
+        block = next((b for b in reversed(merged)
+                      if b.get("type") == piece.get("type") and b.get("index") == piece.get("index")), None)
+        if block is None:
+            merged.append(dict(piece))
+            continue
+        for key, value in piece.items():
+            if key in _DETAIL_TEXT and isinstance(value, str) and isinstance(block.get(key), str):
+                block[key] += value
+            elif key in ("id", "format", "signature") or key not in block:
+                block[key] = value
+
+
 @dataclass
 class ToolCall:
     id: str = ""
@@ -140,11 +170,26 @@ class Completion:
     # servers, delta.reasoning on OpenRouter). Never shown or sent back; it tells a reasoning-only reply, which
     # has nothing to show, from an empty one in the log.
     reasoning_chars: int = 0
+    # The reply's reasoning_details (OpenRouter), merged by merge_reasoning_details; only read when the model's
+    # keep_reasoning switch is on (as_message), since the API wants a thinking model's reasoning sent back whole.
+    reasoning_details: list[dict] = field(default_factory=list)
+    # Moonshot's own API (and DeepSeek-style servers) stream the same thing as delta.reasoning_content text, which
+    # they want back under that name; OpenRouter's delta.reasoning only mirrors its reasoning_details, so it is not kept.
+    reasoning_content: str = ""
     # Calls the reply wrote out as text instead of making them; set by agent._drop_copied_records.
     unmade: list[str] = field(default_factory=list)
 
-    def as_message(self) -> dict:
+    def as_message(self, reasoning_model: str = "") -> dict:
+        """The reply as the assistant message stored and sent back. reasoning_model, when the model keeps its
+        reasoning (config.keep_reasoning), is the model id the details came from: they go on the message with
+        REASONING_MODEL so they are only ever sent back to that model (conversations.wire_messages)."""
         message = {"role": "assistant", "content": self.text or None}
+        if reasoning_model and (self.reasoning_details or self.reasoning_content):
+            if self.reasoning_details:
+                message["reasoning_details"] = self.reasoning_details
+            if self.reasoning_content:
+                message["reasoning_content"] = self.reasoning_content
+            message[REASONING_MODEL] = reasoning_model
         if self.tool_calls:
             message["tool_calls"] = [
                 {"id": c.id, "type": "function",
@@ -419,8 +464,8 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         completion.usage["cost"] = float(cost)
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
-                    if on_progress and (delta.get("content") or delta.get("tool_calls")
-                                        or delta.get("reasoning_content") or delta.get("reasoning")):
+                    if on_progress and (delta.get("content") or delta.get("tool_calls") or delta.get("reasoning_content")
+                                        or delta.get("reasoning") or delta.get("reasoning_details")):
                         on_progress()
                     text = delta.get("content")
                     if text:
@@ -430,6 +475,9 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if isinstance(reasoning, str) and reasoning:
                         completion.reasoning_chars += len(reasoning)  # Nothing shown, so not "streamed".
+                    if isinstance(delta.get("reasoning_content"), str):
+                        completion.reasoning_content += delta["reasoning_content"]
+                    merge_reasoning_details(completion.reasoning_details, delta.get("reasoning_details"))
                     for part in delta.get("tool_calls") or []:
                         streamed = True
                         call = calls.setdefault(part.get("index", 0), ToolCall())
@@ -619,6 +667,7 @@ def stream_chat(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
+        "User-Agent": USER_AGENT,
     })
     sized = image_budget.Sized(messages)
     gateway = base_url.strip().rstrip("/") == config.SERVICE_BASE_URL  # Gzipped bodies: see GZIP_REFUSED.

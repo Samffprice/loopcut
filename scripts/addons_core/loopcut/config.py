@@ -14,6 +14,7 @@ import shutil
 from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
+from urllib.parse import urlparse
 
 SERVICE_URL = os.environ.get("LOOPCUT_SERVICE_URL", "https://loopcut.org").rstrip("/")
 # loopcut.org's beta page, which redirects to the owner's form (REPORT_BUG_URL on the server) or shows an email page.
@@ -98,6 +99,24 @@ def anthropic(base_url: str) -> bool:
     return (base_url or "").strip().startswith("anthropic://")
 
 
+KIMI_HOSTS = ("api.kimi.ai", "api.moonshot.ai", "api.moonshot.cn")
+
+
+def keeps_reasoning_by_default(base_url: str, model: str) -> bool:
+    """Whether a model's reasoning goes back to it unasked: Moonshot's Kimi K3 family and kimi-for-coding, on
+    Moonshot's own hosts or by model id (also through OpenRouter as moonshotai/kimi-k3...). Moonshot's docs
+    (https://platform.kimi.ai/docs/guide/use-thinking-models) say a thinking model's full assistant message,
+    reasoning included, is sent back unchanged in the later requests of a tool-calling conversation, and
+    OpenRouter's reasoning-token docs say the same of reasoning_details. Everything else is off: another provider
+    may reject the field. LOOPCUT_KEEP_REASONING and the service's keep_reasoning entry override this."""
+    try:
+        host = urlparse((base_url or "").strip()).hostname or ""
+    except ValueError:
+        host = ""
+    name = (model or "").strip().lower().removeprefix("moonshotai/")
+    return host in KIMI_HOSTS or name == "kimi-for-coding" or name == "kimi-k3" or name.startswith(("kimi-k3.", "kimi-k3-"))
+
+
 # Tokens per request, the system prompt and tool schemas (about 7k) included, before the current
 # turn's older steps are folded early and then the earlier conversation is summarized (context.py).
 # A 25-step history sent whole is about 30k; longer turns fold older steps as needed.
@@ -120,6 +139,7 @@ class Config:
     max_steps: int  # 0 = unlimited; orchestrated workers always use 0.
     context_budget: int  # Tokens one request may carry before old tool results are cut; see context.py.
     keep_context: bool = False  # Never rewrite what a turn already sent (context.py, keep mode); per model.
+    keep_reasoning: bool = False  # Store and send back the model's reasoning_details (llm.merge_reasoning_details); per model.
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS  # llm.py's max_tokens; see agent._completion_unusable.
     call_max_seconds: float = DEFAULT_CALL_MAX_SECONDS  # llm.py's call_max_seconds; 0 = none; ignored for 127.0.0.1.
 
@@ -285,8 +305,9 @@ def checkpoint_budget_mb() -> int:
 
 
 def spending():
-    """The user's credit spending settings (spending.py, C47): LOOPCUT_ASK_ABOVE_CREDITS (default 25),
-    LOOPCUT_CHAT_BUDGET_CREDITS (150) and LOOPCUT_ASK_EVERY_PAID_CALL (false). Readable without an API key."""
+    """The user's credit spending settings (spending.py, C47): LOOPCUT_ASK_ABOVE_CREDITS (default 100),
+    LOOPCUT_CHAT_BUDGET_CREDITS (150), LOOPCUT_ASK_EVERY_PAID_CALL (false) and LOOPCUT_EXTRAS (AUTO, ASK or
+    ONLY_ASKED; AUTO). Readable without an API key."""
     from . import spending as policy
     _, get = _getter()
     values = {}
@@ -296,9 +317,13 @@ def spending():
         if not value.isascii() or not value.isdigit() or not low <= int(value) <= policy.MAX_SETTING:
             raise ConfigError(f"{key} must be {low}-{policy.MAX_SETTING} credits, got {value!r}")
         values[key] = int(value)
+    extras = get("LOOPCUT_EXTRAS", policy.AUTO).strip().upper()
+    if extras not in policy.EXTRAS:
+        raise ConfigError(f"LOOPCUT_EXTRAS must be one of {', '.join(policy.EXTRAS)}, got {extras!r}")
     return policy.Settings(ask_above=values["LOOPCUT_ASK_ABOVE_CREDITS"],
                            chat_budget=values["LOOPCUT_CHAT_BUDGET_CREDITS"],
-                           ask_every=_as_bool(get("LOOPCUT_ASK_EVERY_PAID_CALL", "false"), "LOOPCUT_ASK_EVERY_PAID_CALL"))
+                           ask_every=_as_bool(get("LOOPCUT_ASK_EVERY_PAID_CALL", "false"), "LOOPCUT_ASK_EVERY_PAID_CALL"),
+                           extras=extras)
 
 
 def skills_dir() -> Path | None:
@@ -427,6 +452,10 @@ def load() -> Config:
         # default for Anthropic, whose cache and replayed thinking both reward a request that extends the last whole.
         keep_context=_as_bool(get("LOOPCUT_KEEP_CONTEXT", "true" if anthropic(base_url) else "false"),
                               "LOOPCUT_KEEP_CONTEXT"),
+        # Off except for Kimi (keeps_reasoning_by_default): another provider may reject the field. On the Loopcut
+        # service the model's catalogue entry decides (agent._keep_mode), like keep_context.
+        keep_reasoning=_as_bool(get("LOOPCUT_KEEP_REASONING", "true" if keeps_reasoning_by_default(base_url, model) else "false"),
+                                "LOOPCUT_KEEP_REASONING"),
     )
 
 

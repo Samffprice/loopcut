@@ -20,6 +20,15 @@ a run's cold first frame is left out when it rendered more. Without one it stays
   the credits pop-up opens, or says no plan's month does; any paid card short of its price gets that Upgrade too
   (shortfall()).
 
+A render_job start the model makes is offered the same way (0.2.20; rel019-cloud2: asked for the cloud so they could
+close the laptop, the model started a render job): when its frames would take over LONG_SECONDS here by the same
+timing rules and this account has the cloud render, its card is the choice (prepare_job, agent._ask_choice), even
+with renders always allowed, since it is also a time choice (owner). A quote needs the scene packed and uploaded, so
+nothing is priced before the click: the cloud option says it is priced before it starts and is never Recommended.
+In the cloud runs the cloud render for the same frames in the job's place, its quote's own card asking as any paid
+call's (short of it, shortfall()'s Upgrade); this computer runs the job as asked, with the time the card said it
+takes; Not now runs neither (job_call, job_result).
+
 No bpy at import: the layout and its tests read the copy here.
 """
 
@@ -32,12 +41,17 @@ from contextlib import contextmanager
 from . import chat_credits, config
 
 LONG_SECONDS = 15 * 60  # Over this on this computer, a cloud render's card offers both.
+# A long render_job asks as the choice even with renders always allowed ("Always allow renders"), since it is also a
+# time choice: the owner's open question (out/plans/cloud-tools-implicit-use.md, section 3, "Still asks"). False: an
+# always-allowed render job runs as asked, with no card.
+ASK_EVEN_WHEN_ALWAYS_ALLOWED = True
 LOCAL = "render_here"   # The CloudError code that carries "the user picked this computer" out of the consent.
 OUTPUT_DIR = "//renders"  # The local render's frames: a loopcut-<id> folder in renders/ beside the .blend.
 REASON = "insufficient_credits"  # The pricing page's reason, as the credits pop-up's server link names it.
 ENGINES = {"cycles": "CYCLES", "eevee": "BLENDER_EEVEE"}  # The render tool's engine input, as Blender names it.
 EEVEE = {"BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"}  # Blender 4.2-4.x called EEVEE Next by its own id.
 CLOUD_SAMPLES = {"CYCLES": 128, "BLENDER_EEVEE": 64}  # The render service's defaults (its adapter, render.ts).
+CLOUD_MAX_SAMPLES = 4096  # The render tool's samples maximum (its input_schema).
 ENGINE_LABELS = {"CYCLES": "Cycles", "BLENDER_EEVEE": "EEVEE"}
 RESOLUTIONS = {(3840, 2160): "4K", (2560, 1440): "1440p", (1920, 1080): "1080p", (1280, 720): "720p"}
 MAX_TIMINGS = 32
@@ -50,7 +64,8 @@ BUDGET_SLACK = 600
 # cloud_jobs.SURVIVES_QUIT); until then the cloud option promises only what is true.
 CLOUD_BULLETS = ("Quit Blender or turn your computer off: it keeps rendering",
                  "Work on something else meanwhile",
-                 "The frames wait in this chat; ask for the MP4 when you're back")
+                 "The frames and the MP4 wait in this chat")  # An animation's MP4 beside them (contract 0.10).
+CLOUD_BULLETS_ONE = CLOUD_BULLETS[:2] + ("The image waits in this chat",)  # One frame: no MP4.
 CLOUD_BULLETS_OPEN = ("Work on something else meanwhile", "Blender stays open until it's done")
 HERE_BULLETS = ("Blender stays open, plugged in and awake until it's done",
                 "Your laptop is slow for anything else meanwhile")
@@ -72,6 +87,15 @@ HERE_FAILED_WORKSPACE = ("The user chose to render these frames on this computer
 FRAME_PREFIX = "Loopcut frame: "  # render_timing.PREFIX (that prelude imports bpy, so it is not imported here).
 SKIPPED = ("The user closed the render choice without picking the cloud or this computer. Nothing ran and nothing "
            "was charged. Ask which they want; do not start either render until they say.")
+# A render_job's choice (0.2.20): no quote before the click, since a quote needs the scene packed and uploaded.
+UNPRICED = "Priced before it starts"
+JOB_HERE = "The user chose to render these frames on this computer, not in the cloud."
+JOB_BUDGET = " Its time limit is {budget} s, the measured time of its {count} frames with a margin{asked}."
+JOB_CLOUD = ("The user chose to render these frames in the cloud, not on this computer: render_job did not start, and "
+             "Loopcut called loopcut_cloud.render for the same frames with {inputs}.{mp4} Its result follows; a job_id "
+             "there is the render: follow it with loopcut_cloud.job_status, and do not start render_job for these "
+             "frames.\n{result}")
+JOB_MP4 = " The cloud render returns the frames and, for an animation, an MP4 beside them."
 
 _lock = threading.Lock()
 _timings: list[dict] = []  # Local renders this session: {key, engine, width, height, samples, seconds, at}.
@@ -295,6 +319,83 @@ def choice(offer: dict, quote: dict) -> dict:
     return {**offer, "credits": quote["credits"], "cloud_seconds": cloud if type(cloud) is int and cloud > 0 else None}
 
 
+# --- A render job's offer (0.2.20): the model started a render here, and the same choice comes first -----------------
+
+def cloud_tool() -> str:
+    """The cloud render's tool name while this account can call it (managed, among its tools now), else "". Any
+    thread. A tool locked for credits has no quote to name its need by, so it offers no choice."""
+    from . import cloud
+    runtime = cloud._runtime
+    if runtime is None or not runtime.signed_in:
+        return ""
+    found = any(d.get("name") == "render" and d.get("backend") == "managed" for d in runtime.descriptors())
+    return cloud.PREFIX + "render" if found else ""
+
+
+def prepare_job(arguments: dict) -> dict | None:
+    """Main thread, before a render_job start asks: prepare()'s offer for the job's frames, engine, pixels and samples,
+    with the cloud render's inputs for the same frames ("cloud"). None (today's render job card) without a timing, at
+    or under LONG_SECONDS, for an unsaved file, for frames or pixels the cloud render cannot name (not one evenly
+    spaced run, no resolution_pct of the scene's), an engine it does not render, or when anything here fails."""
+    try:
+        return _prepare_job(arguments)
+    except Exception as ex:  # The choice is a convenience: the render job asks with its usual card.
+        print(f"Loopcut: no render choice for this render job: {ex!r}")
+        return None
+
+
+def _prepare_job(arguments: dict) -> dict | None:
+    import bpy
+    from . import checkpoints, job_tools, jobs
+    scene = bpy.context.scene
+    key, r = scene_key(scene), scene.render
+    engine = _family(r.engine)
+    if not key[0] or engine not in CLOUD_SAMPLES:
+        return None
+    frames = job_tools.frame_range(arguments.get("frames"), arguments.get("start"), arguments.get("end"))
+    run = _evenly(frames)
+    # What the job renders (job_tools.create_spec): its pixels and samples, else the scene's.
+    width, height, samples = (arguments.get(k) for k in ("width", "height", "samples"))
+    width = max(4, r.resolution_x * r.resolution_percentage // 100) if width is None else width
+    height = max(4, r.resolution_y * r.resolution_percentage // 100) if height is None else height
+    if samples is None:
+        samples = (scene.cycles.samples if r.engine == "CYCLES" else
+                   scene.eevee.taa_render_samples if r.engine == "BLENDER_EEVEE" else 32)
+    size = lambda pct: (max(4, r.resolution_x * pct // 100), max(4, r.resolution_y * pct // 100))
+    pct = next((pct for pct in (r.resolution_percentage, *range(100, 9, -1)) if 10 <= pct <= 100
+                and size(pct) == (width, height)), None)  # The cloud render's resolution_pct for these pixels.
+    if run is None or pct is None or not 1 <= samples <= CLOUD_MAX_SAMPLES:
+        return None
+    wanted = {"engine": engine, "width": width, "height": height, "samples": samples}
+    seconds = seconds_per_frame(key, wanted, jobs.list_jobs(checkpoints.data_root()))
+    if seconds is None or seconds * len(frames) <= LONG_SECONDS:
+        return None
+    start, end, step = run
+    camera = arguments.get("camera")
+    denoise = bool(getattr(scene.cycles, "use_denoising", True)) if engine == "CYCLES" else True
+    inputs = {"frame_start": start, "frame_end": end, **({"frame_step": step} if step != 1 else {}),
+              "engine": next(k for k, v in ENGINES.items() if v == engine), "samples": samples, "resolution_pct": pct,
+              **({"camera": camera} if camera is not None else {}),
+              **({"denoise": denoise} if engine == "CYCLES" else {})}
+    return {**wanted, "frames": [start, end, step], "count": len(frames), "fps": r.fps / r.fps_base,
+            "camera": camera or (scene.camera.name if scene.camera else ""), "seconds_per_frame": seconds,
+            "key": list(key), "denoise": denoise, "cloud": inputs}
+
+
+def _evenly(frames: list):
+    """(start, end, step) of frames that are one evenly spaced run, as the cloud render names a range; else None."""
+    step = frames[1] - frames[0] if len(frames) > 1 else 1
+    if step < 1 or list(frames) != list(range(frames[0], frames[-1] + 1, step)):
+        return None
+    return frames[0], frames[-1], step
+
+
+def job_choice(offer: dict) -> dict:
+    """A render job's choice card (prepare_job): no quote before the click, so no price and no cloud time; the cloud
+    option says it is priced before it starts, and nothing is Recommended."""
+    return {**offer, "credits": None, "cloud_seconds": None, "balance": live_balance(), "plan": account_plan()}
+
+
 # --- Copy ------------------------------------------------------------------------------------------------------------
 
 def _n(value) -> str:
@@ -385,19 +486,24 @@ def rate(data: dict):
 
 def options(data: dict, balance) -> tuple[list, str]:
     """The two options, recommended first, and the balance footer. balance: the live one (else the card's). Short of
-    the quote, the cloud option is the way to the credits (shortfall) and the laptop stays as it is."""
+    the quote, the cloud option is the way to the credits (shortfall) and the laptop stays as it is. A render job's
+    choice has no quote (job_choice): the cloud option says it is priced before it starts, and its quote's own card
+    is short or not."""
     credits = data["credits"]
+    quoted = credits is not None
     balance = balance if _amount(balance) else data.get("balance")
     short = shortfall(credits, balance, data.get("plan") or "", rate(data), render=True)
     facts = ([f"About {about(data['cloud_seconds'])}"] if data.get("cloud_seconds") else []) + [
-        f"{_n(credits)} credits · {chat_credits.balance_dollars(credits)}, quoted"]
-    cloud = {"key": "cloud", "title": "In the cloud", "primary": True, "facts": facts, "bullets": cloud_bullets()}
+        f"{_n(credits)} credits · {chat_credits.balance_dollars(credits)}, quoted" if quoted else UNPRICED]
+    cloud = {"key": "cloud", "title": "In the cloud", "primary": True, "facts": facts,
+             "bullets": cloud_bullets(data["count"])}
     if short:
         cloud.update(badge=short["badge"], warn=short["warn"], note=short["note"], action="upgrade",
                      **({"button": short["label"], "short": short["short_label"]} if short["label"] else {}))
     else:  # Enter picks it only when it is Recommended (enter_ok): the button says so with ⏎.
         enter = "  ⏎" if recommended(data) else ""
-        cloud.update(badge="Recommended" if enter else "", button=f"Render in the cloud · {_n(credits)} credits{enter}",
+        price = f" · {_n(credits)} credits" if quoted else ""
+        cloud.update(badge="Recommended" if enter else "", button=f"Render in the cloud{price}{enter}",
                      short=f"Render in the cloud{enter}", action="cloud")
     here = {"key": "here", "title": "On this laptop", "primary": False, "bullets": list(HERE_BULLETS)}
     measured = f"{frame_line(data['seconds_per_frame']).removesuffix(' a frame')} × {data['count']:,}"
@@ -408,8 +514,8 @@ def options(data: dict, balance) -> tuple[list, str]:
         long = here_seconds(data) >= MAX_BUDGET
         here.update(facts=["Over a day on this computer" if long else
                            f"About {about(here_seconds(data))}: too long for one run here", f"({measured})"])
-    footer = (f"Balance {_n(balance)} credits · after the cloud render {_n(balance - credits)}"
-              if _amount(balance) and not short else "")
+    footer = ("" if not _amount(balance) or short else f"Balance {_n(balance)} credits" if not quoted else
+              f"Balance {_n(balance)} credits · after the cloud render {_n(balance - credits)}")
     return [cloud, here], footer
 
 
@@ -425,10 +531,13 @@ def enter_ok(data: dict, balance) -> bool:
     return recommended(data) and not short(data, balance)
 
 
-def cloud_bullets() -> list:
-    """What the cloud means for the user's evening: quitting is safe only once cloud jobs survive it."""
+def cloud_bullets(count: int) -> list:
+    """What the cloud means for the user's evening: quitting is safe only once cloud jobs survive it; one frame comes
+    back as an image, more as frames and an MP4."""
     from . import cloud_jobs
-    return list(CLOUD_BULLETS if getattr(cloud_jobs, "SURVIVES_QUIT", False) is True else CLOUD_BULLETS_OPEN)
+    if getattr(cloud_jobs, "SURVIVES_QUIT", False) is not True:
+        return list(CLOUD_BULLETS_OPEN)
+    return list(CLOUD_BULLETS_ONE if count == 1 else CLOUD_BULLETS)
 
 
 def short(data: dict, balance) -> bool:
@@ -609,6 +718,39 @@ def here(data: dict, card: dict):
     if job_id:
         card["local_job"] = job_id  # Its card shows the job's frames (ui.render_choice.local_line).
     return cloud_http.CloudError(text, LOCAL, extra={"ok": ok, "job_id": job_id})
+
+
+def job_call(pick: str, offer: dict, arguments: str, card: dict) -> tuple[str, str]:
+    """Agent thread: what a render_job's card runs once the user picked on its choice (prepare_job): (tool name, its
+    arguments). The cloud: the cloud render for the same frames, and the card becomes its card, so its quote, progress
+    and charge show there; this computer: the job as asked, with time to render what the card said it takes here
+    (budget()) when the model asked for less."""
+    from . import cloud, job_tools
+    if pick == "cloud":
+        name, inputs = cloud.PREFIX + "render", offer["cloud"]
+        card.update(name=name, summary=(cloud.describe(name, inputs) or (name,))[0], code=json.dumps(inputs, indent=2))
+        return name, json.dumps(inputs)
+    parsed = json.loads(arguments)
+    asked = parsed.get("budget_seconds")
+    if type(asked) is not int or asked < budget(offer):
+        parsed["budget_seconds"] = min(MAX_BUDGET, budget(offer))
+        summary, code = job_tools.describe("render_job", parsed)
+        card.update(summary=summary, code=code)
+    return "render_job", json.dumps(parsed)
+
+
+def job_result(pick: str, offer: dict, arguments: str, ran: str, result) -> None:
+    """The model's result for a render_job the user picked on (job_call): what they chose and what ran, then that
+    call's own result. ran: the arguments it ran with."""
+    parsed, made = json.loads(arguments), json.loads(ran)
+    if pick == "cloud":
+        mp4 = JOB_MP4 if parsed.get("format") == "MP4" else ""
+        result.text = JOB_CLOUD.format(inputs=json.dumps(made), mp4=mp4, result=result.text)
+        return
+    asked, given = parsed.get("budget_seconds"), made["budget_seconds"]
+    raised = "" if given == asked else JOB_BUDGET.format(
+        budget=given, count=f"{offer['count']:,}", asked=f", not the {asked} s asked" if type(asked) is int else "")
+    result.text = f"{JOB_HERE}{raised}\n{result.text}"
 
 
 def result(error):

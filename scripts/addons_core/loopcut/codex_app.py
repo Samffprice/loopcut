@@ -599,6 +599,7 @@ class CodexTurn:
             card["outcome"] = result.outcome  # An attached report's line (agent.run_loop).
         if getattr(result, "card_output", ""):
             card["card_output"] = result.card_output  # Its JSON for the card; Codex gets the table (tool_call).
+        agent._failed_card(card, result)  # Its plain line for a refusal of Codex's arguments (ui.layout).
         image = getattr(result, "image_path", None)
         return (result.text, result.ok, Path(image) if image and Path(image).is_file() else None,
                 getattr(result, "file_image", False))

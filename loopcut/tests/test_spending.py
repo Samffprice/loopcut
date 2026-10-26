@@ -24,7 +24,7 @@ from loopcut import (agent, cloud, cloud_account, cloud_http, cloud_jobs, config
                      spending, state)
 from loopcut.ui import layout, theme as T  # noqa: E402
 
-S = spending.Settings()
+S = spending.Settings(ask_above=25)  # A user who set their own 25, the default before 0.2.20.
 TOKEN = "lcc_" + "0123456789abcdef" * 4  # The server's single-use confirm_token: lcc_ and 64 hex.
 PROJECT = {"id": "local", "no_generation": False}
 
@@ -56,6 +56,15 @@ class PolicyTest(unittest.TestCase):
                               (26, spending.COST), (80, spending.COST)):
             with self.subTest(credits=credits):
                 self.assertEqual(self.decide(managed(credits)), kind)
+
+    def test_the_default_ask_above_is_100_so_a_90_credit_call_runs_without_a_card(self):
+        """Owner, 2026-10-26 (0.2.20): "a good chunk of credits just auto approve"; picture→3D final (80) included."""
+        self.assertEqual(spending.ASK_ABOVE, 100)
+        self.assertEqual(spending.Settings().ask_above, 100)
+        for credits, kind in ((6, spending.RUN), (80, spending.RUN), (90, spending.RUN), (100, spending.RUN),
+                              (101, spending.COST), (640, spending.COST)):
+            with self.subTest(credits=credits):
+                self.assertEqual(self.decide(managed(credits), settings=spending.Settings()), kind)
 
     def test_the_lower_of_server_and_user_thresholds_decides(self):
         self.assertEqual(self.decide(managed(20, server=10)), spending.COST, "the server asks lower")
@@ -101,6 +110,42 @@ class PolicyTest(unittest.TestCase):
         spending.allow(spending.BURST_ASK, managed(6), spending.new_ledger(), S, turn, [])
         self.assertEqual(turn.burst_limit, 10)
         self.assertEqual(self.decide(managed(6), calls=5, burst_limit=turn.burst_limit), spending.RUN)
+
+    def test_ask_me_first_asks_for_every_paid_call_a_6_credit_picture_too(self):
+        """Paid extras "Ask me first" (ASK): every paid call asks, whatever its price; free ones never do."""
+        first = spending.Settings(extras=spending.ASK)
+        self.assertEqual(self.decide(managed(6), settings=first), spending.COST)
+        self.assertEqual(self.decide(own_key(), settings=first, vendors=["OpenAI"]), spending.COST)
+        self.assertEqual(self.decide(managed(0), settings=first), spending.RUN)
+        self.assertEqual(spending.ask_lines(spending.COST, managed(6), spending.new_ledger(), first)[0],
+                         "You asked to approve every paid call.")
+        self.assertIn("and they approve every paid call", spending.declined(spending.COST, managed(6), first))
+
+    def test_only_when_i_ask_refuses_a_paid_call_not_asked_for_with_no_card(self):
+        only = spending.Settings(extras=spending.ONLY_ASKED)
+        self.assertEqual(self.decide(managed(6), settings=only, asked=False), spending.NOT_ASKED)
+        self.assertEqual(self.decide(own_key(), settings=only, asked=False, vendors=["OpenAI"]), spending.NOT_ASKED)
+        self.assertEqual(self.decide(managed(0), settings=only, asked=False), spending.RUN, "free never asks")
+        self.assertEqual(self.decide(managed(6), settings=only, asked=True), spending.RUN)
+        self.assertEqual(self.decide(managed(120), settings=only, asked=True), spending.COST, "Ask above still asks")
+        self.assertEqual(self.decide(managed(6), asked=False), spending.RUN, "Use when it helps: as before")
+        self.assertEqual(spending.declined(spending.NOT_ASKED, managed(6), only),
+                         "Not run: the user wants paid tools only when they ask for one. Nothing ran and nothing was "
+                         "charged. Go on without it; you may say in one line what it would add.")
+
+    def test_a_call_is_asked_for_when_the_latest_message_names_its_kind_or_result(self):
+        for tool, text, asked in (
+                ("sfx", "add some rain ambience", True), ("sfx", "model a typewriter", False),
+                ("sfx", "no sound please", False), ("sfx", "don't add music", False),
+                ("sfx", "rain sounds, without music", True), ("image_generate", "make a picture of the axe first", True),
+                ("image_to_3d", "turn the photo into a 3D model", True), ("image_to_3d", "turn it into 3D", True),
+                ("image_to_3d", "make me a 3D lantern", False), ("retopology", "make it game-ready", True),
+                ("motion_from_text", "animate him walking", True), ("render", "render it in the cloud", True),
+                ("auto_rig", "rig my character", True), ("auto_rig", "a bright room", False),
+                ("sfx", "use the paid tools if you like", True), ("voice_line", "add a voiceover", True),
+                ("lip_sync", "model a typewriter", False), ("sfx", None, False), ("", "sound", False)):
+            with self.subTest(tool=tool, text=text):
+                self.assertEqual(spending.asked_for(tool, text), asked)
 
     def test_ask_every_time_asks_for_paid_and_own_key_calls(self):
         every = spending.Settings(ask_every=True)
@@ -155,7 +200,7 @@ class ConsentTest(unittest.TestCase):
     def setUp(self):
         self.session = state.new_session()
         self.turn = agent.Turn()
-        self.turn.spending = spending.Settings()
+        self.turn.spending = S
         for target in (patch.object(agent, "_redraw"), patch.object(conversations, "save")):
             target.start()
             self.addCleanup(target.stop)
@@ -166,6 +211,58 @@ class ConsentTest(unittest.TestCase):
 
     def answer(self, approved):
         return patch.object(agent, "_wait_for_approval", return_value=approved)
+
+    def test_ask_me_first_brings_the_card_back_for_a_6_credit_picture(self):
+        self.turn.spending = spending.Settings(extras=spending.ASK)
+        card, consent = self.consent()
+        seen = {}
+        with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: seen.update(card) or True):
+            self.assertTrue(consent({**managed(6), "balance": 20}))
+        self.assertEqual((seen["status"], seen["ask"], seen["ask_label"]), ("awaiting", spending.COST, "Approve"))
+        self.assertIn("You asked to approve every paid call.", seen["ask_lines"])
+        self.assertEqual(self.session["spend"], {"credits": 6, "auto": 0, "allowed": 0}, "approved, not auto")
+
+    def test_only_when_i_ask_refuses_an_extra_with_no_card_and_runs_what_the_user_asked_for(self):
+        self.turn.spending = spending.Settings(extras=spending.ONLY_ASKED)
+        self.session["items"].append(state.item_user("model a typewriter"))
+        card, consent = self.consent(state.item_tool("loopcut_cloud__sfx", "Sound effect", ""))
+        with self.answer(True) as wait, self.assertRaises(cloud_http.CloudError) as caught:
+            consent(managed(4))
+        wait.assert_not_called()
+        self.assertEqual(caught.exception.code, "declined")
+        self.assertEqual(cloud.error_text(caught.exception), "declined: Not run: the user wants paid tools only when "
+                         "they ask for one. Nothing ran and nothing was charged. Go on without it; you may say in "
+                         "one line what it would add.")
+        self.assertTrue(card["declined"])
+        self.assertEqual(self.session["spend"]["credits"], 0)
+        self.session["items"].append(state.item_user("add the sound of keys clacking"))
+        card, consent = self.consent(state.item_tool("loopcut_cloud__sfx", "Sound effect", ""))
+        with self.answer(True) as wait:
+            self.assertTrue(consent(managed(4)))
+        wait.assert_not_called()
+        self.assertEqual(self.session["spend"]["credits"], 4)
+        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""),
+                                     clicked=True, shown=80)
+        self.assertTrue(consent(managed(80)), "the user's own click asked for it")
+
+    def test_a_call_is_implied_when_the_user_neither_asked_for_it_nor_approved_its_card(self):
+        """Undone means no counts only what the model added on its own."""
+        self.session["items"].append(state.item_user("model a typewriter"))
+        cases = ((managed(4), {}, True), (managed(120), {}, False),  # 120 asked on its card: approved.
+                 (managed(80), {"clicked": True, "shown": 80}, False), (managed(4), {"chosen": True}, False))
+        for details, options, implied in cases:
+            with self.subTest(details=details["credits"], options=options), self.answer(True):
+                _, consent = self.consent(state.item_tool("loopcut_cloud__sfx", "Sound effect", ""), **options)
+                self.assertTrue(consent(details))
+                self.assertIs(consent.implied, implied)
+        self.session["items"].append(state.item_user("add typing sounds"))
+        _, consent = self.consent(state.item_tool("loopcut_cloud__sfx", "Sound effect", ""))
+        self.assertTrue(consent(managed(4)))
+        self.assertFalse(consent.implied, "the user asked for it")
+        self.assertEqual(spending.undone_text("sfx"), "Not run: the user removed the last sound you added; don't add "
+                                                      "it again unless they ask. Nothing was charged.")
+        self.assertEqual((spending.kind_noun("motion_from_text"), spending.kind_noun("motion_from_video")),
+                         ("motion", "motion"), "one kind")
 
     def test_small_call_runs_unasked_and_is_counted(self):
         card, consent = self.consent()
@@ -310,9 +407,9 @@ class ConsentTest(unittest.TestCase):
 
 
 class MadePictureTest(unittest.TestCase):
-    """Owner, 2026-10-26: image_to_3d on a picture Loopcut made always asks, "Turn it into 3D · N credits" with the
-    picture, whatever the thresholds; "Make it again" declines it and the model asks what to change. The picture's
-    own button is that click already."""
+    """Owner, 2026-10-26 (0.2.20): image_to_3d on a picture Loopcut made asks as any paid call does, with no card of
+    its own; Loopcut checks the picture itself (cloud_jobs.made_seen, test_cloud_e2e). The picture's own button
+    approves the price it showed."""
 
     setUp, consent, answer = ConsentTest.setUp, ConsentTest.consent, ConsentTest.answer
 
@@ -321,48 +418,25 @@ class MadePictureTest(unittest.TestCase):
                                                   "expires_at": "2099-01-01T00:00:00Z"})
         return {**details, "balance": 100, "made_picture": {"name": "Loopcut job_1 image", "path": path}}
 
-    def test_a_made_pictures_3d_always_asks_and_a_users_own_picture_keeps_its_threshold(self):
-        loose = spending.Settings(ask_above=500)  # A Pro user who lets 80 credits run unasked.
-        for credits, server in ((80, 100), (25, 100), (80, 1000), (0, 100)):
-            with self.subTest(credits=credits, server=server):
-                self.assertEqual(spending.decide(self.made(credits, server), spending.new_ledger(), loose),
-                                 spending.MADE)
-        own = {k: v for k, v in self.made().items() if k != "made_picture"}
-        self.assertEqual(spending.decide(own, spending.new_ledger(), loose), spending.RUN, "today's rules")
-        self.assertEqual(spending.decide(own, spending.new_ledger(), S), spending.COST)
-        self.assertEqual(spending.approve_label(spending.MADE), "Turn it into 3D")
-        self.assertEqual(spending.skip_label(spending.MADE), "Make it again")
+    def test_a_made_pictures_3d_follows_the_usual_thresholds(self):
+        default = spending.Settings()
+        for credits, settings, kind in ((80, default, spending.RUN), (25, default, spending.RUN),
+                                        (0, default, spending.RUN), (101, default, spending.COST),
+                                        (80, S, spending.COST), (80, spending.Settings(ask_every=True), spending.COST)):
+            with self.subTest(credits=credits, settings=settings):
+                self.assertEqual(spending.decide(self.made(credits), spending.new_ledger(), settings), kind)
+        self.assertFalse(hasattr(spending, "MADE"), "no always-ask card")
         self.assertEqual(spending.skip_label(spending.COST), "Skip this")
-        self.assertEqual(spending.ask_title(spending.MADE, self.made()), "Turn it into 3D · 80 credits")
         self.assertEqual(spending.ask_title(spending.COST, self.made()), "")
-        declined = cloud.error_text(cloud_http.CloudError(spending.declined(spending.MADE, self.made(), S), "declined"))
-        self.assertEqual(declined, "declined: The user wants the picture made again before it becomes a 3D model. "
-                                   "Nothing ran and nothing was charged. Ask them what to change (the angle, the "
-                                   "background, one object only), then make it again with image_generate.")
 
-    def test_the_card_asks_with_the_picture_and_turn_it_into_3d_runs_it(self):
-        self.turn.spending = spending.Settings(ask_above=500)
+    def test_at_the_default_the_models_80_credit_conversion_runs_without_a_card(self):
+        self.turn.spending = spending.Settings()
         card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
-        seen = {}
-        with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: seen.update(card) or True):
+        with self.answer(True) as wait:
             self.assertTrue(consent(self.made()))
-        self.assertEqual((seen["status"], seen["ask"]), ("awaiting", spending.MADE))
-        self.assertEqual((seen["ask_title"], seen["ask_label"], seen["ask_skip"]),
-                         ("Turn it into 3D · 80 credits", "Turn it into 3D", "Make it again"))
-        self.assertEqual(seen["image_path"], "/tmp/made.png")
-        self.assertIn("Balance 100 → 20 credits", seen["ask_lines"])
+        wait.assert_not_called()
         self.assertEqual(card["status"], "running")
-        self.assertFalse({"ask", "ask_title", "ask_skip", "image_path"} & set(card), card)
-        self.assertEqual(self.session["spend"], {"credits": 80, "auto": 0, "allowed": 0}, "approved, not auto")
-
-    def test_make_it_again_declines_and_the_model_asks_what_to_change(self):
-        card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
-        with self.answer(False), self.assertRaises(cloud_http.CloudError) as caught:
-            consent(self.made(25))
-        self.assertEqual(caught.exception.code, "declined")
-        self.assertIn("Ask them what to change", str(caught.exception))
-        self.assertEqual((card["status"], card["declined"]), ("rejected", True))
-        self.assertEqual(self.session["spend"]["credits"], 0)
+        self.assertEqual(self.session["spend"], {"credits": 80, "auto": 80, "allowed": 0})
 
     def test_the_pictures_button_approves_the_price_it_showed_and_no_card_asks(self):
         card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""),
@@ -414,31 +488,14 @@ class MadePictureTest(unittest.TestCase):
         self.assertFalse(later.decided.is_set(), "the later turn's card was not answered by it")
         self.assertEqual(card["status"], "running")
 
-    def test_a_daily_limit_approval_does_not_skip_the_made_pictures_card(self):
+    def test_a_daily_limit_approval_that_showed_the_price_is_the_conversions_approval(self):
         card, consent = self.consent(state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model", ""))
         kinds = []
         with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: kinds.append(card["ask"]) or True):
             limit = {**self.made(), "limit": spending.DAILY, "required": True, "message": "Today's limit is reached."}
             self.assertTrue(consent(limit))
             self.assertTrue(consent(self.made()))
-        self.assertEqual(kinds, [spending.DAILY, spending.MADE])
-
-    def test_the_waiting_card_reads_turn_it_into_3d_with_the_picture(self):
-        session = state.new_session()
-        card = state.item_tool("loopcut_cloud__image_to_3d", "Image to 3D model · About 80 credits ($0.80)", "")
-        card["cost"] = "80 credits ($0.80), quoted"
-        state.awaiting(card, ask=spending.MADE, ask_title="Turn it into 3D · 80 credits", ask_label="Turn it into 3D",
-                       ask_skip="Make it again", ask_lines=["Check the picture first."], paid_approval=True,
-                       image_path="/tmp/made.png")
-        session["items"] = [card]
-        drawn = layout.build(session, 420, 900, 1, measure, "fast", None, {})
-        texts = {p["id"]: p["text"] for p in drawn["prims"] if p.get("t") == "text"}
-        self.assertEqual(texts["item0.tool.summary.l0"], "Turn it into 3D · 80 credits")
-        self.assertEqual(texts["item0.tool.run.label"], "Turn it into 3D  ⏎")
-        self.assertEqual(texts["item0.tool.reject.label"], "Make it again  esc")
-        self.assertIn("/tmp/made.png", [p.get("path") for p in drawn["prims"] if p.get("t") == "image"])
-        self.assertEqual([h["action"] for h in drawn["hits"] if h["id"] in ("item0.tool.run", "item0.tool.reject")],
-                         [("approve", 0), ("reject", 0)], "Enter and Esc answer it as any drawn card")
+        self.assertEqual(kinds, [spending.DAILY])
 
 
 class WorkerTest(unittest.TestCase):
@@ -447,7 +504,7 @@ class WorkerTest(unittest.TestCase):
     def setUp(self):
         self.main = state.new_session()
         self.main_turn = agent.Turn()
-        self.main_turn.spending = spending.Settings()
+        self.main_turn.spending = S
         self.worker_turn = agent.Turn()
         self.worker_turn.chat = (self.main, self.main_turn)
         self.worker_turn.worker = "worker chair (props)"
@@ -745,6 +802,82 @@ class ChargeTest(unittest.TestCase):
         cloud._settle_error(report, cloud_http.CloudError("Unsure", "job_unconfirmed", 503, {"job": running}))
         self.assertEqual(reports, [0, 0], "a job 5xx answers left unconfirmed may still be charged: its hold stays")
 
+    def test_a_job_kept_with_its_chat_titles_its_card_with_the_charge_its_record_settles(self):
+        """The card's title (agent._priced_title) and the turn's line (chat_credits.turn_line) agree on the settled
+        charge: rel019-cloud2's render, 29 quoted and held, 5 charged."""
+        from loopcut import cloud_restore
+        card = state.item_tool("loopcut_cloud__render", "Render scene" + agent.QUOTING, "")
+        consent = agent._Consent(self.session, self.turn, card)
+        self.turn.spending = spending.Settings(ask_above=100)
+        consent(managed(29, server=100))
+        self.assertEqual((card["summary"], self.session["spend"]["credits"]), ("Render scene · 29 credits", 29))
+        with cloud_account.approval_context(consent):
+            report = cloud_account.charge_reporter()
+        job = {"id": "job_r", "status": "succeeded", "credits": {"reserved": 29, "charged": 5, "refunded": 24}}
+        with patch.object(cloud_restore, "settle") as settle:
+            cloud._settle_saved(report, {"id": "job_r"}, job)
+        settle.assert_called_once()
+        self.assertEqual((card["summary"], card["cost"]), ("Render scene · 5 credits", "Used 5 credits ($0.05)"))
+        self.assertEqual(self.session["spend"]["credits"], 29, "its record settles the chat's spend, once")
+
+    def test_a_models_cancel_asks_on_its_card_and_keep_it_running_cancels_nothing(self):
+        card = state.item_tool("loopcut_cloud__job_status", "Cloud job job_r", "")
+        consent, shown = agent._Consent(self.session, self.turn, card), []
+        question = {"title": "Cloud rendering", "held": 29, "pct": 93}
+        with patch.object(consent, "_pause", lambda card, **fields: shown.append(fields) or False):
+            self.assertFalse(consent({"cancel_job": question}))
+        [fields] = shown
+        self.assertEqual((fields["ask"], fields["ask_title"], fields["ask_label"], fields["ask_skip"]),
+                         (spending.CANCEL, "Cancel this cloud job?", "Cancel it", "Keep it running"))
+        self.assertEqual(fields["ask_lines"], ["Cloud rendering, 93% done. Loopcut's AI asked to cancel it.",
+                                               "29 credits held; canceling returns them."])
+        self.assertEqual((card["status"], card["declined"], self.turn.declined), ("rejected", True, True))
+        self.assertIn("kept this cloud job running", spending.declined(spending.CANCEL, question, spending.Settings()))
+        downloading = spending.ask_lines(spending.CANCEL, {**question, "pct": None, "charged": 29}, {}, S)
+        self.assertEqual(downloading[-1], "It finished and was charged 29 credits; canceling stops its download.")
+        with patch.object(consent, "_pause", lambda card, **fields: True):
+            self.assertTrue(consent({"cancel_job": question}))
+        self.assertEqual(card["status"], "running")
+        self.assertEqual(spending.ledger(self.session)["credits"], 0, "asking holds nothing")
+
+    def test_only_a_plain_request_to_stop_skips_the_cancel_card(self):
+        for text in ("stop the render", "Cancel it please", "please cancel the cloud render, I'll do it here", "STOP"):
+            self.assertTrue(spending.asked_to_stop(text), text)
+        for text in ("why did it stop?", "don't cancel it", "don’t stop", "do not stop", "keep going", "stopped?",
+                     "it looks wrong, but no need to stop", "render it in the cloud", "", None):
+            self.assertFalse(spending.asked_to_stop(text), text)
+
+
+class KeptHereTest(unittest.TestCase):
+    """cloud_jobs.kept_here, what undone means no reads: the user still has a job's outputs in the open file."""
+
+    class Block(dict):
+        def __init__(self, job="", users=1):
+            super().__init__()
+            self.users = users
+            if job:
+                self["loopcut_provenance"] = json.dumps({"job_id": job, "tool": "sfx"})
+
+    def kept(self, job="job_1", **data):
+        scenes = data.pop("strips", None)
+        fake = types.SimpleNamespace(data=types.SimpleNamespace(
+            scenes=[types.SimpleNamespace(sequence_editor=types.SimpleNamespace(strips_all=scenes))] if scenes else [],
+            **data))
+        with patch.dict(sys.modules, {"bpy": fake}):
+            return cloud_jobs.kept_here(job)
+
+    def test_deleted_or_undone_outputs_are_gone_and_what_a_delete_leaves_does_not_count(self):
+        B = self.Block
+        self.assertTrue(self.kept(objects=[B("job_1")], meshes=[B("job_1")]), "its model is in the scene")
+        self.assertFalse(self.kept(objects=[], meshes=[B("job_1", users=0)], materials=[B("job_1")]),
+                         "its objects were deleted: the mesh and material left behind don't count")
+        self.assertTrue(self.kept(strips=[B("job_1")], sounds=[B("job_1")]), "its sound strip is in the editor")
+        self.assertFalse(self.kept(strips=[B()], sounds=[B("job_1", users=0)]), "its strip was deleted")
+        self.assertTrue(self.kept(actions=[B("job_1", users=1)]), "its motion is on the character")
+        self.assertFalse(self.kept(actions=[B("job_1", users=0)]))
+        self.assertFalse(self.kept(objects=[B("job_2")], images=[B("job_2")]), "another job's")
+        self.assertFalse(self.kept(), "Undo took everything")
+
 
 class PersistenceTest(unittest.TestCase):
     def setUp(self):
@@ -768,6 +901,24 @@ class PersistenceTest(unittest.TestCase):
         loaded = conversations.load(session["id"])
         self.assertEqual(loaded["spend"], {"credits": 46, "auto": 40, "allowed": 150})
         self.assertEqual(loaded["spend_vendors"], [])
+
+    def test_what_the_model_added_unasked_survives_a_reload_and_damaged_rows_go(self):
+        """Undone means no holds for the chat, reopened too; only for this chat (a new one starts empty)."""
+        session = self.saved()
+        spending.note_implied(session, "sfx", "job_1")
+        spending.note_implied(session, "sfx", "job_1")  # A replay of the same job.
+        session["implied"].append({"tool": "image_generate", "job": "job_2", "removed": True})
+        session["implied"] += [{"tool": 3, "job": "job_3"}, "junk", {"tool": "sfx", "job": ""}]
+        conversations.save(session)
+        loaded = conversations.load(session["id"])
+        self.assertEqual(loaded["implied"], [{"tool": "sfx", "job": "job_1", "removed": False},
+                                             {"tool": "image_generate", "job": "job_2", "removed": True}])
+        self.assertEqual(state.new_session()["implied"], [])
+        self.assertEqual(spending.implied_rows("lots"), [])
+        for n in range(40):
+            spending.note_implied(session, "sfx", f"job_{n + 10}")
+        self.assertEqual(len(session["implied"]), spending.IMPLIED_KEEP)
+        self.assertEqual(session["implied"][-1]["job"], "job_49", "the newest kept")
 
     def test_older_and_damaged_files_start_from_zero(self):
         session = self.saved()
@@ -855,6 +1006,27 @@ class PanelTest(unittest.TestCase):
                 if kind == spending.DAILY:
                     self.assertEqual(hits["item0.tool.link"]["action"], ("open_web", "https://loopcut.org/account"))
 
+    def test_a_models_cancel_card_fits_260_px_and_says_what_it_cancels(self):
+        question = {"title": "Cloud rendering", "held": 29, "pct": 93}
+        card = state.item_tool("loopcut_cloud__job_status", "Cloud job job_r", "")
+        card.update(status="awaiting", paid_approval=True, ask=spending.CANCEL,
+                    ask_label=spending.approve_label(spending.CANCEL), ask_skip=spending.skip_label(spending.CANCEL),
+                    ask_title=spending.ask_title(spending.CANCEL, question),
+                    ask_lines=spending.ask_lines(spending.CANCEL, question, spending.new_ledger(), S))
+        session = state.new_session()
+        session["items"].append(card)
+        display = self.build(session)
+        hits = {h["id"]: h for h in display["hits"]}
+        self.assertEqual((hits["item0.tool.run"]["action"], hits["item0.tool.reject"]["action"]),
+                         (("approve", 0), ("reject", 0)))
+        for hit in display["hits"]:
+            if hit["id"].startswith("item0"):
+                self.assertLessEqual(hit["x"] + hit["w"], 260 - T.PAD, hit["id"])
+        shown = " ".join(t for t in self.texts(display).values() if t)
+        for said in ("Cancel this cloud job?", "Cloud rendering, 93% done", "29 credits held", "Cancel it",
+                     "Keep it running"):
+            self.assertIn(said, shown)
+
     def test_worker_ask_card_names_the_worker(self):
         session = state.new_session()
         card = self.ask_card(spending.COST, worker="worker chair (props)", summary="worker chair (props): Image to 3D")
@@ -890,15 +1062,23 @@ class PanelTest(unittest.TestCase):
 class SettingsTest(unittest.TestCase):
     def test_spending_settings_from_preferences_or_environment(self):
         with patch.object(config, "_preference_values", return_value={}), patch.dict(os.environ, {}, clear=False):
-            for key in ("LOOPCUT_ASK_ABOVE_CREDITS", "LOOPCUT_CHAT_BUDGET_CREDITS", "LOOPCUT_ASK_EVERY_PAID_CALL"):
+            for key in ("LOOPCUT_ASK_ABOVE_CREDITS", "LOOPCUT_CHAT_BUDGET_CREDITS", "LOOPCUT_ASK_EVERY_PAID_CALL",
+                        "LOOPCUT_EXTRAS"):
                 os.environ.pop(key, None)
             with patch.object(config, "_find_env_file", return_value=None):
-                self.assertEqual(config.spending(), spending.Settings(25, 150, False))
+                self.assertEqual(config.spending(), spending.Settings(100, 150, False))
             values = {"LOOPCUT_ASK_ABOVE_CREDITS": "0", "LOOPCUT_CHAT_BUDGET_CREDITS": "300",
                       "LOOPCUT_ASK_EVERY_PAID_CALL": "true"}
             with patch.object(config, "_preference_values", return_value=values), \
                     patch.object(config, "_find_env_file", return_value=None):
                 self.assertEqual(config.spending(), spending.Settings(0, 300, True))
+            for extras in spending.EXTRAS:
+                with patch.object(config, "_preference_values", return_value={"LOOPCUT_EXTRAS": extras}), \
+                        patch.object(config, "_find_env_file", return_value=None):
+                    self.assertEqual(config.spending(), spending.Settings(extras=extras))
+            with patch.object(config, "_preference_values", return_value={"LOOPCUT_EXTRAS": "SOMETIMES"}), \
+                    patch.object(config, "_find_env_file", return_value=None), self.assertRaises(config.ConfigError):
+                config.spending()
             with patch.object(config, "_preference_values", return_value={"LOOPCUT_CHAT_BUDGET_CREDITS": "0"}), \
                     patch.object(config, "_find_env_file", return_value=None), self.assertRaises(config.ConfigError):
                 config.spending()

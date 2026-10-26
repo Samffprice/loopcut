@@ -62,6 +62,7 @@ class VerificationStyleTest(unittest.TestCase):
             conversations.save(session)
             loaded = conversations.load(session["id"])
         self.assertEqual(loaded["items"][0]["verification"], block)
+        loaded["items"][0]["expanded"] = True  # Its details: folded under one line by default (the next test).
         for width in (240, 420):
             with self.subTest(width=width):
                 drawn = layout.build(loaded, width, 900, 1, measure)
@@ -75,6 +76,80 @@ class VerificationStyleTest(unittest.TestCase):
                 for line in verified:
                     self.assertLessEqual(line["x"] + measure("ui", line["size"], line["text"]), width - T.PAD)
 
+    def final_reply(self, model: str, rows, requirements=()):
+        """A build's last reply as finish_gate leaves it: the model's text, then the Verified block."""
+        from loopcut import llm, orchestrator
+        session = state.new_session()
+        if model:  # Else the turn ended with no text, and the block is the reply.
+            session["items"] = [{"kind": "assistant", "text": model, "streaming": False}]
+            session["messages"] = [{"role": "assistant", "content": model}]
+        orchestrator._append_to_reply(session, llm.Completion(text=model),
+                                      orchestrator.verified_block(rows, requirements=requirements))
+        return session
+
+    ASKED = "a red ball bouncing on a wooden floor"
+    ROWS = [("o3", {"kind": "exists", "name": "Ball", "quote": ASKED}, {"status": "pass"}),
+            ("o4", {"kind": "exists", "name": "Floor", "quote": ASKED}, {"status": "pass"})]
+
+    def test_a_final_reply_leads_with_its_summary_and_folds_the_checks_to_one_line(self):
+        """0.2.19 gate: personas read the build's last message as a checklist ("Requirements (the user's words): 0 of 1
+        covered, 1 partly covered"). The model's summary leads; the block is one line under it that opens it."""
+        summary = "I added a red ball bouncing on a wooden floor. Press Space to play it."
+        session = self.final_reply(summary, self.ROWS)
+        block = session["items"][0]["verification"]
+        drawn = build(session)
+        prose = [p for p in drawn["prims"] if p["id"].startswith("item0.p")]
+        folded = [p for p in drawn["prims"] if p["id"].startswith("item0.verification.summary.l")]
+        self.assertEqual(" ".join(p["text"] for p in prose), summary)
+        self.assertEqual([p["text"] for p in folded], ["Checked: 2 of 2 pass, 1 partly covered ▸"])
+        self.assertLess(max(p["y"] for p in prose), folded[0]["y"], "the summary first")
+        self.assertFalse(any(p["id"].startswith("item0.verification.l") for p in drawn["prims"]), "details folded")
+        self.assertFalse(any("o3" in p.get("text", "") for p in drawn["prims"]), "no check ids on the line")
+        toggle = hit(drawn, "item0.verification.toggle")
+        self.assertEqual(toggle["action"], ("toggle", 0))
+        self.assertEqual(toggle["y"], folded[0]["y"])
+        session["items"][0]["expanded"] = True  # What ui.host does with the toggle's hit.
+        opened = build(session)
+        details = [p for p in opened["prims"] if p["id"].startswith("item0.verification.l")]
+        self.assertEqual(prim(opened, "item0.verification.summary.l0")["text"],
+                         "Checked: 2 of 2 pass, 1 partly covered ▾")
+        self.assertEqual(" ".join(p["text"] for p in details), block.replace("\n", " "), "today's details")
+        self.assertIn('- partly covered: "a red ball bouncing on a wooden floor": o3, o4 pass; nothing measures "on" '
+                      '(a contact check would)', block)
+        self.assertGreater(details[0]["y"], prim(opened, "item0.verification.summary.l0")["y"])
+        self.assertEqual(hit(opened, "item0.verification.toggle")["action"], ("toggle", 0))
+        passing = build(self.final_reply(summary, self.ROWS[:1], ["a red ball"]))
+        self.assertEqual(prim(passing, "item0.verification.summary.l0")["text"], "✓ Checked: 1 of 1 pass ▸")
+
+    def test_a_reply_with_no_text_of_its_own_still_reads_alone(self):
+        from loopcut import orchestrator
+        session = self.final_reply("", self.ROWS[:1], ["a red ball"])
+        drawn = build(session)
+        self.assertEqual([p["text"] for p in drawn["prims"] if p["id"].startswith("item0.") and p.get("text")],
+                         ["Done. ✓ Checked: 1 of 1 pass ▸"])
+        self.assertNotIn("item0.verification.rule", ids(drawn, "prims"), "no rule over nothing")
+        self.assertEqual(orchestrator.checked_line("Not verified by Loopcut: the checks could not run (x).", alone=True),
+                         "Not checked")
+        failing = "Verified by Loopcut on this scene: 1 of 2 checks.\n- not met: x"
+        self.assertEqual(orchestrator.checked_line(failing, alone=True), "Checked: 1 of 2 pass", "no Done. on a failure")
+        two = f"{failing}\n\nPlacement measured this turn: 2 of 2 checks.\nThe dog rests on Ground."
+        self.assertEqual(orchestrator.checked_line(two), "Checked: 3 of 4 pass", "every block's checks")
+
+    def test_the_panel_says_your_words_and_the_model_keeps_the_users_words(self):
+        session = self.final_reply("Done.", self.ROWS)
+        session["items"][0]["expanded"] = True
+        drawn = " ".join(p.get("text", "") for p in build(session)["prims"])
+        self.assertIn("Requirements (your words): 0 of 1 covered, 1 partly covered.", drawn)
+        self.assertNotIn("the user's words", drawn)
+        self.assertNotIn("the user", session["items"][0]["text"])
+        self.assertIn("Requirements (the user's words): 0 of 1 covered, 1 partly covered.",
+                      session["messages"][0]["content"], "the model's copy is unchanged")
+        old = session["messages"][0]["content"]  # A reply saved before 0.2.20: the model's wording on the item too.
+        session["items"][0].update(text=old, verification=old.split("\n\n", 1)[1])
+        drawn = " ".join(p.get("text", "") for p in build(session)["prims"])
+        self.assertIn("Requirements (your words): 0 of 1 covered, 1 partly covered.", drawn)
+        self.assertNotIn("the user's words", drawn)
+
     def test_no_step_notice_is_plain_and_last(self):
         from loopcut import completion_guard
         session = state.new_session()
@@ -84,6 +159,25 @@ class VerificationStyleTest(unittest.TestCase):
         notice = [p for p in drawn["prims"] if p["id"].startswith("item1.") and p.get("text")]
         self.assertEqual(" ".join(p["text"] for p in notice), completion_guard.NOTICE)
         self.assertFalse(any(".verification" in p["id"] for p in drawn["prims"]))
+
+
+class OwnKeyLineTest(unittest.TestCase):
+    def test_an_own_key_failure_is_one_line_above_the_composer_and_not_while_a_turn_runs(self):
+        line = "This key was refused by OpenAI. Check it or make a new one."
+        drawn = build(provider="OPENAI", own_key_check=line)
+        texts = [p for p in drawn["prims"] if p["id"].startswith("input.own_key.")]
+        self.assertEqual(" ".join(p["text"] for p in texts), line)
+        self.assertEqual({p["color"] for p in texts}, {T.WARN})
+        card = next(p for p in drawn["prims"] if p["id"] == "input.card")
+        self.assertLess(max(p["y"] + p["h"] for p in texts), card["y"])
+        plain = build(provider="OPENAI")
+        zone = {name: next(p["y"] for p in d["prims"] if p["id"] == "input.zone") for name, d in (("line", drawn),
+                                                                                                    ("plain", plain))}
+        self.assertLess(zone["line"], zone["plain"])  # Its own measured space: the composer keeps its size.
+        busy = state.new_session()
+        busy["busy"] = True
+        for quiet in (plain, build(busy, provider="OPENAI", own_key_check=line)):
+            self.assertFalse([p for p in quiet["prims"] if p["id"].startswith("input.own_key.")])
 
 
 class LimitRecoveryTest(unittest.TestCase):
@@ -798,6 +892,36 @@ class ToolFailureCardTest(unittest.TestCase):
         display = self.display(output, name="checks", summary="Checks: add 1", status="done")
         self.assertFalse(any(p["id"].startswith("item0.tool.reason") for p in display["prims"]))
 
+    def test_a_refusal_of_the_models_arguments_reads_plainly_with_the_precise_text_behind_the_toggle(self):
+        # rel019-cloud: a render's red card read "Unknown tool input; use the fields in this tool's schema."
+        output = "Unknown tool input; use the fields in this tool's schema."
+        card = dict(name="loopcut_cloud__render", summary="Render scene", input_mistake=True)
+        line = lambda display: " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item0.tool.reason"))
+        display = self.display(output, **card)
+        self.assertEqual(line(display), "This step needed different settings, so it didn't run.")
+        self.assertTrue(all(p["color"] == T.TEXT_MUTED for p in display["prims"] if p["id"].startswith("item0.tool.reason")))
+        self.assertEqual((prim(display, "item0.tool.glyph")["text"], prim(display, "item0.tool.glyph")["color"]),
+                         ("–", T.TEXT_MUTED))
+        self.assertFalse(any("schema" in p.get("text", "") for p in display["prims"]))
+        self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
+        display = self.display(output, expanded=True, **card)
+        self.assertEqual(line(display), "")
+        lines = [p for p in display["prims"] if p["id"].startswith("item0.tool.output")]
+        self.assertEqual(" ".join(p["text"] for p in lines), output, "the precise text, behind the toggle")
+        self.assertTrue(all(p["color"] == T.TEXT_MUTED for p in lines))
+        # A refusal the user acts on (credits, sign-in) keeps its own line, as does any other failure.
+        credits = {"message": "Not enough credits: this needs 29 and you have 3."}
+        display = self.display(output, cloud_error=credits, **card)
+        self.assertEqual(line(display), credits["message"])
+        self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
+        self.assertTrue(line(self.display(output, name="loopcut_cloud__render", summary="Render scene"))
+                        .startswith("Unknown tool input"), "unmarked, as before")
+        # A run_python refused before running (no code argument) is not "a mistake in the code".
+        display = self.display("Bad arguments for run_python: missing a required argument: 'code'", name="run_python",
+                               summary="Build", input_mistake=True)
+        self.assertEqual(line(display), "This step needed different settings, so it didn't run.")
+        self.assertFalse(any(p["id"].startswith(("item0.tool.correction", "item0.tool.details")) for p in display["prims"]))
+
     def test_collapsed_success_and_running_cards_keep_only_the_title(self):
         for status in ("done", "running"):
             with self.subTest(status=status):
@@ -1029,6 +1153,22 @@ class CodeCorrectionTest(unittest.TestCase):
         self.assertIn("This step failed", self.note(display))
         self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.ERROR)
 
+    def test_a_refusal_of_the_models_arguments_says_whether_the_turn_carried_on(self):
+        refused = lambda **extra: {**state.item_tool("loopcut_cloud__render", "Render scene", ""), "status": "failed",
+                                   "output": "Unknown tool input; use the fields in this tool's schema.",
+                                   "input_mistake": True, "turn_id": "one", **extra}
+        line = lambda display: " ".join(p["text"] for p in display["prims"] if p["id"].startswith("item0.tool.reason"))
+        glyph = lambda display: (prim(display, "item0.tool.glyph")["text"], prim(display, "item0.tool.glyph")["color"])
+        display = self.display([refused()], busy=True, active_turn_id="one")
+        self.assertEqual(line(display), "This step needed different settings; Loopcut is adjusting it.")
+        self.assertEqual(glyph(display), ("↻", T.TEXT_MUTED))
+        display = self.display([refused(), self.card("done", turn_id="one")])
+        self.assertEqual(line(display), "This step needed different settings; Loopcut carried on.")
+        self.assertEqual(glyph(display), ("–", T.TEXT_MUTED))
+        for items in ([refused()], [refused(), state.item_error("Stopped.")], [refused(code_repair="recovered")]):
+            with self.subTest(items=items):
+                self.assertEqual(line(self.display(items)), "This step needed different settings, so it didn't run.")
+
     def test_pending_correction_keeps_run_approval_and_terminal_failure_is_red(self):
         pending = self.card("awaiting", code="pass")
         display = self.display([self.card(), pending], busy=True)
@@ -1229,6 +1369,42 @@ class FooterTest(unittest.TestCase):
             "credits": "100 credits", "today": "Today: 0 credits", "hover": "input.rings",
             "account": {"session": {"used": 0.71}, "week": {"used": 0.3}}})
         self.assertNotIn("tooltip.bg", ids(drawn, "prims"))
+
+    def test_no_tooltip_covers_a_card_waiting_for_an_answer(self):
+        # rel019-app2 (2026-10-26): the credits line's tip covered the newest card, an import's Run and Reject.
+        tip = "Loopcut's AI and the cloud tools use credits. Open your account."
+        ui = {"billing": "credits", "credits": "100 credits", "credit_balance": 100}
+        session = state.new_session()
+        session["items"] = [state.item_user("bring in a wooden floor")]
+        tip_text = lambda drawn: " ".join(p["text"] for p in drawn["prims"] if p["id"].startswith("tooltip.l"))
+        drawn = layout.build(session, 420, 600, 1, measure, ui={**ui, "hover": "input.credits"})
+        self.assertEqual(tip_text(drawn), tip, "with no card waiting, as before")
+        self.assertEqual(tip_text(layout.build(session, 420, 600, 1, measure,
+                                               ui={**ui, "hover": "input.credits", "tip_dismissed": "input.credits"})),
+                         "", "a click on it put it away (ui.host)")
+        replies = [{**state.item_assistant(), "text": f"Step {n}: placed the floor boards and checked them.",
+                    "streaming": False} for n in range(30)]
+        session["items"] += [*replies, state.awaiting(state.item_tool("import_asset", "Import Poly Haven asset #1", ""))]
+        for width, height, scale in ((420, 600, 1), (240, 400, 1), (840, 1200, 2)):
+            with self.subTest(width=width, height=height, scale=scale):
+                base = layout.build(session, width, height, scale, measure, ui=ui)
+                card = prim(base, "item31.tool.card")
+                answers = [h for h in base["hits"] if h["action"][0] in layout.ANSWERS]
+                self.assertTrue(answers)
+                for target in base["hits"]:
+                    drawn = layout.build(session, width, height, scale, measure, ui={**ui, "hover": target["id"]})
+                    for box in (p for p in drawn["prims"] if p["id"] == "tooltip.bg"):
+                        for answer in answers:
+                            if answer["id"] != target["id"]:
+                                self.assert_disjoint(answer, box)
+                        if not layout._overlaps(target, card):  # A card's own button tips may cover its text.
+                            self.assert_disjoint(card, box)
+                self.assertEqual(tip_text(layout.build(session, width, height, scale, measure,
+                                                       ui={**ui, "hover": "input.credits"})), "",
+                                 "the newest card, waiting just above the composer: no room for it")
+        self.assertIn("ordinary steps", tip_text(layout.build(session, 420, 600, 1, measure,
+                                                              ui={**ui, "hover": "item31.tool.always"})),
+                      "the waiting card's own Always allow still explains itself")
 
     def test_chat_notice_threshold_fuller_window_and_provider_filtering(self):
         for used, expected in ((0.69, ""), (0.7, "Chat 70% used (5-hour window)"),

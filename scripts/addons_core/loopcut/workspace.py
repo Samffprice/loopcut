@@ -135,8 +135,8 @@ finish, say briefly what you did and anything the user must decide."""
 
 # The live-scene tools the workspace agent keeps (agent._tool_schemas' names): the rest are the cheaper
 # single agent's ways to do what the shell, run_blender and view_image do here.
-LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "search_assets", "import_asset",
-              "character_rig")
+LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "read_result", "search_assets",
+              "import_asset", "character_rig")
 
 SCHEMAS = [  # Sent with every workspace request: every word here is paid for on every step.
     {"type": "function", "function": {

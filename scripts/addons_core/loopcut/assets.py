@@ -19,7 +19,7 @@ import re
 
 from . import (asset_libraries, asset_picks, asset_search, blenderkit, indexed_assets, polyhaven,
                polypizza, tools)
-from .tools import ToolError
+from .tools import InputMistake, ToolError
 
 # source: (module, its search function, its import function, the name that function gives `id`)
 SOURCES = {
@@ -95,7 +95,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 
 def _source(source: str) -> tuple:
     if not isinstance(source, str) or source not in IMPORT_SOURCES:
-        raise ToolError(f"source must be one of {', '.join(IMPORT_SOURCES)}")
+        raise InputMistake(f"source must be one of {', '.join(IMPORT_SOURCES)}")
     return IMPORT_SOURCES[source]
 
 
@@ -138,7 +138,7 @@ def search_assets(source: str | None = None, **arguments) -> tools.ToolResult:
         return tools.forward(asset_search.search_assets, arguments, "combined asset search",
                              _properties("search_assets"), _searches())
     if not isinstance(source, str) or source not in SOURCES:
-        raise ToolError(f"search source must be one of {', '.join(SOURCES)}, or omitted")
+        raise InputMistake(f"search source must be one of {', '.join(SOURCES)}, or omitted")
     module, search, _, _ = _source(source)
     return tools.forward(getattr(module, search), _native(source, arguments), f"source {source}",
                          _properties("search_assets"), _searches())
@@ -171,9 +171,9 @@ def _picked(source, asset_id, pick):
     if pick is not None and pick != "":
         number = asset_picks.parse(pick)
         if number is None:
-            raise ToolError("pick is a result's number from search_assets: 9 for #9")
+            raise InputMistake("pick is a result's number from search_assets: 9 for #9")
     elif asset_id is None or asset_id == "":
-        raise ToolError("Give pick, a result's number from search_assets (9 for #9), or source and id.")
+        raise InputMistake("Give pick, a result's number from search_assets (9 for #9), or source and id.")
     else:
         number = asset_picks.parse(asset_id)
     if number is None:

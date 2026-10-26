@@ -407,6 +407,28 @@ class ChoiceConsentTest(unittest.TestCase):
         self.assertEqual(seen["ask"], spending.COST)
         self.assertNotIn("render_choice", seen)
 
+    def test_the_cards_title_says_its_quote_then_what_it_was_charged(self):
+        """rel019-cloud2: "Render scene · Getting a credit quote…" stayed the card's title after its quote showed (29)
+        and after the render ran (5 charged, 24 returned)."""
+        def run(card, credits, charged, text):
+            seen = {}
+            consent = agent._Consent(self.session, agent.Turn(), card)
+            consent.turn.spending = spending.Settings(ask_above=25)  # 29 credits asks.
+            with patch.object(agent, "_wait_for_approval", side_effect=lambda turn: seen.update(card) or True):
+                self.assertTrue(consent(render_details(credits=credits, offer=None)))
+            quoted = card["summary"]
+            with patch.object(state, "session", return_value=self.session):  # Its chat, on screen.
+                consent({"charged": charged, "text": text})
+            return seen.get("summary"), quoted, card["summary"]
+        self.assertEqual(run(self.card, 29, 5, "Used 5 credits ($0.05)"),
+                         ("Render scene · 29 credits", "Render scene · 29 credits", "Render scene · 5 credits"))
+        self.assertEqual(self.card["cost"], "Used 5 credits ($0.05)")
+        refunded = state.item_tool("loopcut_cloud__render", "Render scene · Getting a credit quote…", "")
+        self.assertEqual(run(refunded, 640, 0, "")[1:], ("Render scene · 640 credits", "Render scene · no charge"))
+        estimated = state.item_tool("loopcut_cloud__image_generate", "Generate image · About 6 credits ($0.06)", "")
+        self.assertEqual(run(estimated, 6, 6, "Used 6 credits ($0.06)")[1:],
+                         ("Generate image · About 6 credits ($0.06)",) * 2, "a priced title stays as it was")
+
     def test_an_offer_makes_the_ask_the_choice(self):
         _, seen = self.ask(render_details(), lambda card: True)
         self.assertEqual(seen["status"], "awaiting")
@@ -1100,6 +1122,332 @@ class WorkspaceRouteTest(Timings):
         with patch.object(workspace, "current", return_value=None), \
                 patch.object(job_tools, "start_render_job", side_effect=started):
             self.assertIn("render_job action status", render_offer._start(data)[1], "the single loop has it")
+
+
+# --- 0.2.20: a long render_job's card is the same choice (rel019-cloud2: "in the cloud, I want to close my laptop",
+# and the model called render_job, whose card offered no cloud) ------------------------------------------------------
+
+JOB = {"action": "start", "output_dir": "//renders", "start": 1, "end": 120, "format": "MP4", "budget_seconds": 900}
+JOB_INPUTS = {"frame_start": 1, "frame_end": 120, "engine": "eevee", "samples": 64, "resolution_pct": 100}
+JOB_OFFER = {**UHD, "frames": [1, 120, 1], "count": 120, "fps": 24.0, "camera": "Camera", "seconds_per_frame": 31.0,
+             "key": list(KEY), "denoise": True, "cloud": JOB_INPUTS}  # 120 × 31 s: about 1 h here.
+CLOUD_JOB = json.dumps({"job_id": "job_1", "status": "queued", "next": "loopcut_cloud.job_status"})
+
+
+class PrepareJobTest(Timings):
+    """render_offer.prepare_job: a render_job's frames, pixels and samples, timed as prepare() times a cloud call's,
+    and the cloud render's inputs for the same frames."""
+
+    def prepare(self, arguments, current=None, rows=(), file=KEY[0]):
+        current = current or scene()
+        current.frame_start, current.frame_end = 1, 250
+        with patch.object(bpy, "context", types.SimpleNamespace(scene=current), create=True), \
+                patch.object(bpy, "data", types.SimpleNamespace(filepath=file), create=True), \
+                patch.object(checkpoints, "data_root", return_value=Path("/nowhere")), \
+                patch.object(jobs, "list_jobs", return_value=list(rows)):
+            return render_offer.prepare_job(arguments)
+
+    def test_no_timing_or_under_fifteen_minutes_means_no_offer(self):
+        self.assertIsNone(self.prepare(JOB), "no guess")
+        render_offer.record(KEY, UHD, 31.0)
+        self.assertIsNone(self.prepare({**JOB, "end": 29}))  # 29 × 31 s = 899 s.
+        self.assertIsNotNone(self.prepare({**JOB, "end": 30}))
+
+    def test_an_unsaved_file_gets_no_offer(self):
+        render_offer.record(("", "Scene"), UHD, 31.0)
+        self.assertIsNone(self.prepare(JOB, file=""))
+
+    def test_the_same_frames_pixels_and_samples_in_the_cloud(self):
+        render_offer.record(KEY, UHD, 31.0)
+        self.assertEqual(self.prepare(JOB), JOB_OFFER)
+        self.assertEqual(self.prepare({**JOB, "camera": "Wide"})["cloud"], {**JOB_INPUTS, "camera": "Wide"})
+        stepped = self.prepare({**JOB, "start": None, "end": None, "frames": list(range(1, 241, 2))})
+        self.assertEqual((stepped["count"], stepped["frames"], stepped["cloud"]),
+                         (120, [1, 239, 2], {**JOB_INPUTS, "frame_end": 239, "frame_step": 2}))
+        default = self.prepare({k: v for k, v in JOB.items() if k not in ("start", "end")})
+        self.assertEqual((default["count"], default["cloud"]["frame_end"]), (250, 250), "the scene's range")
+
+    def test_pixels_are_a_resolution_pct_of_the_scenes_and_samples_the_jobs(self):
+        half = {**UHD, "width": 1920, "height": 1080}
+        render_offer.record(KEY, half, 31.0)
+        self.assertEqual(self.prepare({**JOB, "width": 1920, "height": 1080})["cloud"]["resolution_pct"], 50)
+        self.assertEqual(self.prepare(JOB, scene(pct=50))["cloud"]["resolution_pct"], 50, "the scene's own size")
+        render_offer.record(KEY, {**UHD, "samples": 16}, 31.0)
+        self.assertEqual(self.prepare({**JOB, "samples": 16})["cloud"]["samples"], 16)
+        cycles = {"engine": "CYCLES", "width": 3840, "height": 2160, "samples": 512, "device": "CPU"}
+        render_offer.record(KEY, cycles, 31.0)
+        current = scene(engine="CYCLES", samples=512)
+        current.cycles.use_denoising = False
+        self.assertEqual(self.prepare(JOB, current)["cloud"], {**JOB_INPUTS, "engine": "cycles", "samples": 512,
+                                                               "denoise": False})
+
+    def test_what_the_cloud_render_cannot_name_means_no_offer(self):
+        render_offer.record(KEY, UHD, 31.0)
+        render_offer.record(KEY, {**UHD, "width": 1000, "height": 1000}, 31.0)
+        cases = [{**JOB, "start": None, "end": None, "frames": [1, 2, 5] + list(range(6, 100))},  # Not one run.
+                 {**JOB, "width": 1000, "height": 1000},                                         # No pct gives it.
+                 {**JOB, "samples": 128}]                                                        # Not the measured.
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                self.assertIsNone(self.prepare(arguments))
+        self.assertIsNone(self.prepare(JOB, scene(engine="BLENDER_WORKBENCH")), "the cloud renders no Workbench")
+        render_offer.record(KEY, {**UHD, "samples": 8192}, 31.0)
+        self.assertIsNone(self.prepare(JOB, scene(samples=8192)), "over the cloud render's 4096")
+        self.assertIsNone(self.prepare({**JOB, "end": 0}), "a range render_job refuses")
+
+    def test_the_cloud_render_must_be_there_for_this_account(self):
+        managed = [{"name": "render", "backend": "managed"}]
+        for runtime, expected in ((types.SimpleNamespace(signed_in=True, descriptors=lambda: managed),
+                                   cloud.PREFIX + "render"),
+                                  (types.SimpleNamespace(signed_in=False, descriptors=lambda: managed), ""),
+                                  (types.SimpleNamespace(signed_in=True, descriptors=lambda: [
+                                      {"name": "render", "backend": "byok"}]), ""),
+                                  (types.SimpleNamespace(signed_in=True, descriptors=lambda: []), ""),
+                                  (None, "")):
+            with self.subTest(runtime=runtime), patch.object(cloud, "_runtime", runtime):
+                self.assertEqual(render_offer.cloud_tool(), expected)
+
+
+class JobChoiceLoopTest(unittest.TestCase):
+    """agent.run_loop: the model's render_job start asks as the choice card, and each answer does what it says."""
+
+    def run_job(self, answer, arguments=JOB, offer=JOB_OFFER, *, auto_heavy=False, tool="loopcut_cloud__render"):
+        """One render_job call through the loop; answer(card) is the user's answer while it waits. (session, the card
+        as it waited, tool runs, prepare_job's mock)."""
+        from unittest import mock
+        from loopcut import llm, nudges
+        session = state.new_session()
+        session["auto_heavy"] = auto_heavy
+        session["items"].append(state.item_user("render the animation"))
+        session["messages"].append({"role": "user", "content": "render the animation"})
+        turn = agent.Turn()
+        turn.config = config.Config("test-key", "https://example.invalid/v1", "fake", "low", False, False, 0, 24000)
+        spec = agent.LoopSpec(role="single", system=lambda s: "", schemas=lambda: [
+            {"type": "function", "function": {"name": "render_job"}}], save=lambda s: None, asks=True,
+            checkpoints=False, changes_card=False)
+        replies = iter([llm.Completion(tool_calls=[llm.ToolCall("c1", "render_job", json.dumps(arguments))]),
+                        llm.Completion(text="Done.")])
+
+        def reply(*_):
+            completion = next(replies)
+            item = state.item_assistant()
+            item.update(text=completion.text, streaming=False)
+            session["items"].append(item)
+            return completion
+        seen = {}
+
+        def wait(_turn):
+            card = next(i for i in session["items"] if i.get("status") == "awaiting")
+            seen.update(json.loads(json.dumps(card)))
+            return answer(card)
+        run = mock.Mock(side_effect=lambda name, _: tools.ToolResult(
+            CLOUD_JOB if name == tool else json.dumps({"id": JOB_ID, "state": "queued"}) + job_tools.STARTED_NOTE))
+        with patch.object(agent, "_request", side_effect=reply), patch.object(agent, "_redraw"), \
+                patch.object(nudges, "flush"), patch.object(agent, "_wait_for_approval", side_effect=wait), \
+                patch.object(mainthread, "run_on_main", side_effect=on_main_now), \
+                patch.object(render_offer, "cloud_tool", return_value=tool), \
+                patch.object(render_offer, "prepare_job", return_value=offer) as prepared, \
+                patch.object(render_offer, "live_balance", return_value=1850):
+            session["busy"] = True
+            agent.run_loop(session, turn, spec, run_tool=run, ensure_checkpoint=mock.Mock())
+        return session, seen, run, prepared
+
+    @staticmethod
+    def result(session):
+        return next(m["content"] for m in session["messages"] if m["role"] == "tool")
+
+    @staticmethod
+    def card(session):
+        return next(i for i in session["items"] if i.get("kind") == "tool")
+
+    def test_a_long_render_job_asks_as_the_choice(self):
+        session, seen, run, prepared = self.run_job(lambda card: False)
+        prepared.assert_called_once_with(JOB)
+        self.assertEqual(seen["render_choice"], {**JOB_OFFER, "credits": None, "cloud_seconds": None,
+                                                 "balance": 1850, "plan": ""})
+        session, seen, *_ = self.run_job(lambda card: False, auto_heavy=True)
+        self.assertIn("render_choice", seen, "renders always allowed: the long-render choice still asks")
+
+    def test_the_owners_switch_lets_always_allowed_renders_skip_the_choice(self):
+        with patch.object(render_offer, "ASK_EVEN_WHEN_ALWAYS_ALLOWED", False):
+            session, seen, run, prepared = self.run_job(lambda card: self.fail("no card asks"), auto_heavy=True)
+            prepared.assert_not_called()
+            self.assertEqual((seen, run.call_args.args), ({}, ("render_job", json.dumps(JOB))), "as asked, unasked")
+            self.assertEqual(self.result(session),
+                             json.dumps({"id": JOB_ID, "state": "queued"}) + job_tools.STARTED_NOTE)
+            session, seen, run, _ = self.run_job(lambda card: False)
+            self.assertIn("render_choice", seen, "a card that asks anyway is still the choice")
+            run.assert_not_called()
+
+    def test_this_computer_runs_the_render_job_with_time_to_finish(self):
+        def here(card):
+            card["picked"] = "here"
+            return False
+        session, _, run, _ = self.run_job(here)
+        name, arguments = run.call_args.args
+        self.assertEqual((run.call_count, name), (1, "render_job"))
+        budget = math.ceil(31 * 120 * 1.25) + 600
+        self.assertEqual(json.loads(arguments), {**JOB, "budget_seconds": budget}, "the card said 1 h, not 15 min")
+        result = self.result(session)
+        self.assertTrue(result.startswith(render_offer.JOB_HERE + f" Its time limit is {budget} s, the measured time "
+                                          f"of its 120 frames with a margin, not the 900 s asked.\n"), result)
+        self.assertIn(JOB_ID, result)
+        card = self.card(session)
+        self.assertEqual((card["name"], card["status"]), ("render_job", "done"))
+        self.assertIn("up to about 1½ h", card["summary"])
+        self.assertNotIn("render_choice", card)
+        session, _, run, _ = self.run_job(here, {**JOB, "budget_seconds": 86400})
+        self.assertEqual(json.loads(run.call_args.args[1])["budget_seconds"], 86400, "as asked")
+        self.assertTrue(self.result(session).startswith(render_offer.JOB_HERE + "\n"))
+        session, _, run, _ = self.run_job(here, {k: v for k, v in JOB.items() if k != "budget_seconds"})
+        self.assertEqual(json.loads(run.call_args.args[1])["budget_seconds"], budget)
+        self.assertTrue(self.result(session).startswith(
+            render_offer.JOB_HERE + f" Its time limit is {budget} s, the measured time of its 120 frames with a "
+                                    "margin.\n"), self.result(session))
+
+    def test_the_cloud_runs_the_cloud_render_for_the_same_frames_and_no_render_job(self):
+        def cloud_pick(card):
+            card["picked"] = "cloud"
+            return True
+        session, _, run, _ = self.run_job(cloud_pick)
+        self.assertEqual(run.call_count, 1, "render_job never started")
+        name, arguments = run.call_args.args
+        self.assertEqual((name, json.loads(arguments)), ("loopcut_cloud__render", JOB_INPUTS))
+        result = self.result(session)
+        self.assertEqual(result, render_offer.JOB_CLOUD.format(inputs=json.dumps(JOB_INPUTS), mp4=render_offer.JOB_MP4,
+                                                               result=CLOUD_JOB))
+        self.assertIn("job_1", result)
+        self.assertIn("follow it with loopcut_cloud.job_status", result)
+        self.assertIn("the frames and, for an animation, an MP4 beside them", result, "a video comes back (0.2.19)")
+        card = self.card(session)
+        self.assertEqual((card["name"], json.loads(card["code"])), ("loopcut_cloud__render", JOB_INPUTS),
+                         "its card is the cloud render's: its quote, progress and charge show there")
+        session, _, run, _ = self.run_job(cloud_pick, {**JOB, "format": "PNG"})
+        self.assertNotIn(render_offer.JOB_MP4.strip(), self.result(session))
+
+    def test_not_now_runs_neither_and_the_model_asks_which(self):
+        session, _, run, _ = self.run_job(lambda card: False)
+        run.assert_not_called()
+        self.assertEqual(self.result(session), render_offer.SKIPPED)
+        self.assertEqual(self.card(session)["status"], "rejected")
+
+    def test_without_an_offer_the_card_is_todays_render_job_card(self):
+        session, seen, run, _ = self.run_job(lambda card: True, offer=None)
+        self.assertNotIn("render_choice", seen)
+        self.assertEqual(seen["summary"], "Render frames 1-120 as an MP4 on this computer, up to about 15 min. "
+                                          + job_tools.STAYS_ON)
+        self.assertEqual(run.call_args.args, ("render_job", json.dumps(JOB)), "as asked")
+        self.assertEqual(self.result(session), json.dumps({"id": JOB_ID, "state": "queued"}) + job_tools.STARTED_NOTE)
+        session, seen, run, prepared = self.run_job(lambda card: True, tool="")
+        prepared.assert_not_called()  # No cloud render for this account: nothing to choose, nothing timed.
+        self.assertNotIn("render_choice", seen)
+        self.assertEqual(run.call_args.args[0], "render_job")
+
+    def test_only_a_start_in_a_loop_that_asks_is_timed(self):
+        spec = types.SimpleNamespace(asks=True)
+        turn = agent.Turn()
+        call = lambda arguments, name="render_job": types.SimpleNamespace(name=name, arguments=json.dumps(arguments))
+        with patch.object(render_offer, "cloud_tool", return_value="loopcut_cloud__render"), \
+                patch.object(render_offer, "prepare_job", return_value=JOB_OFFER) as prepared, \
+                patch.object(mainthread, "run_on_main", side_effect=on_main_now):
+            self.assertEqual(agent._job_offer(spec, call(JOB), turn, True), JOB_OFFER)
+            self.assertEqual(agent._job_offer(spec, call(JOB), turn, False), JOB_OFFER, "renders always allowed")
+            for asks, made in ((True, call({"action": "status", "job_id": "j"})), (True, call(JOB, "run_python")),
+                               (False, call(JOB))):
+                with self.subTest(asks=asks, made=made):
+                    self.assertIsNone(agent._job_offer(types.SimpleNamespace(asks=asks), made, turn, True))
+            with patch.object(render_offer, "ASK_EVEN_WHEN_ALWAYS_ALLOWED", False):
+                self.assertIsNone(agent._job_offer(spec, call(JOB), turn, False), "the switch off: no choice")
+                self.assertEqual(agent._job_offer(spec, call(JOB), turn, True), JOB_OFFER)
+        self.assertEqual(prepared.call_count, 3)
+
+
+class JobChoiceCardTest(ChoiceLayoutTest):
+    """The render job's choice card: no quote before the click, so no price and no cloud time, ever guessed."""
+
+    def job_card(self, balance=1850):
+        item = state.item_tool("render_job", "Render frames 1-120 as an MP4 on this computer", "")
+        with patch.object(render_offer, "live_balance", return_value=balance):
+            return state.awaiting(item, render_choice=render_offer.job_choice(JOB_OFFER))
+
+    def test_the_cloud_says_it_is_priced_before_it_starts(self):
+        with self.survives_quit(True):
+            display = self.build(self.job_card())
+        texts = self.texts(display)
+        self.assertEqual((texts["item0.choice.title"], texts["item0.choice.detail"]),
+                         ("Render 120 frames", "4K · 5 s · EEVEE"))
+        self.assertEqual(texts["item0.choice.cloud.fact0"], render_offer.UNPRICED)
+        self.assertNotIn("item0.choice.cloud.fact1", texts, "no cloud time without a quote")
+        self.assertNotIn("item0.choice.cloud.badge.label", texts, "never Recommended unpriced")
+        self.assertEqual(texts["item0.choice.cloud.go.label"], "Render in the cloud", "no price, no ⏎")
+        self.assertEqual([texts[f"item0.choice.cloud.bullet{k}"] for k in range(3)], list(render_offer.CLOUD_BULLETS))
+        self.assertEqual(texts["item0.choice.cloud.bullet2"], "The frames and the MP4 wait in this chat",
+                         "an animation's cloud render returns its MP4 beside the frames (0.2.19)")
+        self.assertEqual([texts["item0.choice.here.fact0"], texts["item0.choice.here.fact1"]],
+                         ["About 1 h (31 s × 120)", "Free"])
+        self.assertEqual(texts["item0.choice.here.go.label"], "Render on my laptop")
+        self.assertEqual(texts["item0.choice.footer"], "Balance 1,850 credits")
+        cloud_texts = " ".join(v for k, v in texts.items() if k.startswith("item0.choice.cloud"))
+        self.assertNotIn("credit", cloud_texts)
+        self.assertNotIn("$", cloud_texts)
+        hits = {h["id"]: h["action"] for h in display["hits"]}
+        self.assertEqual((hits["item0.choice.cloud.go"], hits["item0.choice.here.go"], hits["item0.choice.skip"]),
+                         (("render_choice", (0, "cloud")), ("render_choice", (0, "here")), ("reject", 0)))
+        self.assert_inside(display)
+        self.assertEqual(display["max_scroll"], 0)
+
+    def test_one_frame_comes_back_as_an_image(self):
+        one = {**JOB_OFFER, "frames": [40, 40, 1], "count": 1}
+        with self.survives_quit(True):
+            for data in ({**render_offer.job_choice(one), "balance": 1850},                  # A render job's card.
+                         {**render_details()["render_offer"], "frames": [40, 40, 1], "count": 1}):  # The cloud call's.
+                with self.subTest(credits=data["credits"]):
+                    bullets = render_offer.options(data, None)[0][0]["bullets"]
+                    self.assertEqual(bullets[2], "The image waits in this chat")
+                    self.assertNotIn("MP4", " ".join(bullets))
+            self.assertEqual(render_offer.options(render_offer.job_choice(JOB_OFFER), None)[0][0]["bullets"][2],
+                             "The frames and the MP4 wait in this chat")
+            item = self.job_card()
+            item["render_choice"].update(frames=[40, 40, 1], count=1)
+            display = self.build(item)
+        self.assertEqual(self.texts(display)["item0.choice.cloud.bullet2"], "The image waits in this chat")
+        self.assert_inside(display)
+        with self.survives_quit(False):
+            self.assertEqual(render_offer.cloud_bullets(1), list(render_offer.CLOUD_BULLETS_OPEN))
+
+    def test_a_low_balance_gets_no_guessed_shortfall_and_no_balance_no_footer(self):
+        data = render_offer.job_choice(JOB_OFFER)
+        cloud_option, _ = render_offer.options({**data, "balance": 3}, None)[0]
+        self.assertNotIn("warn", cloud_option)
+        self.assertEqual(cloud_option["action"], "cloud")
+        with patch.object(render_offer, "live_balance", return_value=None):
+            self.assertEqual(render_offer.options(render_offer.job_choice(JOB_OFFER), None)[1], "")
+
+    def test_enter_picks_neither_and_a_click_answers(self):
+        session, turn = state.new_session(), agent.Turn()
+        item = self.job_card()
+        session["items"].append(item)
+        session["turn"] = turn
+        with patch.object(state, "session", return_value=session), \
+                patch.object(render_offer, "live_balance", return_value=1850):
+            self.assertFalse(agent.decide(True, index=0), "Enter: nothing is Recommended")
+            self.assertFalse(turn.decided.is_set())
+            render_offer.click(session, 0, "here")
+        self.assertEqual((turn.approved, item["picked"]), (False, "here"))
+
+    def test_the_quote_after_a_cloud_pick_asks_on_the_plain_paid_card(self):
+        session, turn = state.new_session(), agent.Turn()
+        turn.spending = spending.Settings()
+        card = state.item_tool("loopcut_cloud__render", "Render scene · Getting a credit quote…", "")
+        session["items"].append(card)
+        seen = {}
+        consent = agent._Consent(session, turn, card, chosen=True)
+        with patch.object(agent, "_redraw"), patch.object(conversations, "save"), \
+                patch.object(agent, "_wait_for_approval", side_effect=lambda t: seen.update(card) or True):
+            self.assertTrue(consent(render_details()))
+        self.assertEqual(seen["ask"], spending.COST)
+        self.assertNotIn("render_choice", seen, "the user already chose the cloud: no second choice")
+        self.assertEqual(seen["price"]["credits"], 640, "its price, and an Upgrade when short (price_shortfall)")
 
 
 if __name__ == "__main__":

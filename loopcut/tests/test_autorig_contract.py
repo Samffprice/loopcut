@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from test_autorig import human, inputs
 import platform_contract
 from loopcut import autorig, cloud, cloud_http, rig_bundle, rig_experimental, rig_transport
-from test_autorig_r10 import PLATFORM_NOTICE
+from test_autorig_r10 import PLATFORM_NOTICES
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness'))
 import autorig_contract
@@ -101,7 +101,7 @@ class PlatformRigFixtures(unittest.TestCase):
         self.assertEqual((cloud_http.CONTRACT, descriptor['version'], request['tool_version']), ('0.10', 3, 3))
         self.assertIs(request['input']['accept_experimental'], task['accept_experimental'])
         # The card shows rig_text.QUOTE, never this field; the platform's line may trail the card's (R10).
-        self.assertIn(quote['experimental_notice'], (PLATFORM_NOTICE, rig_experimental.QUOTE))
+        self.assertIn(quote['experimental_notice'], PLATFORM_NOTICES + (rig_experimental.QUOTE,))
         self.assertNotIn('accept_experimental', cloud.schema(descriptor)['function']['parameters']['properties'])
         info = self.contract.schemas['rig']['properties']['experimental']
         self.assertEqual(set(rig_experimental.REASONS), set(info['properties']['reasons']['items']['enum']))

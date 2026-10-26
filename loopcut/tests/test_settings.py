@@ -9,7 +9,9 @@ import importlib.util
 import io
 import os
 import sys
+import tempfile
 import threading
+import time
 import types
 import unittest
 from contextlib import redirect_stderr
@@ -83,6 +85,37 @@ class Layout:
     def operator(self, name, **kwargs):
         self.calls.append(("operator", name, self))
         return types.SimpleNamespace()
+
+
+OWN_KEY = "sk-" + "test-settings-0123456789abcdef"
+
+
+class Timers:
+    """bpy.app.timers, recorded: fire() runs what is registered, as Blender would once its wait ends."""
+
+    def __init__(self):
+        self.registered, self.registrations, self.unregistrations = {}, 0, 0
+
+    def is_registered(self, fn):
+        return fn in self.registered
+
+    def register(self, fn, first_interval=0.0):
+        self.registered[fn] = first_interval
+        self.registrations += 1
+
+    def unregister(self, fn):
+        del self.registered[fn]
+        self.unregistrations += 1
+
+    def fire(self):
+        for fn in list(self.registered):
+            del self.registered[fn]
+            fn()
+        deadline = time.monotonic() + 5  # The check's worker thread reports back.
+        while threading.active_count() > 1 and any(t.name == "loopcut-own-key-check" for t in threading.enumerate()):
+            if time.monotonic() > deadline:
+                raise AssertionError("the key check did not finish")
+            time.sleep(0.01)
 
 
 class SettingsTest(unittest.TestCase):
@@ -240,6 +273,70 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(self.prefs.no_generation)
         self.assertFalse(self.prefs.private_mode)
 
+    def test_ask_above_moves_to_100_unless_the_user_set_their_own(self):
+        """0.2.20: Blender saves an add-on preference only once it is set (an IDProperty, is_property_set), so a user
+        who never changed Ask above reads the new default, 100, and one who set a value keeps it, 25 included."""
+        field = type(self.prefs).__annotations__["ask_above_credits"]
+        self.assertEqual(field.options["default"], 100)
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value=""):
+            self.assertFalse(self.prefs.is_property_set("ask_above_credits"))
+            self.assertEqual(self.settings.values()["LOOPCUT_ASK_ABOVE_CREDITS"], "100")
+            for own in (25, 40, 0):
+                self.prefs.ask_above_credits = own
+                self.assertTrue(self.prefs.is_property_set("ask_above_credits"))
+                self.assertEqual(self.settings.values()["LOOPCUT_ASK_ABOVE_CREDITS"], str(own))
+        self.assertEqual(self.settings.values.__globals__["config"].spending.__doc__.count("default 100"), 1)
+
+    def test_paid_extras_is_a_preference_beside_ask_above_and_reaches_config(self):
+        """Owner, 2026-10-26: Use when it helps (default) / Ask me first / Only when I ask; lane H-b's context line
+        reads getattr(prefs, "extras_mode", "AUTO"), so the name and ids are fixed."""
+        field = type(self.prefs).__annotations__["extras_mode"]
+        self.assertEqual([(i, label) for i, label, _ in field.options["items"]],
+                         [("AUTO", "Use when it helps"), ("ASK", "Ask me first"), ("ONLY_ASKED", "Only when I ask")])
+        self.assertEqual((field.options["name"], field.options["default"]), ("Paid extras", "AUTO"))
+        self.assertEqual(self.prefs.extras_mode, "AUTO")
+        layout = Layout()
+        with patch.object(self.cloud, "_runtime", None):
+            self.settings.draw_spending(layout, self.prefs)
+        drawn = [name for kind, name, _ in layout.calls if kind == "prop"]
+        self.assertEqual(drawn[:2], ["extras_mode", "ask_above_credits"], "right above Ask above")
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value=""):
+            self.assertEqual(self.settings.values()["LOOPCUT_EXTRAS"], "AUTO")
+            self.prefs.extras_mode = "ONLY_ASKED"
+            self.assertEqual(self.settings.values()["LOOPCUT_EXTRAS"], "ONLY_ASKED")
+
+    def test_set_extras_saves_each_mode_and_this_turns_settings(self):
+        """What the user says in chat ("ask me before using paid tools" → ask): the preference, saved, and the
+        running turn's settings, so its next paid call goes by it."""
+        tools = importlib.import_module(NAME + ".tools")
+        state = importlib.import_module(NAME + ".state")
+        spending = importlib.import_module(NAME + ".spending")
+        session = state.reset()
+        session["turn"] = turn = types.SimpleNamespace(spending=spending.Settings(ask_above=40))
+        save = Mock()
+        fake = types.SimpleNamespace(ops=types.SimpleNamespace(wm=types.SimpleNamespace(save_userpref=save)))
+        with patch.object(self.settings, "preferences", return_value=self.prefs), patch.object(tools, "bpy", fake), \
+                patch.object(self.settings.credentials, "api_key", return_value=""):
+            for mode, value, label in (("ask", "ASK", "Ask me first"), ("only_asked", "ONLY_ASKED", "Only when I ask"),
+                                       ("auto", "AUTO", "Use when it helps")):
+                with self.subTest(mode=mode):
+                    result = tools.set_extras(mode)
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.text, f'Saved: paid extras "{label}". The user can change it in '
+                                                  'Preferences.')
+                    self.assertEqual(self.prefs.extras_mode, value)
+                    self.assertEqual(turn.spending, spending.Settings(ask_above=40, extras=value))
+                    self.assertEqual(self.settings.values()["LOOPCUT_EXTRAS"], value)
+            self.assertEqual(save.call_count, 3)
+            with self.assertRaises(tools.InputMistake):
+                tools.set_extras("never")
+        schema = next(s["function"] for s in tools.SCHEMAS if s["function"]["name"] == "set_extras")
+        self.assertEqual(schema["parameters"]["properties"]["mode"]["enum"], ["auto", "ask", "only_asked"])
+        self.assertTrue(schema["description"].startswith("Only when the user says how paid tools should be used"))
+        self.assertIs(tools._DISPATCH["set_extras"], tools.set_extras)
+
     def test_local_no_generation_reaches_config_values(self):
         with patch.object(self.settings, "preferences", return_value=self.prefs), \
                 patch.object(self.settings.credentials, "api_key", return_value=""):
@@ -273,7 +370,7 @@ class SettingsTest(unittest.TestCase):
         self.assertIn(call(self.prefs, "private_mode"), layout.prop.call_args_list)
 
     def test_workers_checkbox_is_disabled_with_note_for_each_byok_provider(self):
-        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "ANTHROPIC"):
+        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "ANTHROPIC", "GEMINI", "KIMI"):
             for stored in (True, False):
                 with self.subTest(provider=provider, stored=stored):
                     calls = self.draw_preferences(provider, stored)
@@ -299,11 +396,59 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse([entry for entry in calls if entry[:2] == ("label", "Workers and routing run on Loopcut plans")])
         self.assertIs(self.prefs.orchestrate, True)
 
-    def test_anthropic_is_the_last_provider_with_opus_by_default_and_a_class_a_note(self):
-        self.assertEqual([p[0] for p in self.settings.PROVIDERS],
-                         ["LOOPCUT", "META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "CHATGPT", "ANTHROPIC"],
+    def test_providers_keep_their_stored_order_with_new_ones_appended(self):
+        """Blender saves an enum by its item's position: a row inserted anywhere but the end would turn every saved
+        provider after it into the next one."""
+        order = ["LOOPCUT", "META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "CHATGPT", "ANTHROPIC", "GEMINI", "KIMI"]
+        self.assertEqual([p[0] for p in self.settings.PROVIDERS], order,
                          "appended, so the stored enum values of the others stay what they were")
-        _, label, base_url, model, note = self.settings.PROVIDERS[-1]
+        items = type(self.prefs).__annotations__["provider"].options["items"]
+        self.assertEqual([item[0] for item in items], order)
+
+    def test_gemini_and_kimi_presets(self):
+        by_id = self.settings._BY_ID
+        self.assertEqual(by_id["GEMINI"][1:4], ("Google Gemini (API key)",
+                                                "https://generativelanguage.googleapis.com/v1beta/openai", ""))
+        self.assertEqual(by_id["KIMI"][1:4], ("Kimi Code (your membership)", "https://api.kimi.ai/coding/v1",
+                                              "kimi-for-coding"))
+        self.assertIn("Fetch models", by_id["GEMINI"][4])
+        for provider in ("GEMINI", "KIMI"):
+            self.prefs.provider = provider
+            self.settings._provider_changed(self.prefs, None)
+            self.assertEqual((self.prefs.base_url, self.prefs.model), by_id[provider][2:4])
+
+    def test_a_refused_key_on_gemini_or_kimi_names_it_as_preferences_does(self):
+        ui = importlib.import_module(NAME + ".own_key_ui")
+        for provider, name in (("GEMINI", "Google Gemini"), ("KIMI", "Kimi Code")):
+            self.prefs.provider, self.prefs.base_url = provider, self.settings._BY_ID[provider][2]
+            self.assertEqual(ui.own_key.message(ui.own_key.REFUSED, ui._about(self.prefs, OWN_KEY)),
+                             f"This key was refused by {name}. Check it or make a new one.")
+
+    def test_fetch_models_says_loopcut_in_the_user_agent(self):
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request)
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.read.return_value = b'{"data": [{"id": "kimi-for-coding"}]}'
+            return response
+        self.prefs.provider, self.prefs.base_url = "KIMI", "https://api.kimi.ai/coding/v1"
+        operator = self.settings.LOOPCUT_OT_fetch_models()
+        operator.report = Mock()
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value=OWN_KEY), \
+                patch.object(self.settings.urllib.request, "urlopen", side_effect=urlopen):
+            self.assertEqual(operator.execute(None), {"FINISHED"})
+        (request,) = sent
+        self.assertEqual((request.full_url, request.get_header("User-agent")),
+                         ("https://api.kimi.ai/coding/v1/models", "Loopcut (Blender add-on)"))
+        self.assertEqual(self.settings.listed_models("KIMI"), ["kimi-for-coding"])
+        self.settings._models.clear()
+
+    def test_anthropic_keeps_its_place_with_opus_by_default_and_a_class_a_note(self):
+        _, label, base_url, model, note = self.settings._BY_ID["ANTHROPIC"]
         self.assertEqual((label, base_url, model), ("Anthropic (Claude)", "anthropic://api.anthropic.com/v1", "claude-opus-5-5"))
         self.assertIn("Private (A)", note)
         self.assertIn("30 days", note)
@@ -419,6 +564,103 @@ class SettingsTest(unittest.TestCase):
         calls = self.draw_preferences("LOOPCUT", False)
         self.assertIn("Reports aren't available right now. Please email hello@loopcut.org instead.",
                       [c[1] for c in calls if c[0] == "label"])
+
+    # --- The own-key check (own_key_ui.py) ----------------------------------------------------------------------
+
+    def own_key_ui(self, timers=None, background=False):
+        """own_key_ui with its state reset, this test's preferences and key, and Blender's timers recorded."""
+        ui = importlib.import_module(NAME + ".own_key_ui")
+        ui._result.update(status="idle", code="", text="", settings=None)
+        ui._looked.clear()
+        ui._again = False
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+        for context in (patch.object(ui.bpy, "app", types.SimpleNamespace(background=background, timers=timers)),
+                        patch.object(self.settings, "preferences", return_value=self.prefs),
+                        patch.object(ui.credentials, "api_key", return_value=OWN_KEY),
+                        patch.object(ui.credentials, "folder", return_value=self.folder),
+                        patch.object(ui.mainthread, "run_on_main", side_effect=lambda fn: fn()),
+                        patch.object(ui.mainthread, "request_redraw")):
+            context.start()
+            self.addCleanup(context.stop)
+        self.prefs.provider, self.prefs.base_url, self.prefs.model = "OPENAI", "https://api.openai.com/v1", "gpt-x"
+        return ui
+
+    def test_saving_a_key_or_changing_the_base_url_model_or_provider_asks_for_a_check(self):
+        ui = importlib.import_module(NAME + ".own_key_ui")
+        fields = type(self.prefs).__annotations__
+        self.assertIs(fields["model"].options["update"], self.settings._connection_changed)
+        self.assertIs(fields["base_url"].options["update"], self.settings._connection_changed)
+        with patch.object(ui, "request") as request, patch.object(self.settings.credentials, "store") as store:
+            self.prefs.provider, self.prefs.base_url = "OPENAI", "https://api.openai.com/v1"
+            self.prefs.api_key = OWN_KEY
+            store.assert_called_once_with("https://api.openai.com/v1", OWN_KEY)
+            self.settings._connection_changed(self.prefs, None)
+            self.settings._provider_changed(self.prefs, None)
+        self.assertEqual(request.call_count, 3)
+
+    def test_the_check_waits_for_changes_to_settle_runs_off_the_main_thread_and_never_for_loopcut_or_chatgpt(self):
+        timers = Timers()
+        ui = self.own_key_ui(timers)
+        ran = []
+
+        def check(about, base_url, key, model, folder, again=False, cancelled=None):
+            ran.append((threading.current_thread() is threading.main_thread(), about["name"], base_url, key, model,
+                        folder, again))
+            return {"code": "ok", "text": f"Works with {model}."}
+        with patch.object(ui.own_key, "check", side_effect=check):
+            for provider in ("LOOPCUT", "CHATGPT"):
+                self.prefs.provider = provider
+                ui.request()
+                self.assertEqual((timers.registered, ui.status()["status"]), ({}, "idle"))
+            self.prefs.provider = "OPENAI"
+            with patch.object(ui.credentials, "api_key", return_value=""):
+                ui.request()  # No key saved yet: the key field says so; saving one asks again.
+                self.assertEqual((timers.registered, ui.status()["status"]), ({}, "idle"))
+            for _ in range(5):  # A burst of changes: one check, after the last.
+                ui.request()
+            self.assertEqual(timers.registered, {ui._start: ui.DEBOUNCE})
+            self.assertEqual((timers.registrations, timers.unregistrations), (5, 4))
+            self.assertEqual(ui.status()["status"], "checking")
+            timers.fire()
+            self.assertEqual(ran, [(False, "OpenAI", "https://api.openai.com/v1", OWN_KEY, "gpt-x", self.folder, False)])
+            self.assertEqual(ui.status(), {"status": "done", "code": "ok", "text": "Works with gpt-x."})
+            self.assertEqual(ui.panel_line(), "")  # A pass stays out of the chat panel.
+            ui.LOOPCUT_OT_own_key_check().execute(None)  # Check again: soon, and it may probe again (own_key.RECHECK).
+            self.assertEqual(timers.registered, {ui._start: ui.AGAIN_DELAY})
+            timers.fire()
+            self.assertEqual(ran[-1][-1], True)
+            ui.request()
+            self.prefs.provider = "LOOPCUT"  # Switched away before the wait ended: no check.
+            timers.fire()
+            self.assertEqual(len(ran), 2)
+
+    def test_a_failure_shows_under_the_fields_with_check_again_and_above_the_composer(self):
+        ui = self.own_key_ui(Timers())
+        refused = "This key was refused by OpenAI. Check it or make a new one."
+        with patch.object(ui.own_key, "check", return_value={"code": "refused", "text": refused}):
+            ui.request()
+            ui.bpy.app.timers.fire()
+        self.assertEqual(ui.panel_line(), refused)
+        calls = self.draw_preferences("OPENAI", False)
+        labels = [entry[1] for entry in calls if entry[0] == "label"]
+        self.assertIn(refused, labels)
+        self.assertIn("loopcut.own_key_check", [entry[1] for entry in calls if entry[0] == "operator"])
+        self.prefs.model = "gpt-y"  # Its answer was about gpt-x.
+        self.assertEqual((ui.panel_line(), ui.status()["status"]), ("", "idle"))
+        self.prefs.model = "gpt-x"
+        ui._result.update(status="done", code="rate_limited", text="OpenAI is limiting this key right now. Try "
+                          "again in a minute.", settings=ui._settings(self.prefs))
+        self.assertEqual(ui.panel_line(), "")  # Passing, not a setup mistake: Preferences only.
+
+    def test_after_a_relaunch_the_saved_probe_result_shows_with_no_request(self):
+        ui = self.own_key_ui(Timers())
+        ui.own_key.remember(self.folder, OWN_KEY, "https://api.openai.com/v1", "gpt-x", "no_credit", "")
+        with patch.object(ui.own_key, "check", side_effect=AssertionError("no check on launch")):
+            self.assertEqual(ui.panel_line(), "This OpenAI account has no credit left.")
+        self.assertEqual(ui.bpy.app.timers.registered, {})
+        self.assertNotIn(OWN_KEY, (self.folder / ui.own_key.CACHE_FILE).read_text(encoding="utf-8"))
 
     def draw_preferences(self, provider, stored):
         self.prefs.provider = provider

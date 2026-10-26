@@ -335,6 +335,20 @@ class CloudEndToEndTest(unittest.TestCase):
     def make_picture(self):
         """image_generate with the real apply of its picture (an image datablock, its empty, a pinned reference),
         its card in the chat as the agent's loop leaves it (agent._made_pictures). Returns (card, result, image)."""
+        from loopcut import agent
+        self.picture_setup()
+        arguments = {'prompt': 'a brass lantern, a single object on a plain background, three-quarter view'}
+        result = self.execute('image_generate', arguments)
+        self.assertTrue(result.ok, result.text)
+        card = state.item_tool(cloud.PREFIX + 'image_generate', 'Generate image', '')
+        card['status'] = 'done'
+        state.session()['items'] = [card]
+        call = types.SimpleNamespace(name=cloud.PREFIX + 'image_generate', arguments=json.dumps(arguments))
+        agent._made_pictures(state.session(), card, call, result)
+        return card, result, self.data.images[0]
+
+    def picture_setup(self):
+        """What a picture's real apply needs here: Blender's data, the chat's copies and saves stood in for."""
         from loopcut import agent, attachments, conversations
         self.data.images, self.data.objects = Images(), Objects()
         self.linked = []
@@ -353,23 +367,51 @@ class CloudEndToEndTest(unittest.TestCase):
         self.addCleanup(data.stop)
         self.replace(cloud_jobs, '_add_images', ADD_IMAGES)
         self.replace(agent, '_POLL_SECONDS', .01)
-        arguments = {'prompt': 'a brass lantern, a single object on a plain background, three-quarter view'}
-        result = self.execute('image_generate', arguments)
-        self.assertTrue(result.ok, result.text)
-        card = state.item_tool(cloud.PREFIX + 'image_generate', 'Generate image', '')
-        card['status'] = 'done'
-        state.session()['items'] = [card]
-        call = types.SimpleNamespace(name=cloud.PREFIX + 'image_generate', arguments=json.dumps(arguments))
-        agent._made_pictures(state.session(), card, call, result)
-        return card, result, self.data.images[0]
 
-    def asked(self, answer=True, settings=None):
+    def test_a_picture_the_model_added_unasked_and_the_user_undid_is_not_added_again_in_this_chat(self):
+        """Owner, 2026-10-26 (0.2.20), undone means no: a paid output the model added without the user asking, which
+        the user then undoes or deletes, is not added again in that chat: the model's next unasked call of that kind
+        is refused before any quote, with no card. One the user asks for still runs."""
+        from loopcut import spending
+        self.picture_setup()
+        state.session()['items'].append(state.item_user('model a brass lantern for my game'))
+        _, consent, asks = self.asked(True, tool='image_generate')
+        made = self.execute('image_generate', {'prompt': 'a brass lantern'}, consent=consent)
+        self.assertTrue(made.ok, made.text)
+        job = state.session()['implied'][0]['job']
+        self.assertTrue(job.startswith('job_'))
+        self.assertEqual(state.session()['implied'], [{'tool': 'image_generate', 'job': job, 'removed': False}])
+        _, consent, asks = self.asked(True, tool='image_generate')
+        kept = self.execute('image_generate', {'prompt': 'a brass lantern, closer'}, consent=consent)
+        self.assertTrue(kept.ok, 'while the picture is in the file, another unasked one runs')
+        self.data.images[:] = []  # Undo: the pictures and their stamps leave the file.
+        _, consent, asks = self.asked(True, tool='image_generate')
+        refused = self.execute('image_generate', {'prompt': 'a brass lantern again'}, consent=consent)
+        self.assertFalse(refused.ok)
+        self.assertTrue(refused.input_mistake, 'a plain card, not an approval')
+        self.assertEqual(refused.text, "Not run: the user removed the last picture you added; don't add it again "
+                                       "unless they ask. Nothing was charged.")
+        self.assertEqual((asks, len(self.sent('jobs'))), ([], 2), 'nothing quoted or sent')
+        self.assertTrue(state.session()['implied'][-1]['removed'])
+        self.data.images[:] = [Image('Loopcut picture back', '')]  # A redo would not bring the "no" back.
+        _, consent, asks = self.asked(True, tool='image_generate')
+        self.assertFalse(self.execute('image_generate', {'prompt': 'a lantern'}, consent=consent).ok,
+                         'remembered for the rest of this chat')
+        state.session()['items'].append(state.item_user('ok, make a picture of the lantern after all'))
+        _, consent, asks = self.asked(True, tool='image_generate')
+        asked = self.execute('image_generate', {'prompt': 'a brass lantern'}, consent=consent)
+        self.assertTrue(asked.ok, asked.text)
+        self.assertEqual(len(self.sent('jobs')), 3)
+        self.assertEqual(len(state.session()['implied']), 2, 'the one asked for is not an implied output')
+        self.assertEqual(spending.implied_rows(state.session()['implied']), state.session()['implied'])
+
+    def asked(self, answer=True, settings=None, tool='image_to_3d'):
         """The agent's own consent for the next call, on its own card: its asks recorded with what was sent by
         then, each answered with answer. Returns (card, consent, asks)."""
         from loopcut import agent, spending
         turn = agent.Turn()
         turn.spending = settings or spending.Settings()
-        card = state.item_tool(cloud.PREFIX + 'image_to_3d', 'Image to 3D model', '')
+        card = state.item_tool(cloud.PREFIX + tool, 'Image to 3D model', '')
         asks = []
         def wait(_):
             asks.append({**{k: card.get(k) for k in ('ask', 'ask_title', 'ask_label', 'ask_skip', 'image_path')},
@@ -397,8 +439,9 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertEqual(card['to_3d'], {'pictures': [{'image': image.name, 'job': job, 'path': path,
                                                        'state': 'ready'}], 'credits': 80})
         self.assertTrue(result.model_note.endswith(cloud.TO_3D_LINE))
-        self.assertEqual(cloud.TO_3D_LINE, "The picture's card has a Turn it into 3D button; ask the user to check "
-                                           "the picture and press it if it's right, or say what to change.")
+        self.assertEqual(cloud.TO_3D_LINE, "The picture's card has a Turn it into 3D button for the user. Before you "
+                                           "turn it into 3D yourself, look at it with look_at_reference; if it isn't "
+                                           "one whole object on a plain background, make it again.")
         from loopcut.ui import layout
         drawn = layout.build(state.session(), 420, 900, 1, lambda font, size, text: len(text) * size * .5, 'fast',
                              None, {})
@@ -410,30 +453,47 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertIn('Turn it into 3D · about 80 credits', [p['text'] for p in drawn['prims'] if p.get('t') == 'text'])
         self.assertEqual([url.rsplit('/', 1)[-1] for url, _ in self.requests], ['quotes', 'jobs'], 'nothing more ran')
 
-    def test_the_model_calling_image_to_3d_on_a_made_picture_waits_on_turn_it_into_3d_under_any_threshold(self):
-        """The model's own call on the picture: its card asks "Turn it into 3D · 80 credits" with the picture before
-        any job, also for a user who lets 80 credits run unasked; Make it again declines it and nothing runs."""
-        from loopcut import cloud_account, spending
+    def look(self, name):
+        """The model's look_at_reference at a picture, its pixels stubbed (no numpy here): what made_unseen reads."""
+        from loopcut import conversations, tools
+        for reference in state.session()['references']:  # The chat's copies, which the stub attach does not write.
+            stored = conversations.image_path(state.session()['id'], reference.get('full') or reference['ref'])
+            stored.parent.mkdir(parents=True, exist_ok=True)
+            stored.write_bytes(b'\x89PNG')
+        with patch.object(tools, '_pixels', lambda path, height=None: types.SimpleNamespace(shape=(8, 8, 4))), \
+                patch.object(tools, '_save_pixels', lambda pixels, path, max_side=None: (8, 8)):
+            return tools.look_at_reference(name)
+
+    def test_the_models_3d_of_a_made_picture_it_has_not_looked_at_is_refused_with_no_card(self):
+        """Owner, 2026-10-26 (0.2.20), in place of that day's always-ask card: Loopcut checks the picture itself. Not
+        looked at, the model's call is refused before any quote, with the look-first text and no card; looked at, it
+        runs under the usual rule, no card at the default Ask above (80 under 100)."""
+        from loopcut import spending
         _, _, image = self.make_picture()
-        loose = spending.Settings(ask_above=500)
-        card, consent, asks = self.asked(False, loose)
-        again = self.execute('image_to_3d', {'image': image.name}, consent=consent)
-        self.assertFalse(again.ok)
-        self.assertIn('declined: The user wants the picture made again', again.text)
-        self.assertEqual(asks[0]['sent'], ['quotes', 'jobs', 'quotes'], 'quoted, and no job before the answer')
-        self.assertEqual((asks[0]['ask'], asks[0]['ask_title'], asks[0]['ask_label'], asks[0]['ask_skip']),
-                         (spending.MADE, 'Turn it into 3D · 80 credits', 'Turn it into 3D', 'Make it again'))
-        self.assertEqual(asks[0]['image_path'], image.source, "the picture, on the card that asks")
-        self.assertEqual([p['tool'] for p in self.sent('jobs')], ['image_generate'])
-        card, consent, asks = self.asked(True, loose)
+        card, consent, asks = self.asked(True)
+        refused = self.execute('image_to_3d', {'image': image.name}, consent=consent)
+        self.assertFalse(refused.ok)
+        self.assertTrue(refused.input_mistake, 'a plain card, not an approval')
+        self.assertEqual(refused.text, cloud.LOOK_FIRST.format(name=image.name))
+        self.assertIn(f"Not run: you haven't looked at the picture {image.name} yet. Look at it with "
+                      f'look_at_reference (name "{image.name}").', refused.text)
+        self.assertLess(len(refused.text), 400, 'a refusal reaches the model cut at 400 characters')
+        self.assertEqual((asks, [p['tool'] for p in self.sent('jobs')]), ([], ['image_generate']), 'nothing quoted')
+        self.assertEqual([url.rsplit('/', 1)[-1] for url, _ in self.requests], ['quotes', 'jobs'])
+        looked = self.look(image.name)
+        self.assertTrue(looked.ok and looked.image_path, looked.text)
+        self.assertTrue(state.session()['references'][0]['made']['seen'])
         model = self.execute('image_to_3d', {'image': image.name}, consent=consent)
         self.assertTrue(model.ok, model.text)
-        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks, [], 'no card: 80 is under the default Ask above')
         self.assertEqual([(p['tool'], self.runtime.quotes[p['quote_id']]['credits']) for p in self.sent('jobs')],
                          [('image_generate', 6), ('image_to_3d', 80)])
         self.assertEqual(self.sent('jobs')[1]['files'], {'image': hashlib.sha256(
             Path(image.source).read_bytes()).hexdigest()}, "the made picture's own pixels")
-        self.assertEqual(state.session()['spend']['auto'], 0, 'approved on its card')
+        self.assertEqual(state.session()['spend']['auto'], 80, 'it ran without asking')
+        card, consent, asks = self.asked(True, spending.Settings(ask_above=25))
+        self.assertTrue(self.execute('image_to_3d', {'image': image.name}, consent=consent).ok)
+        self.assertEqual([a['ask'] for a in asks], [spending.COST], 'a user who set 25 still gets the usual card')
 
     def test_a_name_that_is_no_picture_gets_the_pictures_loopcut_made_not_an_offer_to_make_one(self):
         """A later turn's model may no longer have the made picture's name (the context folds older results): photo→3D
@@ -454,7 +514,7 @@ class CloudEndToEndTest(unittest.TestCase):
         card, consent, asks = self.asked(True, spending.Settings(ask_above=500))
         self.assertTrue(self.execute('image_to_3d', {'image': 'cat.png'}, consent=consent).ok)
         self.assertEqual(asks, [], 'under the thresholds it runs unasked, as before')
-        card, consent, asks = self.asked(True)
+        card, consent, asks = self.asked(True, spending.Settings(ask_above=25))
         self.assertTrue(self.execute('image_to_3d', {'image': 'cat.png'}, consent=consent).ok)
         self.assertEqual([a['ask'] for a in asks], [spending.COST], 'over Ask above it asks as before')
 
@@ -544,32 +604,40 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertEqual(self.sent('jobs')[-1]['files'], {'image': hashlib.sha256(
             Path(image.source).read_bytes()).hexdigest()})
 
-    def test_the_model_calling_image_to_3d_on_a_made_picture_without_its_datablock_still_waits_on_its_card(self):
-        """Review, 2026-10-26: without the datablock, made_picture missed it, and an 80-credit conversion ran with no
-        card for a Pro user who lets 80 run unasked. The chat's reference says Loopcut made it."""
-        from loopcut import spending
+    def test_a_made_picture_without_its_datablock_still_needs_the_models_look(self):
+        """Review, 2026-10-26: without the datablock, made_picture missed it. The chat's reference says Loopcut made
+        it, so the model looks at it first; then it runs with no card."""
         _, _, image = self.make_picture()
         self.data.images.remove(image)
-        card, consent, asks = self.asked(True, spending.Settings(ask_above=500))
+        card, consent, asks = self.asked(True)
         consent.files_allowed = True  # Auto-run on: the chat's copy of the picture is read unasked.
+        refused = self.execute('image_to_3d', {'image': image.name}, consent=consent)
+        self.assertEqual(refused.text, cloud.LOOK_FIRST.format(name=image.name))
+        self.look(image.name)
         self.assertTrue(self.execute('image_to_3d', {'image': image.name}, consent=consent).ok)
-        self.assertEqual([a['ask'] for a in asks], [spending.MADE])
+        self.assertEqual(asks, [])
 
-    def test_a_quote_over_the_buttons_price_asks_on_its_card_and_make_it_again_leaves_the_button(self):
-        """The button showed 25 and the quote says 80: the click approved 25, so the card asks with the quote;
-        Make it again runs nothing and the button is there again."""
+    def asks_above(self, credits=25):
+        """The user's own Ask above, which a click's quote over its button's price goes by (agent.turn_into_3d)."""
+        from loopcut import config, spending
+        self.replace(config, 'spending', lambda: spending.Settings(ask_above=credits))
+
+    def test_a_quote_over_the_buttons_price_asks_on_its_card_and_skip_leaves_the_button(self):
+        """The button showed 25 and the quote says 80: the click approved 25, so the card asks with the quote for a
+        user whose Ask above is under it; Skip this runs nothing and the button is there again."""
         from loopcut import agent
         picture, _, _ = self.make_picture()
+        self.asks_above(25)
         card = self.press(shown=25)
         self.assertTrue(self.until(lambda: card['status'] == 'awaiting'), card['status'])
-        self.assertEqual((card['ask'], card['ask_title']), ('made_picture', 'Turn it into 3D · 80 credits'))
+        self.assertEqual((card['ask'], card['ask_skip']), ('cost', 'Skip this'))
         items = state.session()['items']
         self.assertTrue(agent.decide(False, index=items.index(card), drawn=(id(card), card['ask_serial'])))
         self.assertTrue(self.until(lambda: not state.running_clicks))
         self.assertEqual(card['status'], 'rejected')
         self.assertEqual([p['tool'] for p in self.sent('jobs')], ['image_generate'])
         self.assertEqual([p['state'] for p in picture['to_3d']['pictures']], ['ready'])
-        self.assertIn('it did not run: declined: The user wants the picture made again',
+        self.assertIn('it did not run: declined: The user declined this paid call (it costs 80 credits, over the 25',
                       state.session()['between_turns'][-1])
 
     def test_a_reopened_chats_copy_of_a_clicks_card_answers_its_ask(self):
@@ -578,6 +646,7 @@ class CloudEndToEndTest(unittest.TestCase):
         import copy
         from loopcut import agent
         self.make_picture()
+        self.asks_above(25)
         old = state.session()
         card = self.press(shown=25)
         self.assertTrue(self.until(lambda: card['status'] == 'awaiting'))
@@ -596,6 +665,7 @@ class CloudEndToEndTest(unittest.TestCase):
         import copy
         from loopcut import conversations
         picture, _, _ = self.make_picture()
+        self.asks_above(25)
         card = self.press(shown=25)
         self.assertTrue(self.until(lambda: card['status'] == 'awaiting'))
         first = state.session()
@@ -663,8 +733,12 @@ class CloudEndToEndTest(unittest.TestCase):
         own conversion left it ready and a click converted it twice."""
         from loopcut import agent, spending
         picture, _, image = self.make_picture()
+        made_as = image.name
         image.name = 'Brass lantern'
         card, consent, asks = self.asked(True, spending.Settings())
+        refused = self.execute('image_to_3d', {'image': 'Brass lantern'}, consent=consent)
+        self.assertEqual(refused.text, cloud.LOOK_FIRST.format(name=made_as), 'the name look_at_reference knows it by')
+        self.look(made_as)
         result = self.execute('image_to_3d', {'image': 'Brass lantern'}, consent=consent)
         self.assertTrue(result.ok, result.text)
         self.assertEqual(result.converted, picture['to_3d']['pictures'][0]['job'])
@@ -910,6 +984,54 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertGreater(charged, 0)
         self.assertEqual(before['balance'] - after['balance'], charged, 'charged once')
 
+    def test_a_renders_replay_with_its_key_sends_its_first_quote_and_scene_and_gets_the_one_job(self):
+        # 0.2.20: job_unconfirmed tells the model to call again with the same arguments plus the key. The replay
+        # quoted anew and packed the scene anew, so its body was another request's: a second job, or a refusal.
+        self.replace(cloud_jobs, 'SERVER_RETRY_SECONDS', (.01,) * 6)
+        steps, uploads = self.pack()
+        before = self.client.request('GET', '/mock/state')
+        busy, send = {'create': 99}, self.client.transport
+
+        def transport(request, **options):
+            if busy['create'] and request.method == 'POST' and request.full_url.endswith('/v1/jobs'):
+                busy['create'] -= 1
+                send(request, **options).close()  # Made and charged; only its answers are lost.
+                return Reply({'error': {'code': 'server_error', 'type': 'server_error', 'message': 'Busy.'}}, 500)
+            return send(request, **options)
+        self.replace(self.client, 'transport', transport)
+        arguments = {'frame_start': 1, 'frame_end': 3}
+        with patch.object(cloud_jobs, '_load_frames', self.import_output), \
+                patch.object(cloud_jobs, '_reports', return_value=[]):
+            first = self.execute('render', arguments)
+            self.assertFalse(first.ok)
+            self.assertTrue(first.text.startswith('job_unconfirmed'), first.text)
+            key = self.sent('jobs')[0]['idempotency_key']
+            busy['create'] = 0
+            again = self.execute('render', {**arguments, 'idempotency_key': key})
+            self.assertTrue(again.ok, again.text)
+            result = self.wait_status(json.loads(again.text)['job_id'])
+        self.assertTrue(result.ok, result.text)
+        posts = self.sent('jobs')
+        self.assertEqual(len(posts), 1 + len(cloud_jobs.SERVER_RETRY_SECONDS) + 1)
+        self.assertTrue(all(post == posts[0] for post in posts), 'one body: the first quote, scene and key')
+        self.assertEqual(len(uploads), 1, 'the scene was packed once')
+        self.assertEqual(len(self.sent('quotes')), 1)
+        after = self.client.request('GET', '/mock/state')
+        self.assertEqual(after['jobs'], before['jobs'] + 1, 'one job')
+        self.assertEqual(len(self.applied), 1)
+
+    def test_a_replay_the_server_refuses_as_another_requests_key_is_never_a_bare_error(self):
+        self.refusals = [Reply({'error': {'code': 'invalid_input', 'type': 'invalid_request', 'field': 'idempotency_key',
+                                          'message': 'This idempotency_key was already used for a different request. '
+                                                     'Send a new idempotency_key for a new job.'}}, 422)]
+        result = self.execute('image_generate', {'prompt': 'tiny prop', 'idempotency_key': 'k-first-attempt'})
+        self.assertFalse(result.ok)
+        self.assertTrue(result.text.startswith('job_unconfirmed'), result.text)
+        for said in ('may still be running and be charged', 'do not start another', 'job_status'):
+            self.assertIn(said, result.text)
+        self.assertNotIn('Send a new idempotency_key', result.text)
+        self.assertEqual(len(self.sent('jobs')), 1, 'not asked again')
+
     def test_live_account_policy_changes_are_refused_with_stale_manifest(self):
         for setting, tool, code, extra in [('no_generation', 'image_generate', 'generation_disabled', 'account'),
                                            ('private_mode', 'sfx', 'private_mode', 'C')]:
@@ -983,6 +1105,42 @@ class CloudEndToEndTest(unittest.TestCase):
                 self.assertIn('canceled', result.text)
                 self.assertIn('refunded', result.text)
         self.assertEqual(self.applied, [])
+
+    def test_a_models_cancel_of_a_running_paid_job_asks_the_user_first(self):
+        # rel019-cloud (2026-10-26): the model canceled the user's approved 29-credit render at 93% by itself.
+        self.long_image()
+        handle = json.loads(self.execute().text)['job_id']
+        asked = []
+
+        def keep(details):
+            asked.append(details)
+            return False
+        kept = self.execute('job_status', {'job_id': handle, 'cancel': True}, consent=keep)
+        self.assertFalse(kept.ok)
+        self.assertIn('The user kept this cloud job running: it was not canceled', kept.text)
+        self.assertFalse(cloud_jobs._registry[handle]['cancel'].is_set())
+        [question] = [details['cancel_job'] for details in asked]
+        self.assertEqual(question['title'], 'Image generation')
+        self.assertGreater(question['held'], 0)
+        # "Cancel it": the cancel goes, and its credits come back.
+        self.execute('job_status', {'job_id': handle, 'cancel': True})
+        self.assertTrue(cloud_jobs._registry[handle]['cancel'].is_set())
+        result = self.wait_status(handle)
+        self.assertIn('refunded', result.text)
+        self.assertEqual(self.applied, [])
+
+    def test_a_cancel_the_users_latest_message_asked_for_needs_no_card(self):
+        self.long_image()
+        for said, asks in (("why did it stop?", True), ("stop that render please", False)):
+            with self.subTest(said=said):
+                handle = json.loads(self.execute().text)['job_id']
+                state.session()['items'].append(state.item_user(said))
+                asked = []
+                self.execute('job_status', {'job_id': handle, 'cancel': True},
+                             consent=lambda details: asked.append(details) or True)
+                self.assertEqual(any('cancel_job' in details for details in asked), asks)
+                self.assertTrue(cloud_jobs._registry[handle]['cancel'].is_set())
+                self.wait_status(handle)
 
     def test_agent_stop_cancels_blocking_job_without_apply(self):
         stopped = threading.Event()
@@ -1087,7 +1245,10 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertEqual(self.sent('jobs')[0]['bundle'], uploads[0])
         self.assertEqual(self.sent('jobs')[0]['input'], {'frame_start': 1, 'frame_end': 3})
         self.assertIn('Packing the scene…', shown)
-        self.assertTrue(any(isinstance(v, str) and v.startswith('Uploading ') for v in shown), shown)
+        self.assertTrue(any(isinstance(v, str) and v.startswith('Sending a copy of the scene (') for v in shown), shown)
+        # In setup's words ("Except for a cloud render, which sends a copy of the scene and its files."), never "Scene uploaded".
+        self.assertTrue(any(isinstance(v, str) and v.startswith('Sent a copy of the scene for this render (')
+                            for v in shown), shown)
         self.assertEqual(self.prepared_inputs(), [])  # The staged bundle went with the call's inputs.
         image = self.execute()  # A tool without a bundle input never packs the scene.
         self.assertTrue(image.ok, image.text)

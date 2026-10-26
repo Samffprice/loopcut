@@ -935,8 +935,13 @@ def make_one_prices(runtime=None):
 
 # What the model is told with image_generate's picture while its card has the button (agent's loop): plain words,
 # which the Fast model passes on as they are.
-TO_3D_LINE = ("The picture's card has a Turn it into 3D button; ask the user to check the picture and press it if "
-              "it's right, or say what to change.")
+TO_3D_LINE = ("The picture's card has a Turn it into 3D button for the user. Before you turn it into 3D yourself, look "
+              "at it with look_at_reference; if it isn't one whole object on a plain background, make it again.")
+# image_to_3d on a picture Loopcut made that the model has not looked at (cloud_jobs.made_unseen): refused, no card,
+# nothing quoted (owner, 2026-10-26, in place of that day's "made picture→3D always asks" card).
+LOOK_FIRST = ("Not run: you haven't looked at the picture {name} yet. Look at it with look_at_reference (name "
+              "\"{name}\"). If it shows one whole object on a plain background, as the user wants it, call image_to_3d "
+              "again; if not, make it again with image_generate. Nothing was charged.")
 
 
 def to_3d_offer(pictures, runtime=None):
@@ -1003,11 +1008,13 @@ def unavailable_line(runtime=None):
 
 def offer_schema(locked):
     """One short tool, sent only while something is locked: the model asks the add-on to show the way."""
-    titles = ", ".join(row["title"] for row in locked)
+    from . import nudges  # Each tool's plain need ("Image to 3D needs about 80 credits"); a balance would
+    # change these tools, and the prompt's cache with them, every turn: offer_tool's result says it.
+    needs = "; ".join(nudges.model_note(row).removesuffix(".") for row in locked)
     return {"type": "function", "function": {"name": PREFIX + OFFER,
             "title": "Checking tool availability", "description":
-            f"Locked Loopcut cloud tools: {titles}. Only when the user asks for what one does, call this once "
-            "so the app shows them how to unlock it. Never call it unprompted.",
+            f"Loopcut cloud tools that need something first: {needs}. Only when the user asks for what one does, call "
+            "this once so the app shows them how to unlock it. Never call it unprompted.",
             "parameters": {"type": "object", "properties": {"tool": {"type": "string",
                            "enum": [row["name"] for row in locked]}}, "required": ["tool"]}}}
 
@@ -1325,6 +1332,10 @@ def _error_message(error):
     if extra.get('rig_code') or (isinstance(extra.get('job'), dict) and extra['job'].get('tool') == 'auto_rig'):
         from . import rig_text
         return rig_text.error(error)
+    if code == "job_unconfirmed" and extra.get("taken"):  # cloud_jobs._taken: a replay the server refused (0.2.20).
+        return (f"job_unconfirmed: {error}, which may still be running and be charged. This is not a failed job: do "
+                "not start another one, reword the request or change its key. If you have its job_id, check it with "
+                "job_status; otherwise tell the user it may still arrive, and ask before buying it again.")
     if code == "job_unconfirmed":  # cloud_jobs._unsure: 5xx answers outlasted the retries; the job may exist (0.2.19).
         job = extra["job"] if isinstance(extra.get("job"), dict) and extra["job"].get("id") else None
         key = extra.get("idempotency_key")
@@ -1334,6 +1345,19 @@ def _error_message(error):
                 + (' Wait a minute, then call the same tool again with exactly the same arguments plus '
                    f'idempotency_key "{key}": that returns ' + (f"job {job['id']}" if job else "this job if it exists")
                    + " and never charges twice." if key else ""))
+    if code == "outputs_unfetched":  # cloud_jobs._unfetched: 5xx answers kept a succeeded job's files back (0.2.20).
+        job = extra["job"] if isinstance(extra.get("job"), dict) and extra["job"].get("id") else {"id": "?"}
+        charged, key = _charged(job), extra.get("idempotency_key")
+        with _jobs_lock:
+            handle = job["id"] in _jobs  # A long job's: job_status fetches its files anew.
+        again = (f'Call job_status with job_id "{job["id"]}" in a minute: it downloads and applies them.' if handle
+                 else 'Wait a minute, then call the same tool again with exactly the same arguments plus '
+                      f'idempotency_key "{key}": that returns this job and downloads its files, with no new charge.'
+                 if key else "")
+        return (f"outputs_unfetched: job {job['id']} succeeded and was charged"
+                + (f" {charged:g} credits" if charged else "") + f", but downloading its files failed: {error}. "
+                "This is not a failed job: do not start another one or reword the request. Its files wait in the "
+                "cloud. " + again).rstrip()
     if code == "vendor_failed" and extra.get("field") == "input.bundle":
         return _BUNDLE_REFUSED.format(refunded="credits refunded" if extra.get("refunded") else "no credits charged",
                                       detail=re.sub(r"\s*To try again,.*", "", str(error))[:300])
@@ -1443,6 +1467,52 @@ def _run(runtime, module, descriptor, arguments, files, out_dir, cancel, progres
         raise
 
 
+# Undone means no (spending.py): apply handlers whose outputs the user can delete or undo in the scene.
+UNDONE_APPLY = ("add_image_reference", "import_model", "add_audio_strip", "apply_motion", "apply_rig")
+
+
+def _chat(consent):
+    """The chat a call's card belongs to (agent._Consent.chat), or None for any other approval callback."""
+    chat = consent.chat() if callable(getattr(consent, "chat", None)) else None
+    return chat[0] if isinstance(chat, tuple) and chat and isinstance(chat[0], dict) else None
+
+
+def _note_implied(consent, descriptor, job) -> None:
+    """Agent thread: this call's outputs were added unasked (consent.implied): remembered with its chat."""
+    chat = _chat(consent) if getattr(consent, "implied", False) is True else None
+    if chat is not None and descriptor.get("apply") in UNDONE_APPLY and isinstance(job, dict) and job.get("id"):
+        from . import spending
+        spending.note_implied(chat, descriptor["name"], str(job["id"]))
+
+
+def _undone(module, descriptor, consent) -> str:
+    """Main thread: undone means no. The model's unasked call of a kind whose unasked output the user deleted or
+    undid in this chat is refused: the text the model gets, else "". A job still running, or whose outputs never
+    came into the file, is not one the user removed; once removed it stays so in this chat."""
+    kept = getattr(module, "kept_here", None)
+    if descriptor.get("apply") not in UNDONE_APPLY or not callable(kept) or not callable(
+            getattr(consent, "asked_for", None)):
+        return ""
+    chat = _chat(consent)
+    if chat is None or consent.asked_for(chat) is not False:
+        return ""  # The user asked for this one: it runs.
+    from . import spending
+    kind = spending.kind_noun(descriptor["name"])
+    pending = {r.get("id") for r in chat.get("cloud_jobs") or () if not r.get("applied")}
+    with spending.lock:
+        rows = [r for r in chat.get("implied") or () if isinstance(r, dict) and r.get("job") not in pending
+                and spending.kind_noun(r.get("tool")) == kind]
+    for row in reversed(rows):
+        if row.get("removed") or not kept(row["job"]):
+            row["removed"] = True
+            return spending.undone_text(row["tool"])
+    return ""
+
+
+class _InputMistake(ValueError):
+    """_validate_arguments' refusal: the model's arguments (tools.InputMistake), said plainly on the call's card."""
+
+
 def _validate_arguments(descriptor, arguments):
     """Check the scene-reference boundary before exporting anything or starting a paid call."""
     json.dumps(arguments, allow_nan=False)
@@ -1454,9 +1524,9 @@ def _validate_arguments(descriptor, arguments):
         field for field, spec in file_fields.items() if spec["required"]}
     missing = required - arguments.keys()
     if missing:
-        raise ValueError("Required tool input missing: " + ", ".join(sorted(missing)))
+        raise _InputMistake("Required tool input missing: " + ", ".join(sorted(missing)))
     if parameters.get("additionalProperties") is False and arguments.keys() - properties.keys() - file_fields.keys():
-        raise ValueError("Unknown tool input; use the fields in this tool's schema.")
+        raise _InputMistake("Unknown tool input; use the fields in this tool's schema.")
     types = {"string": str, "object": dict, "array": list, "boolean": bool, "integer": int}
     for field, value in arguments.items():
         spec = {"type": "string"} if field in file_fields else properties.get(field, {})
@@ -1465,10 +1535,10 @@ def _validate_arguments(descriptor, arguments):
         if ((expected and (not isinstance(value, expected) or kind == "integer" and type(value) is not int))
                 or kind == "number" and (type(value) not in (int, float) or not math.isfinite(value))
                 or field in file_fields and not value.strip()):
-            raise ValueError(f"Invalid {field}: use the type described in this tool's schema.")
+            raise _InputMistake(f"Invalid {field}: use the type described in this tool's schema.")
     if "bundle" in arguments and (not isinstance(arguments["bundle"], str)
                                   or not re.fullmatch(r"[0-9a-f]{64}", arguments["bundle"])):
-        raise ValueError("Invalid bundle: use an uploaded manifest SHA-256.")
+        raise _InputMistake("Invalid bundle: use an uploaded manifest SHA-256.")
 
 
 def _discard_preparation(directory):
@@ -1517,13 +1587,14 @@ def _upload_bundle(session, checkpoint, staging, client, cancel, progress):
         raise _bundle_refusal(packed)
     cloud_account._check_cancel(cancel)
     size = f"{sum(item['size'] for item in packed['manifest']['files']) / 1_000_000:,.1f} MB"
-    progress(f"Uploading {size}…")
+    progress(f"Sending a copy of the scene ({size})…")
     try:
         digest = bundles.upload(staging, packed["manifest"], client=client, cancel=cancel, progress=progress,
                                 multipart=blob_multipart())
     except (bundles.BundleError, OSError, ValueError) as ex:
         raise cloud_http.CloudError(f"Could not upload the scene: {ex}", "bundle_failed") from ex
-    progress(f"Scene uploaded ({size}).")  # What the card says while its quote waits for approval.
+    # What the card says while its quote waits for approval, in setup's words (onboarding._draw_privacy).
+    progress(f"Sent a copy of the scene for this render ({size}).")
     return digest
 
 
@@ -1581,7 +1652,7 @@ def execute(name, arguments, *, fresh=False):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is missing).", ok=False)
     if any(not callable(getattr(module, fn, None)) for fn in ("resolve_files", "run", "apply_result")):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is incomplete).", ok=False)
-    out_dir, session, bundle_checkpoint = None, None, None
+    out_dir, session, bundle_checkpoint, replayed = None, None, None, None
     rig_notice, rig_notice_first = '', False
     if _packs_scene(descriptor):
         arguments = {k: v for k, v in arguments.items() if k != "bundle"}  # Only the scene packed here is sent.
@@ -1601,7 +1672,7 @@ def execute(name, arguments, *, fresh=False):
             from .autorig import STAGES
             _progress(name, STAGES['checking'])
         files = module.resolve_files(descriptor, arguments, out_dir)
-        made = getattr(module, "made_picture", None)  # A picture Loopcut made: its 3D always asks (spending.MADE).
+        made = getattr(module, "made_picture", None)  # A picture Loopcut made: the model looks at it first.
         made = made(descriptor, arguments) if callable(made) else None
         clicked = getattr(getattr(cloud_account._approval, "callback", None), "clicked", False)
         if made and (state.session().get("id"), made.get("job")) in state.running_clicks and not clicked:
@@ -1610,6 +1681,9 @@ def execute(name, arguments, *, fresh=False):
             raise cloud_http.CloudError("This picture is turning into 3D from its card's Turn it into 3D button now; "
                                         "its model comes into the scene when that ends. Don't start it again.",
                                         "invalid_input")
+        unseen = getattr(module, "made_unseen", lambda job: "")(made.get("job")) if made and not clicked else ""
+        if unseen:  # The user's click needs no look.
+            raise _InputMistake(LOOK_FIRST.format(name=unseen))
         if descriptor.get('apply') == 'apply_rig':
             from . import autorig
             rig_notice, rig_notice_first = autorig.quote_notice(out_dir)
@@ -1636,7 +1710,12 @@ def execute(name, arguments, *, fresh=False):
                                        timeout=source.timeout, client_headers=source.version_headers())
         else:
             vendor_key = credentials.vendor_key(descriptor["byok"]["key_name"])
-        if _packs_scene(descriptor):  # Last, so nothing above can strand it: the scene as it is at this call.
+        sent = getattr(module, "sent", None)
+        if _packs_scene(descriptor) and callable(sent):
+            # A replay with its key (job_unconfirmed's) sends the scene its first request packed: the key names that
+            # request, and a scene packed anew would make it another (a second job, or the server's refusal).
+            replayed = (sent(arguments.get("idempotency_key")) or {}).get("bundle")
+        if _packs_scene(descriptor) and not replayed:  # Last, so nothing above can strand it: the scene as it is now.
             session = state.session()
             bundle_checkpoint = checkpoints.for_bundle(session)
     except (cloud_http.CloudError, config.ConfigError, OSError, ValueError, tools.ToolError,
@@ -1654,7 +1733,8 @@ def execute(name, arguments, *, fresh=False):
         if isinstance(ex, cloud_http.CloudError):
             runtime.handle_error(ex)
         return tools.ToolResult(error_text(ex, rig=True) if descriptor.get('apply') == 'apply_rig' else
-                                error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False)
+                                error_text(ex) if isinstance(ex, cloud_http.CloudError) else str(ex), ok=False,
+                                input_mistake=isinstance(ex, (_InputMistake, tools.InputMistake)))
     where = None
     if descriptor["latency"] == "long" and descriptor["backend"] == "managed":
         from . import cloud_restore
@@ -1670,9 +1750,14 @@ def execute(name, arguments, *, fresh=False):
             cancel.heard = lambda: turn.touch(f"the {name} cloud job")
         progress = lambda p: _progress(name, p)
         report = cloud_account.charge_reporter()  # Settles the chat's spend on this call's card (C47).
+        consent = getattr(cloud_account._approval, "callback", None)  # This call's card: bound on this thread only.
         authorized = False
         try:
             cloud_account._check_cancel(cancel)
+            undone = on_main(lambda: _undone(module, descriptor, consent)) \
+                if descriptor.get("apply") in UNDONE_APPLY and callable(getattr(consent, "asked_for", None)) else ""
+            if undone:  # Before any quote: nothing ran and no card asks.
+                return tools.ToolResult(undone, ok=False, input_mistake=True)
             if file_consent:
                 cloud_account.confirm({'required': True, 'text': 'Upload local files: ' + ', '.join(external),
                                        'credits': None, 'file_access': True})
@@ -1680,6 +1765,8 @@ def execute(name, arguments, *, fresh=False):
             if bundle_checkpoint:  # Packed once: the quote, its card and an Approve retry all send this hash.
                 call_arguments = {**arguments, "bundle": _upload_bundle(session, bundle_checkpoint, out_dir / "bundle",
                                                                         snapshot.client, cancel, progress)}
+            elif replayed:
+                call_arguments = {**arguments, "bundle": replayed}
             if descriptor.get('apply') == 'apply_rig':
                 from .autorig import STAGES
                 progress(STAGES['uploading'])
@@ -1687,7 +1774,7 @@ def execute(name, arguments, *, fresh=False):
                 project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
                 cancel=cancel, client=snapshot.client, notice=rig_notice, notice_first=rig_notice_first,
                 on_progress=progress if descriptor.get('apply') == 'apply_rig' else None,  # Quote stages: a rig's only.
-                offer=offer, made_picture=made)
+                offer=offer)
             on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
             authorized = True
         except cloud_http.CloudError as ex:
@@ -1712,11 +1799,12 @@ def execute(name, arguments, *, fresh=False):
                 cancel.detach()
                 release = lambda spent=False: cloud_account.complete(runtime, approved_arguments, spent)
                 from . import cloud_restore
-                consent = getattr(cloud_account._approval, "callback", None)
                 chat = consent.chat()[0] if callable(getattr(consent, "chat", None)) else state.session()
                 # Kept with the conversation, so a later Blender picks it up (cloud_restore).
                 saved = cloud_restore.record(chat, job, descriptor, approved_arguments, where,
                                              getattr(consent, "hold", None))
+                if saved is not None:  # Counted once its record says it was applied (_undone).
+                    _note_implied(consent, descriptor, job)
                 with _jobs_lock:
                     finished = [key for key, row in _jobs.items()
                                 if row["result"] is not None and row["result"].then is None]
@@ -1757,6 +1845,8 @@ def execute(name, arguments, *, fresh=False):
             result = on_main(lambda: _apply_to_scene(module, descriptor, job, origin_scene, report=report))
             if made and result.ok:
                 result.converted = made.get("job", "")
+            if result.ok:
+                _note_implied(consent, descriptor, job)
             return result.then(is_cancelled, on_main) if result.then else result
         except cloud_http.CloudError as ex:
             _settle_error(report, ex)
@@ -1823,7 +1913,8 @@ def _settle_saved(report, saved, job):
     cloud_restore.settle(saved, job)
     charged, canceled = _charged(job), job["status"] == "canceled"
     if charged is not None or job["status"] != "succeeded":
-        report(None, spending.receipt_text(charged or 0, canceled=canceled))  # The card's line; no ledger change.
+        # The card's line and title, the same charge the turn's line takes from the record; no ledger change.
+        report(None, spending.receipt_text(charged or 0, canceled=canceled), charged or 0)
 
 
 def _settle_error(report, error):
@@ -1952,8 +2043,51 @@ def _same_scene(scene):
         return False  # The originating .blend or scene was closed while the job ran.
 
 
-def _job_status(arguments, *, here=False):
-    """here: the user pressed Load here anyway on its card, so a file Loopcut can't match to the job is the one."""
+def _cancel_question(record, module, job_id):
+    """The model asked job_status to cancel this job: what its card asks the user ({title, held, pct},
+    spending.CANCEL) while it runs and holds credits, or None when the cancel goes at once (it is over, free or not
+    followed here, or the user's latest message asked to stop). rel019-cloud (2026-10-26): the model canceled the
+    user's approved 29-credit render at 93% by itself, to render here instead, which the user then rejected. Under
+    auto-approve many paid jobs start without a card, so any running paid job asks, not only card-approved ones."""
+    from . import spending, state
+    try:
+        job = module.job_status(job_id)
+    except cloud_http.CloudError:
+        return None  # Over or unknown: the call says so as before.
+    if job.get("status") not in ("queued", "running") or record["descriptor"].get("backend") != "managed":
+        return None
+    saved, credits = record.get("saved") or {}, job.get("credits") or {}
+    held = next((v for v in (credits.get("reserved"), saved.get("quoted"), saved.get("held")) if spending._amount(v)),
+                None)
+    if held == 0:
+        return None  # Free: nothing of theirs is at stake.
+    charged = credits.get("charged") if spending._amount(credits.get("charged")) and credits["charged"] else None
+    said = next((item.get("text") for item in reversed(state.session().get("items") or [])
+                 if item.get("kind") == "user"), "")
+    if spending.asked_to_stop(said):
+        return None
+    descriptor = record["descriptor"]
+    pct = (job.get("progress") or {}).get("pct")
+    return {"title": _display(descriptor, "title") or descriptor.get("title") or descriptor.get("name", ""),
+            "held": held, "pct": pct if type(pct) is int and 0 < pct < 100 else None,
+            **({"charged": charged} if charged else {})}  # Finished, its files downloading: canceling stops that.
+
+
+def _cancel_asked(arguments, question):
+    """Agent thread: the user's answer on the call's card (cloud_account.ask_cancel), then the cancel only on yes."""
+    from . import spending, tools
+
+    def then(is_cancelled, on_main):
+        if not cloud_account.ask_cancel(question):
+            return tools.ToolResult(spending.declined(spending.CANCEL, question, spending.Settings()), ok=False)
+        result = on_main(lambda: _job_status(arguments, asked=True))
+        return result.then(is_cancelled, on_main) if result.then else result
+    return then
+
+
+def _job_status(arguments, *, here=False, asked=False):
+    """here: the user pressed Load here anyway on its card, so a file Loopcut can't match to the job is the one.
+    asked: the user said cancel it (_cancel_question)."""
     from . import cloud_restore, tools
     if set(arguments) - {"job_id", "cancel"} or not isinstance(arguments.get("job_id"), str) or type(arguments.get("cancel", False)) is not bool:
         return tools.ToolResult("job_status needs a string job_id and optional boolean cancel.", ok=False)
@@ -1989,6 +2123,9 @@ def _job_status(arguments, *, here=False):
             if state != "here":  # Said before anything is downloaded.
                 return tools.ToolResult(cloud_restore.refusal(record, state), ok=False)
         cloud_restore.follow(record)  # Fetched, followed and downloaded here first (a cancel is queued meanwhile).
+    question = _cancel_question(record, module, job_id) if arguments.get("cancel") and not asked else None
+    if question is not None:  # Asked on this call's card first; the panel's own Cancel and Stop never come here.
+        return tools.ToolResult("Asking the user before canceling this job…", then=_cancel_asked(arguments, question))
     try:
         if arguments.get("cancel"):
             module.cancel_job(job_id)
@@ -2004,7 +2141,7 @@ def _job_status(arguments, *, here=False):
                   if ex.extra.get('apply_failure') is True else tools.ToolResult(
                       error_text(ex, rig=record.get('descriptor', {}).get('apply') == 'apply_rig'), ok=False))
         if result.then is not None or ex.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch',
-                                                      'job_unconfirmed'}:  # cloud_jobs.UNCONFIRMED
+                                                      'job_unconfirmed', 'outputs_unfetched'}:  # UNCONFIRMED, UNFETCHED
             record["result"] = result
         return result
     if job["status"] in ("queued", "running"):

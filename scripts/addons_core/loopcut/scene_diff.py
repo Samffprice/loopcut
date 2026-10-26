@@ -8,6 +8,8 @@ snapshot() reads Blender (main thread). diff() and the formatters are pure, so t
 without Blender.
 """
 
+import re
+
 MAX_OBJECTS = 5000      # Above this a snapshot per step would be felt; the diff says so instead.
 MAX_SHAPE_VERTS = 1_000_000  # Vertices whose positions a snapshot hashes (about 50 ms); past this, counts and bounds.
 MAX_UV_CORNERS = 2_000_000   # Face corners whose active UV map a snapshot hashes; past this, the map's name only.
@@ -18,7 +20,10 @@ MAX_UV_CORNERS = 2_000_000   # Face corners whose active UV map a snapshot hashe
 MAX_IMAGE_PIXELS = 16_777_216
 MAX_PACKED_BYTES = 256 * 2 ** 20
 MAX_NODE_TREES = 300    # Materials and worlds read node by node; above this only their node counts.
-MAX_LINES = 40
+MAX_LINES = 40          # Lines of the turn's changes card, and of the user's own edits (scene_context).
+# Lines of run_python's "Scene changes": the model is shown them compact (compact, result_store), and its result
+# store keeps them all, so a big build's every object stays findable with read_result.
+MODEL_LINES = 150
 MAX_FIELDS = 8          # Changed fields listed per object or material before "(+N more)".
 _DIGITS = 4            # 0.1 mm: at 1 mm a product shot's small moves (a floor lowered 0.3 mm) went unreported.
 _SCENE_SETTINGS = ("frame_start", "frame_end", "frame_current")
@@ -528,12 +533,144 @@ def is_empty(changes: dict) -> bool:
     return not any(value for key, value in changes.items() if key != "unseen")
 
 
-def lines(changes: dict) -> list[str]:
+def lines(changes: dict, limit: int = MAX_LINES) -> list[str]:
     out = ([f"+ {text}" for text in changes["added"]] + [f"- {text}" for text in changes["removed"]]
            + [f"~ {text}" for text in changes["changed"]] + [f"~ {text}" for text in changes["other"]])
-    if len(out) > MAX_LINES:
-        out = out[:MAX_LINES] + [f"... and {len(out) - MAX_LINES} more"]
+    if len(out) > limit:
+        out = out[:limit] + [f"... and {len(out) - limit} more"]
     return out
+
+
+# ------------------------------------------------------------------ compact, for the model
+
+GROUP_MIN = 3     # Objects with the same change before they share one line.
+GROUP_NAMES = 3   # Names a shared line lists before "and N more".
+_KINDS = ("material", "world", "collection", "image", "text")  # Labels of a "~ <kind> <name>: ..." line.
+_BOUNDS = re.compile(r"(?:^|; )bounds now \[([^\]]*)\]\.\.\[([^\]]*)\]")
+_ADDED = re.compile(r"^(?P<sign>[+-]) (?P<name>.+) \((?P<type>[a-z_]+)\)(?: at \[(?P<lo>[^\]]*)\]\.\.\[(?P<hi>[^\]]*)\])?$")
+_COPY = re.compile(r"(?:\.\d{3}|[ _.-]?\d+)$")  # Name.001, Name_2, Name 3: copies of one thing.
+_SHARED = re.compile(r"^[+~-] (?P<count>\d+) (?:(?P<type>[a-z_]+) )?objects \(")  # A line _group_line wrote.
+
+
+def _box(lo: str, hi: str):
+    """([x, y, z], [x, y, z]) from a line's "[lo]..[hi]" text, or None if it does not read as numbers."""
+    try:
+        low, high = [float(v) for v in lo.split(",")], [float(v) for v in hi.split(",")]
+    except ValueError:
+        return None
+    return (low, high) if len(low) == len(high) == 3 else None
+
+
+def _corners(boxes: list) -> str:
+    """The box around boxes (_box): what objects that share a line occupy together."""
+    low = [round(min(lo[i] for lo, _ in boxes), _DIGITS) for i in range(3)]
+    high = [round(max(hi[i] for _, hi in boxes), _DIGITS) for i in range(3)]
+    return f"[{', '.join(map(str, low))}]..[{', '.join(map(str, high))}]"
+
+
+def _named(names: list) -> str:
+    shown = ", ".join(names[:GROUP_NAMES])
+    return shown + (f" and {len(names) - GROUP_NAMES} more" if len(names) > GROUP_NAMES else "")
+
+
+def _changed_key(line: str):
+    """(notes without the bounds, the bounds as _box or None, the name) of an object's "~ name: notes" line; None
+    for any other line (a material's, the scene's, a rename). Notes name no object, so objects with the same
+    notes had the same change; their bounds, which differ, are what a shared line folds into one box."""
+    label, colon, notes = line[2:].partition(": ")
+    if not line.startswith("~ ") or not colon or label.split(" ", 1)[0] in _KINDS or "(renamed)" in label:
+        return None
+    found = _BOUNDS.search(notes)
+    bounds = _box(*found.groups()) if found else None
+    if found and bounds is None:
+        return None
+    return _BOUNDS.sub("", notes).strip("; "), bounds, label
+
+
+def _grouped(listed: list[str]) -> list[str]:
+    """listed with each change GROUP_MIN or more objects share on one line, at the first one's place: the same
+    notes (a rotation given to a whole rig's parts, their bounds in one box), or objects added or removed that
+    are copies of one name (Pipe, Pipe.001, ...)."""
+    keys = []
+    for line in listed:
+        changed, added = _changed_key(line), _ADDED.match(line)
+        if changed:
+            keys.append(("~", changed[0]))
+        elif added:
+            keys.append((added["sign"], added["type"], _COPY.sub("", added["name"]) or added["name"]))
+        else:
+            keys.append(None)
+    members: dict = {}
+    for line, key in zip(listed, keys):
+        if key is not None:
+            members.setdefault(key, []).append(line)
+    out, done = [], set()
+    for line, key in zip(listed, keys):
+        group = members.get(key) if key is not None else None
+        if not group or len(group) < GROUP_MIN:
+            out.append(line)
+        elif key not in done:
+            done.add(key)
+            out.append(_group_line(key, group))
+    return out
+
+
+def _group_line(key: tuple, group: list[str]) -> str:
+    if key[0] == "~":
+        parts = [_changed_key(line) for line in group]
+        boxes = [bounds for _, bounds, _ in parts if bounds]
+        notes = "; ".join(filter(None, [key[1], boxes and f"bounds now within {_corners(boxes)}"]))
+        return f"~ {len(group)} objects ({_named([label for _, _, label in parts])}): {notes}"
+    found = [_ADDED.match(line) for line in group]
+    boxes = [box for m in found if m["lo"] is not None and (box := _box(m["lo"], m["hi"]))]
+    names = [m["name"] for m in found]
+    where = f" at {_corners(boxes)} together" if boxes else ""
+    return f"{key[0]} {len(group)} {key[1]} objects ({names[0]} … {names[-1]}){where}"
+
+
+def _kind(line: str) -> tuple[str, str, int]:
+    """(added, removed or changed; what; how many) of a line, for the summary of the lines left out: an object's
+    type, or the fields that changed; a shared line (_group_line) counts its objects."""
+    sign = {"+ ": "added", "- ": "removed", "~ ": "changed"}.get(line[:2], "")
+    shared = _SHARED.match(line)
+    count = int(shared["count"]) if shared else 1
+    if shared and shared["type"]:
+        return sign, shared["type"], count
+    found = _ADDED.match(line)
+    if found:
+        return sign, found["type"], count
+    if sign != "changed":
+        return sign, line[2:].split(" ", 1)[0], count
+    label, colon, notes = line[2:].partition(": ")
+    first = label.split(" ", 1)[0]
+    if not shared and (first in _KINDS or first in ("scene", "mode") or not colon or "(renamed)" in label):
+        return sign, "renamed" if "(renamed)" in label else first, count
+    fields = [note.split(" ", 1)[0].lstrip("+-") for note in notes.split("; ")]
+    return sign, ", ".join(dict.fromkeys("UV map" if f in ("active", "UVs") else f for f in fields)), count
+
+
+def compact(listed: list[str], budget: int) -> tuple[list[str], int, str]:
+    """lines() as the model reads them when there are many: grouped (_grouped), then lines in order while
+    they fit `budget` characters (at least one). Returns (shown, how many lines were left out, what they were:
+    "added 16 (mesh, curve); changed 4 (location, scale)", objects counted), so every kind of change stays in
+    view without every line. Lines that are not a change (a pixel note, a rig's line, lines()' own "... and N
+    more") always show."""
+    shown, left, used = [], [], 0
+    for line in _grouped(listed):
+        if not line.startswith(("+ ", "- ", "~ ")) or not shown or not left and used + len(line) + 1 <= budget:
+            shown.append(line)
+            used += len(line) + 1
+        else:
+            left.append(line)
+    kinds: dict = {}
+    for line in left:
+        sign, what, count = _kind(line)
+        entry = kinds.setdefault(sign, [0, []])
+        entry[0] += count
+        entry[1] += [w.strip() for w in what.split(",")]
+    summary = "; ".join(f"{sign} {count} ({', '.join(dict.fromkeys(filter(None, whats)))})"
+                        for sign, (count, whats) in kinds.items())
+    return shown, len(left), summary
 
 
 def _unseen_line(changes: dict) -> str:
@@ -549,8 +686,8 @@ def for_model(changes: dict) -> str:
                 "blocks, collections and render settings; not custom properties, keyframes, drivers, constraints "
                 "or inside node groups. If you expected a tracked one to change, the code did not do what you "
                 "think.)" + _unseen_line(changes))
-    return ("Scene changes (+ added, - removed, ~ changed; bounds are world space):\n" + "\n".join(lines(changes))
-            + _unseen_line(changes))
+    return ("Scene changes (+ added, - removed, ~ changed; bounds are world space):\n"
+            + "\n".join(lines(changes, MODEL_LINES)) + _unseen_line(changes))
 
 
 def headline(changes: dict) -> str:

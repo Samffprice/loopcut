@@ -17,27 +17,41 @@ single time, but we also don't want it just going crazy and one agent just doing
 - Own-key (BYOK) calls ask once per chat per vendor, then run within the burst guard. The user's own vendor
   account pays, so they never count against credits.
 - "Ask before every paid call" asks for each one. "Run without asking" changes none of this.
+- Paid extras (owner, 2026-10-26; Preferences, or set_extras from what the user says in chat): "Use when it helps"
+  (AUTO) is the rules above; "Ask me first" (ASK) asks for every paid call, whatever its price; "Only when I ask"
+  (ONLY_ASKED) refuses, with no card, a paid call the user did not ask for (asked_for: their latest message names
+  its kind or the result it makes, or they approved its card or clicked its button). A free call never asks.
 - Workers spend from the same chat ledger and turn; their asks show in the user's panel (agent._Consent).
-- Owner, 2026-10-26: image_to_3d on a picture Loopcut made (image_generate) always asks, whatever the thresholds
-  and settings: "Turn it into 3D" or "Make it again". A wrong picture (the angle, the background, two objects)
-  must not spend up to 80 credits on a model unseen. The made picture's own button (agent.turn_into_3d) is that
-  click already.
+- image_to_3d on a picture Loopcut made (image_generate) asks as any paid call does (owner, 2026-10-26, for 0.2.20:
+  it replaced that day's "always asks" card). Loopcut checks the picture instead: the model must have looked at it
+  (look_at_reference) before converting it, or the call is refused with no card (cloud_jobs.made_unseen).
+- Undone means no (owner, 2026-10-26): a paid output the model added unasked (no card approved it and the user's
+  message did not ask for it) that the user then deletes or undoes is not added again in that chat: the model's
+  next unasked call of that kind is refused with no card (note_implied, cloud.execute). Per chat, not across chats.
+- A running paid job is never canceled by the model without the user's say (rel019-cloud, 2026-10-26: the model
+  canceled the user's approved 29-credit render at 93% by itself): its card asks "Cancel it" or "Keep it running",
+  unless the user's latest message asked to stop (asked_to_stop). Jobs that ran without a card count the same. The
+  panel's own Cancel and Stop never ask.
 
 Pure apart from a lock that serializes the agent's and the workers' threads. The ledger is a plain dict saved
 with the conversation (conversations.py); the approved own-key vendors are consent, so they are not saved.
 """
 
 import math
+import re
 import threading
 from dataclasses import dataclass
 
-ASK_ABOVE = 25      # Credits: image 6, HD image 20, SFX 4, voice 10, retopology 5 run; image→3D final (80) asks.
+ASK_ABOVE = 100     # Credits: image 6, HD image 20, SFX 4, voice 10, retopology 5, image→3D final 80 run (owner, 2026-10-26).
 CHAT_BUDGET = 150   # Credits one chat may spend without asking, before "Allow 150 more?".
 BURST = 5           # Paid calls one turn may make before the next asks.
 MAX_SETTING = 100_000
 
 RUN, COST, VENDOR, BURST_ASK, BUDGET = "run", "cost", "vendor", "burst", "budget"
-MADE = "made_picture"  # image_to_3d on a picture Loopcut made: details["made_picture"] (cloud_account.authorize).
+NOT_ASKED = "not_asked"  # ONLY_ASKED: a paid call the user did not ask for, refused with no card.
+AUTO, ASK, ONLY_ASKED = "AUTO", "ASK", "ONLY_ASKED"  # The extras preference (settings.extras_mode, set_extras).
+EXTRAS = (AUTO, ASK, ONLY_ASKED)
+CANCEL = "cancel_job"  # The model's cancel of a running paid job (cloud._job_status): {title, held, pct}.
 DAILY, RATE = "daily_limit_reached", "rate_limited"  # The server's refusals that carry a confirm_token.
 SERVER_LIMITS = (DAILY, RATE)
 
@@ -49,6 +63,12 @@ class Settings:
     ask_above: int = ASK_ABOVE
     chat_budget: int = CHAT_BUDGET
     ask_every: bool = False
+    extras: str = AUTO
+
+    @property
+    def asks_each(self) -> bool:
+        """Every paid call asks: "Ask before every paid call", or the extras preference's "Ask me first"."""
+        return self.ask_every or self.extras == ASK
 
 
 def _amount(value) -> bool:
@@ -89,16 +109,17 @@ def paid(details: dict) -> bool:
 
 
 def decide(details: dict, spend: dict, settings: Settings, *, calls: int = 0, burst_limit: int = BURST,
-           vendors=()) -> str:
+           vendors=(), asked: bool = True) -> str:
     """RUN, or what the call's card asks: COST (this call), VENDOR (an own-key vendor, once per chat), BURST_ASK
-    or BUDGET (Allow more). details is cloud_account.approval_details: required is the server's own threshold
-    (credits > confirm_over_credits)."""
-    if details.get("made_picture"):
-        return MADE  # Never runs unasked, under any threshold or setting.
+    or BUDGET (Allow more); NOT_ASKED refuses it with no card. details is cloud_account.approval_details: required
+    is the server's own threshold (credits > confirm_over_credits). asked: the user asked for this call
+    (asked_for), which "Only when I ask" needs."""
     if not paid(details):
         return RUN  # Free calls never ask and never count.
+    if settings.extras == ONLY_ASKED and not asked:
+        return NOT_ASKED
     vendor, credits = details.get("vendor"), details.get("credits")
-    if settings.ask_every:
+    if settings.asks_each:
         return COST
     if vendor:
         if vendor not in vendors:
@@ -164,7 +185,7 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
         lines.append(f"Allow {vendor} calls in this chat?" if kind == VENDOR else "")
     elif kind == COST:
         limit = threshold(details, settings)
-        lines.append("You asked to approve every paid call." if settings.ask_every
+        lines.append("You asked to approve every paid call." if settings.asks_each
                      else "Its price is not known yet." if not _amount(credits)
                      else "Every paid call asks on this account." if limit == 0
                      else f"Over {_n(limit)} credits, so it asks first." if limit is not None
@@ -178,8 +199,14 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
     elif kind == DAILY:  # HTTP 402: "Today's cloud spending limit of N credits is reached."
         lines.append(details.get("message") or "Today's credit limit is reached.")
         lines.append("Approve to go over it for this one job.")
-    elif kind == MADE:
-        lines.append("Check the picture first: one object, a plain background, all of it in view.")
+    elif kind == CANCEL:
+        pct, held = details.get("pct"), details.get("held")
+        lines.append(f"{details.get('title') or 'This cloud job'}" + (f", {pct}% done" if _amount(pct) and pct else "")
+                     + ". Loopcut's AI asked to cancel it.")
+        lines.append(f"It finished and was charged {_n(details['charged'])} credits; canceling stops its download."
+                     if _amount(details.get("charged")) and details["charged"]
+                     else f"{_n(held)} credits held; canceling returns them." if _amount(held) and held
+                     else "Canceling returns its unused credits.")
     elif kind == RATE:  # HTTP 429: the service's burst guard, more than 30 paid jobs in 10 minutes.
         lines.append("Many paid jobs in a short time.")
         lines.append(details.get("message") or "")
@@ -191,9 +218,9 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
 
 
 BUTTONS = {COST: "Approve", VENDOR: "Approve", BURST_ASK: f"Allow {BURST} more", DAILY: "Approve", RATE: "Approve",
-           MADE: "Turn it into 3D"}
+           CANCEL: "Cancel it"}
 SKIP = "Skip this"
-SKIPS = {MADE: "Make it again"}
+SKIPS = {CANCEL: "Keep it running"}
 
 
 def approve_label(kind: str, settings: Settings | None = None) -> str:
@@ -207,11 +234,8 @@ def skip_label(kind: str) -> str:
 
 
 def ask_title(kind: str, details: dict) -> str:
-    """The card's title while it asks, in place of the tool's: "Turn it into 3D · 80 credits" from the quote; ""."""
-    if kind != MADE:
-        return ""
-    credits = details.get("credits")
-    return f"Turn it into 3D · {_n(credits)} credits" if _amount(credits) and credits else "Turn it into 3D"
+    """The card's title while it asks, in place of the tool's: "Cancel this cloud job?"; ""."""
+    return "Cancel this cloud job?" if kind == CANCEL else ""
 
 
 def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) -> str:
@@ -219,7 +243,7 @@ def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) ->
     vendor, credits = details.get("vendor"), details.get("credits")
     limit = threshold(details, settings)
     reason = {COST: (f"it costs {_n(credits)} credits" if _amount(credits) else "its price was not known")
-                    + (", and they approve every paid call" if settings.ask_every
+                    + (", and they approve every paid call" if settings.asks_each
                        else f", over the {_n(limit)} credits that run without asking" if limit is not None else ""),
               VENDOR: f"it uses their own {vendor} key",
               BURST_ASK: f"it would be paid call {calls + 1} in this turn",
@@ -228,12 +252,89 @@ def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) ->
               RATE: "the service saw too many paid jobs in a short time"}.get(kind, "they chose not to run it")
     if kind == COST and vendor:
         reason = f"it uses their own {vendor} key"
-    if kind == MADE:
-        return ("The user wants the picture made again before it becomes a 3D model. Nothing ran and nothing was "
-                "charged. Ask them what to change (the angle, the background, one object only), then make it again "
-                "with image_generate.")
+    if kind == NOT_ASKED:
+        return ("Not run: the user wants paid tools only when they ask for one. Nothing ran and nothing was charged. "
+                "Go on without it; you may say in one line what it would add.")
+    if kind == CANCEL:
+        return ("The user kept this cloud job running: it was not canceled, and it goes on and is charged as usual. "
+                "Don't cancel it unless they ask; check it with job_status.")
     return (f"The user declined this paid call ({reason}). Nothing ran and nothing was charged. Go on without "
             "it: use another way, or finish the turn and say what it would have added.")
+
+
+# The user's latest message asks to stop: a model's cancel of their paid job then needs no card. Conservative: English
+# words only, and any negation, "keep" or "why" in the message makes it a no ("why did it stop?", "don't cancel it").
+_STOP = re.compile(r"\b(?:stop|cancel|abort|halt|kill|terminate)\b", re.I)
+_NOT_STOP = re.compile(r"\b(?:not|no|never|dont|keep|why|without|until|unless)\b|n['’]t\b", re.I)
+
+
+def asked_to_stop(text) -> bool:
+    return isinstance(text, str) and bool(_STOP.search(text)) and not _NOT_STOP.search(text)
+
+
+# What each paid tool makes, in the user's words: "Only when I ask" runs a call whose kind or result the user's latest
+# message names. Simple and conservative: English and the obvious words; a word after no, not, without or never (or
+# a -n't) within a few words does not count ("no sound"). A tool not listed counts by its own name's words.
+_PICTURE = r"pictures?|images?|photos?|illustrations?|drawings?|posters?"
+_KINDS = {
+    "image_generate": _PICTURE, "image_edit": _PICTURE,
+    "image_to_3d": rf"(?:{_PICTURE})\b.*\b(?:3d|model|mesh)|\b(?:in|into|to) 3d",
+    "sfx": r"sounds?|audio|sfx|ambien(?:ce|t)|music|soundtrack|noises?",
+    "voice_line": r"voices?|voice-?overs?|narrat\w*|speech|dialogue|tts",
+    "dialogue_from_recordings": r"voices?|dialogue|recordings?|lines",
+    "lip_sync": r"lip-? ?sync\w*|lips",
+    "retopology": r"retopo\w*|topology|game-? ?ready|quads?",
+    "motion_from_text": r"motion|mocap|animat\w*", "motion_from_video": r"motion|mocap|animat\w*|videos?|clips?",
+    "render": r"render\w*",
+    "auto_rig": r"rig|rigs|rigged|rigging|armatures?|skeletons?", "character_rig": r"rig|rigs|rigged|rigging|armatures?",
+}
+_ANY = r"(?:cloud|paid) (?:tools?|steps?|extras?)"  # "use the paid tools": every kind.
+_NEGATED = re.compile(r"(?:\b(?:no|not|without|never)|n['’]t)\W+(?:\w+\W+){0,2}$", re.I)
+
+
+def asked_for(tool, text) -> bool:
+    """The user's latest message asks for this paid tool's kind or its result (see _KINDS)."""
+    if not isinstance(text, str) or not isinstance(tool, str) or not tool:
+        return False
+    words = _KINDS.get(tool) or re.escape(tool.replace("_", " "))
+    for match in re.finditer(rf"\b(?:{words}|{_ANY})\b", text, re.I):
+        if not _NEGATED.search(text[max(0, match.start() - 40):match.start()]):
+            return True
+    return False
+
+
+# Undone means no: the paid outputs the model added unasked in a chat, by kind. A kind is what the user would call it.
+IMPLIED_KEEP = 32  # Records a chat keeps, the newest.
+_KIND_NOUNS = {"sfx": "sound", "voice_line": "voice line", "dialogue_from_recordings": "dialogue",
+               "lip_sync": "lip sync", "image_generate": "picture", "image_edit": "picture edit",
+               "image_to_3d": "3D model", "retopology": "retopology", "motion_from_text": "motion",
+               "motion_from_video": "motion", "render": "render", "auto_rig": "rig", "character_rig": "rig"}
+
+
+def kind_noun(tool: str) -> str:
+    return _KIND_NOUNS.get(tool) or str(tool).replace("_", " ")
+
+
+def implied_rows(value) -> list:
+    """A chat's records, damaged ones dropped: [{"tool", "job", "removed"}]."""
+    rows = [{"tool": r["tool"], "job": r["job"], "removed": bool(r.get("removed"))} for r in value
+            if isinstance(r, dict) and isinstance(r.get("tool"), str) and isinstance(r.get("job"), str) and r["job"]
+            ] if isinstance(value, list) else []
+    return rows[-IMPLIED_KEEP:]
+
+
+def note_implied(session: dict, tool: str, job: str) -> None:
+    """The model added this job's outputs to the chat unasked."""
+    with lock:
+        rows = session["implied"] = implied_rows(session.get("implied"))
+        if job and not any(r["job"] == job for r in rows):
+            rows.append({"tool": tool, "job": job, "removed": False})
+            del rows[:-IMPLIED_KEEP]
+
+
+def undone_text(tool: str) -> str:
+    return (f"Not run: the user removed the last {kind_noun(tool)} you added; don't add it again unless they ask. "
+            "Nothing was charged.")
 
 
 def chat_label(spend) -> str:

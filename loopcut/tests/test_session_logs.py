@@ -10,6 +10,7 @@ fixtures check the small validator below first.
 Key-shaped test values are joined at run time (k()), so the file itself holds nothing a secret scanner flags."""
 
 import contextlib
+import copy
 import gzip
 import importlib
 import io
@@ -288,6 +289,25 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual(attached, [{"role": "event", "text": "image omitted", "data": {"kind": "attachment", "bytes": 3000}}])
         self.assertIn({"role": "event", "text": "input_audio omitted"}, entries)
         self.assertIn("Like this [image data omitted]", [e.get("text") for e in entries])
+
+    def test_a_cut_result_carries_its_whole_text_from_the_store(self):
+        from loopcut import result_store
+        results = Path(self.directory.name) / result_store.FOLDER
+        whole = "\n".join(f"line {n}: " + "x" * 60 for n in range(200))
+        shown = result_store.keep(lambda: results, whole, "run_python")
+        self.assertIn("stored as r1", shown)
+        messages = [{"role": "user", "content": "Build a room"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "function": {"name": "run_python", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": shown + "\n\nA note Loopcut added."}]
+        entries = session_logs.build_transcript(messages, [{"kind": "user", "text": "Build a room"}], results=results)
+        self.assertEqual(entries[2]["text"], shown + "\n\nA note Loopcut added.")  # What the model worked from.
+        self.assertEqual(entries[2]["data"], {"full_result": whole})
+        trimmed = session_logs._trim_entry(copy.deepcopy(entries[2]), 1024)
+        self.assertLess(len(trimmed["data"]["full_result"]), 2 * 1024 + 200)
+        (results / "r1.json").unlink()  # A cleared store leaves the cut text, never a failed log.
+        entries = session_logs.build_transcript(messages, [{"kind": "user", "text": "Build a room"}], results=results)
+        self.assertNotIn("data", entries[2])
 
     def test_announced_step_nudges_are_counted_on_their_turn(self):
         from loopcut import completion_guard

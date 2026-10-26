@@ -35,6 +35,9 @@ STREAM_ATTEMPTS = 2
 # bought the picture again.
 SERVER_RETRY_SECONDS = (1, 2, 4, 8, 15, 30)
 UNCONFIRMED = "job_unconfirmed"
+# A succeeded, charged job whose files storage's 5xx answers kept back for SERVER_RETRY_SECONDS (_download): they wait
+# in the cloud, and job_status (or the call's replay with its key) fetches them anew. Never a failure to buy again.
+UNFETCHED = "outputs_unfetched"
 MAX_EVENT = 4 * 1024 * 1024
 MAX_REPORT = 64 * 1024
 MAX_OUTPUTS = 4096
@@ -81,6 +84,11 @@ def _left(job_id, cancel):
 _adopting = {}
 _adopt_errors = {}
 _adopt_cancels = set()  # Canceled while being fetched (job_status cancel right after a reopen): canceled once followed.
+# Idempotency key -> the quote_id and bundle its first request sent (sent()). A key names one request (SPEC §3.4), so
+# its replay after job_unconfirmed sends them again, not a fresh quote's id: a new one made a different body, which the
+# server refuses (0.2.19 review, 2026-10-26).
+_sent = {}
+MAX_SENT = 64
 
 
 def _invalid(message="Invalid job response from Loopcut"):
@@ -263,7 +271,8 @@ def _cancel_now(client, job_id):
 
 
 def job_status(job_id):
-    """Long tools return immediately; their eventual local paths are available here."""
+    """Long tools return immediately; their eventual local paths are available here. A succeeded job whose files
+    5xx answers kept back (UNFETCHED) is fetched anew here, with fresh URLs, and reads as running meanwhile."""
     with _lock:
         row = _registry.get(job_id)
         if row is None and job_id in _adopting:
@@ -272,16 +281,23 @@ def job_status(job_id):
             raise _adopt_errors.pop(job_id)
         if row is None:
             raise cloud_http.CloudError("Cloud job is not available in this session", "not_found", 404)
-        if row.get("error"):
+        again = row.get("error") is not None and row["error"].code == UNFETCHED and row.get("client") is not None
+        if again:
+            del _registry[job_id]
+        elif row.get("error"):
             raise row["error"]
-        job = copy.deepcopy(row["job"])
-        incomplete = job['status'] in TERMINAL and not row.get('ready', True)
-        if incomplete and (job['status'] == 'succeeded' or not row.get('final', True)):
-            job.update(status="running", progress={"pct": 100, "message": "Downloading outputs"})
-        _raise_failed(job)  # A done event can precede _finish's stored exception.
-        from .cloud import safe_value
-        return safe_value({**job, 'outputs': [{k: v for k, v in output.items() if k not in {'url', 'expires_at'}}
-                                             for output in job['outputs']]})
+        else:
+            job = copy.deepcopy(row["job"])
+            incomplete = job['status'] in TERMINAL and not row.get('ready', True)
+            if incomplete and (job['status'] == 'succeeded' or not row.get('final', True)):
+                job.update(status="running", progress={"pct": 100, "message": "Downloading outputs"})
+    if again:
+        adopt(job_id, row["title"], row["input"], row["apply_args"], row["references"], client=row["client"])
+        return job_status(job_id)
+    _raise_failed(job)  # A done event can precede _finish's stored exception.
+    from .cloud import safe_value
+    return safe_value({**job, 'outputs': [{k: v for k, v in output.items() if k not in {'url', 'expires_at'}}
+                                         for output in job['outputs']]})
 
 
 def over(job_id):
@@ -331,6 +347,36 @@ def applied_here(job_id):
         if any(stamped(strip) for strip in strips):
             return True
     return False
+
+
+_OBJECT_DATA = ("meshes", "curves", "armatures", "cameras", "lights", "volumes", "pointclouds", "grease_pencils",
+                "hair_curves")
+
+
+def kept_here(job_id) -> bool:
+    """Main thread: the user still has this job's outputs (spending's undone means no): a stamped object or strip,
+    or, for outputs with neither (an action), a stamped datablock something uses. Delete and Undo take them away; what
+    a delete leaves in the file (a deleted object's mesh, a deleted strip's sound) does not count."""
+    import bpy
+    data = getattr(bpy, "data", None)
+
+    def stamped(block):
+        try:
+            value = block.get("loopcut_provenance") if callable(getattr(block, "get", None)) else None
+            return isinstance(value, str) and job_id in value and json.loads(value).get("job_id") == job_id
+        except (ReferenceError, TypeError, ValueError, AttributeError):
+            return False
+    if any(stamped(block) for block in getattr(data, "objects", None) or ()):
+        return True
+    for scene in getattr(data, "scenes", None) or ():
+        editor = getattr(scene, "sequence_editor", None)
+        strips = getattr(editor, "strips_all", None) or getattr(editor, "sequences_all", None) or ()
+        if any(stamped(strip) for strip in strips):
+            return True
+    if any(stamped(block) for name in _OBJECT_DATA for block in getattr(data, name, None) or ()):
+        return False  # Its objects are gone; their data is what the delete left.
+    return any(stamped(block) and getattr(block, "users", 1) > 0
+               for name in _DATA_COLLECTIONS for block in getattr(data, name, None) or ())
 
 
 def canceled_here(job_id):
@@ -419,7 +465,7 @@ def _remember(job, title, cancel, inputs=None, apply_args=None, references=None,
                 return False  # Preserve the original account and immutable report on same-job replay.
             error = row.get('error')
             if error is None or error.code not in {'connection_failed', 'output_save_failed', 'hash_mismatch',
-                                                   UNCONFIRMED}:
+                                                   UNCONFIRMED, UNFETCHED}:
                 return False  # Preserve live workers and definitive outcomes on replay.
             del _registry[job['id']]
         # Keep a bounded history for job_status, retaining every running job.
@@ -464,6 +510,29 @@ def _unsure(error, job=None):
     # Not the server's own text: "Try again shortly" is what the gate's model did, with a new key.
     return cloud_http.CloudError(f"Loopcut's server kept failing (HTTP {error.status or '?'} {error.code}) for "
                                  f"{sum(SERVER_RETRY_SECONDS)} s", UNCONFIRMED, error.status, extra, error.error_type)
+
+
+def sent(key):
+    """What the first request with this idempotency key sent here ({quote_id, bundle}), or None. Its replay sends
+    them again (run; cloud.execute reuses the scene it packed), so the body is the first one and the server returns
+    that request's job."""
+    with _lock:
+        first = _sent.get(key) if isinstance(key, str) else None
+        return dict(first) if first is not None else None
+
+
+def taken(error):
+    """The server refused the key as another request's (SPEC §3.4: 422 invalid_input on idempotency_key, or a 409
+    conflict): a job for it exists already. An expired quote (409 quote_expired) is not: no job has the key."""
+    return error.extra.get("field") == "idempotency_key" or (error.status == 409 and error.code == "conflict")
+
+
+def _taken(error):
+    """A refused replay: its key's job may exist, run and be charged (cloud._error_message), never a bare error the
+    model would answer with a new key and a second job."""
+    return cloud_http.CloudError(f"Loopcut refused this request's key (HTTP {error.status or '?'} {error.code}): its "
+                                 "first request made a job", UNCONFIRMED, error.status, {"taken": True},
+                                 error.error_type)
 
 
 def _pause(cancel, seconds):
@@ -742,6 +811,37 @@ def expired_message(job):
             else "These files were deleted after 30 days.")
 
 
+def _fetch(client, output, target, cancel, job):
+    """One output into target, verified against its size and hash."""
+    digest, size = hashlib.sha256(), 0
+    with target.open("xb") as handle, client.download(output["url"]) as response:
+        while True:
+            if cancel.is_set():
+                raise cloud_http.CloudError("Cloud output download canceled", "canceled", extra={"job": job})
+            chunk = response.read(blobs.CHUNK_SIZE)
+            if not chunk:
+                break
+            _heard(cancel)
+            size += len(chunk)
+            if size > output["size"]:
+                raise cloud_http.CloudError("Cloud output size does not match", "hash_mismatch")
+            digest.update(chunk)
+            try:
+                handle.write(chunk)
+            except OSError as ex:
+                raise cloud_http.CloudError("Could not save cloud outputs", "output_save_failed") from ex
+    if size != output["size"] or digest.hexdigest() != output["sha256"]:
+        raise cloud_http.CloudError("Cloud output checksum does not match", "hash_mismatch")
+
+
+def _unfetched(error, job):
+    """Storage's 5xx answers outlasted SERVER_RETRY_SECONDS on a succeeded job's files: it was charged and its files
+    wait in the cloud, so this says so (cloud._error_message), never a plain failure the model would buy again."""
+    return cloud_http.CloudError(f"Loopcut's storage kept failing (HTTP {error.status or '?'} {error.code}) for "
+                                 f"{sum(SERVER_RETRY_SECONDS)} s", UNFETCHED, error.status, {"job": job},
+                                 error.error_type)
+
+
 def _download(client, job, cancel):
     _output_limits(job)
     message = expired_message(job)
@@ -759,25 +859,24 @@ def _download(client, job, cancel):
             # Server names never become filesystem paths. Index keeps identical frame hashes distinct.
             suffix = _SUFFIXES.get(output["mime"], ".bin")
             target = directory / f"{n:04d}-{output['sha256'][:12]}{suffix}"
-            digest, size = hashlib.sha256(), 0
-            with target.open("xb") as handle, client.download(output["url"]) as response:
-                while True:
-                    if cancel.is_set():
-                        raise cloud_http.CloudError("Cloud output download canceled", "canceled", extra={"job": job})
-                    chunk = response.read(blobs.CHUNK_SIZE)
-                    if not chunk:
-                        break
+            pauses = iter(SERVER_RETRY_SECONDS)
+            while True:
+                try:
+                    _fetch(client, output, target, cancel, job)
+                    break
+                except cloud_http.CloudError as ex:
+                    # Storage's 5xx on a finished, charged job's file is asked again as a create's or a follow's is.
+                    if not server_trouble(ex):
+                        raise
+                    target.unlink(missing_ok=True)
+                    pause = next(pauses, None)
+                    if pause is None:
+                        raise _unfetched(ex, job) from ex
                     _heard(cancel)
-                    size += len(chunk)
-                    if size > output["size"]:
-                        raise cloud_http.CloudError("Cloud output size does not match", "hash_mismatch")
-                    digest.update(chunk)
-                    try:
-                        handle.write(chunk)
-                    except OSError as ex:
-                        raise cloud_http.CloudError("Could not save cloud outputs", "output_save_failed") from ex
-            if size != output["size"] or digest.hexdigest() != output["sha256"]:
-                raise cloud_http.CloudError("Cloud output checksum does not match", "hash_mismatch")
+                    _pause(cancel, pause)
+                    if cancel.is_set():
+                        raise cloud_http.CloudError("Cloud output download canceled", "canceled",
+                                                    extra={"job": job}) from ex
             output["path"] = str(target)
             output.pop('url', None)
             output.pop('expires_at', None)
@@ -807,7 +906,7 @@ def _finish(client, job, cancel, on_progress, *, leave=False):
         ex.extra.setdefault('job', job)
         with _lock:
             key = (_registry.get(job["id"]) or {}).get("key")
-        if ex.code == UNCONFIRMED and key:  # A long job's thread: job_status names the replay that picks it up.
+        if ex.code in (UNCONFIRMED, UNFETCHED) and key:  # A long job's thread: its text names the replay.
             ex.extra.setdefault("idempotency_key", key)
         if job['tool'] == 'auto_rig' and job['status'] == 'succeeded' and ex.code == 'hash_mismatch':
             ex.extra.update(apply_failure=_report_rig_failure(job, 'validation_failed'),
@@ -923,6 +1022,11 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
                    "no_generation": project["no_generation"]}, idempotency_key=key)
     if arguments.get("quote_id"):
         payload["quote_id"] = arguments["quote_id"]
+    with _lock:
+        first = _sent.setdefault(key, {"quote_id": payload.get("quote_id"), "bundle": payload.get("bundle")})
+        while len(_sent) > MAX_SENT:
+            del _sent[next(iter(_sent))]
+    payload.update({k: v for k, v in first.items() if v is not None})  # A replay: the first request's.
     try:
         lost, pauses = False, iter(SERVER_RETRY_SECONDS)
         while True:
@@ -936,6 +1040,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
                 if ex.code == "connection_failed" and not lost:
                     lost = True
                     continue
+                if taken(ex):
+                    raise _taken(ex) from ex
                 if not server_trouble(ex):
                     raise  # A 4xx is definite (quote_changed, insufficient_credits, ...).
                 pause = None if cancel.is_set() else next(pauses, None)
@@ -1029,7 +1135,7 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
     return found
 
 
-MADE_BY = ("image_generate",)  # Tools whose pictures Loopcut made: image_to_3d asks first on one (spending.MADE).
+MADE_BY = ("image_generate",)  # Tools whose pictures Loopcut made: the model looks at one before its 3D (made_unseen).
 MADE_LISTED = 3  # A refusal names at most this many made pictures: it reaches the model cut at 400 characters.
 
 
@@ -1083,6 +1189,16 @@ def made_picture(descriptor: dict, arguments: dict) -> dict | None:
         return None
     path = attached_image(value)
     return {"name": value, "path": str(path) if path else "", "job": job}
+
+
+def made_unseen(job) -> str:
+    """Main thread: the name the model looks at the picture that job made by (look_at_reference, which marks its
+    conversation reference seen, as compare_with_reference does) while it has not in this chat; "" once it has, or
+    when no reference here holds it (nothing to look at it by). A renamed datablock keeps its reference's name."""
+    from . import state
+    found = next((r for r in reversed(state.session().get("references") or ())
+                  if job and isinstance(r.get("made"), dict) and r["made"].get("job") == job), None)
+    return "" if found is None or found["made"].get("seen") else found["name"]
 
 
 def made_last() -> list[str]:

@@ -54,7 +54,7 @@ class CodexAppTest(unittest.TestCase):
         self.env.start()
         self.patches = [mock.patch.object(agent, name, value) for name, value in (
             ("_redraw", lambda: None), ("_on_main", lambda fn, is_cancelled=None, name="": fn()),
-            ("_workspace_turn", lambda session, turn: None), ("_keeps_context", lambda cfg: False),
+            ("_workspace_turn", lambda session, turn: None), ("_keeps_context", lambda cfg: False), ("_keeps_reasoning", lambda cfg: None),
             ("_tool_schemas", lambda: tools.SCHEMAS + [{"type": "function", "function": {
                 "name": n, "description": f"{n} tool", "parameters": {"type": "object", "properties": {}}}}
                 for n in ("search_assets", "import_asset", "add_object")]))]
@@ -347,6 +347,16 @@ class CodexAppTest(unittest.TestCase):
         card = self.session["items"][-1]
         self.assertEqual((card["output"], card["outcome"]), (whole, "Searched libraries: 1 match"))
         self.assertNotIn("card_output", card)
+
+    def test_a_refusal_of_codex_s_arguments_marks_its_card_and_codex_gets_the_precise_text(self):
+        refusal = "source polyhaven does not take colour"
+        result = tools.ToolResult(refusal, ok=False, input_mistake=True)
+        driver = codex_app.CodexTurn(self.session, agent.Turn(), config.load(), None, self.ws, None,
+                                     lambda name, arguments: result, lambda session: None)
+        reply = driver.tool_call({"tool": "search_assets", "arguments": {"colour": "red"}, "callId": "c1"})
+        self.assertEqual((reply["success"], reply["contentItems"][0]["text"]), (False, refusal))
+        card = self.session["items"][-1]
+        self.assertEqual((card["status"], card["output"], card["input_mistake"]), ("failed", refusal, True))
 
     def test_whatever_codex_sends_is_progress_for_the_stall_clock(self):
         turn = agent.Turn()

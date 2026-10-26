@@ -39,6 +39,14 @@ ROLES = (*orchestrator.ROLES, "shot")  # delegate's roles and shot (a camera wit
 MAX_SCENE, MAX_REQUEST, MAX_PREVIOUS = 1200, 2400, 400
 SHARED_SETUP = "palette, supports, render and output settings"
 STYLE = "look, parts, detail, finish"  # A brief's art direction; prompt served by Loopcut (contract 0.3).
+# What the work is for (cloud-tools-implicit-use section 1; router prompt 0.2.20+): the router's `purpose`, at most
+# MAX_PURPOSE words, and `calls_for`, the paid finishes such work usually has, from this fixed list; each one's plain
+# words for the <routing> note's purpose line. Replies without them (older router prompts) route as before.
+MAX_PURPOSE = 8
+CALLS_FOR = {"sound": "ambience or sound effects", "voice": "a voice line", "motion": "character motion",
+             "rig": "a rig", "game_ready": "a game-ready mesh within a triangle budget",
+             "custom_model": "a made picture turned into 3D", "custom_image": "a made picture",
+             "render": "a camera move ready to render"}
 # The scene_context lines that say nothing about the work: the build, engines, editors.
 _NOISE = ("Blender ", "media type:")
 # Loopcut's blocks: its first head, or a later block's (orchestrator.block_head) on a reply after the turn's first.
@@ -53,17 +61,22 @@ class Decision:
     why: str = ""
     source: str = "model"   # model | rules (the image rule alone) | parked (the answer to a question)
     turn: int = 0
+    purpose: str = ""       # What the work is for, at most MAX_PURPOSE words; "" when the user did not say.
+    calls_for: list = field(default_factory=list)  # Keys of CALLS_FOR.
 
     def record(self) -> dict:
         return {"turn": self.turn, "level": self.level, "source": self.source, "why": self.why,
-                "deliverables": [list(pair) for pair in self.deliverables]}
+                "deliverables": [list(pair) for pair in self.deliverables],
+                **({"purpose": self.purpose} if self.purpose else {}),
+                **({"calls_for": list(self.calls_for)} if self.calls_for else {})}
 
     @classmethod
     def from_record(cls, record: dict) -> "Decision":
         pairs = [tuple(pair) for pair in record.get("deliverables") or []]
         deliverables = [p if len(p) == 3 else (*p, "modeling") for p in pairs]  # Older records had no role.
         return cls(level=record["level"], deliverables=deliverables, why=record.get("why", ""),
-                   source=record.get("source", "model"), turn=record.get("turn", 0))
+                   source=record.get("source", "model"), turn=record.get("turn", 0),
+                   purpose=_purpose(record.get("purpose")), calls_for=_calls_for(record.get("calls_for")))
 
 
 # ------------------------------------------------------------------ the reply
@@ -92,6 +105,24 @@ def _deliverables(value) -> list:
     return found
 
 
+def _purpose(value) -> str:
+    """The router's purpose: a string, cut to MAX_PURPOSE words, without a closing full stop; "" for null or anything
+    else."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(_one_line(value, MAX_WHY).split()[:MAX_PURPOSE]).rstrip(" .;:,")
+
+
+def _calls_for(value) -> list:
+    """The router's calls_for: the CALLS_FOR keys it names, in its order, once each; unknown values dropped."""
+    found = []
+    for entry in value if isinstance(value, list) else []:
+        key = entry.strip().lower() if isinstance(entry, str) else ""
+        if key in CALLS_FOR and key not in found:
+            found.append(key)
+    return found
+
+
 def parse(text: str) -> Decision | None:
     """The first JSON object in the reply that names a level 0-3, whatever surrounds it (code fences,
     a sentence). None for anything else: no note is better than a wrong one."""
@@ -109,7 +140,8 @@ def parse(text: str) -> Decision | None:
         if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level <= 3:
             return None
         return Decision(level=level, deliverables=_deliverables(reply.get("deliverables")) if level >= 2 else [],
-                        why=_one_line(reply.get("why"), MAX_WHY))
+                        why=_one_line(reply.get("why"), MAX_WHY), purpose=_purpose(reply.get("purpose")),
+                        calls_for=_calls_for(reply.get("calls_for")))
     return None
 
 
@@ -285,6 +317,16 @@ def skeleton(decision: Decision, threads: dict | None = None) -> str:
 CAP_NOTE = "This turn can start at most {n} workers."  # The account's max_workers (config.Roles.turn_workers).
 
 
+def purpose_line(decision: Decision) -> str:
+    """The <routing> note's line for what the work is for, and the finishes such work usually has (CALLS_FOR's
+    plain words): "Purpose: horror game trailer. A finished one usually also has: ambience or sound effects, a
+    camera move ready to render." "" without a purpose."""
+    if not decision.purpose:
+        return ""
+    finishes = ", ".join(CALLS_FOR[key] for key in decision.calls_for if key in CALLS_FOR)
+    return f"Purpose: {decision.purpose}." + (f" A finished one usually also has: {finishes}." if finishes else "")
+
+
 def note(decision: Decision, threads: dict | None = None, workers: int = 0) -> str:
     """The line added to the user's message for the orchestrator; workers: the turn's worker limit, 0 for none."""
     listing = _listing(decision)
@@ -304,6 +346,9 @@ def note(decision: Decision, threads: dict | None = None, workers: int = 0) -> s
         body += " " + CAP_NOTE.format(n=workers)
     if decision.source == "parked":
         body = body.replace(" — ", " — the work your question was about: ", 1)
+    purpose = purpose_line(decision)
+    if purpose:
+        body += f"\n{purpose}"
     return f"<routing>{body}</routing>"
 
 

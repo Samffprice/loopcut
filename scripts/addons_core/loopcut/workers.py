@@ -58,7 +58,7 @@ SCHEMAS_OWN = [
             "question": {"type": "string", "description": "Only when you are blocked"}}}}},
 ]
 # Tools from the agent's own set, in the order they are offered; capture_viewport has its own text.
-_SHARED_TOOLS = ("run_python", "get_scene_info", "get_object_info", "inspect_api", "look_at_reference")
+_SHARED_TOOLS = ("run_python", "get_scene_info", "get_object_info", "inspect_api", "look_at_reference", "read_result")
 MAX_SUMMARY = 300
 MAX_REQUESTS = 3
 STEER_INSTRUCTION = ("Reconsider requirements that conflict with this correction. Change only what clearly applies "

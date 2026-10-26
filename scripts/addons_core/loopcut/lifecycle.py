@@ -45,6 +45,9 @@ def _on_load_post(*_):
         _on_undo_redo()  # But what it loaded may lack a cloud job's outputs, or have them back.
         return
     resume_for_open_file()
+    # File > Open, Open Recent, File > New: the file's own layout replaced the screen, usually without the panel.
+    if not bpy.app.timers.is_registered(_dock_after_load):
+        bpy.app.timers.register(_dock_after_load, first_interval=0.0)
 
 
 @persistent
@@ -84,9 +87,9 @@ def _on_save_post(*_):
     conversations.save(session)
 
 
-def _dock_at_startup() -> None:
-    """The Loopcut build opens with the panel in place, once per start and only if the layout
-    that loaded has none. Stock Blender is left as the user arranged it."""
+def _dock_if_missing() -> None:
+    """The Loopcut build shows the panel at startup and with every file opened, docked only if the layout
+    that loaded has none: a file saved with the panel keeps its own. Stock Blender is left as the user arranged it."""
     from . import settings
     from .ui import host
     prefs = settings.preferences()
@@ -100,6 +103,12 @@ def _dock_at_startup() -> None:
             print(f"Loopcut: {ex}")
 
 
+def _dock_after_load():
+    # From a timer, as at startup: outside the file read, with the loaded screen up.
+    _dock_if_missing()
+    return None
+
+
 def _initial_resume():
     # From a timer: bpy.data is not readable while an add-on is still registering.
     # Saved System add-ons must have finished loading before repairing incidental prefs saves.
@@ -110,7 +119,7 @@ def _initial_resume():
         import traceback
         traceback.print_exc()  # Keep the journal, and leave the panel usable for recovery.
     resume_for_open_file()
-    _dock_at_startup()
+    _dock_if_missing()
     return None
 
 
@@ -120,8 +129,9 @@ def _poll_jobs():
     import traceback
     from . import job_tools, workspace
     from .ui import host
-    # poll_left: what a shell command left running, ended or due a Stop's SIGKILL.
-    for step in (job_tools.refresh_ui, workspace.poll_left, host.tag_redraw_all):
+    # poll_left: what a shell command left running, ended or due a Stop's SIGKILL. sync_topbars: "Open Loopcut"
+    # follows a panel closed through Blender's UI.
+    for step in (job_tools.refresh_ui, workspace.poll_left, host.tag_redraw_all, host.sync_topbars):
         try:
             step()
         except Exception:
@@ -157,8 +167,9 @@ def unregister() -> None:
     inspection.unregister()
     if bpy.app.timers.is_registered(_poll_jobs):
         bpy.app.timers.unregister(_poll_jobs)
-    if bpy.app.timers.is_registered(_initial_resume):  # Disabled before its first tick.
-        bpy.app.timers.unregister(_initial_resume)
+    for timer in (_initial_resume, _dock_after_load):
+        if bpy.app.timers.is_registered(timer):  # Disabled before its first tick.
+            bpy.app.timers.unregister(timer)
     conversations.save(state.session())
     for handlers, fn in _handlers():
         if fn in handlers:

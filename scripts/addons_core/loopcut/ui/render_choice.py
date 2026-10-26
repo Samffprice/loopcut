@@ -1,7 +1,7 @@
-"""The cloud-or-laptop card (render_offer.py): a paid render's approval card when the same frames here would take
-over 15 minutes. The recommended option first and emphasised, each with its time, its price, what it means for the
-user's evening and its one button; the two stack, since side by side at 420 px every bullet wraps. Built from
-layout.py's own primitives (f0's composed card, cloud-render-offer/proposed_cards.py)."""
+"""The cloud-or-laptop card (render_offer.py): a paid render's approval card, or a render job's (0.2.20), when the same
+frames here would take over 15 minutes. The recommended option first and emphasised, each with its time, its price,
+what it means for the user's evening and its one button; the two stack, since side by side at 420 px every bullet
+wraps. Built from layout.py's own primitives (f0's composed card, cloud-render-offer/proposed_cards.py)."""
 
 from .. import render_offer
 from . import theme as T

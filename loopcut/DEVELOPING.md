@@ -285,7 +285,8 @@ descriptions, and the worker brief's step count and budget wording (C16). Artifa
 | `get_scene_info` | What is in the scene. Large scenes list names by collection and take `name_contains` / `type`. |
 | `get_object_info` | How an object is set up: modifier settings, material and geometry node trees, constraints, animation, custom properties. Read before editing someone's material. `detail=transform`: only transform, dimensions, bounds, mesh counts, modifiers, parent/children and slot names. Past 8,000 characters whole sections go, largest first, named in `omitted` (`object_info.fit`), never a value cut in half. `"world"` (or a world's name) reads the world's node tree. A socket name a node has twice carries its index, here and in Scene changes' links: `Mix Shader.Shader (inputs[2])`, so a swapped connection shows. |
 | `check_contact` | Placement measured on the evaluated world-space meshes, not judged from bounds or a capture: for pairs `{a, relation, b}`, `rests_on` (every foot or leg of a on b's top, gravity -Z; a leg through a rug fails), `touches`, `clear_of` (at least `gap` apart) or `inside` (b's convex hull), each gets pass, fail or unavailable with the reason, the gap or penetration, and for a failure the move that would fix it. Nothing is moved. An empty stands for its child meshes. `watch=true` measures the pairs again after every later `run_python` of the conversation and lists a change of status in its Scene changes. How: `contact.py`'s docstring. |
-| `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. |
+| `inspect_api` | The Python API of the running Blender: properties, enum values, operator arguments, node sockets, plus tested notes where recent versions differ from what models remember. Concise by default: names, types, defaults and the first 8 enum values, no descriptions, 25 search hits, the tested note right under the type's name; `detail: true`, or one property's or function's own path, gives every description and value. |
+| `read_result` | The rest of a result Loopcut cut short (Context, below): `grep` (words or a regex, case-insensitive, numbered lines) or `lines` ("41-70") of the stored whole, at most 1,200 characters a call, with where to go on. Answered by the loop itself from its own conversation's store (`agent._read_result`), so a worker reads its own. |
 | `capture_viewport` | A self-framed image (`three_quarter`, `front`, `side`, `top`, `camera`, `user`; style `material` or `distinct`) and which objects are nearest, because similar colors hide what is in front. Its caption ends with how it was drawn (viewport mode, view transform, size). Object names are drawn on only with `labels: true` (here and in `compare_with_reference`): on a close shot they covered the subject. A worker's own `capture_viewport` renders in its child instead: see "Worker looks". |
 | `frame_camera` | Aim a camera and fit `objects` (a root or empty counts its children, instances included) into its render frame in one call: `direction` `keep` (its rotation), `front`, `side`, `top`, `three_quarter` or a vector, no roll; `margin` per side; `region` (x0,y0,x1,y1) fits into part of the frame, the lens shift kept; `lens`, or `ortho_scale` for an orthographic camera. Solved exactly from evaluated vertices, render aspect, sensor fit and shift (`framing.py`), not a bounding sphere; the clip range widens if the subject needs it; `create` makes a scene camera. Reports per object its bounds in frame, % inside, clipped edges, margins and offset, and which margin binds the fit. A scene change (checkpoint, approval, one undo step), except `report_only`, which only measures (`tools.only_reads`), with `frames` a line per frame. |
 | `inspect_scene` | [Real inspection renders](VISUAL_INSPECTION.md) across named cameras and frames, in a labeled sheet; geometry, studio materials, or actual scene lighting, with stale-result rejection. |
@@ -569,6 +570,8 @@ fresh one without losing the old.
   the turn starts) carries that Blender's mark until the turn's last save, and another Blender's mark
   on load means the turn never ended.
   Files on disk are validated on load; a damaged one is skipped and left in place.
+- Tool results the model was shown cut short are kept whole in `results/r<n>.json` beside it (Context,
+  below), so `read_result` works after a restart; ids count up and are never reused, also after a restore.
 - Checkpoints keep working across restarts. A snapshot store untouched for 30 days is dropped
   to reclaim space; its conversation stays and shows those checkpoints as expired.
 
@@ -610,8 +613,8 @@ append-only while the model works and shrinking it in batches:
 
 1. Step records. A step (an assistant message with tool calls, its results, the captures after
    it) can be sent as its record: what the model said at that step, word for word, then per call
-   whether it worked (or its exception), what the code printed (400 characters) and the full
-   "Scene changes" (15 lines). Code bodies and long outputs are left out. The model's own sentences
+   whether it worked (or its exception), what the code printed (200 characters) and its
+   "Scene changes" (6 lines, the rest by name; 400 and 15 before 2026-10-26). Code bodies and long outputs are left out. The model's own sentences
    are the part that says why: a run on 2026-09-23 lost them and the model undid its own fixes twice.
    The system prompt asks the model to open every tool-calling reply with what it sees and why.
    A folded step is only marked (`loopcut_folded`); its stored messages are never edited.
@@ -622,7 +625,20 @@ append-only while the model works and shrinking it in batches:
    before a cut into one `<conversation_summary>` message, and the chat shows a "Summarized N
    earlier messages" notice. The summary is stored on the first message it does not cover, so
    checkpoint restores that cut the conversation cut or keep it correctly.
-5. Images: the captures the model has not acted on yet, the newest capture of the conversation,
+5. Results cut as they are made (`result_store.py`), in every loop, so the history stays append-only: past
+   1,200 characters (`result_store.LIMIT`) the model gets the head, whole lines first, and one pointer,
+   `[Loopcut: 6,412 more characters stored as r12: read_result("r12", grep="…") or lines="41-70"]`. A
+   failed call keeps its last 500 characters (the exception, the last frames, the NOTE) after the pointer,
+   and any result its short closing paragraphs (a worker's rolled-back note). run_python's "Scene changes"
+   stays in view, compact past 900 characters (`scene_diff.compact`): a change three or more objects share
+   is one line with their bounds in one box, copies of one name added are one line, then lines in order and
+   one line naming how many more and of which kinds. What Loopcut appends after the tool (repeat notes, look
+   notes) is never cut; the card shows the whole. Kept whole: search_assets (picks, credits), delegate and
+   checks (budgeted reports), check_brief. The whole text is `results/r<n>.json` beside the conversation
+   (a worker's in its job folder, carried to a brief sent back to it); a folded step's record names its id.
+   Lines over 300 characters are numbered in pieces cut after a comma, so one-line JSON reads in ranges.
+   Replaying 12 local conversations (992 requests, 200k budget): Kimi input $0.0112 -> $0.0097 a request.
+6. Images: the captures the model has not acted on yet, the newest capture of the conversation,
    and pinned references (768 px, until unpinned) are sent; a dropped capture is remembered in the
    record by what it showed. The automatic look is taken once per reply, after all of its calls,
    and only if the model did not look after its last change. Looks at an unchanged scene are

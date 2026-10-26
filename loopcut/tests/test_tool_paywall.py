@@ -308,6 +308,29 @@ class WorkerTest(Fixture):
         self.assertEqual(len(self.limits()), 1)
 
 
+class TwentyCreditsTest(Fixture):
+    """Owner, 2026-10-26 (cloud-tools-implicit-use section 2): a free account at 20 credits still gets the picture
+    → 3D chain. The picture runs, and no client rule blocks the 3D step: it meets the paywall (this pop-up) with the
+    picture already made, not a card or a warning before it."""
+    BALANCE = 20
+    TOOLS = tuple({**paid(name, title, shown, credits), "approval": {"confirm_over_credits": 100}}  # The server's.
+                  for name, title, shown, credits in (("image_generate", "Generate image", "Image generation", 6),
+                                                      ("image_to_3d", "Image to 3D model", "Image to 3D", 80)))
+
+    def test_the_picture_runs_and_its_3d_meets_the_paywall_with_no_card(self):
+        with patch.object(agent, "_wait_for_approval") as wait:
+            _, made = self.call("image_generate")
+            self.assertTrue(made.ok, made.text)
+            self.job_refusal = refused(14, 80)
+            _, refusal = self.call("image_to_3d")
+        wait.assert_not_called()  # 80 credits is under the default Ask above: no card before the paywall.
+        self.assertEqual(self.jobs, ["image_generate", "image_to_3d"], "quoted and sent: the server refused it")
+        self.assertFalse(refusal.ok)
+        [item] = self.limits()
+        self.assertIs(state.ui["allowance_notice"]["item"], item)
+        self.assertEqual(words(self.draw(), "popup.title"), "Not enough credits: Image to 3D needs 80, you have 14")
+
+
 class ProPlanTest(Fixture):
     PLAN = "pro"
 

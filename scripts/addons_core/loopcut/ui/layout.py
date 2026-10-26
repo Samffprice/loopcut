@@ -33,6 +33,12 @@ ANSWERS = frozenset({"approve", "approve_always", "reject", "render_choice", "pa
 # Internal tools whose failure is schema talk for the model (orchestrator.checks refusing a malformed add): the card
 # says so plainly, the output stays behind its toggle. A free-plan beginner read one as "i think something broke?".
 INTERNAL_FAILURES = {"checks": "Loopcut's internal check didn't take; the agent adjusted and went on."}
+# A call refused for the model's arguments (tools.InputMistake: a field the tool doesn't take, a missing one): the
+# model has the precise text, the card a plain line by whether the turn carried on (_code_repairs), the text behind
+# its toggle. rel019-cloud: a render's card read "Unknown tool input; use the fields in this tool's schema."
+INPUT_MISTAKE = {"correcting": "This step needed different settings; Loopcut is adjusting it.",
+                 "continued": "This step needed different settings; Loopcut carried on.",
+                 None: "This step needed different settings, so it didn't run."}
 # The running turn's stall clock (agent.check_stall) this long with nothing new: a muted line under "Thinking…".
 STALL_NOTICE_SECONDS = 120
 STALL_NOTICE = "No reply for 2 minutes. You can Stop and try again."
@@ -287,12 +293,23 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
         else:
             cursor += f.paragraph(f"item{n}.p{k}", x, cursor, width, body, size, T.TEXT)
     if verification:
-        cursor += f.px(8)
-        f.rect(f"item{n}.verification.rule", x, cursor, width, f.px(1), T.CARD_BORDER)
-        cursor += f.px(6)
-        cursor += f.paragraph(f"item{n}.verification", x, cursor, width, verification,
-                              f.px(T.FONT_SIZE_SMALL), T.TEXT_MUTED)
-        from .. import rig_gate
+        from .. import orchestrator, rig_gate
+        small, expanded = f.px(T.FONT_SIZE_SMALL), item.get("expanded", False)
+        if segments:
+            cursor += f.px(8)
+            f.rect(f"item{n}.verification.rule", x, cursor, width, f.px(1), T.CARD_BORDER)
+            cursor += f.px(6)
+        # The model's summary leads; Loopcut's checks fold to one line under it that opens them (0.2.19 gate: the
+        # final reply read as a checklist).
+        folded = f"{orchestrator.checked_line(verification, alone=not segments)} {'▾' if expanded else '▸'}"
+        height = f.paragraph(f"item{n}.verification.summary", x, cursor, width, folded, small, T.TEXT_MUTED)
+        f.hit(f"item{n}.verification.toggle", x, cursor, width, height, ("toggle", n),
+              "Hide what Loopcut checked" if expanded else "Show what Loopcut checked on the scene")
+        cursor += height
+        if expanded:  # for_user again: a reply saved before 0.2.20 holds the model's wording.
+            cursor += f.px(4)
+            cursor += f.paragraph(f"item{n}.verification", x, cursor, width, orchestrator.for_user(verification),
+                                  small, T.TEXT_MUTED)
         found = rig_gate.footer_action(item, f.ui.get("watch_rigs") or ())
         if found:  # R7-D2: "Watch it" runs character_rig show, free; only an allowlisted op on a Loopcut rig.
             cursor += f.px(6)
@@ -302,7 +319,7 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
             cursor += f.px(24)
     if not item.get("streaming"):
         cursor += _reference_rows(f, n, item.get("file_references", []), x, cursor, width)
-        line = chat_credits.turn_line(item)
+        line = chat_credits.turn_line(item, f.session)
         if line:  # Only the credits arm's turns carry one (chat_credits.record).
             small = f.px(T.FONT_SIZE_SMALL)
             cursor += f.px(4)
@@ -406,10 +423,14 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     rig = item["name"] in ("loopcut_cloud__auto_rig", "loopcut_cloud.auto_rig")
     glyph, glyph_color = STATUS_GLYPH[status]
     plan_repair = item.get("plan_repair")
-    code_failure = (status == "failed" and item["name"] in CODE_TOOLS
+    # Not an account, sign-in or network refusal (cloud_error): those keep their own line.
+    mistake = (status == "failed" and item.get("input_mistake") and not plan_repair and not rig
+               and not (item.get("cloud_error") or {}).get("message"))
+    code_failure = (status == "failed" and item["name"] in CODE_TOOLS and not mistake
                     and not item.get("output", "").startswith("Not run."))
-    code_repair = item.get("code_repair") if code_failure else None
-    internal = INTERNAL_FAILURES.get(item["name"]) if status == "failed" else None
+    code_repair = item.get("code_repair") if code_failure or mistake else None
+    internal = (INTERNAL_FAILURES.get(item["name"]) or mistake and INPUT_MISTAKE.get(code_repair, INPUT_MISTAKE[None])
+                if status == "failed" else None)
     if plan_repair in {"resolved", "retried"}:
         glyph, glyph_color = "✓", T.TEXT_MUTED
     elif plan_repair == "adjusting":
@@ -419,7 +440,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     if code_repair:
         glyph, glyph_color = ("–" if code_repair == "continued" else "↻"), T.TEXT_MUTED
     if internal:
-        glyph, glyph_color = "–", T.TEXT_MUTED
+        glyph, glyph_color = ("↻" if code_repair == "correcting" else "–"), T.TEXT_MUTED
     awaiting = status == "awaiting"
     expanded = awaiting or item.get("expanded", False)
     mark = len(f.prims)
@@ -849,24 +870,39 @@ def _to_3d_buttons(f: Frame, n: int, item: dict, x, y, width) -> int:
 _BACK_MARKS = {"succeeded": (T.OK, "✓"), "canceled": (T.WARN, "–"), "failed": (T.ERROR, "!")}
 
 
-def _thumbnails(f: Frame, id: str, x, y, width, paths: list, labels: list, columns: int) -> int:
-    """Frame thumbnails in a row of 16:9 tiles (the credits pop-up's tile style), each named on a dark strip."""
-    gap, label_size = f.px(5), f.px(10)
-    tile_w = (width - gap * (columns - 1)) // columns
-    tile_h = round(tile_w * 9 / 16)
-    for k, path in enumerate(paths):
-        tx, ty = x + (k % columns) * (tile_w + gap), y + (k // columns) * (tile_h + gap)
-        f.rect(f"{id}{k}.bg", tx, ty, tile_w, tile_h, TILE_BG, f.px(4))
-        f.prims.append({"t": "image", "id": f"{id}{k}", "path": path, "x": tx, "y": ty, "w": tile_w, "h": tile_h})
+PREVIEWS_IN_ROW = 3     # A render card's previews side by side (first, middle and last).
+PREVIEW_MIN_W = 45      # Narrower tiles than this (90 px on a 2x screen) are unreadable: the middle one alone.
+PREVIEW_MAX_H = 70      # The row stays compact on a wide panel (140 px on a 2x screen).
+
+
+def _thumbnails(f: Frame, id: str, x, y, width, paths: list, labels: list, aspect: float) -> int:
+    """A render's previews in one compact row, each whole in its frame's shape (aspect: height over width) and named
+    underneath; on a panel too narrow for readable tiles, the middle one alone at the card's width, at most 220 px
+    tall as the chat's other pictures. rel019-cloud2: four tiles to a row, each named on a strip over its lower half,
+    showed a dark band of background; three card-wide ones made the card 1,400 px tall, its title out of view."""
+    small, gap = f.px(T.FONT_SIZE_SMALL), f.px(6)
+    shown = list(enumerate(paths[:PREVIEWS_IN_ROW]))
+    tile_w = (width - gap * (len(shown) - 1)) // max(1, len(shown))
+    if len(shown) > 1 and tile_w < f.px(PREVIEW_MIN_W):
+        shown = [shown[len(shown) // 2]]
+    if len(shown) == 1:
+        tile_w = width
+    cap = f.px(PREVIEW_MAX_H if len(shown) > 1 else 220)
+    tile_h = round(tile_w * aspect)
+    if tile_h > cap:
+        tile_h, tile_w = cap, round(cap / aspect)
+    bottom = y + tile_h
+    for column, (k, path) in enumerate(shown):
+        tx = x + column * (tile_w + gap)
+        f.rect(f"{id}{k}.bg", tx, y, tile_w, tile_h, TILE_BG, f.px(4))
+        f.prims.append({"t": "image", "id": f"{id}{k}", "path": path, "x": tx, "y": y, "w": tile_w, "h": tile_h})
+        f.rect(f"{id}{k}.border", tx, y, tile_w, tile_h, T.NONE, f.px(4), 1, T.CARD_BORDER)
         label = labels[k] if k < len(labels) else ""
         if label:
-            strip = f.line_height(label_size) + f.px(4)
-            f.rect(f"{id}{k}.strip", tx, ty + tile_h - strip, tile_w, strip, (0.0, 0.0, 0.0, 0.55))
-            f.text(f"{id}{k}.label", tx + f.px(5), ty + tile_h - strip + f.px(2),
-                   _ellipsize(f, label, label_size, tile_w - f.px(10)), label_size, T.TEXT)
-        f.rect(f"{id}{k}.border", tx, ty, tile_w, tile_h, T.NONE, f.px(4), 1, T.CARD_BORDER)
-    rows = -(-len(paths) // columns)
-    return rows * tile_h + (rows - 1) * gap
+            f.text(f"{id}{k}.label", tx, y + tile_h + f.px(3), _ellipsize(f, label, small, tile_w), small,
+                   T.TEXT_MUTED)
+            bottom = y + tile_h + f.px(3) + f.line_height(small)
+    return bottom - y
 
 
 def _item_cloud_back(f: Frame, n: int, item: dict, x, y, width) -> int:
@@ -894,7 +930,7 @@ def _item_cloud_back(f: Frame, n: int, item: dict, x, y, width) -> int:
     cursor = max(cursor, ring_y + ring)
     if item.get("thumbnails"):
         cursor += f.px(10) + _thumbnails(f, id + ".frame", ix, cursor + f.px(10), iw, item["thumbnails"],
-                                         item.get("thumbnail_labels", []), 4)
+                                         item.get("thumbnail_labels", []), item.get("thumbnail_aspect") or 9 / 16)
     if item.get("note") and not item.get("resolved"):  # "Asked Loopcut to make the MP4." while Load stays.
         cursor += f.px(10) + f.paragraph(id + ".note", ix, cursor + f.px(10), iw, item["note"], small, T.TEXT_MUTED)
     if item.get("busy"):
@@ -1910,7 +1946,7 @@ def _code_repairs(items: list, busy: bool, active_turn_id=None) -> dict:
     active = ("turn", active_turn_id) if active_turn_id else current
     repairs = {}
     for n, item in enumerate(items):
-        if (item.get("kind") != "tool" or item.get("name") not in CODE_TOOLS
+        if (item.get("kind") != "tool" or item.get("name") not in CODE_TOOLS and not item.get("input_mistake")
                 or item.get("status") != "failed" or item.get("output", "").startswith("Not run.")):
             continue
         if busy and turns[n] in {active, ("legacy", legacy)}:
@@ -1934,7 +1970,7 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
         item = original
         if n in repairs:
             item = {**item, "plan_repair": repairs[n]}
-        if item.get("kind") == "tool" and item.get("name") in CODE_TOOLS:
+        if item.get("kind") == "tool" and (item.get("name") in CODE_TOOLS or item.get("input_mistake")):
             item = {**item, "code_repair": code_repairs.get(n)}
         mark = len(f.hits)
         cursor += _ITEM_LAYOUT[item["kind"]](f, n, item, x, cursor, width) + gap
@@ -2124,6 +2160,22 @@ def _chip_rows(f: Frame, id: str, x: int, y: int, width: int, session: dict) -> 
 
 def _input_notice(f: Frame, y: int) -> int:
     """Usage and transient feedback above the composer, with their own measured space."""
+    own_key = _own_key_line(f, y)
+    return own_key + _usage_notices(f, y + own_key)
+
+
+def _own_key_line(f: Frame, y: int) -> int:
+    """What the own-key check found wrong (own_key_ui.panel_line), so a user who never opens Preferences reads it
+    before their first turn fails; gone once the key works, and while a turn runs."""
+    line = f.ui.get("own_key_check") or ""
+    if not line or f.session.get("busy"):
+        return 0
+    pad = f.px(T.PAD)
+    return f.paragraph("input.own_key", pad, y, f.width - 2 * pad, line, f.px(T.FONT_SIZE_SMALL), T.WARN) + f.px(6)
+
+
+def _usage_notices(f: Frame, y: int) -> int:
+    """The account's usage, a limit's card or line, and a click's short feedback."""
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
     width = f.width - 2 * pad
     usage = ""
@@ -2183,13 +2235,12 @@ def _credit_lines(f: Frame, width: int) -> list[str]:
     small = f.px(T.FONT_SIZE_SMALL)
     balance = f.ui.get("credit_balance")
     if _credits_arm(f) and isinstance(balance, (int, float)):
-        total = chat_credits.chat_total(f.session)
         whole = math.floor(balance)
         line = f"{whole:,} credits ({chat_credits.balance_dollars(whole)})"
         # No "Today: N credits": it counts cloud jobs only (the daily cloud limit's counter), never chat.
-        if not total:
+        spent = chat_credits.chat_line(f.session)  # Was "chat N", which read as nothing (0.2.15).
+        if not spent:
             return [line]
-        spent = f"This chat: {chat_credits.credits_text(total)}"  # Was "chat N", which read as nothing (0.2.15).
         joined = f"{line} · {spent}"
         return [joined] if f.measure("ui", small, joined) <= width else [line, spent]
     spend = f.session.get("spend")
@@ -2212,12 +2263,14 @@ def _offer_live(f: Frame) -> bool:
 def _chat_tip(f: Frame) -> str:
     """The credits arm's footer tooltip: what this chat used, AI chat and tools apart."""
     spend = f.session.get("spend")
-    tools = spend.get("credits", 0) if spending.valid_ledger(spend) else 0
+    holding = chat_credits.held(f.session)
+    tools = max(0, (spend.get("credits", 0) if spending.valid_ledger(spend) else 0) - holding)
     total = chat_credits.chat_total(f.session)
-    if not total:
+    if not total and not holding:
         return "Loopcut's AI and the cloud tools use credits. Open your account."
+    held = f", {holding:,g} held by running jobs" if holding else ""
     return (f"This chat: {chat_credits.credits_text(total)} (AI {chat_credits.credits_text(total - tools)}, "
-            f"tools {chat_credits.credits_text(tools)}). Open your account.")
+            f"tools {chat_credits.credits_text(tools)}{held}). Open your account.")
 
 
 def _credit_height(f: Frame, lines: list[str]) -> int:
@@ -2754,11 +2807,16 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     return height
 
 
+def _overlaps(a: dict, b: dict) -> bool:
+    return a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"] and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"]
+
+
 def _tooltip(f: Frame) -> None:
-    """A bounded hover card that never covers the composer or its notices."""
+    """A bounded hover card that never covers the composer or its notices, nor a card waiting for an answer, and is
+    gone once a click lands on what it describes (tip_dismissed, ui.host) until the pointer moves to another hit."""
     hover = f.ui.get("hover")
     hit = next((h for h in reversed(f.hits) if h["id"] == hover and h.get("tip")), None) if hover else None
-    if hit is None:
+    if hit is None or f.ui.get("tip_dismissed") == hover:
         return
     small, pad_x, pad_y = f.px(T.FONT_SIZE_SMALL), f.px(8), f.px(5)
     lines = [line.rstrip() for _, line in wrap(hit["tip"], "ui", small,
@@ -2766,14 +2824,27 @@ def _tooltip(f: Frame) -> None:
     width = max(round(f.measure("ui", small, line)) for line in lines) + 2 * pad_x
     height = len(lines) * f.line_height(small) + 2 * pad_y
     x = max(f.px(4), min(f.width - width - f.px(4), hit["x"] + hit["w"] // 2 - width // 2))
-    y = hit["y"] - height - f.px(6)
-    if y < f.px(2):
-        y = hit["y"] + hit["h"] + f.px(6)
     zone = next((p for p in f.prims if p["id"] == "input.zone"), None)
-    if zone and y + height > zone["y"] and y < zone["y"] + zone["h"]:
-        y = zone["y"] - height - f.px(6)
-    if y < f.px(2) or y + height > f.height - f.px(2):
-        return  # A short panel must keep typing usable even when a tooltip cannot fit.
+    # rel019-app2 (2026-10-26): the credits line's tip, above the composer, covered the chat's newest card, an import's
+    # Run and Reject. A waiting card's own buttons' tips may cover its text above them, never an answer button.
+    waiting = [p for card in f.cards for p in f.prims
+               if p["id"] in (f"item{card['index']}.tool.card", f"item{card['index']}.choice.card")]
+    answers = [h for h in f.hits if h is not hit and h.get("card") and (h["action"] or ("",))[0] in ANSWERS]
+
+    def fits(y) -> bool:
+        box = {"x": x, "y": y, "w": width, "h": height}
+        return (f.px(2) <= y and y + height <= f.height - f.px(2) and not (zone and _overlaps(box, zone))
+                and not any(_overlaps(box, card) for card in waiting if not _overlaps(hit, card))
+                and not any(_overlaps(box, answer) for answer in answers))
+
+    # Above the hit, else under it, else (a hit in the composer) above the composer; where none fits, no tooltip: a
+    # short panel keeps typing usable, and a waiting card its buttons.
+    places = [hit["y"] - height - f.px(6), hit["y"] + hit["h"] + f.px(6)]
+    if zone and _overlaps(hit, zone):
+        places.append(zone["y"] - height - f.px(6))
+    y = next((y for y in places if fits(y)), None)
+    if y is None:
+        return
     f.rect("tooltip.bg", x, y, width, height, T.CARD, f.px(T.RADIUS_SMALL), 1, T.INPUT_BORDER)
     for n, line in enumerate(lines):
         f.text(f"tooltip.l{n}", x + pad_x, y + pad_y + n * f.line_height(small), line, small, T.TEXT)
@@ -2863,6 +2934,39 @@ def _cloud_jobs(f: Frame, cursor, *, exclude=()):
     return cursor
 
 
+def _ready_jobs(f: Frame, cursor) -> tuple[int, int]:
+    """The chat's finished cloud jobs whose outputs are not in the file yet (cloud_restore.card): "Ready · <title>"
+    with the card's own Load, which loads them as the card does. Once in, the card says so and the row goes.
+    rel019-cloud2: the render's running row went at its end, and Background jobs said "No background jobs yet"
+    beside a finished render. Returns (cursor, rows drawn)."""
+    pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+    drawn = 0
+    for n, item in enumerate(f.session.get("items", ())):
+        if item.get("kind") != "cloud_back" or item.get("status") != "succeeded" or item.get("resolved"):
+            continue
+        load = next(((k, a) for k, a in enumerate(item.get("actions") or ()) if a["do"] in ("load", "load_here")), None)
+        if load is None:
+            continue  # Its frames are past retention: nothing to load.
+        id, right = f"ready.{item['job_id']}", f.width - pad
+        if not item.get("busy"):
+            k, action = load
+            label_w = round(f.measure("ui", small, action["label"])) + f.px(20)
+            f.button(f"{id}.load", right - label_w, cursor, action["label"], T.BUTTON, T.BUTTON_TEXT,
+                     ("cloud_back", (n, k)))
+            right -= label_w + f.px(8)
+        title = f"Ready · {item.get('job_title') or item['title']}"
+        f.text(f"{id}.title", pad, cursor + f.px(3), _ellipsize(f, title, small, right - pad), small, T.TEXT)
+        cursor += f.px(26)
+        detail = item.get("busy") or item.get("detail", "").split("\n")[0]
+        if detail:
+            cursor += f.paragraph(f"{id}.detail", pad, cursor, f.width - pad * 2, detail, small, T.TEXT_MUTED)
+        if item.get("error"):
+            cursor += f.paragraph(f"{id}.error", pad, cursor, f.width - pad * 2, item["error"], small, T.ERROR)
+        cursor += pad
+        drawn += 1
+    return cursor, drawn
+
+
 def _safe_note(f: Frame, id: str, x, y, width, title: str, text: str) -> int:
     """The green box (_keep_chatting's colours): what the user may do while a job runs."""
     pad, small = f.px(10), f.px(T.FONT_SIZE_SMALL)
@@ -2886,7 +2990,7 @@ def _duration(seconds: float) -> str:
 
 def _jobs(f: Frame, top, bottom):
     pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
-    cursor = _cloud_jobs(f, top + pad)
+    cursor, ready = _ready_jobs(f, _cloud_jobs(f, top + pad))
     for row in f.ui.get("local_processes", []):
         id = row["id"]
         minutes, seconds = divmod(int(row["elapsed"]), 60)
@@ -2922,7 +3026,7 @@ def _jobs(f: Frame, top, bottom):
         cursor += f.paragraph("jobs.error", pad, cursor, f.width - 2 * pad, error, small, T.ERROR) + pad
     rows = f.ui.get("jobs", [])
     if not rows:
-        if f.ui.get("cloud_jobs") or f.ui.get("local_processes") or f.ui.get("left_running"):
+        if f.ui.get("cloud_jobs") or f.ui.get("local_processes") or f.ui.get("left_running") or ready:
             return
         f.paragraph("jobs.empty", pad, cursor, f.width - 2 * pad,
                     "No background jobs yet. Ask Loopcut to render or export a scene.", small, T.TEXT_MUTED)

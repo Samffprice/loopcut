@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 import json
+import os
 import re
 import threading
 import time
@@ -12,7 +13,7 @@ from copy import deepcopy
 from typing import Any, Callable
 
 from . import (allowance, checkpoints, completion_guard, config, context, conversations, image_budget,
-               llm, repeats, spending, state, videoref)
+               llm, own_key, repeats, result_store, spending, state, videoref)
 from .ui.markdown import finish_reply
 
 SYSTEM_PROMPT = """You are Loopcut, an AI agent inside the user's running Blender session. You act through tools: \
@@ -169,6 +170,11 @@ UNMADE_STORED = context.UNMADE_STORED
 # refers to: "pressed by mistake, continue" was read as a mistaken press of continue, and it stopped (0.2.14 logs).
 STOPPED_LINE = ("last turn: the user pressed Stop before you finished. If this message says that was a mistake or "
                 "asks you to go on, carry on with the stopped work; otherwise do what it asks.")
+# A <scene_context> line for the user's extras preference (prefs.extras_mode; cloud-tools-implicit-use section 3)
+# when it is not "Use when it helps" (AUTO, which says nothing): per turn, so the cached prompt is the same whichever
+# they chose. The balance and prices are the gateway's line (0.2.20+), not ours.
+EXTRAS_LINES = {"ASK": "Paid tools: ask the user before each one.",
+                "ONLY_ASKED": "Paid tools: only when the user asks for one by name."}
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -199,6 +205,7 @@ class Turn:
         self.decided = threading.Event()
         self.approved = False
         self.thread: threading.Thread | None = None
+        self.own_key: dict = {}  # own_key.for_turn: whose own key runs this turn ({} on Loopcut or the ChatGPT plan).
         self.captures = 0        # Looks at the scene the model asked for this turn.
         self.idle_captures = 0   # The same look again, with no scene change since the previous one.
         self.changed = True      # The user's message itself is a change worth a look.
@@ -419,6 +426,36 @@ def _asks(approval: str, name: str, session: dict, cfg) -> bool:
     return bool(approval) and not allowed
 
 
+def _job_offer(spec, call, turn, card_asks: bool) -> dict | None:
+    """A render_job start whose frames would take over 15 minutes here, by a measured frame, while this account has
+    the cloud render (render_offer.prepare_job): its card is the cloud-or-this-computer choice. card_asks: today's
+    card would ask (renders not always allowed); when it would not, the choice still asks only while
+    render_offer.ASK_EVEN_WHEN_ALWAYS_ALLOWED (the owner's open question). None otherwise, and in a loop that cannot
+    ask."""
+    from . import render_offer
+    if not spec.asks or call.name != "render_job" or not (card_asks or render_offer.ASK_EVEN_WHEN_ALWAYS_ALLOWED):
+        return None
+    parsed = _arguments(call.arguments)
+    if parsed.get("action") != "start" or not render_offer.cloud_tool():
+        return None
+    return _on_main(lambda: render_offer.prepare_job(parsed), turn.cancel.is_set, name="the render's time here")
+
+
+def _ask_choice(card: dict, offer: dict, turn) -> str | None:
+    """The render job's card asks as the choice (ui.render_choice): "cloud", "here", or None for Not now (Esc). Enter
+    picks neither: with no quote, the cloud is never Recommended (render_offer.enter_ok)."""
+    from . import render_offer
+    turn.decided.clear()
+    state.awaiting(card, render_choice=render_offer.job_choice(offer), heavy=False, install=False)
+    _redraw()
+    try:
+        approved = _wait_for_approval(turn)
+    finally:
+        card.pop("render_choice", None)
+        picked = card.pop("picked", None)
+    return "cloud" if approved else "here" if picked == "here" else None
+
+
 def _only_reads(name: str, parsed: dict) -> bool:
     """A scene-changing tool's call that only measures: frame_camera report_only, delegate dry_run."""
     from . import orchestrator, tools
@@ -498,6 +535,28 @@ def _setup_line(cfg: config.Config | None) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _extras_line(cfg: config.Config | None) -> str:
+    """Main thread: EXTRAS_LINES for the user's extras preference, or "" at AUTO and on a turn with no Loopcut paid
+    tools (the user's own key without Loopcut's cloud tools). Hosted and ChatGPT-plan turns get it. Never raises."""
+    try:
+        from . import settings
+        line = EXTRAS_LINES.get(getattr(settings.preferences(), "extras_mode", "AUTO"))
+    except Exception:  # Outside Blender (tests, harness/evals/run.py), or no preferences yet: AUTO.
+        return ""
+    if not line or cfg is None:
+        return ""
+    try:
+        from . import cloud
+        if config.on_service(cfg.base_url) or config.chatgpt_plan(cfg.base_url):
+            return line
+        runtime = cloud._runtime
+        paid = runtime is not None and any(d.get("backend") == "managed" for d in runtime.descriptors())
+        return line if paid else ""
+    except Exception as ex:  # A fact line is a nicety; the turn goes on without it.
+        print(f"Loopcut: could not check for Loopcut's paid tools: {ex!r}")
+        return ""
+
+
 def _system_prompt(session: dict) -> str:
     """The fixed prompt plus what is installed, read at the turn's start on the main thread."""
     extra = session.get("addons_line") or ""
@@ -555,10 +614,22 @@ def _keeps_context(cfg: config.Config) -> bool:
     return account.keeps_context(cfg.base_url, cfg.model)
 
 
+def _keeps_reasoning(cfg: config.Config) -> bool | None:
+    """The service's keep_reasoning for a model it lists; None off the service (an own key, a direct provider),
+    where config's model-id default and LOOPCUT_KEEP_REASONING decide, with no account to ask."""
+    if not config.on_service(cfg.base_url):
+        return None
+    from . import account
+    return account.keeps_reasoning(cfg.base_url, cfg.model)
+
+
 def _keep_mode(cfg: config.Config) -> config.Config:
-    """Keep mode switched on when the Loopcut service lists the model with it."""
+    """Keep mode, and keep_reasoning, switched on when the Loopcut service lists the model with them."""
     if not cfg.keep_context and _keeps_context(cfg):
         cfg = dataclasses.replace(cfg, keep_context=True)
+    listed = _keeps_reasoning(cfg)
+    if listed is not None and listed != cfg.keep_reasoning and "LOOPCUT_KEEP_REASONING" not in os.environ:
+        cfg = dataclasses.replace(cfg, keep_reasoning=listed)  # The service's word beats the model-id default.
     return cfg
 
 
@@ -1046,6 +1117,35 @@ def _patch_spend(session: dict, change) -> None:
         print(f"Loopcut: could not save a closed chat's spend: {ex!r}")
 
 
+QUOTING = " · Getting a credit quote…"  # A quoted call's card title until its quote comes (cloud.describe).
+
+
+def _priced_title(card: dict, credits, *, charged: bool = False) -> None:
+    """A quoted call's card title, in cloud.describe's "<tool> · <price>" form: its quote once it comes, then what it
+    was charged ("no charge" when nothing). rel019-cloud2: "Render scene · Getting a credit quote…" stayed the title
+    after its quote showed and after the render ran."""
+    summary = card.get("summary") or ""
+    title = card.get("quoted_title") or (summary[:-len(QUOTING)] if summary.endswith(QUOTING) else None)
+    if title is None or type(credits) not in (int, float) or credits < 0:
+        return
+    card["quoted_title"] = title
+    price = "no charge" if charged and not credits else f"{credits:,g} credit{'' if credits == 1 else 's'}"
+    card["summary"] = f"{title} · {price}"
+
+
+def _failed_card(card: dict, result) -> None:
+    """A failed call's card: a quote that never came leaves its title (rel019-cloud: "Render scene · Getting a credit
+    quote…" on a call refused before any quote), and a refusal of the model's arguments (tools.InputMistake) reads
+    plainly on it, the model's text behind its toggle (ui.layout)."""
+    if result.ok:
+        return
+    summary = card.get("summary") or ""
+    if summary.endswith(QUOTING):
+        card["summary"] = summary[:-len(QUOTING)]
+    if getattr(result, "input_mistake", False):
+        card["input_mistake"] = True
+
+
 def _settle_spend(chat_session: dict, held, charged, auto: bool) -> None:
     """A call's hold becomes its charge in its chat as it is now: the copy on screen (History may have reopened it
     as a new copy), or else its file, never by saving an older copy over it."""
@@ -1077,9 +1177,12 @@ class _Consent:
 
     settles = True  # cloud_account.charge_reporter sends it what each call was charged.
 
-    def __init__(self, session, turn, card, asks=True, files_allowed=False, clicked=False, shown=None):
+    def __init__(self, session, turn, card, asks=True, files_allowed=False, clicked=False, shown=None, chosen=False):
         self.session, self.turn, self.card = session, turn, card
         self.asks, self.files_allowed = asks, files_allowed
+        # The user picked the cloud on a render job's choice card (render_offer.job_call): its quote, once priced, asks
+        # on the plain paid card, never the choice again.
+        self.chosen = chosen
         # A Turn it into 3D click made this call (turn_into_3d): no turn of the panel's, so its asks are answered on
         # their own card; shown is the price its button showed, which the click approved, and charged what the call
         # was charged, which goes to its chat when it ends.
@@ -1087,6 +1190,7 @@ class _Consent:
         self.hold = None       # (credits held, ran without asking) once the call may run.
         self.settled = None    # A rig's last net charge and original auto flag; its refund can reduce it later.
         self.limit_approved = False  # The user approved past a server limit, seeing this call's cost: no second ask.
+        self.implied = False   # It may run, and the user neither asked for it nor approved its card (undone means no).
         self.shown = [card]    # The cards that show its cost: its own, and a worker's ask in the user's panel.
         self.rig = card.get('name') in ('loopcut_cloud__auto_rig', 'loopcut_cloud.auto_rig')
 
@@ -1119,6 +1223,21 @@ class _Consent:
         return (self.clicked and type(self.shown_credits) in (int, float) and type(credits) in (int, float)
                 and credits <= self.shown_credits and not details.get("vendor"))
 
+    def tool(self) -> str:
+        """The paid tool this call is: image_to_3d, sfx, auto_rig..."""
+        from . import cloud
+        name = str(self.card.get("name") or "")
+        return cloud.tool_name(name) or name
+
+    def asked_for(self, chat_session: dict) -> bool:
+        """The user asked for this call (spending.asked_for): their latest message names it, or they clicked its
+        button or picked the cloud on its choice card."""
+        if self.clicked or self.chosen:
+            return True
+        said = next((item.get("text") for item in reversed(chat_session.get("items") or ())
+                     if item.get("kind") == "user"), "")
+        return spending.asked_for(self.tool(), said)
+
     def __call__(self, details):
         if 'progress' in details:  # Only a rig reports here (cloud_account.progress_reporter).
             from . import cloud
@@ -1145,10 +1264,14 @@ class _Consent:
             _redraw()
             return True
         if "charged" in details:
-            self._settle(details["charged"], details.get("text") or "")
+            self._settle(details["charged"], details.get("text") or "", details.get("settled"))
             return True
+        if "cancel_job" in details:
+            return self._ask_cancel(details["cancel_job"])
         previous_cost = self.card.get('cost', '')
         self.card["cost"] = details["text"]
+        for card in self.shown:
+            _priced_title(card, details.get("credits"))
         if self.rig:
             from . import rig_text
             if details.get('credits') is not None:
@@ -1177,26 +1300,31 @@ class _Consent:
             return approved
         chat_session, chat_turn = self.chat()
         settings = getattr(chat_turn, "spending", None) or spending.Settings()
-        # A limit card that showed the price was its approval, unless the call is a made picture's 3D, which asks on
-        # its own card; a click approved what its button showed (_click_covers).
-        explicit = (self.limit_approved and not details.get("made_picture")) or self._click_covers(details)
+        # A limit card that showed the price was its approval; a click approved what its button showed (_click_covers).
+        explicit = self.limit_approved or self._click_covers(details)
+        asked = self.asked_for(chat_session)
         allowed = set()
         while not explicit:
             with spending.lock:
                 kind = spending.decide(details, spending.ledger(chat_session), settings, calls=chat_turn.paid_calls,
                                        burst_limit=chat_turn.burst_limit,
-                                       vendors=chat_session.setdefault("spend_vendors", []))
+                                       vendors=chat_session.setdefault("spend_vendors", []), asked=asked)
             if kind == spending.RUN or kind in allowed:  # Allowed once for this call (a budget smaller than it).
                 break
+            if kind == spending.NOT_ASKED:  # "Only when I ask": refused with no card, and the model told why.
+                from . import cloud_http
+                self.card["declined"] = True
+                raise cloud_http.CloudError(spending.declined(kind, details, settings), "declined")
             allowed.add(kind)
             if not self._ask(kind, details):
                 return False
             with spending.lock:
                 spending.allow(kind, details, spending.ledger(chat_session), settings, chat_turn,
                                chat_session["spend_vendors"])
-            if kind in (spending.COST, spending.VENDOR, spending.MADE):  # The user approved this very call.
+            if kind in (spending.COST, spending.VENDOR):  # The user approved this very call.
                 explicit = True
                 break
+        self.implied = not asked and not explicit
         if self.clicked:  # Nothing held: its charge goes to its chat when it ends (turn_into_3d), wherever that is.
             _redraw()
             return True
@@ -1232,10 +1360,7 @@ class _Consent:
             fields["ask_link"] = details["url"]
         if kind == spending.COST and not self.rig:
             from . import render_offer  # A long render's ask is the choice: the cloud or this computer.
-            fields.update(render_offer.card_fields(details))
-        picture = (details.get("made_picture") or {}).get("path") if kind == spending.MADE else ""
-        if picture:  # The picture it would turn into 3D, on the card that asks.
-            fields["image_path"] = picture
+            fields.update(render_offer.card_fields({**details, "render_offer": None} if self.chosen else details))
         if self.rig:
             fields['rig_stage'] = 'Waiting for approval.'
         if worker:
@@ -1258,8 +1383,6 @@ class _Consent:
         choice, picked = card.get("render_choice"), card.pop("picked", None)
         for key in ("ask", "ask_lines", "ask_label", "ask_link", "render_choice", "price", "ask_skip", "ask_title"):
             card.pop(key, None)
-        if picture:
-            card.pop("image_path", None)
         if choice and not approved and picked == "here":
             # "Render on my laptop": this paid call is declined, and the same frames render here instead.
             from . import render_offer
@@ -1282,6 +1405,17 @@ class _Consent:
             raise cloud_http.CloudError(spending.declined(kind, details, settings, calls=chat_turn.paid_calls),
                                         "declined")
         return True
+
+    def _ask_cancel(self, details: dict) -> bool:
+        """The model asked to cancel a running paid job (cloud._job_status): its card asks the user, "Cancel it" or
+        "Keep it running" (spending.CANCEL). True to cancel; False when they keep it, or nobody can be asked."""
+        from . import cloud_http
+        try:
+            return self._ask(spending.CANCEL, details)
+        except cloud_http.CloudError as ex:
+            if ex.code != "declined":
+                raise
+            return False
 
     def _paywall(self, refusal: dict) -> None:
         """The credits arm (0.2.19): the server refused this paid call for credits (cloud_account.error_details), so
@@ -1317,7 +1451,9 @@ class _Consent:
             card.update(status='done' if result.ok else 'rejected' if self.card.get('declined') else 'failed',
                         output=result.text)
 
-    def _settle(self, charged, text: str) -> None:
+    def _settle(self, charged, text: str, settled=None) -> None:
+        """settled: a job kept with its chat, whose record settles the chat's spend: its charge for the title alone,
+        so the title says what the turn's line says once it settles (chat_credits.turn_line)."""
         if self.rig:
             self._settle_rig(charged, text)
             return
@@ -1328,6 +1464,8 @@ class _Consent:
         if text:
             for card in self.shown:
                 card["cost"] = text
+        for card in self.shown:
+            _priced_title(card, charged if charged is not None else settled, charged=True)
         if self.hold is not None and charged is not None:
             held, auto = self.hold
             self.hold = None  # Once: a job's watcher and its job_status may both report.
@@ -1419,6 +1557,10 @@ def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
     state.running_clicks[key] = image
     conversations.save(session)  # Reopened meanwhile, the chat shows it running.
     turn = Turn()
+    try:
+        turn.spending = config.spending()  # The user's Ask above for a quote over the button's price.
+    except config.ConfigError:
+        pass
     # files_allowed: the picture is Loopcut's own (the chat's copy, when Undo took its datablock away).
     consent = _Consent(session, turn, card, files_allowed=True, clicked=True, shown=shown)
 
@@ -2054,7 +2196,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
         if session.get("mode") == "workspace" else None
     wired = [*([{"role": "system", "content": system}] if system else []),
              *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session), cfg.keep_context,
-                                          full_refs=full_refs)]
+                                          full_refs=full_refs, reasoning_model=cfg.model if cfg.keep_reasoning else "")]
 
     def call(messages: list[dict], effort: str) -> llm.Completion:
         try:
@@ -2237,15 +2379,20 @@ def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec,
 
 def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
     """After the existing finish gate (including late merges), Loopcut's own check of a rig this turn animated or
-    reweighted (rig_gate), then this turn's contact evidence."""
+    reweighted (rig_gate), its advisory note on an animation without sound (sound_gap, once per chat), then this
+    turn's contact evidence."""
     if turn.cancel.is_set():
         return None
     bounce = spec.on_final(session, turn, completion) if spec.on_final else None
     if bounce and turn.outcome == "running":
         return bounce
-    from . import contact, rig_gate
+    from . import contact, rig_gate, sound_gap
     bounce = rig_gate.finish_gate(session, turn, completion, spec.role,
                                   lambda fn: _on_main(fn, turn.cancel.is_set, "rig check"))
+    if bounce:
+        return bounce
+    bounce = sound_gap.finish_check(session, turn, completion, spec.role,
+                                    lambda fn: _on_main(fn, turn.cancel.is_set, "sound check"))
     if bounce:
         return bounce
     return contact.finish_gate(session, turn, completion,
@@ -2386,6 +2533,35 @@ def _tool_dropped(name: str, ex: BaseException):
                             "Try it again, or go on without it.", ok=False)
 
 
+def _read_result(session: dict, arguments: str):
+    """read_result, answered by the loop itself from its own conversation's store (result_store): the user's chat
+    for the single agent, the orchestrator and the workspace agent; a worker's job folder for a worker, whose
+    tools otherwise run in its child Blender. No scene, no main thread."""
+    from . import tools
+    given = _arguments(arguments)
+    unknown = sorted(set(given) - {"id", "grep", "lines"})
+    if unknown:
+        return tools.ToolResult(f"read_result takes id, grep and lines, not {', '.join(unknown)}.", ok=False)
+    if not given.get("id"):
+        return tools.ToolResult("read_result needs the id a cut result's last line names, such as r12.", ok=False)
+    try:
+        return tools.ToolResult(result_store.read(conversations.results_folder(session), given["id"],
+                                                  given.get("grep"), given.get("lines")))
+    except result_store.StoreError as ex:
+        return tools.ToolResult(str(ex), ok=False)
+
+
+def _shown(session: dict, name: str, text: str, failed: bool) -> str:
+    """A tool's own text as the model gets it: whole, or its start and a pointer to the whole of it, stored with
+    the conversation (result_store.keep). A store that cannot be written leaves the text whole, never a pointer
+    to nothing."""
+    try:
+        return result_store.keep(lambda: conversations.results_folder(session), text, name, failed=failed)
+    except (OSError, conversations.ConversationError) as ex:
+        print(f"Loopcut: could not store the {name} result, so it is sent whole: {ex}")
+        return text
+
+
 def _error_code(ex) -> str:
     """A machine code for the turn's usage event: the API's code, else its HTTP status. Never the message."""
     code = getattr(ex, "code", "")
@@ -2469,7 +2645,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
-            messages.append(completion.as_message())
+            messages.append(completion.as_message(cfg.model if cfg.keep_reasoning else ""))
             if carry and getattr(turn, "carry_steps", False):  # A failed request is made again by a resume:
                 request[STEPS_TAKEN] = step  # only a reply counts.
             if not completion.tool_calls:
@@ -2557,7 +2733,17 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     card["status"] = "rejected"
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": INSTALL_REFUSAL})
                     continue
-                if spec.asks and _asks(approval, call.name, session, cfg):
+                # A long render job's card is the choice: the cloud or this computer (render_offer.prepare_job).
+                offer = _job_offer(spec, call, turn, _asks(approval, call.name, session, cfg))
+                pick = _ask_choice(card, offer, turn) if offer else None
+                if offer and pick is None:  # Not now (Esc): neither runs, and the model asks which.
+                    if no_progress:
+                        no_progress.reset()
+                    card["status"], turn.declined = "rejected", True
+                    from . import render_offer
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": render_offer.SKIPPED})
+                    continue
+                if not offer and spec.asks and _asks(approval, call.name, session, cfg):
                     turn.decided.clear()
                     # heavy: asking because it renders, so the card's "always" allows renders.
                     state.awaiting(card)
@@ -2572,8 +2758,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                                          "content": "The user rejected this action. Ask what they want instead."})
                         continue
                 card["status"], card["started_at"] = "running", time.time()  # The card shows its time (ui.layout).
+                name, arguments, note = call.name, call.arguments, ""
+                if pick:  # The cloud: its render of the same frames runs on this card; here, the job as asked.
+                    from . import render_offer
+                    name, arguments = render_offer.job_call(pick, offer, call.arguments, card)
                 _redraw()
-                arguments, note = call.arguments, ""
                 refusal = _capture_refusal(turn, call.name, arguments)
                 if refusal:
                     if call.name in CAPTURE_TOOLS:
@@ -2585,7 +2774,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                             break
                         continue
                     arguments, note = _without_capture(arguments), f"\n\nCapture skipped: {refusal}"
-                if spec.checkpoints and _changes_scene(call.name, call.arguments):
+                if spec.checkpoints and _changes_scene(name, call.arguments):
                     try:
                         ensure_checkpoint(session)
                     except checkpoints.CheckpointError as ex:
@@ -2604,26 +2793,31 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 delegations = len(turn.delegations)
                 _plan_attempt(card, call, session, plan_turn)
                 from . import cloud_account
-                consent = _Consent(session, turn, card, spec.asks, files_allowed=cfg.auto_run or session['auto_run'])
+                consent = _Consent(session, turn, card, spec.asks, files_allowed=cfg.auto_run or session['auto_run'],
+                                   chosen=pick == "cloud")
                 with cloud_account.approval_context(consent):
                     turn.executed_tools += 1
                     request[completion_guard.EXECUTED] = turn.executed_tools
                     turn.capped_call = call.id if capped else None
                     turn.touch(f"the {call.name} tool")
                     try:
-                        result = run_tool(call.name, arguments)
+                        result = (_read_result(session, arguments) if name == result_store.TOOL
+                                  else run_tool(name, arguments))
                     except Exception as ex:
                         if not llm.dropped_connection(ex):
                             raise
-                        result = _tool_dropped(call.name, ex)
+                        result = _tool_dropped(name, ex)
                     finally:
                         turn.capped_call = None
+                if pick:  # What the user chose, and what ran in the render job's place.
+                    from . import render_offer
+                    render_offer.job_result(pick, offer, call.arguments, arguments, result)
                 turn.touch(state.MODEL_REPLY)
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
                 _after_framing(turn, call.name, call.arguments, result)
                 changed = spec.scene_changed(result)
-                may_change = _changes_scene(call.name, call.arguments)
+                may_change = _changes_scene(name, call.arguments)
                 if may_change or changed:
                     # Any run of a scene-changing tool, not only a measured change: scene_diff does
                     # not see every setting, and a read after such a step may well differ.
@@ -2664,6 +2858,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 # back (waves.held_back_only).
                 card["status"] = ("done" if result.ok or getattr(result, "held_back", False)
                                   else "rejected" if card.get("declined") else "failed")
+                _failed_card(card, result)
                 # An asset search's card keeps its report's JSON (card_output); the model's copy is a table.
                 card_text = getattr(result, "card_output", "") or result.text[:own]
                 card["output"] = card_text + result.text[own + len(ledger_note):]
@@ -2685,8 +2880,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if getattr(result, "notice", ""):
                     items.append(state.item_notice(result.notice))
                 model_note = getattr(result, 'model_note', '')
+                # Cut as it is made, the tool's own text only: what Loopcut appended after it stays in view. The card
+                # keeps the whole text; a failed call's end shows beside its start.
+                failed = not result.ok or repeats.printed_traceback(call.name, result.text)
+                content = _shown(session, call.name, result.text[:own], failed) + result.text[own:]
                 messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": result.text + ('\n\n' + model_note if model_note else '')})
+                                 "content": content + ('\n\n' + model_note if model_note else '')})
                 if changed and not asked_look and not refusal:
                     changed_by = (card, messages[-1])
                 if result.image_path:
@@ -2756,6 +2955,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
         if stopped is not None:
             items.append(stopped)  # The ChatGPT plan stopped: offer Loopcut's models for the same chat (M2).
+        elif own_key_text := own_key.chat_text(ex, getattr(turn, "own_key", None),
+                                                    getattr(turn.config, "model", "")):
+            # The user's own key: the sentence its check shows in Preferences and above the composer (own_key.py).
+            items.append(state.item_error(own_key_text, retry=getattr(ex, "status", None) == 429))
         elif getattr(ex, "status", None) == 402:
             item = _limit_item(ex)
             if config.on_service(cfg.base_url) and item["reason"] in state.HOSTED_LIMITS:
@@ -2964,6 +3167,9 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     scene = _scene_context(text, session.get("scene_seen"))
     if stopped:
         scene = scene.replace("\n</scene_context>", f"\n{STOPPED_LINE}\n</scene_context>", 1)
+    extras = _extras_line(turn.config)
+    if extras:
+        scene = scene.replace("\n</scene_context>", f"\n{extras}\n</scene_context>", 1)
     # What the user started from a card since the last turn (turn_into_3d), and a click still running: the model's
     # only. Taken after turn.submission keeps them for a first request the service refuses.
     between = list(session.get("between_turns") or [])
@@ -3000,6 +3206,7 @@ def _launch(session: dict, turn: Turn) -> None:
     from . import session_logs, telemetry
     turn.started, turn.first_item = time.monotonic(), len(session["items"])
     turn.telemetry = telemetry.turn_start(turn.config)  # Main thread: which kind of model runs this turn.
+    turn.own_key = own_key.for_turn(turn.config)  # The own key's provider, to word a setup failure (run_loop).
     turn.conversation_log = session_logs.turn_start(session, turn.config)  # {} when it is not uploaded.
     from . import chat_credits
     chat_credits.turn_start(session, turn)  # The balance it starts from, in the credits arm; never raises.

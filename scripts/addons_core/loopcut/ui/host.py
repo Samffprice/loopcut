@@ -24,6 +24,7 @@ DOCK_FACTOR = 0.72           # Share of the 3D viewport's width that stays a vie
 CONFIG_TTL = 2.0             # Seconds the model label is trusted before config is read again.
 PATH_TTL = 3.0               # File availability is refreshed by the lifecycle poll, never by drawing.
 COMMAND = "oskey" if sys.platform == "darwin" else "ctrl"
+SHORTCUT = "Cmd+L" if COMMAND == "oskey" else "Ctrl+Alt+L"  # loopcut.focus in the Window keymap, below.
 
 _displays: dict[int, dict] = {}
 _runtime: dict = {}
@@ -171,7 +172,7 @@ def draw_area() -> None:
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
     from .. import cloud_jobs, playback, rig_gate, workspace
-    from .. import chatgpt_ui, onboarding
+    from .. import chatgpt_ui, onboarding, own_key_ui
     if any(item["kind"] == "user" for item in session["items"]):
         onboarding.dismiss_hints()
     display = layout.build(session, region.width, region.height, context.preferences.system.ui_scale,
@@ -179,6 +180,7 @@ def draw_area() -> None:
                            {**state.ui, "now": time.time(), "needs_setup": needs_setup, "selection": selection,
                             "key_needed": key_needed,
                             "provider": getattr(prefs, "provider", "LOOPCUT"),
+                            "own_key_check": own_key_ui.panel_line(),
                             "allowance_notice": state.ui.get("allowance_notice"),
                             "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
                             "watch_rigs": rig_gate.watchable(session),
@@ -1030,6 +1032,7 @@ class LOOPCUT_OT_focus(bpy.types.Operator):
     """Start typing to Loopcut, opening its panel if this window has none"""
     bl_idname = "loopcut.focus"
     bl_label = "Ask Loopcut"
+    bl_description = f"Open Loopcut and start typing to it. {SHORTCUT} from anywhere does the same"
 
     def execute(self, context):
         window = context.window
@@ -1048,6 +1051,46 @@ class LOOPCUT_OT_focus(bpy.types.Operator):
                 self.report({"WARNING"}, str(ex))
                 return {"CANCELLED"}
         return {"FINISHED"}
+
+
+_topbar: dict = {}  # Window pointer: whether its top bar last drew "Open Loopcut".
+
+
+def _open_icon() -> dict:
+    value = account.mark_icon()
+    if value:
+        return {"icon_value": value}
+    return {"icon": "LOOPCUT"} if NATIVE else {}
+
+
+def _draw_topbar(self, context):
+    """The way back, at the right of the top bar: "Open Loopcut" whenever this window shows no panel (a file's
+    own layout, or the user, closed it). Hidden while it shows one."""
+    if context.region.alignment != "RIGHT":
+        return
+    window = context.window
+    shown = not has_panel(window)
+    _topbar[window.as_pointer()] = shown
+    if shown:
+        self.layout.operator(LOOPCUT_OT_focus.bl_idname, text="Open Loopcut", **_open_icon())
+
+
+def _draw_view_menu(self, context):
+    self.layout.operator(LOOPCUT_OT_focus.bl_idname, text="Open Loopcut", **_open_icon())
+    self.layout.separator()
+
+
+def sync_topbars() -> None:
+    """From lifecycle's poll: a top bar whose "Open Loopcut" no longer fits its window is drawn again. Blender
+    redraws the top bar for its own changes, not for an area closed, split or changed to another editor."""
+    for window in bpy.context.window_manager.windows if _topbar else ():
+        drawn = _topbar.get(window.as_pointer())
+        if drawn is not None and drawn == has_panel(window):
+            # The top bar's header redraws on its workspace's tools (topbar_header_region_message_subscribe).
+            bpy.msgbus.publish_rna(key=window.workspace.path_resolve("tools", False))
+
+
+_MENUS = (("TOPBAR_HT_upper_bar", "append", _draw_topbar), ("VIEW3D_MT_view", "prepend", _draw_view_menu))
 
 
 class LOOPCUT_OT_scroll(bpy.types.Operator):
@@ -1119,6 +1162,9 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         display = _displays.get(area.as_pointer())
         x, y, inside = _local(_window_region(area), event)
         if inside and display:
+            # A click puts the hover's tooltip away until the pointer moves to another hit (layout._tooltip): the
+            # 0.2.19 gate's "Background jobs" and "Back to chat" stayed over the chat where its clicks had landed.
+            state.ui["tip_dismissed"] = state.ui.get("hover")
             hit = layout.hit_at(display, x, y) or {}
             action = hit.get("action")
             kind = action[0] if action else None
@@ -1328,6 +1374,7 @@ class LOOPCUT_OT_hover(bpy.types.Operator):
             state.ui["mouse"] = (x, y)
         if state.ui.get("hover") != hovered:
             state.ui["hover"] = hovered
+            state.ui.pop("tip_dismissed", None)
             tag_redraw_all()
         return {"PASS_THROUGH"}
 
@@ -1497,12 +1544,17 @@ def register() -> None:
             {"oskey": True} if COMMAND == "oskey" else {"ctrl": True, "alt": True}))
         hover = window_keymap.keymap_items.new(LOOPCUT_OT_hover.bl_idname, "MOUSEMOVE", "ANY")
         _runtime["keymap"] = [(keymap, items), (window_keymap, [focus, hover])]
+    for menu, how, draw_fn in _MENUS:
+        getattr(getattr(bpy.types, menu), how)(draw_fn)
 
 
 def unregister() -> None:
     from .. import playback
     playback.stop()  # A card's sound does not outlive the panel's code.
     draw.retain_images(())
+    for menu, _how, draw_fn in _MENUS:  # Before a reload, or the old module's buttons stay drawn beside the new.
+        getattr(bpy.types, menu).remove(draw_fn)
+    _topbar.clear()
     if "collection" in _clip_previews:
         from bpy.utils import previews
         previews.remove(_clip_previews.pop("collection"))

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from test_cloud_account import display
 from test_autorig import descriptor
 from loopcut import agent, autorig, cloud, cloud_account, cloud_http, cloud_jobs, rig_experimental, rig_text, state
-from test_autorig_r10 import PLATFORM_NOTICE
+from test_autorig_r10 import PLATFORM_NOTICES
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness'))
 from autorig_card_check import check
@@ -96,7 +96,7 @@ class ShortCards(unittest.TestCase):
         contract = autorig_contract.Contract(platform_contract.require())
         quote = contract.fixture('quote/auto_rig-v3.json')
         self.assertEqual(set(quote), {'quote_id','credits','expires_at','experimental_notice'})
-        self.assertIn(quote['experimental_notice'], (PLATFORM_NOTICE, rig_text.QUOTE))
+        self.assertIn(quote['experimental_notice'], PLATFORM_NOTICES + (rig_text.QUOTE,))
         self.assertEqual(cloud_account.approval_details(descriptor(), quote)['credits'],20)
 
     def test_plain_errors_keep_their_recovery_links(self):

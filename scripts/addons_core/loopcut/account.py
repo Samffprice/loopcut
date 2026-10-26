@@ -431,6 +431,17 @@ def keeps_context(base_url: str, model_id: str) -> bool:
         r.get("id") == model_id and r.get("keep_context") is True for r in (_state["models"] or []))
 
 
+def keeps_reasoning(base_url: str, model_id: str) -> bool | None:
+    """What the service's entry for this model says of keep_reasoning (its API wants the reply's reasoning_details
+    sent back unchanged in later steps of a tool-calling turn): True or False, or None when it says nothing."""
+    if base_url.rstrip("/") != BASE_URL:
+        return None
+    for r in _state["models"] or []:
+        if r.get("id") == model_id and isinstance(r.get("keep_reasoning"), bool):
+            return r["keep_reasoning"]
+    return None
+
+
 def model_label(model_id: str) -> str:
     model_id = LEGACY_MODELS.get(model_id, model_id)
     return next((m["label"] for m in models() if m["id"] == model_id), model_id)

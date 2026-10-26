@@ -1147,6 +1147,104 @@ class AwayCardTest(RestartBase):
         self.assertEqual(sorted(h['action'] for h in drawn['hits'] if h['action'][0] == 'cloud_back'),
                          [('cloud_back', (0, 0)), ('cloud_back', (0, 1))])
 
+    def test_the_previews_show_whole_in_one_compact_row_named_underneath(self):
+        """rel019-cloud2 (obs-0038): the previews were four 16:9 tiles to a row, each named on a strip over its lower
+        half, where the subject was: a dark band of background. Then three card-wide ones made the card 1,400 px
+        tall, its title out of view. Now one row of whole frames in their shape, each named under it, compact on a
+        wide panel, with the card's title and buttons on screen at the default panel size (327 px)."""
+        from loopcut.ui import layout, theme as T
+        box, prims, images = self.draw_previews([1920, 1080], 420)
+        inner = box['w'] - 2 * T.CARD_PAD
+        tile = (inner - 2 * 6) // 3
+        self.assertEqual([(p['w'], p['h']) for p in images], [(tile, round(tile * 9 / 16))] * 3, 'whole, in a row')
+        self.assertEqual(len({p['y'] for p in images}), 1, 'one row')
+        self.assertEqual([p['x'] for p in images], [box['x'] + T.CARD_PAD + k * (tile + 6) for k in range(3)])
+        self.assertFalse([p for p in prims if p['id'].endswith('.strip')], 'nothing drawn over a frame')
+        for k, (image, words) in enumerate(zip(images, ('Frame 1', 'Frame 60', 'Frame 120'))):
+            label = next(p for p in prims if p['id'] == f'item1.back.frame{k}.label')
+            self.assertEqual((label['text'], label['x']), (words, image['x']))
+            self.assertGreaterEqual(label['y'], image['y'] + image['h'], 'named underneath')
+        _, _, wide = self.draw_previews([1920, 1080], 900)
+        self.assertEqual({(p['w'], p['h']) for p in wide}, {(round(layout.PREVIEW_MAX_H * 16 / 9), layout.PREVIEW_MAX_H)},
+                         'compact on a wide panel')
+        _, _, portrait = self.draw_previews([1080, 1920], 420)
+        self.assertEqual({(p['w'], p['h']) for p in portrait},
+                         {(round(layout.PREVIEW_MAX_H * 1080 / 1920), layout.PREVIEW_MAX_H)}, 'its shape')
+        box, prims, images = self.draw_previews([1920, 1080], 327, 600)
+        self.assertEqual(len(images), 3)
+        self.assertIn('Your cloud render finished', [p.get('text') for p in prims if p['id'].startswith('item1.back.title')])
+        self.assertGreaterEqual(box['y'], 40, 'its title is not scrolled away')
+        self.assertTrue([p for p in prims if p['id'] == 'item1.back.a0'], 'its buttons are on screen')
+
+    def test_a_panel_too_narrow_for_readable_tiles_shows_the_middle_preview_at_the_cards_width(self):
+        from loopcut.ui import layout, theme as T
+        box, prims, images = self.draw_previews([1920, 1080], 180)
+        inner = box['w'] - 2 * T.CARD_PAD
+        self.assertLess((inner - 2 * 6) // 3, layout.PREVIEW_MIN_W)
+        [image] = images
+        self.assertEqual((image['id'], image['path'], image['w'], image['h']),
+                         ('item1.back.frame1', '/tmp/b.png', inner, round(inner * 9 / 16)))
+        self.assertEqual(next(p for p in prims if p['id'] == 'item1.back.frame1.label')['text'], 'Frame 60')
+        self.assertFalse([p for p in prims if p['id'] in ('item1.back.frame0.label', 'item1.back.frame2.label')])
+        _, _, [tall] = self.draw_previews([1080, 1920], 180)
+        self.assertEqual((tall['w'], tall['h']), (round(220 * 1080 / 1920), 220), 'at most 220 px tall')
+
+    def draw_previews(self, resolution, width, height=900):
+        """A finished render's card with three previews (frames 1, 60 and 120) after the user's line, drawn at a
+        panel width: (the card's box, every prim, its images)."""
+        from loopcut.ui import layout
+        frames = [{'type': 'render_frames', 'name': f'f{i}', 'mime': 'image/png', 'meta': {'frame': i}} for i in (1, 2, 3)]
+        previews = [{'type': 'image', 'name': f'p{i}.jpg', 'mime': 'image/jpeg', 'meta': {'frame': i, 'preview': True}}
+                    for i in (1, 60, 120)]
+        saved = self.render({'status': 'succeeded', 'outputs': frames + previews, 'credits': {'charged': 5},
+                             'created_at': '2026-10-26T11:13:09Z', 'finished_at': '2026-10-26T11:14:38Z'})
+        saved['resolution'] = resolution
+        card = cloud_restore.card(saved, away=False)
+        card['thumbnails'] = ['/tmp/a.png', '/tmp/b.png', '/tmp/c.png']
+        session = state.new_session()
+        session['items'] = [state.item_user('render it in the cloud'), card]
+        prims = layout.build(session, width, height, 1.0, lambda font, size, text: len(text) * size * 0.6, 'fast',
+                             None, {'selection': [], 'context_budget': 24_000, 'account': None})['prims']
+        box = next(p for p in prims if p['id'] == 'item1.back.card')
+        return box, prims, [p for p in prims if p['t'] == 'image']
+
+    def test_background_jobs_lists_a_finished_job_not_loaded_yet_with_the_cards_load(self):
+        """rel019-cloud2: the render's running row went at its end, and Background jobs said "No background jobs
+        yet" beside a finished render whose frames were not in the file. It is a Ready row now, whose Load is the
+        card's, and it goes once they are in."""
+        from loopcut.ui import layout
+        session = state.session()
+        session['items'].append(state.item_user('render it'))
+        job = self.recorded_render()
+        saved = self.render({**job, 'credits': {'charged': 5}})
+        saved.update(id=job['id'], conversation=session['id'], title='Cloud rendering', previews=[], applied=False)
+        card = cloud_restore.card(saved, away=False)
+        session['items'].append(card)
+
+        def jobs():
+            display = layout.build(session, 420, 700, 1.0, lambda font, size, text: len(text) * size * 0.6, 'fast',
+                                   None, {'selection': [], 'context_budget': 24_000, 'account': None, 'view': 'jobs',
+                                          'jobs': [], 'cloud_jobs': [], 'local_processes': [], 'left_running': []})
+            return display, ' '.join(p['text'] for p in display['prims'] if p['t'] == 'text')
+        display, text = jobs()
+        self.assertIn('Ready · Cloud rendering', text)
+        self.assertIn('3 frames · 4K', text)
+        self.assertNotIn('No background jobs yet', text)
+        load = next(h for h in display['hits'] if h['id'] == f"ready.{job['id']}.load")
+        self.assertEqual(load['action'], ('cloud_back', (1, [a['do'] for a in card['actions']].index('load'))))
+        applies = []
+
+        def job_status(arguments, here=False):  # job_status's apply, as the card's Load does it (cloud_restore.load).
+            applies.append(arguments['job_id'])
+            return tools.ToolResult('Loaded frames in the sequencer.')
+        self.replace(cloud, '_job_status', job_status)
+        cloud_restore.act(session, *load['action'][1])
+        self.assertEqual(applies, [job['id']])
+        self.assertEqual(card['resolved'], 'Loaded 3 frames and the MP4 in the Video Sequencer.')
+        display, text = jobs()
+        self.assertNotIn('Ready ·', text, 'gone once loaded')
+        self.assertIn('No background jobs yet', text)
+
 
 class LiveFinishedCardTest(RestartBase):
     """rel019-cloud (2026-10-26): a long render followed here finished while its chat was open, and its progress row
@@ -1261,6 +1359,66 @@ class LiveFinishedCardTest(RestartBase):
         self.wait_card(card)
         self.assertTrue(self.execute('job_status', {'job_id': handle}).ok)
         self.assertEqual(self.applied, [handle])
+
+    def opener(self):
+        opened = []
+        self.fake.ops = types.SimpleNamespace(wm=types.SimpleNamespace(
+            path_open=lambda filepath: opened.append(filepath) or {'FINISHED'}))
+        return opened
+
+    def test_open_the_mp4_loads_the_frames_and_opens_it_in_one_click_and_says_where_it_opened(self):
+        """rel019-cloud2: the first click loaded the frames and opened QuickTime behind Blender (11:16:02, the MP4's
+        own write time), so the tester saw nothing happen and clicked again. The click now says where it went."""
+        handle, session = self.start_recorded(seconds=30)
+        self.as_render(session, handle)
+        rendered = cloud_jobs._download
+
+        def download(client, job, cancel):  # The render's animation.mp4 beside its frames (contract 0.10).
+            result = rendered(client, job, cancel)
+            folder = Path(tempfile.mkdtemp(prefix='mp4-', dir=self.directory.name))
+            (folder / 'animation.mp4').write_bytes(b'mp4')
+            result['outputs'].append({'name': 'animation.mp4', 'type': 'video', 'mime': 'video/mp4', 'meta': {},
+                                      'sha256': '0' * 64, 'size': 3, 'path': str(folder / 'animation.mp4')})
+            return result
+        self.replace(cloud_jobs, '_download', download)
+        strips = AwayCardTest.fake_sequencer(self)
+        self.replace(cloud_jobs, '_load_frames', self.original_load_frames)
+        opened = self.opener()
+        mock = self.service.transport.state
+        mock.job_seconds = time.monotonic() - mock.jobs[handle]['started'] + .5
+        [card] = self.wait_cards(session)
+        cloud._jobs[handle]['descriptor'] = {**cloud._jobs[handle]['descriptor'], 'apply': 'load_frames'}
+        state.ui.pop('action_notice', None)
+        self.addCleanup(state.ui.pop, 'action_notice', None)
+        self.press(session, card, 'Open the MP4')
+        folder = Path(self.directory.name) / 'renders' / ('cloud-' + handle.removeprefix('job_')[:12])
+        self.assertEqual(opened, [str(folder / 'animation.mp4')], 'one click: loaded, then opened')
+        self.assertEqual([s.kind for s in strips], ['IMAGE', 'MOVIE'])
+        self.assertEqual((card['resolved'], card['error'], card.get('busy')),
+                         ('Loaded 3 frames and the MP4 in the Video Sequencer.', '', ''))
+        self.assertEqual(state.ui['action_notice']['text'], 'Opened animation.mp4 in your default app (outside Blender).')
+        self.assertNotIn('open', card)
+
+    def test_a_load_that_job_status_finished_while_the_card_waited_still_opens_the_mp4(self):
+        """Open the MP4 on a card whose job is still being fetched waits (busy); when the model's job_status loads it
+        first (applied clears busy), the click's open still happens once the wait ends (_again)."""
+        session = state.session()
+        saved = {'id': 'job_0123456789abcdef', 'tool': 'render', 'title': 'Render scene', 'frames': 3,
+                 'resolution': [1920, 1080], 'blend': self.data.filepath, 'scene': 'Scene', 'status': 'succeeded',
+                 'video': True, 'frames_done': 3}
+        card = cloud_restore.card(saved, away=True)
+        session['items'].append(card)
+        video = Path(self.directory.name) / 'animation.mp4'
+        video.write_bytes(b'mp4')
+        self.replace(cloud_jobs, 'kept_video', lambda job_id: video)
+        opened = self.opener()
+        card.update(open=True, busy='')  # The click asked to open; job_status's apply cleared busy (applied).
+        card['resolved'] = cloud_restore._loaded(card)
+        cloud_restore._again(session['id'], saved['id'], False)
+        self.assertEqual(opened, [str(video)])
+        self.assertNotIn('open', card)
+        cloud_restore._again(session['id'], saved['id'], False)
+        self.assertEqual(len(opened), 1, 'once')
 
     def test_a_failed_job_says_so_once(self):
         handle, session = self.start_recorded(seconds=30)

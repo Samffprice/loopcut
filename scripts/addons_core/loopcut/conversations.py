@@ -6,7 +6,8 @@ file it has worked in (Save As and checkpoint restores add to the list); opening
 resumes the most recent conversation for it.
 
 Layout, per conversation id:  conversations/<id>/conversation.json, meta.json, images/<sha>.png
-(every stored image is named .png, but most hold JPEG, image_budget.compact: media_type reads the bytes)
+(every stored image is named .png, but most hold JPEG, image_budget.compact: media_type reads the bytes),
+results/r<n>.json (the whole of each tool result the model was shown cut short: result_store)
 Viewport captures are stored once as files and referenced from messages as `loopcut-image:<name>`;
 inline base64 would make every save rewrite megabytes. wire_messages() expands them per request.
 """
@@ -20,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import checkpoints, context, image_budget, state
+from . import checkpoints, context, image_budget, llm, result_store, state
 
 IMAGE_SCHEME = "loopcut-image:"
 CLOSED_MESSAGE = "Blender was closed before this turn finished."  # load's card for a turn that never ended.
@@ -37,7 +38,7 @@ _ROLES = {"user", "assistant", "tool"}
 # missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
 _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
-              "mode", "codex_thread", "spend", "asset_picks", "between_turns", "cloud_jobs")
+              "mode", "codex_thread", "spend", "asset_picks", "between_turns", "cloud_jobs", "implied")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 # This Blender's mark ("turn_running") on a chat saved while its turn runs (save), left out by that turn's last save.
 # Another Blender's mark on load: the turn never reached its end (Blender quit, crashed or was killed mid-turn).
@@ -59,6 +60,12 @@ def _folder(conversation_id: str) -> Path:
     if not _ID.match(conversation_id):
         raise ConversationError(f"Bad conversation id {conversation_id!r}")
     return FOLDERS.get(conversation_id) or root() / conversation_id
+
+
+def results_folder(session: dict) -> Path:
+    """Where the conversation keeps tool results the model was shown cut short (result_store): beside its
+    conversation.json, so they outlive a restart and go with it; a worker's in its job folder (FOLDERS)."""
+    return _folder(session["id"]) / result_store.FOLDER
 
 
 def project_key(filepath: str) -> str:
@@ -88,12 +95,14 @@ def save(session: dict, *, running: bool = False) -> None:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
         body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED
-                if key not in ("spend", "asset_picks", "cloud_jobs")}
+                if key not in ("spend", "asset_picks", "cloud_jobs", "implied")}
         from . import asset_picks, cloud_restore, spending
         with spending.lock:
             body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
         body["asset_picks"] = asset_picks.snapshot(session)  # Search results' numbers still import after a reload.
         body["cloud_jobs"] = cloud_restore.snapshot(session)  # Its long cloud jobs, picked up when it opens again.
+        with spending.lock:
+            body["implied"] = spending.implied_rows(session.get("implied"))  # Undone means no, after a reopen too.
         body["items"] = items
         if running or session.get("busy"):  # Read under the lock: the turn's last save is written after any of these.
             body["turn_running"] = _LAUNCH
@@ -256,6 +265,8 @@ def _validate(body) -> dict:
     if "cloud_jobs" in body:
         from . import cloud_restore
         body["cloud_jobs"] = cloud_restore.restored(body["cloud_jobs"])  # Damaged records go, never the chat.
+    if "implied" in body:
+        body["implied"] = spending.implied_rows(body["implied"])  # Likewise.
     return body
 
 
@@ -441,13 +452,19 @@ def image_path(conversation_id: str, reference: str) -> Path:
 
 
 def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = frozenset(), keep: bool = False,
-                  *, full_refs: dict | None = None) -> list:
+                  *, full_refs: dict | None = None, reasoning_model: str = "") -> list:
     """Messages as the API wants them: stored image references become data URIs, and only the
     images context.kept_images names are sent; the conversation on disk keeps them all. Workspace
-    full_refs substitutes the larger attached copies on the wire, retaining the stored refs for pinning."""
+    full_refs substitutes the larger attached copies on the wire, retaining the stored refs for pinning.
+    reasoning_details / reasoning_content go only to reasoning_model (the current model when it keeps its reasoning, else ""): those
+    stored from another model, or sent to one without the switch, are left out, for a provider may reject the field;
+    so is the reasoning of earlier turns (Moonshot keeps it for the tool calls of a turn, and a new turn already
+    rewrites the earlier one into records, so the cache loses nothing more). The stored list is passed as it is,
+    never rebuilt, so every request serialises it the same."""
     kept = context.kept_messages(messages, unpinned, keep)
+    current = context.turn_start(messages)
     wired = []
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message.get("content")
         if isinstance(content, list):
             parts = []
@@ -469,5 +486,7 @@ def wire_messages(conversation_id: str, messages: list, unpinned: frozenset = fr
                         part = {"type": "text", "text": "[image no longer available]"}
                 parts.append(part)
             message = message | {"content": parts}
-        wired.append({key: value for key, value in message.items() if not key.startswith(PRIVATE_PREFIX)})
+        stale = index < current or message.get(llm.REASONING_MODEL) != reasoning_model
+        wired.append({key: value for key, value in message.items()
+                      if not key.startswith(PRIVATE_PREFIX) and not (stale and key in llm.REASONING_FIELDS)})
     return wired

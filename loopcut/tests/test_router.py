@@ -121,6 +121,62 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(router.parse('{"level": 1, "deliverables": ["Chair"]}').deliverables, [])
 
 
+class PurposeTest(unittest.TestCase):
+    """What the work is for (cloud-tools-implicit-use section 1): the router's purpose and calls_for (0.2.20+)."""
+
+    def test_valid_fields_are_kept_and_the_purpose_trimmed_to_eight_words(self):
+        decision = router.parse(json.dumps({"level": 3, "deliverables": ["Forest"], "purpose": "  horror game trailer. ",
+                                            "calls_for": ["sound", "render"]}))
+        self.assertEqual((decision.purpose, decision.calls_for), ("horror game trailer", ["sound", "render"]))
+        long = router.parse(json.dumps({"level": 1, "purpose": "a backdrop for my twitch stream with my vtuber "
+                                        "model sitting in front", "calls_for": []}))
+        self.assertEqual(long.purpose, "a backdrop for my twitch stream with my")
+        self.assertEqual(len(long.purpose.split()), router.MAX_PURPOSE)
+
+    def test_unknown_calls_for_are_dropped_and_a_bad_purpose_is_none(self):
+        decision = router.parse(json.dumps({"level": 2, "purpose": None, "calls_for": [
+            "sound", "music", "SOUND", " Rig ", 3, None, "game_ready", "custom_model", "custom_image", "voice",
+            "motion", "render", "upsell"]}))
+        self.assertEqual(decision.purpose, "")
+        self.assertEqual(decision.calls_for, ["sound", "rig", "game_ready", "custom_model", "custom_image", "voice",
+                                              "motion", "render"])
+        for purpose, calls_for in ((42, "sound"), (["trailer"], {"sound": True}), ("", None)):
+            decision = router.parse(json.dumps({"level": 1, "purpose": purpose, "calls_for": calls_for}))
+            self.assertEqual((decision.purpose, decision.calls_for), ("", []))
+
+    def test_the_routing_note_gets_one_purpose_line(self):
+        decision = router.Decision(1, purpose="horror game trailer", calls_for=["sound", "render"])
+        self.assertEqual(router.note(decision), "<routing>level 1 — a small edit: do it yourself.\nPurpose: horror "
+                         "game trailer. A finished one usually also has: ambience or sound effects, a camera move "
+                         "ready to render.</routing>")
+        self.assertEqual(router.purpose_line(router.Decision(1, purpose="a typewriter for my desk")),
+                         "Purpose: a typewriter for my desk.", "a purpose without finishes")
+        self.assertEqual(router.purpose_line(router.Decision(1, calls_for=["sound"])), "", "no purpose, no line")
+        phrases = [router.purpose_line(router.Decision(1, purpose="p", calls_for=[key])).split(": ")[-1]
+                   for key in router.CALLS_FOR]
+        self.assertEqual(phrases, ["ambience or sound effects.", "a voice line.", "character motion.", "a rig.",
+                                   "a game-ready mesh within a triangle budget.", "a made picture turned into 3D.",
+                                   "a made picture.", "a camera move ready to render."])
+
+    def test_old_json_without_the_fields_routes_as_before(self):
+        decision = router.parse(LEVEL_3)
+        self.assertEqual((decision.purpose, decision.calls_for), ("", []))
+        self.assertNotIn("Purpose:", router.note(decision))
+        self.assertNotIn("purpose", decision.record())
+        self.assertNotIn("calls_for", decision.record())
+        old = {"turn": 2, "level": 3, "source": "model", "why": "", "deliverables": [["Armchair", "", "modeling"]]}
+        self.assertEqual(router.Decision.from_record(old).calls_for, [], "a record from before 0.2.20")
+
+    def test_the_fields_survive_the_record_a_resumed_turn_reads(self):
+        session, turn = session_with(CORNER), a_turn()
+        reply = json.dumps({"level": 1, "why": "x", "purpose": "horror game trailer", "calls_for": ["sound"]})
+        router.start_turn(session, turn, CFG, lambda: False, FakeModel(reply))
+        self.assertTrue(session["messages"][-1]["content"].endswith(
+            "\nPurpose: horror game trailer. A finished one usually also has: ambience or sound effects.</routing>"))
+        again = router.Decision.from_record(session["routing"])
+        self.assertEqual((again.purpose, again.calls_for), ("horror game trailer", ["sound"]))
+
+
 class NoteTest(unittest.TestCase):
     def test_level_3_names_the_deliverables_with_the_users_words(self):
         text = router.note(router.parse(LEVEL_3))

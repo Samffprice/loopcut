@@ -685,7 +685,7 @@ class AgentLoopTest(Base):
         for patcher in (index_patch(), *(mock.patch.object(agent, name, value) for name, value in (
                 ("_scene_snapshot", lambda: None), ("_addons_line", lambda: ""), ("_project_roots", lambda: ()),
                 ("_alike_on_main", lambda a, b: False), ("_update_account", lambda info: None),
-                ("_keeps_context", lambda cfg: False), ("_redraw", lambda: None), ("_tool_schemas", lambda: TOOLS),
+                ("_keeps_context", lambda cfg: False), ("_keeps_reasoning", lambda cfg: None), ("_redraw", lambda: None), ("_tool_schemas", lambda: TOOLS),
                 ("_changes_scene", lambda name, arguments="": name == "run_python")))):
             patcher.start()
             self.addCleanup(patcher.stop)

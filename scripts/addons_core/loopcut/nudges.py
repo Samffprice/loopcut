@@ -18,6 +18,7 @@ State lives in <data root>/nudges.json: timestamps and keys only, never content.
 """
 
 import json
+import math
 import threading
 import time
 from datetime import datetime
@@ -161,9 +162,17 @@ def locked_tool_card(tool: dict, balance=None) -> dict:
                             + own_key + [_not_now()])
 
 
-def model_note(tool: dict) -> str:
-    """What the model is told after offer_tool, so its reply matches the card instead of repeating it."""
-    need = {"sign_in": "a free Loopcut account", "plan": "a paid Loopcut plan"}.get(tool["why"], "Loopcut credits")
+def model_note(tool: dict, balance=None) -> str:
+    """What a locked tool needs, as a plain fact the model can say as it is, as a paid call's refusal says it: "Image
+    to 3D needs about 80 credits; you have 15." balance: the account's, in offer_tool's result only; offer_schema
+    says the price alone. rel019-lowcredit: "Locked … Image to 3D" became "photo-to-3D isn't available in this
+    session", right after the free Try it had made a model from a photo."""
+    why, credits = tool.get("why"), tool.get("credits")
+    if why == "credits" and type(credits) is int and credits > 0:
+        have = (f"; you have {math.floor(balance):,}" if type(balance) in (int, float) and math.isfinite(balance)
+                and balance >= 0 else "")
+        return f"{tool['title']} needs about {credits:,} credits{have}."
+    need = {"sign_in": "a free Loopcut account", "plan": "a paid Loopcut plan"}.get(why, "Loopcut credits")
     return f"{tool['title']} needs {need}."
 
 
@@ -173,7 +182,7 @@ def offer_locked(session: dict, tool: dict, balance=None) -> str:
     gets the out-of-credits pop-up instead (credits_item): its Get credits led to a page that plan cannot buy on.
     The card or pop-up and a refusal's pop-up (agent._Consent._paywall) never both show for a tool in one turn."""
     offered = session.setdefault("offered_tools", [])
-    note = model_note(tool)
+    note = model_note(tool, balance)
     turn = session.get("turn")
     this_turn = tool["name"] in (getattr(turn, "credit_offers", None) or ())
     if tool["name"] in offered or this_turn or not may_show("locked_tool"):
@@ -267,7 +276,7 @@ def chip_needs(text: str, attachments, references=(), preparing=()) -> str:
 
 # Photo→3D without a picture of the user's own (owner, 2026-10-25): Loopcut offers to make one first. Two paid
 # steps, never one approval for both (it surprised a persona that day): the picture runs as any paid call does, and
-# the 3D waits for the user's own click on the picture's card (agent.turn_into_3d, spending.MADE).
+# the 3D waits for the user's own click on the picture's card (agent.turn_into_3d).
 def _about(prices, name) -> str:
     cost = (prices or {}).get(name)
     return f"about {cost:g} credits ({dollars(cost)})" if cost else ""

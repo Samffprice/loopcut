@@ -179,9 +179,31 @@ class SceneDiffTest(unittest.TestCase):
                          ["6003 objects (+3); too many to compare one by one"])
 
     def test_long_diffs_are_capped(self):
-        after = scene({f"Cube.{i:03}": cube() for i in range(100)})
-        text = scene_diff.for_model(scene_diff.diff(scene({}), after))
-        self.assertIn("... and 60 more", text)
+        after = scene({f"Cube.{i:03}": cube() for i in range(200)})
+        changes = scene_diff.diff(scene({}), after)
+        self.assertIn("... and 50 more", scene_diff.for_model(changes), "the model's, whose store keeps them")
+        self.assertEqual(scene_diff.lines(changes)[-1], "... and 160 more", "the changes card's")
+
+    def test_compact_reads_the_lines_diff_writes(self):
+        """What a rig's turn and a pipe run produce, as the model is shown them (result_store): a change the
+        objects share is one line with their bounds in one box; copies of one name added are one line."""
+        parts = {f"Arm.{i:03}": cube(bounds=((i, 0, 0), (i + 0.5, 1, 2))) for i in range(6)}
+        turned = {name: {**entry, "rotation_deg": (0, 0, 90), "bounds": (entry["bounds"][0], (i + 0.5, 2, 1))}
+                  for i, (name, entry) in enumerate(parts.items())}
+        pipes = {f"Pipe{'.%03d' % i if i else ''}": cube(type="CURVE", bounds=((0, i, 0), (1, i + 0.5, 1)))
+                 for i in range(4)}
+        before = scene({**parts, "Lamp": cube(type="LIGHT")})
+        after = scene({**turned, **pipes, "Lamp": cube(type="LIGHT", location=(0, 0, 3))})
+        shown, left, kinds = scene_diff.compact(scene_diff.lines(scene_diff.diff(before, after)), 2000)
+        self.assertEqual(shown, [
+            "+ 4 curve objects (Pipe … Pipe.003) at [0.0, 0.0, 0.0]..[1.0, 3.5, 1.0] together",
+            "~ 6 objects (Arm.000, Arm.001, Arm.002 and 3 more): rotation_deg (0, 0, 0) -> (0, 0, 90); "
+            "bounds now within [0.0, 0.0, 0.0]..[5.5, 2.0, 1.0]",
+            "~ Lamp: location (0, 0, 0) -> (0, 0, 3)"])
+        self.assertEqual((left, kinds), (0, ""))
+        shown, left, kinds = scene_diff.compact(scene_diff.lines(scene_diff.diff(before, after)), 100)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual((left, kinds), (2, "changed 7 (rotation_deg, bounds, location)"))
 
     def test_diff_does_not_mutate_its_inputs(self):
         before, after = scene(), scene({"Cube": cube(location=(1, 0, 0))})

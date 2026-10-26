@@ -13037,7 +13037,15 @@ true,
 ],
 [
 "label",
-"Loopcut never uploads your .blend."
+"Except for a cloud render, which sends a copy"
+],
+[
+"label",
+""
+],
+[
+"label",
+"of the scene and its files."
 ],
 [
 "prop",
@@ -13279,7 +13287,15 @@ true,
 ],
 [
 "label",
-"Loopcut never uploads your .blend."
+"Except for a cloud render, which sends a copy"
+],
+[
+"label",
+""
+],
+[
+"label",
+"of the scene and its files."
 ],
 [
 "prop",
@@ -13565,7 +13581,17 @@ true,
 ],
 [
 "label",
-"Loopcut never uploads your .blend.",
+"Except for a cloud render, which sends a copy",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"of the scene and its files.",
 "(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
 "{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
 ],
@@ -13863,7 +13889,17 @@ true,
 ],
 [
 "label",
-"Loopcut never uploads your .blend.",
+"Except for a cloud render, which sends a copy",
+"(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
+"{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
+],
+[
+"label",
+""
+],
+[
+"label",
+"of the scene and its files.",
 "(0.611764705882353, 0.611764705882353, 0.6392156862745098)",
 "{'scale': 1.0, 'bold': False, 'tight': True, 'center': False, 'code': False}"
 ],

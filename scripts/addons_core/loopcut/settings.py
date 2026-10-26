@@ -4,7 +4,6 @@ config.py reads these through values(); the API key itself is kept by credential
 Blender's preferences file.
 """
 
-import json
 import os
 import sys
 import urllib.error
@@ -43,6 +42,13 @@ PROVIDERS = (
      "Private (A): Anthropic does not train on API inputs or outputs and deletes them within 30 days. Requests "
      "go from this computer to Anthropic with your key; the context repeated on every step is cached, which "
      "makes it much cheaper."),
+    # Appended, so the stored enum values of the rows above stay what they were.
+    ("GEMINI", "Google Gemini (API key)", "https://generativelanguage.googleapis.com/v1beta/openai", "",
+     "Use a key from Google AI Studio; usage is billed per token to that key, not to a Google AI Pro or Ultra "
+     "subscription. Google may train on prompts sent with a free-tier key. Press Fetch models to pick one."),
+    ("KIMI", "Kimi Code (your membership)", "https://api.kimi.ai/coding/v1", "kimi-for-coding",
+     "Paste the API key from your Kimi Code console; it uses your own membership quota, and Kimi's rules apply to "
+     "your account. In China use Custom with https://api.kimi.com/coding/v1."),
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
@@ -92,6 +98,7 @@ def draw_spending(layout, prefs) -> None:
     box = layout.box()
     box.label(text="Spending", icon="FUND")
     column = box.column()
+    column.prop(prefs, "extras_mode")
     column.prop(prefs, "ask_above_credits")
     column.prop(prefs, "chat_budget_credits")
     flags = box.column()
@@ -198,6 +205,13 @@ def config_changed() -> None:
     _changed()
 
 
+def _connection_changed(self=None, context=None) -> None:
+    """The base URL or the model changed: on an own key, check it once the changes settle (own_key_ui.py)."""
+    _changed()
+    from . import own_key_ui
+    own_key_ui.request()
+
+
 def _provider_changed(self, context) -> None:
     if self.provider != "LOOPCUT":
         from . import state
@@ -209,6 +223,8 @@ def _provider_changed(self, context) -> None:
         self.base_url, self.model = base_url, model
     _models.clear()
     _changed()
+    from . import own_key_ui
+    own_key_ui.request()
 
 
 def listed_models(provider: str = "") -> list[str]:
@@ -278,6 +294,8 @@ def _set_key(self, value: str) -> None:
     except OSError as ex:
         print(f"Loopcut: could not save the API key: {ex}")
     _changed()
+    from . import own_key_ui
+    own_key_ui.request()  # A saved key is checked once the changes settle (own_key_ui.py).
 
 
 class LoopcutPreferences(bpy.types.AddonPreferences):
@@ -295,12 +313,12 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         name="Model", default="fast", update=_tier_changed,
         description="Which Loopcut model answers; the menu says how much usage each takes against the default")
     base_url: bpy.props.StringProperty(
-        name="Base URL", default=PROVIDERS[0][2], update=_changed,
+        name="Base URL", default=PROVIDERS[0][2], update=_connection_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
     api_key: bpy.props.StringProperty(
         name="API Key", subtype="PASSWORD", options={"SKIP_SAVE"}, get=_get_key, set=_set_key,
         description="Stored in Loopcut's own file in your Blender config folder, not in preferences")
-    model: bpy.props.StringProperty(name="Model", default=PROVIDERS[0][3], update=_changed,
+    model: bpy.props.StringProperty(name="Model", default=PROVIDERS[0][3], update=_connection_changed,
                                    description="Type your provider's model name, or use refresh and pick from the menu")
     reasoning_effort: bpy.props.EnumProperty(
         name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", "Slowest")],
@@ -315,8 +333,18 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         description="Run code and file changes without the Run / Reject step. Renders and bakes still ask, and "
                     "paid steps follow Spending. Every turn still gets a checkpoint you can restore")
     # Spending (spending.py, C47): when a paid step asks first.
+    # 100 since 0.2.20 (owner, 2026-10-26; was 25). Blender saves an add-on preference only once it is set, so a
+    # user who never changed it gets the new default and one who set their own value keeps it (test_settings).
+    # Paid extras (spending.py, owner 2026-10-26): set_extras saves what the user says in chat here too.
+    extras_mode: bpy.props.EnumProperty(
+        name="Paid extras", items=[
+            ("AUTO", "Use when it helps", "Loopcut uses paid tools when they make the result clearly better; steps "
+                                          "over Ask above still ask first"),
+            ("ASK", "Ask me first", "Every paid step asks first, whatever its price"),
+            ("ONLY_ASKED", "Only when I ask", "Paid tools run only when you ask for one")],
+        default="AUTO", update=_changed)
     ask_above_credits: bpy.props.IntProperty(
-        name="Ask above", default=25, min=0, max=100_000, update=_changed,
+        name="Ask above", default=100, min=0, max=100_000, update=_changed,
         description="Credits a single paid step may cost before it asks you first (the service may ask lower). "
                     "0 asks for every paid step")
     chat_budget_credits: bpy.props.IntProperty(
@@ -348,8 +376,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         name="Checkpoints (MB)", default=2048, min=1, max=1_000_000, update=_changed,
         description="Checkpoint storage per conversation. The oldest checkpoints expire first")
     dock_on_startup: bpy.props.BoolProperty(
-        name="Open the panel at startup", default=True,
-        description="Dock Loopcut at the right of the 3D viewport when Blender starts without it")
+        name="Open Loopcut with every file", default=True,
+        description="Dock Loopcut at the right of the 3D viewport when Blender starts or opens a file without it")
     blenderkit_key: bpy.props.StringProperty(
         name="BlenderKit API key", subtype="PASSWORD", options={"SKIP_SAVE"},
         get=_get_blenderkit_key, set=_set_blenderkit_key,
@@ -447,6 +475,8 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
             if listed_models(self.provider):
                 row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
+            from . import own_key_ui
+            own_key_ui.draw(column, self)  # What the check found, right under the key and the model.
         note = provider_note(self.provider)
         if note:
             lines = wrap(note, 90)
@@ -589,21 +619,16 @@ class LOOPCUT_OT_fetch_models(bpy.types.Operator):
             return {"CANCELLED"}
         if config.anthropic(prefs.base_url):
             return self._anthropic(prefs)
+        from . import own_key
         try:
             config._check_base_url(prefs.base_url, "Base URL")
-            request = urllib.request.Request(
-                f"{prefs.base_url.rstrip('/')}/models",
-                headers={"Authorization": f"Bearer {credentials.api_key(prefs.base_url)}", "Accept": "application/json"})
-            with urllib.request.urlopen(request, timeout=10) as response:
-                payload = json.loads(response.read(4_000_000))
+            found = own_key.list_models(prefs.base_url, credentials.api_key(prefs.base_url))
         except urllib.error.HTTPError as ex:
             self.report({"ERROR"}, f"The provider answered HTTP {ex.code}; check the key")
             return {"CANCELLED"}
         except (config.ConfigError, urllib.error.URLError, ValueError, TimeoutError) as ex:
             self.report({"ERROR"}, f"Could not list models: {ex}. Check the URL and key, then retry or type a model name.")
             return {"CANCELLED"}
-        rows = payload.get("data") if isinstance(payload, dict) else None
-        found = sorted({str(r["id"]) for r in rows or [] if isinstance(r, dict) and r.get("id")})
         if not found:
             self.report({"WARNING"}, "The provider listed no models; type the model name instead")
             return {"CANCELLED"}
@@ -867,9 +892,10 @@ def values() -> dict[str, str]:
         "LOOPCUT_CHECKPOINT_BUDGET_MB": str(prefs.checkpoint_budget_mb),
         "LOOPCUT_NO_GENERATION": "true" if prefs.no_generation else "false",
         "LOOPCUT_PRIVATE_MODE": "true" if prefs.private_mode else "false",
-        "LOOPCUT_ASK_ABOVE_CREDITS": str(getattr(prefs, "ask_above_credits", 25)),
+        "LOOPCUT_ASK_ABOVE_CREDITS": str(getattr(prefs, "ask_above_credits", 100)),
         "LOOPCUT_CHAT_BUDGET_CREDITS": str(getattr(prefs, "chat_budget_credits", 150)),
         "LOOPCUT_ASK_EVERY_PAID_CALL": "true" if getattr(prefs, "ask_every_paid_call", False) else "false",
+        "LOOPCUT_EXTRAS": str(getattr(prefs, "extras_mode", "AUTO")),
     }
     for key, _, _, _, first in VENDOR_ROWS:
         found[config.OWN_KEY_FIRST + key] = "true" if getattr(prefs, first, True) else "false"
@@ -946,14 +972,16 @@ _CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_ge
 
 
 def register() -> None:
-    from . import chatgpt_ui
+    from . import chatgpt_ui, own_key_ui
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
     chatgpt_ui.register()
+    own_key_ui.register()
 
 
 def unregister() -> None:
-    from . import chatgpt_ui
+    from . import chatgpt_ui, own_key_ui
+    own_key_ui.unregister()
     chatgpt_ui.unregister()
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)

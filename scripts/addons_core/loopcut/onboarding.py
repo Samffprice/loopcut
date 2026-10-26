@@ -605,11 +605,12 @@ def _headline(column, title: str, line: str = "") -> None:
 
 
 def _item(column, icon: str, label: str, detail: str = "", color=FOREGROUND, detail_color=MUTED) -> None:
-    """A row: an outline icon, a short label, and at most one muted line set close under the label."""
+    """A row: an outline icon, a short label, and a muted line set close under the label (a "\n" breaks a longer one
+    in two: labels don't wrap, and every line stays short)."""
     block = column.column(align=True)
     _text(_icon_row(block, _icon(icon)), label, color)
-    if detail:
-        _text(_icon_row(block), detail, detail_color, tight=True)
+    for line in detail.split("\n") if detail else ():
+        _text(_icon_row(block), line, detail_color, tight=True)
 
 
 def _icon_row(layout, icon: dict | None = None, center: bool = False):
@@ -776,6 +777,8 @@ def _draw_connect(layout, context) -> None:
         row.operator("loopcut.fetch_models", text="", icon="FILE_REFRESH")
         if settings.has_models():
             row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
+        from . import own_key_ui
+        own_key_ui.draw(group, prefs)  # The key's check (own_key.py), as in Preferences; it never holds Continue back.
     if not _connected():
         try:
             config.load()
@@ -1610,7 +1613,9 @@ def _draw_privacy(layout) -> None:
     group.separator(factor=ITEM_GAP)
     _item(group, "cloud", "Cloud tools send only what they need", "A picture, a mesh or a prompt.")
     group.separator(factor=ITEM_GAP)
-    _item(group, "computer", "Your files stay on your computer", "Loopcut never uploads your .blend.")
+    # A cloud render packs a copy of the open scene, with the files it uses, and sends it (cloud._upload_bundle).
+    _item(group, "computer", "Your files stay on your computer",
+          "Except for a cloud render, which sends a copy\nof the scene and its files.")  # Owner's words, 2026-10-26.
     column.separator(factor=CARD_GAP)
     group = _group(column)
     for n, (name, text, line) in enumerate((

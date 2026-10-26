@@ -836,6 +836,22 @@ class OnboardingTest(unittest.TestCase):
         labels = " ".join(r[1] for r in splash.records if r[0] == "label")
         self.assertIn("Anthropic (Claude)", labels)  # Where chats go, by name.
 
+    def test_own_key_screen_shows_the_keys_check_under_the_model_and_never_holds_continue_back(self):
+        own_key_ui = importlib.import_module(NAME + ".own_key_ui")
+        self.onboarding._state["own_key"] = True
+        self.prefs.provider, self.prefs.base_url, self.prefs.model = "OPENAI", "https://api.openai.com/v1", "gpt-x"
+        refused = "This key was refused by OpenAI. Check it or make a new one."
+        splash = Splash()
+        with patch.dict(own_key_ui._result, status="done", code="refused", text=refused,
+                        settings=own_key_ui._settings(self.prefs)), \
+                patch.object(self.onboarding.config, "load", return_value=object()), \
+                patch.object(self.onboarding, "_connected", return_value=True):
+            self.onboarding._draw_connect(splash, self.context)
+        props_and_labels = [r[1] for r in splash.records if r[0] in ("prop", "label")]
+        self.assertLess(props_and_labels.index("model"), props_and_labels.index(refused))
+        self.assertIn("loopcut.own_key_check", [r[1] for r in splash.operators()])
+        self.assertTrue(next(r for r in splash.operators() if r[2] == "Continue")[4].enabled)
+
     def test_privacy_screen_says_what_is_logged_and_shows_the_switch(self):
         """Proposal 015: the conversation is logged for every route, so the old "never sees the conversation" and
         "never the content" lines are gone, and the switch sits beside the usage-stats one."""
@@ -849,7 +865,11 @@ class OnboardingTest(unittest.TestCase):
                 labels = " ".join(r[1] for r in splash.records if r[0] == "label")
                 self.assertIn("What leaves your computer", labels)
                 self.assertIn("A picture, a mesh or a prompt.", labels)
-                self.assertIn("Loopcut never uploads your .blend.", labels)
+                # A cloud render sends a copy of the scene, as its card says ("Sent a copy of the scene for this
+                # render"): setup never says the .blend is never uploaded (rel019-cloud, 2026-10-26).
+                self.assertIn("Except for a cloud render, which sends a copy", labels)  # The owner's sentence, in two short lines.
+                self.assertIn("of the scene and its files.", labels)
+                self.assertNotIn("never uploads", labels)
                 self.assertNotIn("Never your .blend.", labels)  # Said once, in its own row.
                 self.assertNotIn("never sees the conversation", labels)
                 self.assertNotIn("never the content", labels)

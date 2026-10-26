@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (acceptance, agent, checkpoints, config, context, conversations, facts, llm, merge, ownership,
-               paint_stats, pricing, state, tools, workers)
+               paint_stats, pricing, result_store, state, tools, workers)
 
 FIRST_REPLY_WAIT = 90.0   # Seconds workers 2..N wait for worker 1's first reply before going anyway.
 POLL = 0.05
@@ -1047,13 +1047,15 @@ def reference_tile(session: dict, names: list) -> dict | None:
 
 
 def _copy_images(source: Path, folder: Path) -> None:
-    """An earlier thread's captures, so its image references still resolve in the new folder; a
-    thread whose folder was reaped just loses them ("[image no longer available]")."""
-    try:
-        if (source / "images").is_dir():
-            shutil.copytree(source / "images", folder / "images", dirs_exist_ok=True)
-    except OSError as ex:
-        print(f"Loopcut: could not carry a worker's images over: {ex}")
+    """An earlier thread's captures and stored results, so its image references and read_result ids still
+    resolve in the new folder; a thread whose folder was reaped just loses them ("[image no longer
+    available]", "No stored result")."""
+    for name in ("images", result_store.FOLDER):
+        try:
+            if (source / name).is_dir():
+                shutil.copytree(source / name, folder / name, dirs_exist_ok=True)
+        except OSError as ex:
+            print(f"Loopcut: could not carry a worker's {name} over: {ex}")
 
 
 def _created_names(worker: "Worker", merge_report=None) -> list[str]:

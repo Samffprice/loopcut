@@ -301,9 +301,11 @@ def charge_reporter():
     report(charged, text) with charged None when it is not known."""
     callback = getattr(_approval, "callback", None)
 
-    def report(charged, text=""):
+    def report(charged, text="", settled=None):
+        # settled: what a job kept with its conversation was charged, for its card alone; its record settles the
+        # chat's spend (cloud._settle_saved), so charged stays None and the ledger is not settled twice.
         if getattr(callback, "settles", False) is True:  # agent._Consent; a plain consent function is never sent charges.
-            callback({"charged": charged, "text": text})
+            callback({"charged": charged, "text": text, **({"settled": settled} if settled is not None else {})})
     return report
 
 
@@ -321,6 +323,13 @@ def confirm(details):
         accepted = not details["required"]
     if not accepted:
         raise cloud_http.CloudError("Cloud call was not approved; no job was submitted.", "approval_required")
+
+
+def ask_cancel(details):
+    """The model's cancel of a running paid job waits for the user's say on its call's card (agent._Consent): True
+    once they say cancel it. Nobody to ask is a no."""
+    callback = getattr(_approval, "callback", None)
+    return callback is not None and callback({"cancel_job": details}) is True
 
 
 def _check_cancel(cancel):
@@ -354,11 +363,9 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
 
 
 def authorize(module, descriptor, arguments, files, *, project, cancel, runtime, client, notice='', notice_first=False,
-              on_progress=None, offer=None, made_picture=None):
+              on_progress=None, offer=None):
     """Worker: resolve a runtime quote before consent, then forward its ID. offer: a long render's local time
-    (render_offer.prepare), which makes its card the choice between the cloud and this computer. made_picture:
-    image_to_3d's input is a picture Loopcut made (cloud_jobs.made_picture), so its card asks whatever the
-    thresholds (spending.MADE)."""
+    (render_offer.prepare), which makes its card the choice between the cloud and this computer."""
     _check_cancel(cancel)
     arguments = _Authorized(arguments)
     key = arguments.get('idempotency_key')
@@ -398,8 +405,6 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
     if offer and quote is not None:
         from . import render_offer
         details["render_offer"] = render_offer.choice(offer, quote)
-    if made_picture:
-        details["made_picture"] = made_picture
     _check_cancel(cancel)
     confirm(details)
     _check_cancel(cancel)

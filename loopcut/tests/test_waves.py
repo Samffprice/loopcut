@@ -2922,7 +2922,7 @@ class WaveTest(unittest.TestCase):
         self.assertIn("Every worker has reported.", late[0])
         self.assertTrue(session["items"][-1]["text"].endswith(
             "Checked: both rest on the rug.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
-            "Requirements (the user's words): 2 of 2 covered."), session["items"][-1]["text"])
+            "Requirements (your words): 2 of 2 covered."), session["items"][-1]["text"])
         self.assertIn("Helpers were still working when the agent replied",
                       " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
         self.assertEqual((session["jobs"][0]["bounces"], session["jobs"][0]["late_bounces"]), (0, 1),
@@ -2992,7 +2992,7 @@ class WaveTest(unittest.TestCase):
         self.assertIn("[armchair] Armchair · modeling · done", items[2]["output"])
         self.assertTrue(session["items"][-1]["text"].endswith(
             "The armchair is on the rug.\n\nVerified by Loopcut on this scene: 1 of 1 checks.\n"
-            "Requirements (the user's words): 1 of 1 covered."), session["items"][-1]["text"])
+            "Requirements (your words): 1 of 1 covered."), session["items"][-1]["text"])
         self.assertEqual([e["status"] for e in session["jobs"][0]["coverage"]], ["covered"], "the JobLog has it too")
         self.assertEqual(seen, [1, 1], "once after the merge, once at the finish gate")
         log = session["jobs"][0]

@@ -210,7 +210,7 @@ class TurnCreditsTest(unittest.TestCase):
     def test_a_turn_records_the_balance_difference_and_its_chat_part(self):
         turn = types.SimpleNamespace(first_item=0, outcome="completed", returned_submission=False)
         chat_credits.turn_start(self.session, turn)
-        self.assertEqual(turn.credits, {"before": 100, "header": None, "tools": 2})
+        self.assertEqual(turn.credits, {"before": 100, "header": None, "tools": 2, "jobs": []})
         self.session["turn"] = turn
         chat_credits.note_balance({"credits_balance": 100})
         chat_credits.note_balance({"credits_balance": 99})  # A later reply in the same turn: not its start.
@@ -228,6 +228,42 @@ class TurnCreditsTest(unittest.TestCase):
         reply.update(turn_credits=0.3, turn_stopped=True)
         self.assertEqual(chat_credits.turn_line(reply), "Stopped · <1 credit")
         self.assertEqual(chat_credits.turn_line({"text": "old"}), "")
+
+    def test_a_running_jobs_hold_shows_as_held_until_it_settles_to_its_charge(self):
+        """rel019-cloud2 (2026-10-26): "Done · 29 credits" under the reply while the render's card said 5 charged;
+        the balance read 71 until the job settled, then 95."""
+        from loopcut import cloud_restore, spending
+        self.session.update(id="c" * 32, spend=spending.new_ledger())
+        turn = types.SimpleNamespace(first_item=0, outcome="completed", returned_submission=False)
+        chat_credits.turn_start(self.session, turn)
+        self.session["turn"] = turn
+        chat_credits.note_balance({"credits_balance": 100})
+        reply = state.item_assistant()
+        reply.update(text="The cloud render is running; you can close your laptop.", streaming=False)
+        self.session["items"] = [state.item_user("render a 5 second video in the cloud"), reply]
+        with spending.lock:  # The render's quote, held as its call ran (agent._Consent).
+            spending.start(spending.ledger(self.session), {"credits": 29}, False)
+        row = {"id": "job_render", "conversation": self.session["id"], "held": 29, "auto": False, "settled": False,
+               "status": "running", "fingerprint": "", "key": ""}
+        self.session["cloud_jobs"] = [row]
+        with patch.object(chat_credits.threading, "Thread"):
+            chat_credits.turn_end(self.session, turn)
+        with patch("loopcut.conversations.save"):
+            chat_credits.record(self.session, reply, turn.credits, False, after=71)
+        self.assertEqual(chat_credits.turn_line(reply, self.session), "Done · 29 held")
+        self.assertEqual(chat_credits.chat_line(self.session), "This chat: 29 held")
+        self.assertEqual(chat_credits.chat_total(self.session), 0)
+        # The job settles: 5 charged, 24 returned.
+        job = {"id": "job_render", "status": "succeeded", "credits": {"reserved": 29, "charged": 5, "refunded": 24},
+               "outputs": []}
+        with patch("loopcut.conversations.save"):
+            cloud_restore.settle(dict(row), job)
+        self.assertEqual(chat_credits.turn_line(reply, self.session), "Done · 5 credits")
+        self.assertEqual(chat_credits.chat_line(self.session), "This chat: 5 credits")
+        self.assertEqual(chat_credits.chat_total(self.session), 5)
+        self.assertEqual(reply["chat_credits"], 0, "the AI part of the turn")
+        # A caller without the chat's job records: its hold, as the balance had it.
+        self.assertEqual(chat_credits.turn_line(reply), "Done · 29 credits")
 
     def test_the_start_prefers_the_manifests_fraction_when_the_header_agrees(self):
         self.assertEqual(chat_credits._start({"header": 100, "before": 99.5}), 99.5)

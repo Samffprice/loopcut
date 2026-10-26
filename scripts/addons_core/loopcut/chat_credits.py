@@ -254,7 +254,7 @@ def turn_start(session: dict, turn) -> None:
         from . import spending
         with spending.lock:
             tools = spending.ledger(session).get("credits", 0)
-        turn.credits = {"before": balance(account), "header": None, "tools": tools}
+        turn.credits = {"before": balance(account), "header": None, "tools": tools, "jobs": _job_ids(session)}
     except Exception as ex:
         print(f"Loopcut: could not note the balance before this turn: {ex!r}")
 
@@ -295,6 +295,7 @@ def turn_end(session: dict, turn) -> None:
     from . import spending
     with spending.lock:  # This turn's tools, before a next turn can add its own.
         data["tools_after"] = spending.ledger(session).get("credits", 0)
+    data["jobs_after"] = _job_ids(session)
     data["turn"] = turn
     stopped = getattr(turn, "outcome", "") != "completed"
     threading.Thread(target=_settle, args=(session, target, data, stopped), name="loopcut-turn-credits",
@@ -341,7 +342,14 @@ def record(session: dict, target: dict, data: dict, stopped: bool, after=None) -
         ended = data.get("tools_after", spending.ledger(session).get("credits", 0))
     tools = max(0, ended - (data.get("tools") or 0))
     used = max(0.0, float(before) - float(after))
-    target["turn_credits"] = round(used, 2)
+    # A cloud job this turn started that still runs: the balance has its whole hold out, so the line says "29 held"
+    # until it settles, then its charge (turn_line). rel019-cloud2: "Done · 29 credits" beside the card's 5 charged.
+    started = set(data.get("jobs_after", _job_ids(session))) - set(data["jobs"]) if "jobs" in data else set()
+    holds = {row["id"]: row["held"] for row in _job_rows(session)
+             if row["id"] in started and not row.get("settled") and _amount(row.get("held")) and row["held"]}
+    target["turn_credits"] = round(max(0.0, used - sum(holds.values())), 2)
+    if holds:
+        target["turn_held"] = holds
     target["chat_credits"] = round(max(0.0, used - tools), 2)
     if stopped:
         target["turn_stopped"] = True
@@ -357,13 +365,35 @@ def record(session: dict, target: dict, data: dict, stopped: bool, after=None) -
         pass
 
 
+def _job_rows(session: dict) -> list:
+    return [row for row in session.get("cloud_jobs") or () if isinstance(row, dict) and isinstance(row.get("id"), str)]
+
+
+def _job_ids(session: dict) -> list:
+    return [row["id"] for row in _job_rows(session)]
+
+
+def held(session: dict):
+    """What this chat's running cloud jobs hold (cloud_restore's records, until each settles to its charge): part of
+    the tools' spend in the ledger, but not spent yet."""
+    return sum(row["held"] for row in _job_rows(session) if not row.get("settled") and _amount(row.get("held")))
+
+
 def chat_total(session: dict):
-    """What this chat used: the tools' spend (spending.py) and the chat credits of each turn."""
+    """What this chat used: the tools' spend (spending.py) and the chat credits of each turn. A running job's hold is
+    not in it (held) until the job settles, and then its charge is."""
     from . import spending
     spend = session.get("spend")
     tools = spend.get("credits", 0) if spending.valid_ledger(spend) else 0
     chat = sum(item["chat_credits"] for item in session.get("items", []) if _amount(item.get("chat_credits")))
-    return tools + chat
+    return max(0, tools - held(session)) + chat
+
+
+def chat_line(session: dict) -> str:
+    """The composer's "This chat: 6 credits", with "29 held" for running jobs; "" for a chat that used none."""
+    total, holding = chat_total(session), held(session)
+    parts = [credits_text(total) if total or not holding else "", f"{holding:,g} held" if holding else ""]
+    return "This chat: " + " · ".join(p for p in parts if p) if total or holding else ""
 
 
 def credits_text(value) -> str:
@@ -376,12 +406,24 @@ def credits_text(value) -> str:
     return f"{n:,} credit{'' if n == 1 else 's'}"
 
 
-def turn_line(item: dict) -> str:
-    """The line under a finished turn's reply: "Done · 6 credits"; "" for replies that have none."""
+def turn_line(item: dict, session: dict | None = None) -> str:
+    """The line under a finished turn's reply: "Done · 6 credits"; "" for replies that have none. A cloud job the
+    turn started shows as "29 held" while it runs, then as what it was charged (its record in session)."""
     used = item.get("turn_credits")
     if not _amount(used):
         return ""
-    return f"{'Stopped' if item.get('turn_stopped') else 'Done'} · {credits_text(used)}"
+    holding = 0
+    holds = item.get("turn_held") if isinstance(item.get("turn_held"), dict) else {}
+    rows = {row["id"]: row for row in _job_rows(session or {})}
+    for job_id, amount in holds.items():
+        row = rows.get(job_id)
+        amount = amount if _amount(amount) else 0
+        if row is not None and not row.get("settled"):
+            holding += amount
+        else:  # Settled: its charge. A record no longer kept: its hold, as the balance had it.
+            used += row["charged"] if row is not None and _amount(row.get("charged")) else amount
+    parts = [credits_text(used) if used or not holding else "", f"{holding:,g} held" if holding else ""]
+    return f"{'Stopped' if item.get('turn_stopped') else 'Done'} · " + " · ".join(p for p in parts if p)
 
 
 # --- The pop-ups' copy ---------------------------------------------------------------------------------------

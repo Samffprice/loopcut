@@ -20,8 +20,8 @@ fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
 from loopcut import (agent, asset_libraries, assets, autorig, blenderkit, camera, config, contact, context,  # noqa: E402
-                     conversations, files, inspection, job_tools, llm, polyhaven, polypizza, state, texture_tools, tools,
-                     uv_tools)
+                     conversations, files, inspection, job_tools, llm, polyhaven, polypizza, result_store, state,
+                     texture_tools, tools, uv_tools)
 
 TOOL_SCHEMAS = agent._tool_schemas  # test_agent_loop stubs these three; keep the real ones.
 CHANGES_SCENE = agent._changes_scene
@@ -32,6 +32,7 @@ FOUND = tools.ToolResult("found")
 OFFERED = [
     ("run_python", "change"), ("get_scene_info", "read"), ("get_object_info", "read"), ("inspect_api", "read"),
     ("compare_with_reference", ""), ("look_at_reference", "read"), ("capture_viewport", ""),
+    ("set_extras", ""), ("read_result", "read"),
     ("check_contact", "read"), ("list_files", ""), ("read_file", ""), ("write_file", ""), ("move_file", ""),
     ("see_render", ""), ("render_job", ""), ("inspect_scene", ""), ("search_assets", "read"),
     ("import_asset", "change"), ("frame_camera", "change"), ("inspect_uv", "read"), ("uv_unwrap", "change"),
@@ -103,7 +104,9 @@ class OfferedTest(unittest.TestCase):
         dispatched = set().union(tools._DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH,
                                  inspection.DISPATCH, assets.DISPATCH, camera.DISPATCH, uv_tools.DISPATCH,
                                  texture_tools.DISPATCH)
-        self.assertEqual(set(schemas), dispatched)
+        # read_result is the loop's own: agent.run_loop answers it from the loop's conversation, a worker's too.
+        self.assertEqual(set(schemas), dispatched | {result_store.TOOL})
+        self.assertNotIn(result_store.TOOL, dispatched)
         self.assertFalse((set(tools.RENAMED) - {"search_assets", "import_asset"}) & set(schemas))
         for old, (current, implied, _) in tools.RENAMED.items():
             for key, value in implied.items():
@@ -208,6 +211,22 @@ class RoutingTest(unittest.TestCase):
             result = execute(name, **arguments)
             self.assertFalse(result.ok, name)
             self.assertEqual(result.text, expected)
+            self.assertTrue(result.input_mistake, "the model's arguments: a plain card (ui.layout)")
+
+    def test_a_refusal_of_the_arguments_is_an_input_mistake_and_a_failure_inside_the_tool_is_not(self):
+        for name, raw, expected in (("get_scene_info", '{"colour": "red"}', "Bad arguments for get_scene_info: "),
+                                    ("get_scene_info", "[1]", "Invalid tool arguments: "),
+                                    ("no_such_tool", "{}", "Unknown tool 'no_such_tool'"),
+                                    ("inspect_api", "{}", "Pass exactly one of `path`"),
+                                    ("loopcut_cloud__render", "[1]", "Invalid cloud tool arguments")):
+            with self.subTest(name=name, raw=raw):
+                result = tools.execute(name, raw)
+                self.assertFalse(result.ok)
+                self.assertTrue(result.text.startswith(expected), result.text)
+                self.assertTrue(result.input_mistake)
+        with mock.patch.dict(tools._DISPATCH, {"get_scene_info": mock.Mock(side_effect=tools.ToolError("No scene"))}):
+            result = execute("get_scene_info")
+        self.assertEqual((result.text, result.ok, result.input_mistake), ("No scene", False, False))
 
     def test_another_source_s_arguments_are_left_out_and_named(self):
         # GPT-6 Luna fills every optional field: polypizza's filters on every search were refused nine times (0.2.17).
@@ -428,7 +447,8 @@ class OldCallsTest(unittest.TestCase):
     def test_a_render_approval_card_shows_the_job_settings(self):
         settings = {"output_dir": "/out", "frames": [1, 2], "budget_seconds": 60}
         summary, code = self.describe("render_job", {"action": "start", **settings})
-        self.assertEqual(summary, "Background PNG render · 2 frames · 60s budget")
+        self.assertEqual(summary, "Render 2 frames on this computer, up to about 1 min. "
+                                  "Blender must stay open and this computer awake until it's done.")
         self.assertEqual(json.loads(code), settings)
         self.assertEqual(self.describe("start_render_job", settings), (summary, code))
 

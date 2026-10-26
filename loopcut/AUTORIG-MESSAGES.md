@@ -8,9 +8,9 @@ Quote/approval wording uses the existing cloud UI. Typed anatomy refusals use th
 
 The rig card shows this line under the price (`rig_text.QUOTE`), or the clothing warning instead when the local check found a long coat:
 
-> Body bones with automatic weights, and finger bones when it can find them; best on humanoids, others may bend oddly.
+> Gives your character a skeleton so it can move, with fingers when it can find the hands; made for human shapes, so others may bend in odd places.
 
-The platform's quote carries its own `experimental_notice` ("Best on humanoid characters; others get an experimental rig that may bend oddly."); the card does not show it.
+The platform's quote carries its own `experimental_notice` (contract 0.9: "Best on humanoid characters; others get an experimental rig that may bend oddly."; later the card's earlier line, "Body bones with automatic weights, and finger bones when it can find them; best on humanoids, others may bend oddly."); the card does not show it. The owner approved the card's words on 2026-10-26 (R7-D3), and the web const takes them in a coordinated contract change.
 
 The result card, with the real count:
 

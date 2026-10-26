@@ -16,7 +16,7 @@ from typing import Callable
 
 import bpy
 
-from . import scratch
+from . import result_store, scratch
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
@@ -28,6 +28,12 @@ SLEEP_SLICE = 0.1  # A time.sleep in run_python code wakes this often to check t
 
 class ToolError(Exception):
     """A failure the model should see and can react to."""
+
+
+class InputMistake(ToolError):
+    """The model's arguments, not the scene, the account or the network: a field the tool doesn't take, a missing
+    one, a value out of its list. The model gets the text to correct itself; the call's card says it plainly
+    (ToolResult.input_mistake). rel019-cloud: "Unknown tool input; use the fields in this tool's schema." on a card."""
 
 
 @dataclass
@@ -59,6 +65,7 @@ class ToolResult:
     made_pictures: list | None = None  # image_generate's pictures (datablock names): its card's Turn it into 3D button.
     converted: str = ""  # image_to_3d done on a picture Loopcut made: the job that made it (agent._turned_into_3d).
     unapplied: str = ""  # A finished job whose outputs did not land (another file open): its id (cloud.apply_finished).
+    input_mistake: bool = False  # Refused for the model's arguments (InputMistake): a plain card, the text behind its toggle.
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -131,6 +138,8 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Dotted path to describe"},
             "search": {"type": "string", "description": "Words to find in names and descriptions"},
+            "detail": {"type": "boolean", "description": "Descriptions and every enum value too; a property's own "
+                                                         "path always has them"},
         }},
     }},
     {"type": "function", "function": {
@@ -180,6 +189,17 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
             "labels": {"type": "boolean", "description": "Draw object names, to tell objects apart; default off"},
         }},
     }},
+    {"type": "function", "function": {
+        "name": "set_extras",
+        "title": "Saving how paid tools are used",
+        "description": (
+            "Only when the user says how paid tools should be used: auto (when they help), ask (ask before "
+            "each), only_asked (only when they ask for one)."),
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "enum": ["auto", "ask", "only_asked"]},
+        }, "required": ["mode"]},
+    }},
+    result_store.SCHEMA,  # Answered by the loop from its conversation's store (agent._read_result), in every loop.
 ]
 
 # Tools that can change the scene. A checkpoint is taken before the first one in a turn, and they
@@ -218,7 +238,7 @@ RENAMED = {
 # UV and pixel edits are not in scene_diff, but they come from run_python or uv_unwrap, and any call
 # to a scene-changing tool starts the reads over (agent.run_loop).
 SAME_WHILE_UNCHANGED = {"get_scene_info", "get_object_info", "inspect_api", "look_at_reference", "search_assets",
-                        "check_contact", "inspect_uv", "inspect_texture"}
+                        "check_contact", "inspect_uv", "inspect_texture", result_store.TOOL}
 # Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
 # user unless they said "Always allow renders": "Always allow" and auto-run do not cover it.
 # Not render.render: the cost guard refuses it in the code whatever the user allows
@@ -773,7 +793,7 @@ def get_scene_info(name_contains: str = "", type: str = "", collection: str = ""
     fit, names by collection otherwise. Never a truncated JSON: what does not fit is said to be
     missing, and the narrower question that would fit is named."""
     if detail not in ("", "rows", "names"):
-        raise ToolError('detail must be "rows" or "names"')
+        raise InputMistake('detail must be "rows" or "names"')
     from . import capabilities, view_layers
     scene = bpy.context.scene
     active = bpy.context.view_layer.objects.active
@@ -853,9 +873,9 @@ def get_object_info(names: list[str], detail: str = "full") -> ToolResult:
     value cut in half (object_info.fit)."""
     from . import object_info
     if detail not in ("full", "transform"):
-        raise ToolError("detail is full or transform.")
+        raise InputMistake("detail is full or transform.")
     if not names or len(names) > 5:
-        raise ToolError("Pass 1 to 5 object names.")
+        raise InputMistake("Pass 1 to 5 object names.")
     scene_world = bpy.context.scene.world
 
     def world(name):  # "world" is the scene's; a world's own name, that one. Objects come first.
@@ -886,12 +906,12 @@ def get_object_info(names: list[str], detail: str = "full") -> ToolResult:
     return ToolResult(text)
 
 
-def inspect_api(path: str = "", search: str = "") -> ToolResult:
+def inspect_api(path: str = "", search: str = "", detail: bool = False) -> ToolResult:
     from . import api_docs
     try:
-        return ToolResult(api_docs.inspect_api(path, search))
+        return ToolResult(api_docs.inspect_api(path, search, detail is True or str(detail).lower() == "true"))
     except api_docs.ApiError as ex:
-        raise ToolError(str(ex)) from ex
+        raise (InputMistake if isinstance(ex, api_docs.ArgumentError) else ToolError)(str(ex)) from ex
 
 
 _VIEW_EULERS = {  # Degrees, as a viewport rotation.
@@ -1072,11 +1092,11 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: b
     import numpy as np
     angles = [*_VIEW_EULERS, "camera", "user", "sheet"]
     if angle not in angles:
-        raise ToolError(f"angle must be one of {', '.join(angles)}")
+        raise InputMistake(f"angle must be one of {', '.join(angles)}")
     if style not in ("material", "distinct", "rendered"):
-        raise ToolError("style must be material, distinct or rendered")
+        raise InputMistake("style must be material, distinct or rendered")
     if not isinstance(labels, bool):
-        raise ToolError("labels must be true or false")
+        raise InputMistake("labels must be true or false")
     scene = bpy.context.scene
     if angle == "camera" and scene.camera is None:
         raise ToolError("The scene has no active camera (scene.camera is None).")
@@ -1213,6 +1233,12 @@ def _reference(name: str) -> tuple[dict, Path]:
     return found, path
 
 
+def _seen(found: dict) -> None:
+    """A picture Loopcut made was shown to the model: its image_to_3d may run (cloud_jobs.made_unseen)."""
+    if isinstance(found.get("made"), dict):
+        found["made"]["seen"] = True
+
+
 def _pixels(path: Path, height: int | None = None):
     """Rows bottom-up, as Blender keeps them; scaled to `height` when given."""
     import numpy as np
@@ -1270,9 +1296,9 @@ def crop(pixels, region: list | None):
     try:
         x0, y0, x1, y1 = (float(v) for v in region)
     except (TypeError, ValueError) as ex:
-        raise ToolError("region must be four numbers [x0, y0, x1, y1] between 0 and 1") from ex
+        raise InputMistake("region must be four numbers [x0, y0, x1, y1] between 0 and 1") from ex
     if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
-        raise ToolError("region must be [x0, y0, x1, y1] with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
+        raise InputMistake("region must be [x0, y0, x1, y1] with 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
     top_down = pixels[::-1]
     rows, cols = slice(round(y0 * height), max(round(y0 * height) + 8, round(y1 * height))), \
         slice(round(x0 * width), max(round(x0 * width) + 8, round(x1 * width)))
@@ -1292,6 +1318,7 @@ def look_at_reference(name: str, region: list | None = None, frame: int | None =
     out = scratch.folder() / "reference.png"
     out.parent.mkdir(exist_ok=True)
     shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
+    _seen(found)
     return ToolResult(f"Image attached: {title}, {what}, {shown[0]}x{shown[1]} px "
                       f"(the full image is {width}x{height}).", image_path=out)
 
@@ -1338,8 +1365,35 @@ def compare_with_reference(name: str, focus: list[str] | None = None, angle: str
     canvas[:, left.shape[1] + COMPARE_GAP:] = right
     out = scratch.folder() / "compare.png"
     _save_pixels(canvas, out)
+    _seen(found)
     return ToolResult(f"Image attached: {title} on the left, {shot.text[len('Image attached: '):]}"
                       f" on the right, at the same height.", image_path=out)
+
+
+EXTRAS_MODES = {"auto": ("AUTO", "Use when it helps"), "ask": ("ASK", "Ask me first"),
+                "only_asked": ("ONLY_ASKED", "Only when I ask")}
+
+
+def set_extras(mode: str) -> ToolResult:
+    """The user's paid-extras preference from what they said in chat (spending.py): Preferences' Paid extras, saved,
+    and this turn's settings, so the next paid call already goes by it."""
+    import dataclasses
+    from . import settings, state
+    if not isinstance(mode, str) or mode.strip().lower() not in EXTRAS_MODES:
+        raise InputMistake("mode must be auto, ask or only_asked")
+    value, label = EXTRAS_MODES[mode.strip().lower()]
+    prefs = settings.preferences()
+    if prefs is None:
+        raise ToolError("Loopcut's preferences are not available here; the user can set Paid extras in Preferences.")
+    prefs.extras_mode = value
+    try:
+        bpy.ops.wm.save_userpref()
+    except RuntimeError as ex:
+        print(f"Loopcut: could not save the paid extras preference: {ex}")
+    turn = state.session().get("turn")
+    if getattr(turn, "spending", None) is not None:
+        turn.spending = dataclasses.replace(turn.spending, extras=value)
+    return ToolResult(f'Saved: paid extras "{label}". The user can change it in Preferences.')
 
 
 _DISPATCH = {
@@ -1350,6 +1404,7 @@ _DISPATCH = {
     "capture_viewport": capture_viewport_tool,
     "compare_with_reference": compare_with_reference_tool,
     "look_at_reference": look_at_reference,
+    "set_extras": set_extras,
 }
 
 
@@ -1366,10 +1421,10 @@ def forward(fn, arguments: dict, what: str, properties=(), siblings: dict | None
     ignored = [key for key in arguments if key not in parameters and key in properties]
     extra = [key for key in arguments if key not in parameters and key not in ignored]
     if extra:
-        raise ToolError(f"{what} does not take {', '.join(extra)}")
+        raise InputMistake(f"{what} does not take {', '.join(extra)}")
     missing = [key for key, p in parameters.items() if p.default is p.empty and key not in arguments]
     if missing:
-        raise ToolError(f"{what} needs {', '.join(missing)}")
+        raise InputMistake(f"{what} needs {', '.join(missing)}")
     result = fn(**{key: value for key, value in arguments.items() if key not in ignored})
     return _noted(result, _ignored(ignored, what, siblings or {})) if ignored else result
 
@@ -1402,9 +1457,9 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         try:
             arguments = json.loads(arguments_json) if arguments_json.strip() else {}
         except ValueError:
-            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
+            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False, input_mistake=True)
         if not isinstance(arguments, dict):
-            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False)
+            return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False, input_mistake=True)
         return cloud.execute(name, arguments)
     from . import (assets, autorig, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
                    uv_tools, video_attach, workspace)
@@ -1413,17 +1468,18 @@ def execute(name: str, arguments_json: str) -> ToolResult:
               workspace.DISPATCH, video_attach.DISPATCH, autorig.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
-        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False)
+        return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False,
+                          input_mistake=True)
     try:
         arguments = json.loads(arguments_json) if arguments_json.strip() else {}
         if not isinstance(arguments, dict):
             raise ValueError("arguments must be a JSON object")
     except ValueError as ex:
-        return ToolResult(f"Invalid tool arguments: {ex}", ok=False, plan_refused=name == "delegate")
+        return ToolResult(f"Invalid tool arguments: {ex}", ok=False, plan_refused=name == "delegate", input_mistake=True)
     try:
         inspect.signature(fn).bind(**arguments)
     except TypeError as ex:
-        return ToolResult(f"Bad arguments for {name}: {ex}", ok=False, plan_refused=name == "delegate")
+        return ToolResult(f"Bad arguments for {name}: {ex}", ok=False, plan_refused=name == "delegate", input_mistake=True)
     _undo_owed.append("")
     try:
         return fn(**arguments)
@@ -1432,6 +1488,6 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         # model looking for other arguments (get_object_info on a Blender 5 modifier, 2026-09-19).
         return ToolResult(f"{name} failed inside the tool, not because of your arguments: TypeError: {ex}", ok=False)
     except ToolError as ex:
-        return ToolResult(str(ex), ok=False)
+        return ToolResult(str(ex), ok=False, input_mistake=isinstance(ex, InputMistake))
     finally:
         _undo_after(_undo_owed.pop())  # What undo_before recorded; run_python pushes its own.

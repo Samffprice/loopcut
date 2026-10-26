@@ -653,7 +653,11 @@ def card(saved: dict, *, away: bool, ask: bool = False) -> dict:
         actions.append({"label": ("Load the frames" if (frames or 0) > 1 else "Load the frame") if render
                         else "Load the result", "do": "load"})
     item = state.item_cloud_back(saved["id"], "succeeded", title, "\n".join(lines), actions, frames)
+    item["job_title"] = saved["title"]  # Its Background jobs row: "Ready · <title>", as its running row was named.
     item["thumbnail_labels"] = [f"Frame {f:,}" for f in saved.get("preview_frames", [])][:THUMBNAILS]
+    resolution = saved.get("resolution")
+    if resolution and all(_count(n) for n in resolution):  # Each preview drawn in its frames' shape (ui/layout.py).
+        item["thumbnail_aspect"] = resolution[1] / resolution[0]
     return item
 
 
@@ -778,10 +782,11 @@ def _make_mp4(item: dict) -> None:
 
 
 def _open_mp4(item: dict, *, quiet: bool = False) -> bool:
-    """Open the render's MP4 kept beside its frames in the system's player, as Background jobs' Output does. quiet:
-    say nothing when it is not there yet (Open the MP4 then loads the frames first)."""
+    """Open the render's MP4 kept beside its frames in the system's player, as Background jobs' Output does, and say
+    where it went: the player opens outside Blender, often behind it (rel019-cloud2: "did nothing I can see").
+    quiet: say nothing when it is not there yet (Open the MP4 then loads the frames first)."""
     import bpy
-    from . import cloud_jobs
+    from . import cloud_jobs, state
     try:
         path = cloud_jobs.kept_video(item["job_id"])
     except (AttributeError, OSError, RuntimeError, ValueError):
@@ -797,6 +802,9 @@ def _open_mp4(item: dict, *, quiet: bool = False) -> bool:
         opened = False
     if not opened:
         item["error"] = f"Couldn't open the MP4. It is at {path}."
+    else:  # UI only, as a file card's Open says it (ui/host.py reference_open).
+        state.ui["action_notice"] = {"text": f"Opened {path.name} in your default app (outside Blender).",
+                                     "until": time.time() + 6.0}
     return True
 
 
@@ -818,6 +826,7 @@ def load(session: dict, item: dict, *, here: bool = False) -> None:
             attached = cloud_jobs.known(job_id)
         if not attached:
             item["busy"] = ""
+            item.pop("open", None)  # Nothing loads now, so a later Load the frames never opens it unasked.
         return
     item["busy"] = ""
     if row is not None and row.get("already"):  # Not loaded now: the file has them from earlier.
@@ -840,4 +849,7 @@ def _again(conversation: str, job_id: str, here: bool) -> None:
     if item is not None and item.get("busy"):
         item["busy"] = ""
         load(session, item, here=here)
+        mainthread.request_redraw()
+    elif item is not None and item.get("resolved") and item.pop("open", False):
+        _open_mp4(item)  # The model's job_status loaded them while the card waited (applied): the click still opens.
         mainthread.request_redraw()

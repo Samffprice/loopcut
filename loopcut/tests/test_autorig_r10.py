@@ -17,7 +17,8 @@ from loopcut.rig_pose import add, cross, dot, mul, sub, unit  # noqa: E402
 
 P = rig_pose.PREFIX
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness'))
-from autorig_fake import PLATFORM_NOTICE  # noqa: E402,F401  The platform's line; tests accept it or the card's.
+from autorig_fake import PLATFORM_NOTICE, PLATFORM_NOTICES  # noqa: E402,F401  The platform's lines; tests accept
+# them or the card's.
 UP, LEFT, FRONT = (0., 0., 1.), (1., 0., 0.), (0., -1., 0.)  # Facing -Y, as Blender's front view.
 
 
@@ -328,9 +329,11 @@ class RigCard(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness'))
         from autorig_card_check import check
         text = rig_text.QUOTE
-        self.assertIn('finger bones when it can find them', text, 'fingers are not on every standard rig (19-bone B2)')
-        self.assertIn('automatic weights', text)
-        self.assertIn('best on humanoids', text)
+        self.assertIn('with fingers when it can find the hands', text, 'fingers are not on every standard rig (19-bone B2)')
+        self.assertIn('made for human shapes', text)
+        self.assertIn('may bend in odd places', text)
+        for jargon in ('automatic weights', 'humanoid', 'bones', 'weights'):  # R7-D3
+            self.assertNotIn(jargon, text)
         self.assertEqual(len(re.findall(r'[.!?](?=\s|$)', text)), 1)
         check([{'id': 'card.price', 'text': '20 credits ($0.20).'}, {'id': 'card.message', 'text': text}], 'card.')
 
