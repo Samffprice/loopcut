@@ -6,6 +6,8 @@ Blender's preferences file.
 
 import os
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -52,6 +54,19 @@ PROVIDERS = (
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
+# The ChatGPT plan's models for the panel's model menu (chatgpt_auth.list_models rows), fetched on a worker when the
+# menu opens and kept PLAN_MODELS_TTL seconds for the account that fetched them. Not saved. "failed": the last fetch
+# failed, so the menu keeps the list it had and says so in one muted line.
+PLAN_MODELS_TTL = 600.0
+# The ChatGPT plan's reasoning efforts, config.CHATGPT_PLAN_EFFORTS with their labels: Preferences and the panel's
+# model menu ("Reasoning"). Appended only, so a stored choice keeps its meaning. Never ultra (config.py).
+CHATGPT_EFFORTS = (("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", ""),
+                   ("xhigh", "Extra High", "Slower; more careful work"),
+                   ("max", "Max", "Slowest; the most careful work, on the models that offer it"))
+# What the menu offers for a model whose /models row lists no levels: max only where a row lists it.
+_UNLISTED_EFFORTS = ("low", "medium", "high", "xhigh")
+PLAN_MODELS_FAILED = "Couldn't load your plan's models"
+_plan_models: dict = {"rows": [], "account": (), "at": 0.0, "fetching": False, "failed": False}
 # (key name, label, key field, note, "Use this key instead of credits" checkbox). Tool vendors only: the
 # model's own key (Anthropic, OpenAI chat) is the provider's API key above, which credits never replace.
 VENDOR_ROWS = (
@@ -325,9 +340,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         default="medium", update=_changed)
     # The ChatGPT plan's own (config.CHATGPT_PLAN_EFFORTS): high by default, as in the evals, and xhigh too.
     chatgpt_effort: bpy.props.EnumProperty(
-        name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", ""),
-                                 ("xhigh", "Extra High", "Slowest; the most careful work")],
-        default=config.CHATGPT_PLAN_EFFORT, update=_changed)
+        name="Reasoning", items=list(CHATGPT_EFFORTS), default=config.CHATGPT_PLAN_EFFORT, update=_changed)
     auto_run: bpy.props.BoolProperty(
         name="Run without asking", default=False, update=_changed,
         description="Run code and file changes without the Run / Reject step. Renders and bakes still ask, and "
@@ -803,10 +816,112 @@ def model_options() -> list[tuple[str, str, str, bool]]:
         return [(current, current, "from .env", True)]
     if prefs.provider == "LOOPCUT":
         return [(m["id"], m["label"], m["note"], prefs.tier == m["id"]) for m in account.models()]
+    if prefs.provider == "CHATGPT" and _plan_models["rows"]:  # The plan's own list, by display name.
+        rows = [(row["slug"], row["display_name"]) for row in _plan_models["rows"]]
+        if prefs.model and prefs.model not in [slug for slug, _ in rows]:
+            rows.insert(0, (prefs.model, prefs.model))
+        return [(slug, label, "", slug == prefs.model) for slug, label in rows]
     names = listed_models(prefs.provider)
     if prefs.model and prefs.model not in names:
         names.insert(0, prefs.model)
     return [(name, name, "", name == prefs.model) for name in names]
+
+
+def refresh_plan_models() -> None:
+    """Main thread, when the panel's model menu opens: on the ChatGPT plan, fetch the plan's models on a worker
+    unless the list is fresh or a fetch runs. Never blocks the draw; the menu redraws when the rows land."""
+    prefs = preferences()
+    if prefs is None or prefs.provider != "CHATGPT" or _plan_models["fetching"] or not chatgpt_auth.plan_signed_in():
+        return
+    from . import chatgpt_ready
+    account = chatgpt_ready.account_key()
+    if account != _plan_models["account"]:  # Another account's list is not this one's.
+        _plan_models.update(rows=[], account=account, at=0.0, failed=False)
+    elif _plan_models["rows"] and time.monotonic() - _plan_models["at"] < PLAN_MODELS_TTL:
+        return
+    _plan_models["fetching"] = True
+    threading.Thread(target=_fetch_plan_models, args=(account,), name="loopcut-chatgpt-models", daemon=True).start()
+
+
+def _fetch_plan_models(account: tuple) -> None:
+    """Worker: one /models request, then one dict update, so a draw never reads half of it."""
+    from . import mainthread
+    try:
+        rows = chatgpt_auth.list_models()
+    except Exception as ex:  # Refused, offline or an odd reply: the menu keeps the list it has.
+        print(f"Loopcut: couldn't load the ChatGPT plan's models ({getattr(ex, 'code', '') or type(ex).__name__})")
+        _plan_models.update(fetching=False, failed=True)
+    else:
+        if rows and account == _plan_models["account"]:
+            _plan_models.update(rows=rows[:200], at=time.monotonic(), fetching=False, failed=False)
+        else:  # None listed (a failure too), or another account signed in meanwhile.
+            _plan_models.update(fetching=False, failed=not rows)
+    mainthread.request_redraw()
+
+
+def model_menu_note() -> str:
+    """One muted line under the panel's models on the ChatGPT plan: the plan's list is loading or could not load."""
+    prefs = preferences()
+    if prefs is None or prefs.provider != "CHATGPT":
+        return ""
+    if _plan_models["failed"]:
+        return PLAN_MODELS_FAILED
+    return "Loading your plan's models…" if _plan_models["fetching"] and not _plan_models["rows"] else ""
+
+
+def _plan_row(model: str) -> dict:
+    return next((row for row in _plan_models["rows"] if row["slug"] == model), {})
+
+
+def plan_efforts(model: str) -> list[str]:
+    """The reasoning efforts the menu offers for `model` on the ChatGPT plan, in order: the levels its /models row
+    lists that the Responses API accepts (config.CHATGPT_PLAN_EFFORTS: not none, minimal or ultra); low to xhigh
+    when the row lists none of them or the model isn't listed."""
+    named = _plan_row(model).get("efforts") or ()
+    return [effort for effort in config.CHATGPT_PLAN_EFFORTS if effort in named] or list(_UNLISTED_EFFORTS)
+
+
+def effort_options() -> list[tuple[str, str, bool, str]]:
+    """(id, label, current, tooltip) for the "Reasoning" rows of the panel's model menu: the ChatGPT plan only, and
+    only the efforts the chosen model takes. The tooltip is the /models row's description of that level, else ours."""
+    prefs = preferences()
+    if prefs is None or prefs.provider != "CHATGPT":
+        return []
+    allowed, notes = plan_efforts(prefs.model), _plan_row(prefs.model).get("effort_notes") or {}
+    return [(effort, label, effort == prefs.chatgpt_effort, notes.get(effort) or tip)
+            for effort, label, tip in CHATGPT_EFFORTS if effort in allowed]
+
+
+def choose_effort(effort: str) -> None:
+    """The panel's model menu picked a reasoning effort for the ChatGPT plan."""
+    prefs = preferences()
+    if prefs is not None and prefs.provider == "CHATGPT" and effort in config.CHATGPT_PLAN_EFFORTS:
+        prefs.chatgpt_effort = effort
+
+
+def _nearest(effort: str, allowed: list[str]) -> str:
+    """`effort` if allowed, else the nearest allowed one, the higher on a tie. A level Loopcut never sends (ultra,
+    say) counts as above max, so it lands on max when that is allowed, else on the highest allowed."""
+    if effort in allowed:
+        return effort
+    order = config.CHATGPT_PLAN_EFFORTS
+    at = order.index(effort) if effort in order else len(order)
+    return min(allowed, key=lambda e: (abs(order.index(e) - at), -order.index(e)))
+
+
+def _plan_effort(prefs) -> str:
+    """The effort a turn sends on the ChatGPT plan: the chosen one, never a level the Responses API refuses (should
+    one be stored, the nearest the model takes)."""
+    effort = prefs.chatgpt_effort
+    return effort if effort in config.CHATGPT_PLAN_EFFORTS else _nearest(effort, plan_efforts(prefs.model))
+
+
+def _snap_effort(prefs) -> None:
+    """After a model pick on the ChatGPT plan, an effort the new model doesn't take moves to the nearest one it
+    takes (_nearest). Never to the /models row's default_reasoning_level: Loopcut's default stays high."""
+    allowed = plan_efforts(prefs.model)
+    if prefs.chatgpt_effort not in allowed:
+        prefs.chatgpt_effort = _nearest(prefs.chatgpt_effort, allowed)
 
 
 def choose_model(model_id: str) -> None:
@@ -818,6 +933,8 @@ def choose_model(model_id: str) -> None:
         set_tier(model_id)
     else:
         prefs.model = model_id
+        if prefs.provider == "CHATGPT":
+            _snap_effort(prefs)
 
 
 def model_label(model_id: str) -> str:
@@ -883,7 +1000,7 @@ def values() -> dict[str, str]:
     if prefs is None:
         return {}
     found = {
-        "LOOPCUT_REASONING_EFFORT": prefs.chatgpt_effort if prefs.provider == "CHATGPT" else prefs.reasoning_effort,
+        "LOOPCUT_REASONING_EFFORT": _plan_effort(prefs) if prefs.provider == "CHATGPT" else prefs.reasoning_effort,
         "LOOPCUT_AUTO_RUN": "true" if prefs.auto_run else "false",
         "LOOPCUT_AUTO_LOOK": "true" if prefs.auto_look else "false",
         "LOOPCUT_ORCHESTRATE": "true" if prefs.orchestrate else "false",

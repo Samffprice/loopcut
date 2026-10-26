@@ -7,6 +7,7 @@ descriptors so reading UI properties calls their getters, just as Blender does.
 import importlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -14,7 +15,7 @@ import threading
 import time
 import types
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -474,6 +475,223 @@ class SettingsTest(unittest.TestCase):
                          ("anthropic://api.anthropic.com/v1", "claude-opus-5-5", "k-1"))
         with patch.object(self.settings, "preferences", return_value=self.prefs):
             self.assertEqual([option[0] for option in self.settings.model_options()][:2], ["claude-opus-5-5", "claude-sonnet-5-5"])
+
+    # With a ChatGPT plan, the panel's model menu lists the plan's own models (owner, 2026-10-26).
+    PLAN_ROWS = [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"},
+                 {"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "visibility": "list"},
+                 {"slug": "gpt-6-luna", "display_name": "GPT-6 Luna", "visibility": "list"},
+                 {"slug": "internal", "display_name": "x", "visibility": "hide"}]
+
+    def plan_menu(self, provider="CHATGPT", rows=None, error=None):
+        """The panel's model menu on `provider` with a signed-in plan whose /models replies `rows` (or raises
+        `error`); the worker runs inline. Returns the list of /models requests, for counting."""
+        class Inline:
+            def __init__(self, target, args=(), **kwargs):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        requests = []
+
+        def get_json(url, token=""):
+            requests.append(url)
+            if error is not None:
+                raise error
+            return {"models": rows if rows is not None else self.PLAN_ROWS}
+        self.prefs.provider = provider
+        auth = self.settings.chatgpt_auth
+        for context in (patch.object(self.settings, "preferences", return_value=self.prefs),
+                        patch.object(self.settings, "threading", types.SimpleNamespace(Thread=Inline)),
+                        patch.object(auth, "plan_signed_in", return_value=True),
+                        patch.object(auth, "access_token", return_value="fake-access-token"),
+                        patch.object(auth, "_get_json", side_effect=get_json),
+                        patch.object(importlib.import_module(NAME + ".chatgpt_ready"), "account_key",
+                                     return_value=("oaiapp_fake", "https://auth.example.test", "user-fake"))):
+            context.start()
+            self.addCleanup(context.stop)
+        return requests
+
+    def reset_plan_models(self):
+        cache = patch.dict(self.settings._plan_models, rows=[], account=(), at=0.0, fetching=False, failed=False)
+        cache.start()
+        self.addCleanup(cache.stop)
+
+    def test_chatgpt_menu_fetches_the_plans_models_and_lists_them_by_display_name(self):
+        self.reset_plan_models()
+        self.plan_menu()
+        self.prefs.model = "gpt-6.1-sol"
+        self.assertEqual(self.settings.model_options(), [("gpt-6.1-sol", "gpt-6.1-sol", "", True)])  # Before.
+        self.settings.refresh_plan_models()
+        self.assertEqual(self.settings.model_options(),
+                         [("gpt-6.1-sol", "GPT-6.1 Sol", "", True), ("gpt-6.1-terra", "GPT-6.1 Terra", "", False),
+                          ("gpt-6-luna", "GPT-6 Luna", "", False)])
+        self.assertEqual(self.settings.model_menu_note(), "")
+        self.prefs.model = "gpt-6.1-terra"
+        self.assertEqual([option[3] for option in self.settings.model_options()], [False, True, False])
+
+    def test_chatgpt_plan_models_are_cached_ten_minutes(self):
+        self.reset_plan_models()
+        requests = self.plan_menu()
+        clock = [1000.0]
+        with patch.object(self.settings.time, "monotonic", side_effect=lambda: clock[0]):
+            self.settings.refresh_plan_models()
+            clock[0] += 9 * 60
+            self.settings.refresh_plan_models()  # A second open within ten minutes: no request.
+            self.assertEqual(len(requests), 1)
+            clock[0] += 2 * 60
+            self.settings.refresh_plan_models()
+            self.assertEqual(len(requests), 2)
+
+    def test_a_failed_plan_fetch_keeps_the_model_and_list_with_one_muted_line(self):
+        self.reset_plan_models()
+        self.prefs.model = "gpt-6.1-terra"
+        self.plan_menu(error=self.settings.chatgpt_auth.ChatGPTAuthError("offline", "network"))
+        with redirect_stdout(io.StringIO()):
+            self.settings.refresh_plan_models()  # Nothing cached yet: the current model alone.
+        self.assertEqual(self.settings.model_options(), [("gpt-6.1-terra", "gpt-6.1-terra", "", True)])
+        self.assertEqual(self.settings.model_menu_note(), "Couldn't load your plan's models")
+        self.reset_plan_models()
+        self.plan_menu()
+        self.settings.refresh_plan_models()
+        listed = self.settings.model_options()
+        self.settings._plan_models["at"] -= self.settings.PLAN_MODELS_TTL + 1
+        self.plan_menu(error=self.settings.chatgpt_auth.ChatGPTAuthError("offline", "network"))
+        with redirect_stdout(io.StringIO()) as printed:
+            self.settings.refresh_plan_models()  # A stale list and a failed refresh: the old list stays.
+        self.assertNotIn("fake-access-token", printed.getvalue())
+        self.assertEqual(self.settings.model_options(), listed)
+        self.assertEqual((self.prefs.model, self.settings.model_menu_note()),
+                         ("gpt-6.1-terra", "Couldn't load your plan's models"))
+
+    def test_no_plan_model_fetch_on_other_providers(self):
+        self.reset_plan_models()
+        for provider in ("LOOPCUT", "OPENAI", "ANTHROPIC", "CUSTOM"):
+            with self.subTest(provider=provider):
+                requests = self.plan_menu(provider)
+                self.settings.refresh_plan_models()
+                self.assertEqual(requests, [])
+                self.assertFalse(self.settings._plan_models["fetching"])
+                self.assertEqual(self.settings.model_menu_note(), "")
+
+    # Row keys only, shaped as the plan's /models (supported_reasoning_levels): Sol lists no levels; Terra lists
+    # ultra too, which the Responses API refuses, and a default the menu never adopts.
+    EFFORT_ROWS = [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol"},
+                   {"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [{"effort": e, "description": f"Terra {e}"} for e in
+                                                   ("low", "medium", "high", "xhigh", "max", "ultra")]},
+                   {"slug": "two-low-high", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+                   {"slug": "two-low-medium", "supported_reasoning_levels": [{"effort": "minimal"}, {"effort": "low"},
+                                                                             {"effort": "medium"}]},
+                   {"slug": "to-xhigh", "supported_reasoning_levels": [{"effort": e} for e in
+                                                                       ("low", "medium", "high", "xhigh")]}]
+    REAL_ROWS = Path(__file__).resolve().parent / "fixtures" / "chatgpt-models-2026-10-26.json"
+
+    def turn_body(self):
+        """The next turn's config and Responses request body, from the preferences as they are."""
+        config = self.settings.config
+        unset = {key: "" for key in ("LOOPCUT_BASE_URL", "LOOPCUT_MODEL", "LOOPCUT_API_KEY", "LOOPCUT_REASONING_EFFORT")}
+        with patch.object(self.settings.chatgpt_auth, "status", return_value={"signed_in": True, "plan_usage": True}), \
+                patch.object(config, "_find_env_file", return_value=None), patch.dict(os.environ, unset):
+            cfg = config.load()
+        responses = importlib.import_module(NAME + ".chatgpt_responses")
+        body = responses.request_body(model=cfg.model, messages=[{"role": "user", "content": "A chair"}], tools=[],
+                                      reasoning_effort=cfg.reasoning_effort)
+        return cfg, body
+
+    def test_reasoning_rows_offer_the_accepted_levels_the_chosen_model_lists_with_their_descriptions(self):
+        self.reset_plan_models()
+        self.plan_menu(rows=self.EFFORT_ROWS)
+        self.settings.refresh_plan_models()
+        self.prefs.model, self.prefs.chatgpt_effort = "gpt-6.1-sol", "high"
+        self.assertEqual(self.settings.effort_options(),
+                         [("low", "Low", False, "Fastest"), ("medium", "Medium", False, ""),
+                          ("high", "High", True, ""), ("xhigh", "Extra High", False, "Slower; more careful work")])
+        self.prefs.model = "gpt-6.1-terra"
+        self.assertEqual([(effort, tip) for effort, _, _, tip in self.settings.effort_options()],
+                         [(e, f"Terra {e}") for e in ("low", "medium", "high", "xhigh", "max")])
+        self.prefs.model = "two-low-medium"  # minimal is not offered.
+        self.assertEqual([option[0] for option in self.settings.effort_options()], ["low", "medium"])
+        self.prefs.model = "not-listed"
+        self.assertEqual([option[0] for option in self.settings.effort_options()], ["low", "medium", "high", "xhigh"])
+        self.settings.choose_effort("max")
+        self.assertEqual(self.prefs.chatgpt_effort, "max")
+        for refused in ("ultra", "minimal", "none"):
+            self.settings.choose_effort(refused)
+            self.assertEqual(self.prefs.chatgpt_effort, "max")
+        for provider in ("LOOPCUT", "OPENAI"):
+            self.prefs.provider = provider
+            self.assertEqual(self.settings.effort_options(), [])
+            self.settings.choose_effort("low")
+            self.assertEqual(self.prefs.chatgpt_effort, "max")
+
+    def test_picking_a_model_snaps_only_an_effort_it_lacks_to_the_nearest_never_to_the_servers_default(self):
+        self.reset_plan_models()
+        self.plan_menu(rows=self.EFFORT_ROWS)
+        self.settings.refresh_plan_models()
+        for model, before, after in (("gpt-6.1-terra", "xhigh", "xhigh"),   # Taken: kept, not the row's "low".
+                                     ("gpt-6.1-terra", "high", "high"),
+                                     ("two-low-medium", "xhigh", "medium"),  # The nearest.
+                                     ("two-low-high", "medium", "high"),     # A tie: the higher.
+                                     ("to-xhigh", "max", "xhigh"),
+                                     ("gpt-6.1-sol", "max", "xhigh"),        # No levels listed: low to xhigh.
+                                     ("gpt-6.1-terra", "ultra", "max"),      # A level never sent: max if taken,
+                                     ("to-xhigh", "ultra", "xhigh")):        # else the highest taken.
+            with self.subTest(model=model, effort=before):
+                self.prefs.model, self.prefs.chatgpt_effort = "gpt-6.1-sol", before
+                self.settings.choose_model(model)
+                self.assertEqual((self.prefs.model, self.prefs.chatgpt_effort), (model, after))
+
+    def test_the_owners_plan_rows_list_eight_models_and_their_accepted_levels(self):
+        self.reset_plan_models()
+        rows = json.loads(self.REAL_ROWS.read_text(encoding="utf-8"))["models"]
+        self.plan_menu(rows=rows)
+        self.assertEqual(self.settings.LoopcutPreferences().chatgpt_effort, "high")  # Loopcut's default.
+        self.prefs.model, self.prefs.chatgpt_effort = "gpt-6.1-sol", "high"
+        self.settings.refresh_plan_models()
+        self.assertEqual([option[0] for option in self.settings.model_options()],
+                         ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+                          "gpt-5.6-terra", "gpt-5.6-luna"])  # Not gpt-reserve or codex-auto-review.
+        five = ["low", "medium", "high", "xhigh", "max"]
+        for model in ("gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-luna", "gpt-6-astra"):
+            self.assertEqual(self.settings.plan_efforts(model), five, model)
+        self.settings.choose_model("gpt-6.1-terra")  # Its row's default is low: Loopcut keeps high.
+        self.assertEqual(self.prefs.chatgpt_effort, "high")
+        self.prefs.chatgpt_effort = "ultra"  # Stored somehow: moving to a Luna lands on max.
+        self.settings.choose_model("gpt-6-luna")
+        self.assertEqual((self.prefs.model, self.prefs.chatgpt_effort), ("gpt-6-luna", "max"))
+
+    def test_ultra_is_never_offered_or_sent_though_the_plans_rows_list_it(self):
+        self.reset_plan_models()
+        rows = json.loads(self.REAL_ROWS.read_text(encoding="utf-8"))["models"]
+        self.assertIn("ultra", [level["effort"] for level in rows[0]["supported_reasoning_levels"]])
+        self.plan_menu(rows=rows)
+        self.settings.refresh_plan_models()
+        self.assertNotIn("ultra", [effort for effort, *_ in self.settings.CHATGPT_EFFORTS])
+        self.prefs.model, self.prefs.chatgpt_effort = "gpt-6.1-terra", "high"
+        for slug, *_ in self.settings.model_options():
+            self.prefs.model = slug
+            self.assertNotIn("ultra", [option[0] for option in self.settings.effort_options()], slug)
+        self.prefs.model = "gpt-6.1-terra"
+        self.settings.choose_effort("ultra")
+        self.assertEqual(self.prefs.chatgpt_effort, "high")
+        self.settings.choose_effort("max")  # Max goes through unchanged.
+        self.assertEqual(self.turn_body()[1]["reasoning"]["effort"], "max")
+        self.prefs.chatgpt_effort = "ultra"  # Stored somehow: the turn still sends an accepted level.
+        cfg, body = self.turn_body()
+        self.assertEqual((cfg.reasoning_effort, body["reasoning"]["effort"]), ("max", "max"))
+
+    def test_the_next_turn_sends_the_model_and_effort_picked_in_the_menu(self):
+        self.reset_plan_models()
+        self.plan_menu()
+        self.settings.refresh_plan_models()
+        self.prefs.model, self.prefs.chatgpt_effort = "gpt-6.1-sol", "high"
+        self.settings.choose_model(self.settings.model_options()[1][0])  # GPT-6.1 Terra.
+        self.settings.choose_effort(self.settings.effort_options()[3][0])  # Extra High.
+        cfg, body = self.turn_body()
+        self.assertEqual((cfg.base_url, cfg.model, cfg.reasoning_effort),
+                         (self.settings.config.CHATGPT_PLAN_BASE_URL, "gpt-6.1-terra", "xhigh"))
+        self.assertEqual((body["model"], body["reasoning"]["effort"]), ("gpt-6.1-terra", "xhigh"))
 
     # "Use this key instead of credits", per tool-vendor key (owner, 2026-10-16).
     def draw_vendor_keys(self, keys):

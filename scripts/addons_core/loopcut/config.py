@@ -79,7 +79,9 @@ CHATGPT_PLAN_MODEL = "gpt-6.1-sol"
 # chest yet): the single agent in its workspace (keep mode, a 200k context floor), no orchestrator, workers or
 # router, no craft notes, at high effort unless one is chosen (xhigh too). See load_roles.
 CHATGPT_PLAN_EFFORT = "high"
-CHATGPT_PLAN_EFFORTS = ("low", "medium", "high", "xhigh")
+# The efforts Loopcut sends on the plan, in order. max only to the models whose /models row lists it
+# (settings.plan_efforts); never ultra, which /models lists but the Responses API refuses (HTTP 400, 2026-10-26).
+CHATGPT_PLAN_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def chatgpt_plan(base_url: str) -> bool:

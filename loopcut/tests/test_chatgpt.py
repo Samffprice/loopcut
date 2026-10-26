@@ -250,14 +250,15 @@ class FakeResponses(BaseHTTPRequestHandler):
     """api.openai.com/v1 for the ChatGPT plan: a queue of scripted replies; every request recorded."""
     script: list = []
     requests: list = []
+    models: list = [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"},
+                    {"slug": "hidden", "display_name": "x", "visibility": "hide"}]
 
     def log_message(self, *args):
         pass
 
     def do_GET(self):  # noqa: N802
         FakeResponses.requests.append({"path": self.path, "headers": dict(self.headers), "body": None})
-        body = json.dumps({"models": [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"},
-                                      {"slug": "hidden", "display_name": "x", "visibility": "hide"}]}).encode()
+        body = json.dumps({"models": FakeResponses.models}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -628,8 +629,24 @@ class TokenTest(Base):
 
     def test_models(self):
         self.sign_in()
-        self.assertEqual(chatgpt_auth.list_models(), [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol"}])
+        self.assertEqual(chatgpt_auth.list_models(), [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol",
+                                                       "efforts": [], "effort_notes": {}}])
         self.assertEqual(FakeResponses.requests[0]["headers"]["Authorization"], "Bearer at-1")
+
+    def test_models_carry_the_reasoning_levels_a_row_lists_with_their_descriptions(self):
+        # Row keys only, in the shape of the owner's plan's /models (2026-10-26). The row's default is not read.
+        rows = [{"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "default_reasoning_level": "low",
+                 "supported_reasoning_levels": [{"effort": "low", "description": "Fast"}, {"effort": "max"},
+                                                {"effort": "ultra", "description": "Deepest"}]},
+                {"slug": "b", "supported_reasoning_levels": ["high", 7]},
+                {"slug": "c", "supported_reasoning_levels": "high"}]
+        self.sign_in()
+        with mock.patch.object(FakeResponses, "models", rows):
+            found = chatgpt_auth.list_models()
+        self.assertEqual([(row["slug"], row["efforts"], row["effort_notes"]) for row in found],
+                         [("gpt-6.1-terra", ["low", "max", "ultra"], {"low": "Fast", "ultra": "Deepest"}),
+                          ("b", ["high"], {}), ("c", [], {})])
+        self.assertNotIn("default_effort", found[0])
 
 
 # --- Responses adapter -----------------------------------------------------------------------------

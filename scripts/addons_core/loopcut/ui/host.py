@@ -171,6 +171,8 @@ def draw_area() -> None:
     key_needed = _key_needed(needs_setup)
     selection = [o.name for o in context.view_layer.objects.selected] if context.view_layer else []
     options = settings.model_options() if state.ui.get("model_menu") else []
+    model_note = settings.model_menu_note() if state.ui.get("model_menu") else ""
+    efforts = settings.effort_options() if state.ui.get("model_menu") else []
     from .. import cloud_jobs, playback, rig_gate, workspace
     from .. import chatgpt_ui, onboarding, own_key_ui
     if any(item["kind"] == "user" for item in session["items"]):
@@ -184,7 +186,7 @@ def draw_area() -> None:
                             "allowance_notice": state.ui.get("allowance_notice"),
                             "missing_paths": _missing_paths(session), "audio_playing": playback.playing(),
                             "watch_rigs": rig_gate.watchable(session),
-                            "context_budget": budget, "model_options": options, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
+                            "context_budget": budget, "model_options": options, "model_note": model_note, "model_efforts": efforts, "model_label": f"{key_needed} · no key" if key_needed else settings.model_label(model),
                             "hints_dismissed": onboarding.hints_dismissed(),
                             "sign_in": {"loopcut": account.status(), "chatgpt": chatgpt_ui.status()},
                             "update": update.banner(), "cloud_jobs": cloud_jobs.ui_rows(),
@@ -564,9 +566,15 @@ def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
         state.ui["service_settings"] = False
         state.ui["model_menu"] = not state.ui.get("model_menu")
         state.ui["picker"] = None
+        if state.ui["model_menu"]:
+            settings.refresh_plan_models()  # On the ChatGPT plan, its models load on a worker; the menu redraws.
     elif kind == "model_pick":
         _close_popups()
         settings.choose_model(index)
+        config_changed()
+    elif kind == "effort_pick":  # The menu's Reasoning rows, on the ChatGPT plan.
+        _close_popups()
+        settings.choose_effort(index)
         config_changed()
     elif kind == "noop":
         pass
@@ -1348,8 +1356,8 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
-POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "mention_pick", "open_settings", "service_settings",
-                 "service_toggle", "project_generation"}
+POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "effort_pick", "mention_pick", "open_settings",
+                 "service_settings", "service_toggle", "project_generation"}
 
 
 class LOOPCUT_OT_hover(bpy.types.Operator):

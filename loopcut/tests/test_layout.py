@@ -1237,6 +1237,30 @@ class FooterTest(unittest.TestCase):
         self.assertEqual(hit(display, "models.row1")["action"], ("model_pick", "pro"))
         self.assertEqual(hit(display, "models.row3")["action"], ("open_settings", None))
 
+    def test_chatgpt_model_menu_shows_display_names_and_a_muted_line_when_the_list_failed(self):
+        options = [("gpt-6.1-sol", "GPT-6.1 Sol", "", False), ("gpt-6.1-terra", "GPT-6.1 Terra", "", True)]
+        display = build(model_menu=True, model_options=options, model_note="Couldn't load your plan's models")
+        rows = {p["id"]: p for p in display["prims"] if p["id"].startswith("models.row") and p["id"].endswith(".name")}
+        self.assertEqual([p["text"] for p in rows.values()],
+                         ["     GPT-6.1 Sol", "✓  GPT-6.1 Terra", "Couldn't load your plan's models", "Settings…"])
+        self.assertEqual(hit(display, "models.row1")["action"], ("model_pick", "gpt-6.1-terra"))
+        self.assertEqual(rows["models.row2.name"]["color"], T.TEXT_FAINT)
+        self.assertFalse([h for h in display["hits"] if h["id"] == "models.row2"], "the note is not a button")
+
+    def test_chatgpt_model_menu_has_a_reasoning_section_with_the_current_effort_ticked(self):
+        efforts = [("low", "Low", False, "Fast answers"), ("medium", "Medium", False, ""), ("high", "High", True, ""),
+                   ("xhigh", "Extra High", False, ""), ("max", "Max", False, "Deepest reasoning")]
+        display = build(model_menu=True, model_options=[("gpt-6.1-sol", "GPT-6.1 Sol", "", True)], model_efforts=efforts)
+        names = [p["text"] for p in display["prims"] if p["id"].startswith("models.row") and p["id"].endswith(".name")]
+        self.assertEqual(names, ["✓  GPT-6.1 Sol", "Reasoning", "     Low", "     Medium", "✓  High", "     Extra High",
+                                 "     Max", "Settings…"])
+        self.assertEqual(hit(display, "models.row6")["action"], ("effort_pick", "max"))
+        self.assertEqual((hit(display, "models.row2")["tip"], hit(display, "models.row6")["tip"]),
+                         ("Fast answers", "Deepest reasoning"), "each level's description is its tooltip")
+        self.assertFalse([h for h in display["hits"] if h["id"] == "models.row1"], "the caption is not a button")
+        plain = build(model_menu=True, model_options=[("fast", "Fast", "", True)])
+        self.assertNotIn("Reasoning", [p["text"] for p in plain["prims"] if p["t"] == "text"])
+
     def test_context_ring_fills_with_the_request_and_the_session_ring_drains(self):
         session = state.new_session()
         session["usage"] = {"input": 30_000, "output": 2_000, "context": 6_000}

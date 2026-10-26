@@ -1042,6 +1042,36 @@ class OnboardingTest(unittest.TestCase):
                 build, _, _ = self.draw(session, runtime)
                 self.assertEqual(build.call_args.args[-1]["provider"], provider)
 
+    def test_opening_the_model_menu_asks_for_the_plans_models_and_the_draw_passes_its_note(self):
+        session = self.state.new_session()
+        with patch.object(self.settings, "refresh_plan_models") as refresh:
+            self.host._do_action(session, ("model_menu", None))
+            refresh.assert_called_once_with()
+            self.host._do_action(session, ("model_menu", None))  # Closing it asks for nothing.
+            refresh.assert_called_once_with()
+        self.state.ui["model_menu"] = True
+        runtime = types.SimpleNamespace(signed_in=False, lock=threading.RLock(), vote_notice="")
+        with patch.object(self.settings, "model_options", return_value=[]), \
+                patch.object(self.settings, "model_menu_note", return_value="Couldn't load your plan's models"):
+            build, _, _ = self.draw(session, runtime)
+        self.assertEqual(build.call_args.args[-1]["model_note"], "Couldn't load your plan's models")
+
+    def test_the_model_menus_reasoning_rows_reach_the_draw_and_a_pick_sets_the_effort(self):
+        session = self.state.new_session()
+        self.state.ui["model_menu"] = True
+        efforts = [("low", "Low", False, "Fastest"), ("high", "High", True, "")]
+        runtime = types.SimpleNamespace(signed_in=False, lock=threading.RLock(), vote_notice="")
+        with patch.object(self.settings, "model_options", return_value=[]), \
+                patch.object(self.settings, "effort_options", return_value=efforts):
+            build, _, _ = self.draw(session, runtime)
+        self.assertEqual(build.call_args.args[-1]["model_efforts"], efforts)
+        with patch.object(self.settings, "choose_effort") as choose, patch.object(self.host, "config_changed") as changed:
+            self.host._do_action(session, ("effort_pick", "low"))
+        choose.assert_called_once_with("low")
+        changed.assert_called_once_with()  # The next turn's config reads the new effort.
+        self.assertFalse(self.state.ui["model_menu"])
+        self.assertIn("effort_pick", self.host.POPUP_ACTIONS)  # The click isn't a click away from the menu.
+
     def test_service_actions_keep_settings_project_and_upgrade_routes(self):
         session = self.state.new_session()
         self.state.ui.update(model_menu=True, picker={})

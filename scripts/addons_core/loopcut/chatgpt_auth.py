@@ -826,9 +826,24 @@ def sign_out() -> bool:
         return confirmed
 
 
+def _levels(row: dict) -> list[tuple[str, str]]:
+    """(effort, description) for each reasoning level a /models row lists in supported_reasoning_levels, a list of
+    {"effort", "description"} (the owner's plan, 2026-10-26); [] when it lists none. The row's
+    default_reasoning_level is not read: Loopcut keeps its own default (settings.chatgpt_effort)."""
+    levels = row.get("supported_reasoning_levels")
+    found = []
+    for item in levels if isinstance(levels, list) else ():
+        effort = item.get("effort") if isinstance(item, dict) else item
+        if isinstance(effort, str) and effort:
+            note = item.get("description") if isinstance(item, dict) else ""
+            found.append((effort, note if isinstance(note, str) else ""))
+    return found
+
+
 def list_models() -> list[dict]:
-    """The signed-in account's model picker: [{slug, display_name}] in the server's order, only the
-    ones meant for display."""
+    """The signed-in account's model picker: [{slug, display_name, efforts, effort_notes}] in the server's order,
+    only the ones meant for display. efforts: the reasoning levels the row lists, as listed ([] when it lists none;
+    settings.plan_efforts keeps the ones the Responses API accepts); effort_notes: {effort: the row's description}."""
     payload = _get_json(api_base() + "/models", access_token())
     rows = payload.get("models") if isinstance(payload.get("models"), list) else payload.get("data") or []
     found = []
@@ -837,5 +852,8 @@ def list_models() -> list[dict]:
             continue
         slug = str(row.get("slug") or row.get("id") or "")
         if slug and row.get("visibility", "list") == "list":
-            found.append({"slug": slug, "display_name": str(row.get("display_name") or slug)})
+            levels = _levels(row)
+            found.append({"slug": slug, "display_name": str(row.get("display_name") or slug),
+                          "efforts": [effort for effort, _ in levels],
+                          "effort_notes": {effort: note for effort, note in levels if note}})
     return found

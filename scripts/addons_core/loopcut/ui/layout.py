@@ -2599,6 +2599,13 @@ def _model_menu(f: Frame, x: int, bottom: int, width: int) -> None:
         return
     rows = [(("✓  " if current else "     ") + label, note, ("model_pick", id))
             for id, label, note, current in (f.ui.get("model_options") or [])]
+    if f.ui.get("model_note"):  # The ChatGPT plan's list is loading or could not load: one muted line.
+        rows.append((f.ui["model_note"], "", None))
+    efforts = f.ui.get("model_efforts") or []
+    if efforts:  # The ChatGPT plan's reasoning effort, under a caption.
+        rows.append(("Reasoning", "", None))
+        rows += [(("✓  " if current else "     ") + label, "", ("effort_pick", id), *tip)
+                 for id, label, current, *tip in efforts]
     rows.append(("Settings…", "", ("open_settings", None)))
     _list_popup(f, "models", x, bottom, min(width, f.px(280)), rows, -1)
 
