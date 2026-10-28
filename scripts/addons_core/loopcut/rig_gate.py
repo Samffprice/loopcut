@@ -236,7 +236,9 @@ def finish_gate(session, turn, completion, role, run_on_main):
                                       stamp(verdicts, orchestrator.block_head(session, 'Rig checked this turn')))
         request[STAMPED] = request.get(MARKS, 0)
         watched = next((v['rig'] for v in verdicts if v.get('watch')), None)
-        reply = session['items'][-1] if session['items'] else {}
+        reply = getattr(turn, 'pending_reply', None)
+        if reply is None:
+            reply = session['items'][-1] if session['items'] else {}
         if watched and reply.get('kind') == 'assistant' and reply.get('verification'):
             reply[ACTION] = {'label': ACTIONS['loopcut.rig_show'], 'op': 'loopcut.rig_show', 'rig': watched}
     except Exception as ex:  # Never in the way of the reply.

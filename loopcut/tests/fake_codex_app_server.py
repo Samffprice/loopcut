@@ -48,6 +48,8 @@ def wait_for(predicate) -> dict:
         message = receive()
         if predicate(message):
             return message
+        if message.get("method") == "turn/steer":
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"turnId": TURN}})
 
 
 def item(kind: str, key: str, **fields) -> dict:
@@ -123,6 +125,29 @@ def turn() -> None:
         send({"jsonrpc": "2.0", "id": steer["id"], "result": {"turnId": TURN}})
         message("m4", "Made it blue as well.", "final_answer")
         end()
+    elif SCENARIO == "controller_failures":
+        for index in range(4):
+            entry = command(f"failed-{index}", "blender -b source.blend --python broken.py", "AttributeError", code=1)
+            started(entry)
+            completed(entry)
+        followup = wait_for(lambda m: m.get("method") in ("turn/steer", "turn/interrupt"))
+        send({"jsonrpc": "2.0", "id": followup["id"], "result": {}})
+        if followup["method"] == "turn/interrupt":
+            end("interrupted")
+        else:
+            message("m5", "The build is incomplete.", "final_answer")
+            end()
+    elif SCENARIO == "controller_quality":
+        entry = command("human", "create_human", "Human mesh created")
+        started(entry)
+        completed(entry)
+        steer = wait_for(lambda m: m.get("method") == "turn/steer")
+        send({"jsonrpc": "2.0", "id": steer["id"], "result": {"turnId": TURN}})
+        entry = command("rig", "add_rig_and_test", "Rig added; pose tests passed")
+        started(entry)
+        completed(entry)
+        message("quality-final", "The character is rigged and its deformation checked.", "final_answer")
+        end()
 
 
 def main() -> None:
@@ -146,6 +171,8 @@ def main() -> None:
             turn()
         elif method == "turn/interrupt":
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        elif method == "turn/steer":
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"turnId": TURN}})
 
 
 if __name__ == "__main__":

@@ -179,8 +179,8 @@ class ConsentReviewTest(unittest.TestCase):
             approve.assert_called_once()
 
     def test_codex_dynamic_tool_binds_cloud_consent_even_with_auto_run(self):
-        turn = types.SimpleNamespace(turn=agent.Turn(), session=state.new_session(),
-            cfg=types.SimpleNamespace(auto_run=True), items=[], ensure_checkpoint=lambda session: None)
+        turn = codex_app.CodexTurn(state.new_session(), agent.Turn(), types.SimpleNamespace(auto_run=True),
+                                   None, Path('.'), None, None, lambda session: None)
         turn.session['auto_run'] = True
         def run(name, arguments):
             cloud_account.confirm({'required': True, 'text': '100 credits quoted', 'credits': 100})

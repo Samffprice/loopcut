@@ -405,7 +405,7 @@ def outcome_of(outcome: str, code: str | None = None) -> tuple[str, str | None]:
         return "cancelled", code
     if code == "empty_reply":
         return "empty", code
-    return "error", code or (outcome if outcome in ("step_limit", "no_progress", "budget") else "internal")
+    return "error", code or (outcome if outcome in ("step_limit", "no_progress", "budget", "incomplete") else "internal")
 
 
 def turn_end(turn, items: list) -> None:

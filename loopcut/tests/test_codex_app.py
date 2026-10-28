@@ -116,6 +116,94 @@ class CodexAppTest(unittest.TestCase):
             self.assertIs(off.spec, agent.WORKSPACE_SPEC, "off: the HTTP workspace loop as before")
             self.assertIsNone(config.codex_app())
 
+    def test_controller_holds_final_and_continues_codex_after_a_targeted_correction(self):
+        from loopcut import controller
+        from test_controller import answer, model
+        reviews = []
+        def attach(session, turn, settings, run_tool):
+            def stream(**kw):
+                packet = json.loads(kw["messages"][1]["content"])
+                reviews.append(packet)
+                self.assertFalse(any(i.get("text") == "Painted it red." for i in session["items"]))
+                if packet["event"] == "finish":
+                    self.assertTrue(any(i.get("text") == "Looking at the scene." for i in session["items"]))
+                response = answer(packet)
+                if packet["event"] == "finish" and sum(p["event"] == "finish" for p in reviews) == 1:
+                    response = answer(packet, "correct", reason="The colour still needs checking.", findings=[
+                        {"quote": "paint the cube red", "issue": "Colour unverified", "evidence": packet["evidence"][-1]["id"]}])
+                return llm.Completion(text=json.dumps(response))
+            return controller.Controller(session, turn, settings, snapshot=lambda: {"version": 1},
+                                         inspect=lambda *args: ("scene", None), stream=stream)
+        with mock.patch.object(config, "controller", return_value=config.Controller(model())), \
+                mock.patch.object(controller, "attach", side_effect=attach), \
+                mock.patch.object(agent, "_final_reply", return_value=None):
+            turn = self.start()
+            turn.thread.join(15)
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual([p["event"] for p in reviews], ["intent", "finish", "progress", "finish"])
+        self.assertEqual(len([m for m in self.received() if m.get("method") == "turn/start"]), 2)
+        self.assertEqual(len([i for i in self.session["items"] if i.get("text") == "Painted it red."]), 1)
+        self.assertEqual(len(self.ran), 2)
+
+    def test_controller_recovery_receives_native_command_failures(self):
+        from loopcut import controller
+        from test_controller import answer, model
+        events = []
+        def attach(session, turn, settings, run_tool):
+            def stream(**kw):
+                packet = json.loads(kw["messages"][1]["content"])
+                events.append(packet["event"])
+                return llm.Completion(text=json.dumps(answer(packet,
+                    "stop" if packet["event"] == "repeated_failure" else None,
+                    reason="The same command keeps failing.")))
+            return controller.Controller(session, turn, settings, snapshot=lambda: {}, inspect=lambda *args: ("", None),
+                                         stream=stream)
+        with mock.patch.object(config, "controller", return_value=config.Controller(model())), \
+                mock.patch.object(controller, "attach", side_effect=attach):
+            turn = self.start(scenario="controller_failures")
+            turn.thread.join(15)
+        self.assertEqual(turn.outcome, "no_progress")
+        self.assertEqual(events, ["intent", "repeated_failure"])
+        self.assertFalse(any(i.get("text") == "The build is incomplete." for i in self.session["items"]))
+
+    def test_quality_goal_and_inferred_rigging_steer_the_running_codex_turn(self):
+        from loopcut import controller
+        from test_controller import model
+        from test_quality import human_review_reply
+        def attach(session, turn, settings, run_tool):
+            def stream(**kw):
+                rigged = any(i.get("kind") == "tool" and "pose tests passed" in i.get("output", "")
+                             for i in session["items"])
+                return human_review_reply(kw, rigged=rigged)
+            return controller.Controller(session, turn, settings, snapshot=lambda: {}, stream=stream,
+                inspect=lambda name, args: ("Scripted inspected evidence", {"role": "user", "content": "image"}
+                                           if name == "review_view" else None))
+        with mock.patch.object(config, "controller", return_value=config.Controller(model(), check_every=1)), \
+                mock.patch.object(controller, "attach", side_effect=attach), \
+                mock.patch.object(agent, "_final_reply", return_value=None):
+            turn = self.start("Make a human character for my game.", scenario="controller_quality")
+            turn.thread.join(15)
+        self.assertEqual(turn.outcome, "completed")
+        requests = self.received()
+        first = next(m for m in requests if m.get("method") == "turn/start")
+        self.assertIn("Convincing proportions", json.dumps(first["params"]["input"]))
+        steering = [m for m in requests if m.get("method") == "turn/steer"]
+        self.assertIn("Add a simple rig and test its deformation", json.dumps(steering[0]))
+        self.assertEqual(len(turn.controller.improvements), 1)
+
+    def test_quality_steer_finishing_race_is_left_for_the_final_review(self):
+        from test_controller import model
+        turn = agent.Turn()
+        turn.pending_reply = {**state.item_assistant(), "text": "Unreviewed completion."}
+        adapter = codex_app.CodexTurn(self.session, turn, model(), config.CodexApp("codex"), self.ws,
+                                      None, self.run_tool, lambda *args: None)
+        adapter.status = "completed"
+        with mock.patch.object(adapter, "call", side_effect=llm.LLMError("Turn already finished")):
+            adapter.steer_review("Check the character's pose.")
+        self.assertEqual(self.session["messages"][-1]["content"], "Check the character's pose.")
+        self.assertEqual(turn.pending_reply["text"], "Unreviewed completion.")
+        self.assertFalse(any(i.get("kind") == "assistant" for i in self.session["items"]))
+
     def test_a_turn_runs_in_a_codex_thread_with_loopcuts_live_tools(self):
         turn = self.start()
         turn.thread.join(15)
