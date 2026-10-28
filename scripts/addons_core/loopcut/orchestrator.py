@@ -2067,6 +2067,9 @@ def _append_to_reply(session: dict, completion, block: str) -> None:
     if request:
         request[BLOCKS] = request.get(BLOCKS, 0) + 1
     reply = items[-1] if items and items[-1].get("kind") == "assistant" and completion and completion.text.strip() else None
+    pending = getattr(session.get("turn"), "pending_reply", None)
+    if pending is not None:
+        reply = pending
     if reply is None:
         reply = state.item_assistant()
         reply["streaming"] = False

@@ -123,6 +123,18 @@ def turn() -> None:
         send({"jsonrpc": "2.0", "id": steer["id"], "result": {"turnId": TURN}})
         message("m4", "Made it blue as well.", "final_answer")
         end()
+    elif SCENARIO == "controller_failures":
+        for index in range(4):
+            entry = command(f"failed-{index}", "blender -b source.blend --python broken.py", "AttributeError", code=1)
+            started(entry)
+            completed(entry)
+        followup = wait_for(lambda m: m.get("method") in ("turn/steer", "turn/interrupt"))
+        send({"jsonrpc": "2.0", "id": followup["id"], "result": {}})
+        if followup["method"] == "turn/interrupt":
+            end("interrupted")
+        else:
+            message("m5", "The build is incomplete.", "final_answer")
+            end()
 
 
 def main() -> None:

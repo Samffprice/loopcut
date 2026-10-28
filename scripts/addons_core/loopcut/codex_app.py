@@ -291,6 +291,12 @@ class CodexTurn:
         self.error = ""
         self.interrupted_at = 0.0
         self.steering = True
+        self.phases = {}
+        self.final_text = ""
+        self.review_restarts = 0
+        from . import repeats
+        self.no_progress = repeats.NoProgress()
+        self.failure_pending = self.hard_failure = False
 
     # -------------------------------------------------------------- the turn
 
@@ -326,23 +332,64 @@ class CodexTurn:
         started = next((m for m in reversed(self.messages) if context.is_turn_start(m)), None)
         if started is not None:
             started[SENT] = True
-        while not self.status:
-            if self.turn.cancel.is_set():
-                self.interrupt()
-            elif self.turn.notes and self.steering:
-                self.steer()
-            try:
-                message = self.server.inbox.get(timeout=POLL)
-            except queue.Empty:
-                continue
-            if message is None:
-                raise llm.LLMError(f"Codex exited during the turn; see {Path(self.server.log.name).name}.")
-            self.handle(message)
-        if self.status == "interrupted" or self.turn.cancel.is_set():
-            raise llm.Cancelled()
-        if self.status == "failed":
-            raise llm.LLMError(f"Codex: {self.error or 'the turn failed'}")
-        return "completed"
+        while True:
+            while not self.status:
+                if self.turn.cancel.is_set():
+                    self.interrupt()
+                elif self.turn.notes and self.steering:
+                    self.steer()
+                try:
+                    message = self.server.inbox.get(timeout=POLL)
+                except queue.Empty:
+                    continue
+                if message is None:
+                    raise llm.LLMError(f"Codex exited during the turn; see {Path(self.server.log.name).name}.")
+                self.handle(message)
+                if self.failure_pending and self.turn.controller and not self.turn.cancel.is_set():
+                    self.failure_pending = False
+                    note = agent._review_failure(self.session, self.turn, hard_stop=self.hard_failure)
+                    if self.hard_failure or self.turn.outcome == "no_progress":
+                        agent._discard_reply(self.session, self.turn)
+                        if not self.status:
+                            self.server.request("turn/interrupt", {"threadId": self.thread, "turnId": self.turn_id})
+                        self.items.append(state.item_notice(agent.NO_PROGRESS_NOTICE))
+                        return "no_progress"
+                    if note and not self.status:
+                        self.call("turn/steer", {"threadId": self.thread, "expectedTurnId": self.turn_id,
+                                                "input": [_text_input(note)]})
+            if self.status == "interrupted" or self.turn.cancel.is_set():
+                raise llm.Cancelled()
+            if self.status == "failed":
+                raise llm.LLMError(f"Codex: {self.error or 'the turn failed'}")
+            if self.turn.controller is None:
+                return "completed"
+            completion = llm.Completion(text=self.final_text)
+            bounce = agent._final_reply(self.session, self.turn, completion, agent.CODEX_SPEC)
+            can_correct = self.review_restarts < self.turn.controller.settings.max_corrections
+            if not bounce:
+                bounce = agent._review_finish(self.session, self.turn, completion, can_correct=can_correct)
+            if not bounce:
+                agent._publish_reply(self.session, self.turn)
+                return self.turn.outcome if self.turn.outcome != "running" else "completed"
+            if not can_correct:
+                agent._incomplete_review(self.session, self.turn, "Further corrections are needed; the review limit was reached.")
+                agent._publish_reply(self.session, self.turn)
+                return "incomplete"
+            agent._discard_reply(self.session, self.turn)
+            note = bounce if isinstance(bounce, str) else bounce.text
+            self.messages.append({"role": "user", context.STEP_LIMIT: True, "content": note})
+            # User edits arriving during review invalidate it. Pass the human's update with the correction.
+            with self.turn.notes_lock:
+                queued = "\n".join(text for text, _ in self.turn.notes)
+            agent._fold_notes(self.session, self.turn)
+            self.review_restarts += 1
+            self.status, self.final_text = "", ""
+            result = self.call("turn/start", {
+                "threadId": self.thread, "input": [_text_input(note + ("\nUser update:\n" + queued if queued else ""))],
+                "approvalPolicy": policy, "sandboxPolicy": {"type": "dangerFullAccess"},
+                "summary": self.app.summary, **model,
+                **({"effort": self.app.effort} if self.app.effort else {})})
+            self.turn_id = result["turn"]["id"]
 
     def interrupt(self) -> None:
         """Stop: the turn is interrupted, and given INTERRUPT_SECONDS to end before its process is killed."""
@@ -364,6 +411,7 @@ class CodexTurn:
             self.steering = False
             return
         self.turn.notes.pop(0)
+        self.no_progress.reset()
         item.pop("queued", None)
         self.messages.append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
         agent._redraw()
@@ -452,7 +500,9 @@ class CodexTurn:
         kind, key = item.get("type"), item.get("id")
         if kind == "agentMessage":
             self.replies[key] = reply = state.item_assistant()
-            self.items.append(reply)
+            self.phases[key] = item.get("phase")
+            if self.turn.controller is None or item.get("phase") == "commentary":
+                self.items.append(reply)
         elif kind == "commandExecution":
             shown = _command_text(item)
             if self.cards.get(key, {}).get("status") != "rejected":
@@ -476,15 +526,26 @@ class CodexTurn:
         kind, key = item.get("type"), item.get("id")
         if kind == "agentMessage":
             reply = self.replies.pop(key, None) or state.item_assistant()
+            started_phase = self.phases.pop(key, None)
+            phase = item.get("phase") or started_phase
             reply["text"], reply["streaming"] = item.get("text") or reply["text"], False
             agent.finish_reply(reply, self.ws)
             if not reply["text"].strip():
                 if reply in self.items:
                     self.items.remove(reply)
                 return
-            if reply not in self.items:
+            held = self.turn.controller is not None and phase != "commentary"
+            if held:
+                if reply in self.items:
+                    self.items.remove(reply)
+                self.turn.pending_reply = reply
+                self.final_text = reply["text"]
+            elif reply not in self.items:
                 self.items.append(reply)
             self.messages.append({"role": "assistant", "content": reply["text"]})
+            if held:
+                from . import controller
+                self.messages[-1][controller.DRAFT] = True
             conversations.save(self.session)
         elif kind == "contextCompaction":
             self.items.append(state.item_notice("Codex summarized the earlier conversation to make room."))
@@ -504,7 +565,16 @@ class CodexTurn:
                 card["code"] = _clip("\n".join(c.get("diff") or "" for c in changes))
                 card["output"] = "\n".join(f"{(c.get('kind') or {}).get('type', 'update')} {c.get('path')}" for c in changes)
                 agent._note_level(self.turn, "edit_file", "{}", len(self.turn.delegations))
+            self.record_tool(card.get("name", kind), card.get("code", ""), ok, False)
             agent._redraw()
+
+    def record_tool(self, name, arguments, ok, changed):
+        """Native command/file outcomes and dynamic tool outcomes enter the same failure tracker."""
+        from . import repeats
+        if self.turn.controller is None:
+            return
+        self.hard_failure |= self.no_progress.record(repeats.call_key(name, arguments), ok, changed)
+        self.failure_pending |= self.no_progress.end_step() == repeats.STUCK_STEPS or self.hard_failure
 
     def usage(self, last: dict) -> None:
         """One model request's tokens, where agent._request records the HTTP loop's."""
@@ -584,9 +654,18 @@ class CodexTurn:
                 return (f"This step was NOT run, because a checkpoint could not be saved first: {ex} Tell the user; "
                         f"do not retry."), False, None, False
         from . import cloud_account
-        with cloud_account.approval_context(agent._Consent(self.session, self.turn, card, True,
-                files_allowed=self.cfg.auto_run or self.session['auto_run'])):
+        consent = agent._Consent(self.session, self.turn, card, True,
+                                  files_allowed=self.cfg.auto_run or self.session['auto_run'])
+        with cloud_account.approval_context(consent):
             result = self.run_tool(name, arguments)
+        consent.finish(result)
+        from . import repeats
+        changed = agent._scene_changed(result)
+        self.record_tool(name, arguments, result.ok and not repeats.printed_traceback(name, result.text), changed)
+        self.turn.executed_tools += 1
+        self.turn.tool_steps += 1
+        if changed or agent._changes_scene(name, arguments):
+            self.turn.ledger.scene_changed()
         agent._note_level(self.turn, name, arguments, len(self.turn.delegations))
         if getattr(result, "scene_before", None) is not None:
             self.turn.scene_before = self.turn.scene_before or result.scene_before

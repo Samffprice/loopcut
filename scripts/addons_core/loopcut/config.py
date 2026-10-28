@@ -191,6 +191,45 @@ class CodexApp:
     summary: str = "detailed"   # Reasoning summaries, kept in the transcript; the chat does not show them.
 
 
+@dataclass(frozen=True)
+class Controller:
+    """Opt-in selective review. Dollars are a stop-before-next-request limit, not a provider quote."""
+    model: Config
+    max_calls: int = 8
+    max_seconds: int = 30
+    max_usd: float = 0.10
+    paid_min_credits: int = 20
+    max_corrections: int = 2
+
+
+def controller(base: Config) -> Controller | None:
+    _, get = _getter()
+    if not _as_bool(get("LOOPCUT_CONTROLLER", "off"), "LOOPCUT_CONTROLLER"):
+        return None
+    # In particular, Codex-app sign-in is not an API key or a Loopcut ChatGPT-plan sign-in.
+    # Do not silently charge a different account when the executor has no HTTP model config.
+    model = _role(replace(base, max_output_tokens=1200, reasoning_effort="low"), get, "LOOPCUT_CONTROLLER_")
+    if chatgpt_plan(model.base_url):
+        model = replace(model, api_key=CHATGPT_PLAN_KEY, model=model.model or CHATGPT_PLAN_MODEL)
+    if not all((model.base_url, model.api_key, model.model)):
+        raise ConfigError("The controller needs a review model. Set LOOPCUT_CONTROLLER_BASE_URL, "
+                          "LOOPCUT_CONTROLLER_MODEL and LOOPCUT_CONTROLLER_API_KEY, or use a configured "
+                          "Loopcut ChatGPT-plan provider.")
+    try:
+        usd = float(get("LOOPCUT_CONTROLLER_MAX_USD", "0.10"))
+    except ValueError:
+        usd = -1
+    if not 0 < usd <= 100:
+        raise ConfigError("LOOPCUT_CONTROLLER_MAX_USD must be greater than 0 and at most 100")
+    return Controller(
+        model=model, max_usd=usd,
+        max_calls=_whole(get, "LOOPCUT_CONTROLLER_MAX_CALLS", 8, 1, 32),
+        max_seconds=_whole(get, "LOOPCUT_CONTROLLER_MAX_SECONDS", 30, 1, 120),
+        paid_min_credits=_whole(get, "LOOPCUT_CONTROLLER_PAID_MIN_CREDITS", 20, 1, 100_000),
+        max_corrections=_whole(get, "LOOPCUT_CONTROLLER_MAX_CORRECTIONS", 2, 0, 4),
+    )
+
+
 def _parse_env_file(path: Path) -> dict[str, str]:
     values = {}
     for raw in path.read_text(encoding="utf-8").splitlines():

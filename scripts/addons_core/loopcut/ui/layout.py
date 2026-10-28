@@ -1936,7 +1936,7 @@ def _code_repairs(items: list, busy: bool, active_turn_id=None) -> dict:
             current = ("turn", turn)
         turns.append(current)
         if (kind in {"error", "limit"}
-                or item.get("turn_outcome") in {"error", "cancelled", "step_limit", "budget", "no_progress"}):
+                or item.get("turn_outcome") in {"error", "cancelled", "step_limit", "budget", "no_progress", "incomplete"}):
             errors.add(current)
         if kind == "tool" and item.get("status") in {"done", "failed"}:
             last_step[current] = n

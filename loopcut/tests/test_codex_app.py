@@ -116,6 +116,53 @@ class CodexAppTest(unittest.TestCase):
             self.assertIs(off.spec, agent.WORKSPACE_SPEC, "off: the HTTP workspace loop as before")
             self.assertIsNone(config.codex_app())
 
+    def test_controller_holds_final_and_continues_codex_after_a_targeted_correction(self):
+        from loopcut import controller
+        from test_controller import answer, model
+        reviews = []
+        def attach(session, turn, settings, run_tool):
+            def stream(**kw):
+                packet = json.loads(kw["messages"][1]["content"])
+                reviews.append(packet)
+                self.assertFalse(any(i.get("text") == "Painted it red." for i in session["items"]))
+                self.assertTrue(any(i.get("text") == "Looking at the scene." for i in session["items"]))
+                response = answer(packet)
+                if len(reviews) == 1:
+                    response = answer(packet, "correct", reason="The colour still needs checking.", findings=[
+                        {"quote": "paint the cube red", "issue": "Colour unverified", "evidence": packet["evidence"][-1]["id"]}])
+                return llm.Completion(text=json.dumps(response))
+            return controller.Controller(session, turn, settings, snapshot=lambda: {"version": 1},
+                                         inspect=lambda *args: ("scene", None), stream=stream)
+        with mock.patch.object(config, "controller", return_value=config.Controller(model())), \
+                mock.patch.object(controller, "attach", side_effect=attach), \
+                mock.patch.object(agent, "_final_reply", return_value=None):
+            turn = self.start()
+            turn.thread.join(15)
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(len([m for m in self.received() if m.get("method") == "turn/start"]), 2)
+        self.assertEqual(len([i for i in self.session["items"] if i.get("text") == "Painted it red."]), 1)
+        self.assertEqual(len(self.ran), 2)
+
+    def test_controller_recovery_receives_native_command_failures(self):
+        from loopcut import controller
+        from test_controller import answer, model
+        events = []
+        def attach(session, turn, settings, run_tool):
+            def stream(**kw):
+                packet = json.loads(kw["messages"][1]["content"])
+                events.append(packet["event"])
+                return llm.Completion(text=json.dumps(answer(packet, "stop", reason="The same command keeps failing.")))
+            return controller.Controller(session, turn, settings, snapshot=lambda: {}, inspect=lambda *args: ("", None),
+                                         stream=stream)
+        with mock.patch.object(config, "controller", return_value=config.Controller(model())), \
+                mock.patch.object(controller, "attach", side_effect=attach):
+            turn = self.start(scenario="controller_failures")
+            turn.thread.join(15)
+        self.assertEqual(turn.outcome, "no_progress")
+        self.assertEqual(events, ["repeated_failure"])
+        self.assertFalse(any(i.get("text") == "The build is incomplete." for i in self.session["items"]))
+
     def test_a_turn_runs_in_a_codex_thread_with_loopcuts_live_tools(self):
         turn = self.start()
         turn.thread.join(15)

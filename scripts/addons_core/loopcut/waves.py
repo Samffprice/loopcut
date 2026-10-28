@@ -158,6 +158,7 @@ class JobBudget:
         self.prices, self.reported = dict(prices or {}), reported
         self.steps, self.usd = 0, 0.0
         self.costed = False  # A reply said what it cost (usage.cost): its dollars count even for an unpriced model.
+        self.usage_requests = self.unpriced_requests = 0
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
 
@@ -190,6 +191,13 @@ class JobBudget:
     def priced(self, model: str) -> bool:
         return self.costed or pricing.usd(model, {"input": 0}, self.prices) is not None
 
+    def snapshot(self) -> dict:
+        """Worker inference only; other expenses have their own ledger and limits."""
+        with self._lock:
+            unknown = self.unpriced_requests + max(0, self.steps - self.usage_requests)
+            return {"used": None if unknown else self.usd, "known_used": self.usd, "limit": self.max_usd or None,
+                    "requests": self.steps, "unknown_requests": unknown, "reported_cost": self.costed}
+
     def add(self, model: str, usage: dict) -> float | None:
         """One reply's dollars, counted and returned: with the account's terms what its usage says it cost, else
         its tokens at the account's prices or the table's (pricing.charged); None for a model with no price, then
@@ -197,6 +205,8 @@ class JobBudget:
         cost = (pricing.charged if self.reported else pricing.usd)(model, usage, self.prices)
         with self._lock:
             self.costed = self.costed or (self.reported and "cost" in (usage or {}))
+            self.usage_requests += 1
+            self.unpriced_requests += cost is None
             if cost:
                 self.usd += cost
         return cost

@@ -252,6 +252,9 @@ class Turn:
         self.diverted = False
         self.carry_steps = False  # The account's orchestrator_max_steps: steps counted on the turn's message too.
         self.codex = None  # config.CodexApp when Codex's own loop runs the turn (CODEX_SPEC, codex_app.py).
+        self.review_config: config.Controller | None = None
+        self.controller = None  # Shared by the lead and workers' paid calls; never owns scene mutation.
+        self.pending_reply: dict | None = None  # Final delivery stays private until all gates have decided.
         self.try_it = ""  # The setup card that sent this turn's request unedited: its cloud call is on the house.
         # Credits (spending.py, C47): paid calls this turn, workers' included, and the burst guard's limit;
         # the user's spending settings, read on the main thread by _configure.
@@ -652,6 +655,7 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
     if codex is not None:
         session["mode"] = "workspace"
         turn.config, turn.spec, turn.codex = _turn_config(), CODEX_SPEC, codex
+        turn.review_config = config.controller(turn.config)
         return
     roles = config.load_roles()
     # The disk cache normally supplies this before the first refresh completes. With no
@@ -661,6 +665,7 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
         session["mode"] = "workspace"
         turn.config = _workspace_config(_keep_mode(roles.orchestrator) if roles.orchestrate else _turn_config())
         turn.spec = WORKSPACE_SPEC
+        turn.review_config = config.controller(turn.config)
         return
     if orchestrate:
         turn.roles = dataclasses.replace(roles, orchestrator=_keep_mode(roles.orchestrator),
@@ -673,6 +678,7 @@ def _configure(turn: Turn, session: dict | None = None) -> None:
     else:
         turn.config = _keep_mode(roles.orchestrator) if roles.orchestrate else _turn_config()
         turn.spec = SINGLE_SPEC
+    turn.review_config = config.controller(turn.config)
 
 
 def _update_account(info: dict) -> None:
@@ -1304,34 +1310,82 @@ class _Consent:
         explicit = self.limit_approved or self._click_covers(details)
         asked = self.asked_for(chat_session)
         allowed = set()
-        while not explicit:
+        reviewer = getattr(chat_turn, "controller", None) if not self.clicked else None
+        review = None
+        reviewed = False
+        value_question = ""
+        while True:
+            if self.turn.cancel.is_set() or chat_turn.cancel.is_set():
+                raise llm.Cancelled()
+            settings = getattr(chat_turn, "spending", None) or spending.Settings()
+            asked = self.asked_for(chat_session)
+            # Permission first: never pay for a value review of a call the user's policy refuses.
             with spending.lock:
                 kind = spending.decide(details, spending.ledger(chat_session), settings, calls=chat_turn.paid_calls,
                                        burst_limit=chat_turn.burst_limit,
                                        vendors=chat_session.setdefault("spend_vendors", []), asked=asked)
-            if kind == spending.RUN or kind in allowed:  # Allowed once for this call (a budget smaller than it).
-                break
-            if kind == spending.NOT_ASKED:  # "Only when I ask": refused with no card, and the model told why.
+            if kind == spending.NOT_ASKED and not explicit:
                 from . import cloud_http
                 self.card["declined"] = True
                 raise cloud_http.CloudError(spending.declined(kind, details, settings), "declined")
+            if reviewer and reviewer.meaningful(details) and not reviewed:
+                from . import cloud_http, controller
+                try:
+                    review = reviewer.review("paid_action", json.dumps({
+                        "tool": self.tool(), "summary": self.card.get("summary", ""),
+                        "worker": getattr(self.turn, "worker", ""), "worker_scene_revision": self.turn.ledger.revision,
+                        "arguments": str(self.card.get("code", ""))[:1200],
+                        "cost": {key: details.get(key) for key in ("credits", "vendor", "balance")}}), details)
+                except controller.StaleReview as ex:
+                    raise cloud_http.CloudError(str(ex) + " Nothing was charged.", "controller_stale") from ex
+                except controller.ReviewError as ex:
+                    # A failed review has no authority to spend. A fully priced user decision can proceed.
+                    value_question = str(ex) + " Do you want this paid action to run?"
+                else:
+                    if review.action == "alternative":
+                        raise cloud_http.CloudError(review.note() + " Nothing ran and nothing was charged.",
+                                                    "controller_alternative")
+                    if review.action == "user_decision":
+                        value_question = review.reason
+                reviewed = True
+                continue  # Re-read policy/ledger after potentially slow inference.
+            if review is not None and not reviewer.current(review):
+                from . import cloud_http
+                raise cloud_http.CloudError("The scene or user instruction changed after the paid-action review. "
+                                            "Propose the action again for the current request. Nothing was charged.",
+                                            "controller_stale")
+            with spending.lock:
+                # Recheck AND reserve atomically. Another worker may have spent or reserved during the review
+                # or any approval wait. Controller approval never changes this permission decision.
+                kind = (spending.RUN if explicit else spending.decide(
+                    details, spending.ledger(chat_session), settings, calls=chat_turn.paid_calls,
+                    burst_limit=chat_turn.burst_limit, vendors=chat_session["spend_vendors"], asked=asked))
+                if kind == spending.RUN or kind in allowed:
+                    if value_question:
+                        kind = spending.VALUE
+                    else:
+                        if not self.clicked:
+                            if spending.paid(details):
+                                chat_turn.paid_calls += 1
+                            held = spending.start(spending.ledger(chat_session), details, not explicit)
+                            self.hold = (held, not explicit) if held else None
+                        break
+            if kind == spending.NOT_ASKED:
+                continue  # The next pass handles a policy change without asking for a forbidden action.
             allowed.add(kind)
-            if not self._ask(kind, details):
+            if not self._ask(kind, {**details, "value_reason": value_question}):
                 return False
+            if kind in (spending.COST, spending.VENDOR, spending.VALUE):
+                value_question = ""
             with spending.lock:
                 spending.allow(kind, details, spending.ledger(chat_session), settings, chat_turn,
                                chat_session["spend_vendors"])
-            if kind in (spending.COST, spending.VENDOR):  # The user approved this very call.
+            if kind in (spending.COST, spending.VENDOR, spending.VALUE):  # The user approved this very call.
                 explicit = True
-                break
         self.implied = not asked and not explicit
         if self.clicked:  # Nothing held: its charge goes to its chat when it ends (turn_into_3d), wherever that is.
             _redraw()
             return True
-        with spending.lock:
-            chat_turn.paid_calls += 1
-            held = spending.start(spending.ledger(chat_session), details, not explicit)
-        self.hold = (held, not explicit) if held else None
         if self.rig:
             for card in self.shown:
                 card.update(cost=self.card['cost'])
@@ -2179,7 +2233,9 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
             f"Summarized {compacted} earlier messages so requests stay small."))
     estimated = context.estimate_tokens(prepared, fixed, skill_index=index)
     reply = state.item_assistant()
-    items.append(reply)
+    held = turn.controller is not None and spec.role != "worker"
+    if not held:
+        items.append(reply)
 
     def on_text(delta: str) -> None:
         reply["text"] += delta
@@ -2247,7 +2303,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
             reason = cap_reason(completion)
             print(f"Loopcut: {spec.role} step hit {reason} again on the retry; giving up on this step.")
             reply["streaming"] = False
-            if not reply["text"].strip():
+            if not reply["text"].strip() and reply in items:
                 items.remove(reply)
             raise llm.LLMError(f"{spec.role.capitalize()} step stopped at {reason} twice in a row, "
                                f"without a usable reply or tool call.")
@@ -2275,7 +2331,13 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
     _drop_copied_records(completion, reply, items, spec, session["messages"])
     reply["streaming"] = False
     finish_reply(reply, turn.roots[0] if turn.roots else None)
-    if not reply["text"].strip():
+    if held:
+        if completion.tool_calls and turn.outcome == "running":
+            if reply["text"].strip():
+                items.append(reply)  # This is a progress update; the following tools have yet to run.
+        else:
+            turn.pending_reply = reply
+    elif not reply["text"].strip() and reply in items:
         items.remove(reply)
     return completion
 
@@ -2337,6 +2399,8 @@ def _unmade(session: dict, turn: Turn, request: dict, completion: llm.Completion
         print(f"Loopcut: reply only wrote out {names}; sent back once to call them or say nothing ran.")
         return UNMADE_PROMPT.format(calls=names, them="it" if one else "them")
     completion.text = messages[-1]["content"] = UNMADE_STORED  # The next turn reads what happened, not the claim.
+    if turn.pending_reply is not None:
+        turn.pending_reply["text"] = ""
     print(f"Loopcut: reply only wrote out {names} and the turn has no correction left; not sent back.")
     return None
 
@@ -2366,6 +2430,9 @@ def _wrap_up(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
     if completion and completion.text.strip():
         # The text only: a tool call can no longer run, and one left unanswered breaks the history.
         messages.append({"role": "assistant", "content": completion.text})
+        if turn.pending_reply is not None:
+            from . import controller
+            messages[-1][controller.DRAFT] = True
         return completion
     messages.pop()  # Unanswered, it would tell the next turn that tools are off.
     return None
@@ -2375,6 +2442,91 @@ def _end_at_limit(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec,
     """The turn ends short of finishing: the wrap-up, then the spec's last word (it cannot bounce)."""
     completion = _wrap_up(session, turn, cfg, spec, prompt)
     _final_reply(session, turn, completion, spec)
+    _review_finish(session, turn, completion, can_correct=False)
+    _publish_reply(session, turn)
+
+
+def _publish_reply(session: dict, turn: Turn) -> None:
+    from . import controller
+    reply, turn.pending_reply = turn.pending_reply, None
+    if reply is not None and reply.get("text", "").strip() and not turn.cancel.is_set():
+        reply["streaming"] = False
+        finish_reply(reply, turn.roots[0] if turn.roots else None)
+        session["items"].append(reply)
+        for message in session["messages"]:
+            message.pop(controller.DRAFT, None)
+
+
+def _discard_reply(session: dict, turn: Turn) -> None:
+    from . import controller
+    turn.pending_reply = None
+    for message in session["messages"]:
+        if message.pop(controller.DRAFT, False):
+            message["content"] = ("[Loopcut: proposed completion withheld; it was not accepted or delivered.]\n"
+                                  + (message.get("content") or ""))
+
+
+def _incomplete_review(session: dict, turn: Turn, reason: str) -> None:
+    text = "The result is incomplete or not independently verified. " + reason
+    reply = turn.pending_reply or state.item_assistant()
+    reply.update(text=text, streaming=False)
+    reply.pop("verification", None)
+    turn.pending_reply = reply
+    last = session["messages"][-1] if session["messages"] else {}
+    if last.get("role") == "assistant" and not last.get("tool_calls"):
+        last["content"] = text
+    else:
+        session["messages"].append({"role": "assistant", "content": text})
+    if turn.outcome in ("running", "completed"):
+        turn.outcome = "incomplete"
+
+
+def _review_finish(session: dict, turn: Turn, completion, *, can_correct=True):
+    from . import controller
+    reviewer = turn.controller
+    if reviewer is None or turn.cancel.is_set():
+        return None
+    can_correct = can_correct and turn.outcome == "running" and reviewer.corrections < reviewer.settings.max_corrections
+    turn.touch("checking the result")
+    if not any(r.get("event") == "finish" for r in reviewer.records):
+        session["items"].append(state.item_notice("Checking the result before finishing."))
+    try:
+        decision = reviewer.review("finish", completion.text if completion else "No final reply was produced.")
+    except controller.StaleReview as ex:
+        if can_correct:
+            reviewer.corrections += 1
+            reviewer.save()
+            return f"[Loopcut review] {ex}"
+        _incomplete_review(session, turn, str(ex))
+        return None
+    except controller.ReviewError as ex:
+        _incomplete_review(session, turn, str(ex))
+        return None
+    if decision.action == "correct" and can_correct:
+        reviewer.corrections += 1
+        reviewer.save()
+        return decision.note()
+    if decision.action in ("correct", "incomplete"):
+        _incomplete_review(session, turn, decision.reason)
+    return None
+
+
+def _review_failure(session: dict, turn: Turn, *, hard_stop=False):
+    """At most one early recovery review; it may steer a repair, never reset the existing hard stop."""
+    from . import controller
+    reviewer = turn.controller
+    if reviewer is None or reviewer.failures:
+        return None
+    reviewer.failures += 1
+    reviewer.save()
+    try:
+        decision = reviewer.review("repeated_failure", "The existing failure tracker detected repeated trouble."
+                                   + (" Its hard stop has been reached." if hard_stop else ""))
+    except controller.ReviewError as ex:
+        return f"[Loopcut review] {ex} Existing failure limits still apply."
+    if decision.action == "stop":
+        turn.outcome, turn.stop_reason = "no_progress", decision.reason
+    return decision.note()
 
 
 def _final_reply(session: dict, turn: Turn, completion, spec: LoopSpec):
@@ -2591,6 +2743,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         run_tool = lambda name, arguments: _run_tool_on_main(name, arguments, turn.cancel.is_set)
     try:
         cfg = turn.config or config.load()
+        if spec.role != "worker" and turn.controller is None and turn.review_config is not None:
+            from . import controller
+            turn.controller = controller.attach(session, turn, turn.review_config, run_tool)
         first = None
         if turn.try_it and not turn.tool_steps and not turn.executed_tools:  # Resumed, the card's call has run.
             from . import try_it
@@ -2646,6 +2801,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
             messages.append(completion.as_message(cfg.model if cfg.keep_reasoning else ""))
+            if turn.pending_reply is not None:
+                from . import controller
+                messages[-1][controller.DRAFT] = True
             if carry and getattr(turn, "carry_steps", False):  # A failed request is made again by a resume:
                 request[STEPS_TAKEN] = step  # only a reply counts.
             if not completion.tool_calls:
@@ -2678,7 +2836,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     bounce = _motion_claim(session, turn, spec, request, completion, cfg, step)
                 if not bounce:
                     bounce = _final_reply(session, turn, completion, spec)
+                if not bounce:
+                    bounce = _review_finish(session, turn, completion,
+                                            can_correct=not (cfg.max_steps and step >= cfg.max_steps))
                 if bounce:  # Sent back, marked so it continues the turn, and the loop goes on.
+                    _discard_reply(session, turn)
                     text = bounce if isinstance(bounce, str) else bounce.text
                     messages.append({"role": "user", context.STEP_LIMIT: True, "content": text})
                     if getattr(bounce, "image_path", None):  # The late workers' contact sheet.
@@ -2689,7 +2851,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     continue
                 if written_out:  # Not sent back, and nothing sent the turn on: it ends on Loopcut's line.
                     turn.unmade_final = UNMADE_FINAL if turn.unrun_claim else UNMADE_FINAL.replace(" again", "")
-                turn.outcome = "cancelled" if turn.cancel.is_set() else "completed"
+                _publish_reply(session, turn)
+                if turn.outcome == "running":
+                    turn.outcome = "cancelled" if turn.cancel.is_set() else "completed"
                 return
 
             step_message = messages[-1]
@@ -2918,8 +3082,14 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             # Tool messages must directly follow the assistant message, so images go after them all.
             messages.extend(_image_message(reference, what, file_preview=file_preview)
                             for reference, what, file_preview in _fresh_images(images))
-            if no_progress and no_progress.end_step() == repeats.STUCK_STEPS and not stalled and spec.role != "worker":
-                items.append(state.item_notice(STUCK_NOTICE))
+            stuck_steps = no_progress.end_step() if no_progress else 0
+            if spec.role != "worker" and (stuck_steps == repeats.STUCK_STEPS or stalled):
+                note = _review_failure(session, turn, hard_stop=stalled)
+                if note:
+                    messages.append({"role": "user", context.STEP_LIMIT: True, "content": note})
+                stalled = stalled or turn.outcome == "no_progress"
+                if not stalled and stuck_steps == repeats.STUCK_STEPS:
+                    items.append(state.item_notice(STUCK_NOTICE))
             _resume_playback(spec)
             spec.save(session)  # The history is consistent here: every call has its result.
             _redraw()
@@ -2991,6 +3161,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         else:
             items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
+        _discard_reply(session, turn)  # Cancellation/errors cannot turn a private draft into accepted history.
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
         _resume_playback(spec)
         end_failed = False
