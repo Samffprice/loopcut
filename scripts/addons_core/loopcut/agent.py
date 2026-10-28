@@ -255,6 +255,7 @@ class Turn:
         self.review_config: config.Controller | None = None
         self.controller = None  # Shared by the lead and workers' paid calls; never owns scene mutation.
         self.pending_reply: dict | None = None  # Final delivery stays private until all gates have decided.
+        self.quality_note = ""  # Goal context passed to an executor that drives its own loop.
         self.try_it = ""  # The setup card that sent this turn's request unedited: its cloud call is on the house.
         # Credits (spending.py, C47): paid calls this turn, workers' included, and the burst guard's limit;
         # the user's spending settings, read on the main thread by _configure.
@@ -1313,7 +1314,10 @@ class _Consent:
         reviewer = getattr(chat_turn, "controller", None) if not self.clicked else None
         review = None
         reviewed = False
-        value_question = ""
+        value_question = ("This improvement was inferred from your goal, but this step has a cost. "
+                          "Do you want this paid action to run?"
+                          if reviewer and getattr(reviewer, "inferred_improvement", False)
+                          and spending.paid(details) and not explicit and not asked else "")
         while True:
             if self.turn.cancel.is_set() or chat_turn.cancel.is_set():
                 raise llm.Cancelled()
@@ -2482,11 +2486,12 @@ def _incomplete_review(session: dict, turn: Turn, reason: str) -> None:
 
 
 def _review_finish(session: dict, turn: Turn, completion, *, can_correct=True):
-    from . import controller
+    from . import controller, quality
     reviewer = turn.controller
     if reviewer is None or turn.cancel.is_set():
         return None
-    can_correct = can_correct and turn.outcome == "running" and reviewer.corrections < reviewer.settings.max_corrections
+    can_continue = can_correct and turn.outcome == "running"
+    can_correct = can_continue and reviewer.corrections < reviewer.settings.max_corrections
     turn.touch("checking the result")
     if not any(r.get("event") == "finish" for r in reviewer.records):
         session["items"].append(state.item_notice("Checking the result before finishing."))
@@ -2506,9 +2511,37 @@ def _review_finish(session: dict, turn: Turn, completion, *, can_correct=True):
         reviewer.corrections += 1
         reviewer.save()
         return decision.note()
-    if decision.action in ("correct", "incomplete"):
+    if decision.action == "improve" and can_continue and reviewer.take_improvement(decision):
+        return decision.note()
+    if decision.action in ("correct", "improve", "incomplete"):
         _incomplete_review(session, turn, decision.reason)
+    notes = quality.delivery_notes(decision.quality)
+    if notes and turn.pending_reply is not None:
+        turn.pending_reply["text"] += "\n\n" + notes
+        if session["messages"] and session["messages"][-1].get("role") == "assistant":
+            session["messages"][-1]["content"] = turn.pending_reply["text"]
     return None
+
+
+def _review_goal(session: dict, turn: Turn, *, progress=False):
+    """Maintain the outcome and quality bar throughout work, within the review's own allowance."""
+    from . import controller
+    reviewer = turn.controller
+    if reviewer is None or turn.outcome != "running" or not reviewer.checkpoint_due(progress=progress):
+        return None
+    session["items"].append(state.item_notice("Checking the result against your goal." if progress
+                                             else "Checking what a good result needs."))
+    try:
+        decision = reviewer.review("progress" if progress else "intent",
+                                   "Reassess usefulness, quality, inferred needs and the most valuable next step."
+                                   if progress else "Establish the user's outcome and a useful quality standard before work.")
+    except controller.ReviewError as ex:
+        return f"[Loopcut review] {ex} Continue within the original request and existing limits; quality is not certified."
+    if (decision.quality and any(r["disposition"] == "do" for r in decision.quality["improvements"])
+            and not reviewer.take_improvement(decision)):
+        return "[Loopcut review] The improvement allowance is exhausted or this change was already attempted. " \
+               "Do not repeat optional polish. Finish the requested work and report any remaining quality gaps."
+    return decision.note()
 
 
 def _review_failure(session: dict, turn: Turn, *, hard_stop=False):
@@ -2785,6 +2818,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if scene_action is None:
                     scene_action = bool(turn.routed and turn.routed.level > 0)
                 if spec.drive:
+                    turn.quality_note = _review_goal(session, turn) or ""
+                    if not turn.quality_note and turn.controller:
+                        turn.quality_note = turn.controller.goal_context()
                     turn.outcome = spec.drive(session, turn, cfg, run_tool, ensure_checkpoint)
                     return
                 started = True
@@ -2796,6 +2832,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if no_progress:
                     no_progress.reset()
             _fold_notes(session, turn)
+            if spec.role != "worker":
+                note = _review_goal(session, turn)
+                if note:
+                    messages.append({"role": "user", context.STEP_LIMIT: True, "content": note})
             shown = {id(item) for item in items}  # Not an index: a request may drop an earlier setup error.
             # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
             completion = first if first is not None else _request(session, turn, cfg, spec)
@@ -3090,6 +3130,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 stalled = stalled or turn.outcome == "no_progress"
                 if not stalled and stuck_steps == repeats.STUCK_STEPS:
                     items.append(state.item_notice(STUCK_NOTICE))
+            elif spec.role != "worker" and not turn.cancel.is_set():
+                note = _review_goal(session, turn, progress=True)
+                if note:
+                    messages.append({"role": "user", context.STEP_LIMIT: True, "content": note})
             _resume_playback(spec)
             spec.save(session)  # The history is consistent here: every call has its result.
             _redraw()

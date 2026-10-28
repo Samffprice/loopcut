@@ -297,6 +297,7 @@ class CodexTurn:
         from . import repeats
         self.no_progress = repeats.NoProgress()
         self.failure_pending = self.hard_failure = False
+        self.quality_pending = False
 
     # -------------------------------------------------------------- the turn
 
@@ -324,8 +325,11 @@ class CodexTurn:
             self.session["codex_thread"] = thread
             conversations.save(self.session)
         self.thread = thread
+        initial = turn_input(self.session, self.ws)
+        if self.turn.quality_note:
+            initial.append(_text_input(self.turn.quality_note))
         result = self.call("turn/start", {
-            "threadId": thread, "input": turn_input(self.session, self.ws), "approvalPolicy": policy,
+            "threadId": thread, "input": initial, "approvalPolicy": policy,
             "sandboxPolicy": {"type": "dangerFullAccess"}, "summary": self.app.summary, **model,
             **({"effort": self.app.effort} if self.app.effort else {})})
         self.turn_id = result["turn"]["id"]
@@ -355,8 +359,12 @@ class CodexTurn:
                         self.items.append(state.item_notice(agent.NO_PROGRESS_NOTICE))
                         return "no_progress"
                     if note and not self.status:
-                        self.call("turn/steer", {"threadId": self.thread, "expectedTurnId": self.turn_id,
-                                                "input": [_text_input(note)]})
+                        self.steer_review(note)
+                elif self.quality_pending and not self.status and not self.turn.cancel.is_set():
+                    self.quality_pending = False
+                    note = agent._review_goal(self.session, self.turn, progress=True)
+                    if note:
+                        self.steer_review(note)
             if self.status == "interrupted" or self.turn.cancel.is_set():
                 raise llm.Cancelled()
             if self.status == "failed":
@@ -365,7 +373,8 @@ class CodexTurn:
                 return "completed"
             completion = llm.Completion(text=self.final_text)
             bounce = agent._final_reply(self.session, self.turn, completion, agent.CODEX_SPEC)
-            can_correct = self.review_restarts < self.turn.controller.settings.max_corrections
+            can_correct = self.review_restarts < (self.turn.controller.settings.max_corrections
+                                                  + self.turn.controller.settings.max_improvements)
             if not bounce:
                 bounce = agent._review_finish(self.session, self.turn, completion, can_correct=can_correct)
             if not bounce:
@@ -414,7 +423,20 @@ class CodexTurn:
         self.no_progress.reset()
         item.pop("queued", None)
         self.messages.append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
+        note = agent._review_goal(self.session, self.turn)
+        if note:
+            self.steer_review(note)
         agent._redraw()
+
+    def steer_review(self, note):
+        self.messages.append({"role": "user", context.STEP_LIMIT: True, "content": note})
+        try:
+            self.call("turn/steer", {"threadId": self.thread, "expectedTurnId": self.turn_id,
+                                    "input": [_text_input(note)]})
+        except llm.LLMError as ex:
+            # Native work can finish while the independent review runs. The held final reply still
+            # goes through review, which sees this assessment and can restart the turn if needed.
+            print(f"Loopcut: quality guidance deferred to final review ({type(ex).__name__})")
 
     def call(self, method: str, params: dict) -> dict:
         """A request, waited for; whatever else arrives meanwhile is handled."""
@@ -575,6 +597,7 @@ class CodexTurn:
             return
         self.hard_failure |= self.no_progress.record(repeats.call_key(name, arguments), ok, changed)
         self.failure_pending |= self.no_progress.end_step() == repeats.STUCK_STEPS or self.hard_failure
+        self.quality_pending |= ok
 
     def usage(self, last: dict) -> None:
         """One model request's tokens, where agent._request records the HTTP loop's."""

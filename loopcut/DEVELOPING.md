@@ -26,8 +26,8 @@ are ordinary Git files.
 
 ## Setup
 
-The optional [selective controller](CONTROLLER.md) independently reviews paid-action value,
-final delivery and repeated failures across the supported execution paths. It is off by default;
+The optional [goal and quality controller](CONTROLLER.md) establishes intended outcomes, reassesses
+quality during work, and reviews paid-action value, final delivery and repeated failures. It is off by default;
 the guide covers configuration, usage accounting and the paired evaluation protocol.
 
 Keys entered in the app are kept in `credentials.json` in Blender's config folder with user-only

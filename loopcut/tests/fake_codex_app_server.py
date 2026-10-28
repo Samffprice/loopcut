@@ -48,6 +48,8 @@ def wait_for(predicate) -> dict:
         message = receive()
         if predicate(message):
             return message
+        if message.get("method") == "turn/steer":
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"turnId": TURN}})
 
 
 def item(kind: str, key: str, **fields) -> dict:
@@ -135,6 +137,17 @@ def turn() -> None:
         else:
             message("m5", "The build is incomplete.", "final_answer")
             end()
+    elif SCENARIO == "controller_quality":
+        entry = command("human", "create_human", "Human mesh created")
+        started(entry)
+        completed(entry)
+        steer = wait_for(lambda m: m.get("method") == "turn/steer")
+        send({"jsonrpc": "2.0", "id": steer["id"], "result": {"turnId": TURN}})
+        entry = command("rig", "add_rig_and_test", "Rig added; pose tests passed")
+        started(entry)
+        completed(entry)
+        message("quality-final", "The character is rigged and its deformation checked.", "final_answer")
+        end()
 
 
 def main() -> None:
@@ -158,6 +171,8 @@ def main() -> None:
             turn()
         elif method == "turn/interrupt":
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        elif method == "turn/steer":
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"turnId": TURN}})
 
 
 if __name__ == "__main__":

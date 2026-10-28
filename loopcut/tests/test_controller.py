@@ -22,10 +22,16 @@ def model():
 
 def answer(packet, action=None, **extra):
     return {"event": packet["event"], "action": action if action is not None else {
-        "paid_action": "approve", "finish": "present", "repeated_failure": "continue"}[packet["event"]],
+        "intent": "guide", "progress": "continue", "paid_action": "approve", "finish": "present",
+        "repeated_failure": "continue"}[packet["event"]],
         "scene_version": packet["scene_version"], "instruction_version": packet["instruction_version"],
         "reason": "The evidence supports this choice.", "guidance": "Inspect the current object before repairing it.",
-        "findings": [], "advice": "", **extra}
+        "findings": [], "advice": "",
+        "quality": {"goal": "A scripted decision for control-flow testing.", "intended_use": "Protocol validation",
+                    "artifact": False, "inferences": [], "improvements": [], "dimensions": [
+                        {"name": "decision", "kind": "fidelity", "target": "Answer the request",
+                         "status": "meets", "evidence": ["request"], "observation": "The human request is available."}]},
+        **extra}
 
 
 def paid(credits=20):
@@ -254,7 +260,7 @@ class ControllerTest(ControllerFixture, unittest.TestCase):
         with configured():
             settings = config.controller(model())
             self.assertEqual(settings.model.base_url, model().base_url)
-            self.assertEqual(settings.model.max_output_tokens, 1200)
+            self.assertEqual(settings.model.max_output_tokens, 2400)
         for value in ("NaN", "inf", "0", "-1"):
             with configured(LOOPCUT_CONTROLLER_MAX_USD=value), self.assertRaises(config.ConfigError):
                 config.controller(model())

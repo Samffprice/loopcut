@@ -34,10 +34,16 @@ def stream(**kwargs):
     if len(calls) == 1:
         return llm.Completion(tool_calls=[llm.ToolCall('read', 'review_objects', '{"names":["Cube"]}')])
     return llm.Completion(text=json.dumps({
-        'event': 'finish', 'action': 'present',
+        'event': 'finish', 'action': 'incomplete',
         'scene_version': packet['scene_version'], 'instruction_version': packet['instruction_version'],
         'reason': 'Scripted decision for the controller plumbing smoke check.',
-        'guidance': '', 'findings': [], 'advice': ''}))
+        'guidance': '', 'findings': [], 'advice': '',
+        'quality': {'goal': 'A red cube.', 'intended_use': 'A visible model.', 'artifact': True,
+                    'inferences': [], 'improvements': [], 'dimensions': [
+                        {'name': 'appearance', 'kind': 'visual', 'target': 'A red cube', 'status': 'unverified',
+                         'evidence': [], 'observation': 'This smoke check does not inspect an image.'},
+                        {'name': 'use', 'kind': 'functional', 'target': 'A static visible mesh',
+                         'status': 'unverified', 'evidence': [], 'observation': 'Quality is not tested here.'}]}}))
 
 review = controller.Controller(session, turn, config.Controller(cfg), snapshot=inspection.live_token,
                                inspect=inspect, stream=stream)

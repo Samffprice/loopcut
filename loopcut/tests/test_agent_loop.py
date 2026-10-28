@@ -260,7 +260,7 @@ class AgentLoopTest(unittest.TestCase):
                         self.assertFalse(any(i.get("text") == "The red cube is ready." for i in session["items"]))
                         self.assertFalse(any(i.get("text") == "The corrected cube is ready." for i in session["items"]))
                         response = answer(packet)
-                        if len(seen) == 1:
+                        if packet["event"] == "finish" and sum(p["event"] == "finish" for p in seen) == 1:
                             response = answer(packet, "correct", reason="The colour needs correction.", findings=[
                                 {"quote": "red cube", "issue": "Wrong colour", "evidence": packet["evidence"][-1]["id"]}])
                         return llm.Completion(text=json.dumps(response))
@@ -274,11 +274,43 @@ class AgentLoopTest(unittest.TestCase):
                     turn = self.start("Make a red cube.", spec=spec, review=factory)
                     turn.thread.join(10)
                 self.assertEqual(turn.outcome, "completed")
-                self.assertEqual(len(seen), 2)
+                self.assertEqual([p["event"] for p in seen], ["intent", "finish", "finish"])
                 self.assertFalse(SCRIPT.replies)
                 replies = [i["text"] for i in self.session["items"] if i["kind"] == "assistant"]
                 self.assertNotIn("The red cube is ready.", replies)
                 self.assertEqual(replies[-1], "The corrected cube is ready.")
+
+    def test_quality_checkpoint_improves_inferred_use_before_completion_on_all_http_paths(self):
+        from loopcut import controller
+        from test_quality import human_review_reply
+        for base in (agent.SINGLE_SPEC, agent.ORCH_SPEC, agent.WORKSPACE_SPEC):
+            with self.subTest(role=base.role):
+                self.session = state.reset()
+                SCRIPT.replies[:] = [tool_reply("run_python", {"code": "create_human()", "summary": "Build human"}),
+                                     tool_reply("run_python", {"code": "rig_and_test()", "summary": "Make it poseable"}),
+                                     text_reply("The character is rigged and checked.")]
+                seen = []
+                def factory(session, turn):
+                    def stream(**kw):
+                        packet = json.loads(kw["messages"][1]["content"])
+                        if len(kw["messages"]) == 2:
+                            seen.append(packet["event"])
+                        return human_review_reply(kw, rigged=turn.executed_tools >= 2)
+                    return controller.Controller(session, turn, config.Controller(config.load(), check_every=1),
+                        snapshot=lambda: {"tools": turn.executed_tools}, stream=stream,
+                        inspect=lambda name, args: ("Scripted inspected evidence", {"role": "user", "content": "image"}
+                                                   if name == "review_view" else None))
+                spec = dataclasses.replace(base, system=lambda s: "", schemas=lambda: [], on_turn_start=None,
+                                           on_final=None, on_end=None, prompt_id=None)
+                with mock.patch.dict(os.environ, {"LOOPCUT_AUTO_RUN": "true"}), \
+                        mock.patch.object(agent, "_final_reply", return_value=None):
+                    turn = self.start("Make a human character for my game.", spec=spec, review=factory)
+                    turn.thread.join(10)
+                self.assertEqual(turn.outcome, "completed")
+                self.assertEqual(seen, ["intent", "progress", "progress", "finish"])
+                self.assertIn("Add a simple rig and test its deformation", json.dumps(SCRIPT.requests[1]["messages"]))
+                self.assertEqual(len(turn.controller.improvements), 1)
+                self.assertFalse(SCRIPT.replies)
 
     def wait_for(self, predicate, what: str):
         import time
